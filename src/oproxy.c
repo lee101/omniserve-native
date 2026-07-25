@@ -175,6 +175,14 @@ oproxy_target *oproxy_target_create(const char *base_url, int max_idle,
     for (const struct addrinfo *ai = resolved; ai; ai = ai->ai_next) {
         if (ai->ai_addrlen <= sizeof(struct sockaddr_storage)) count++;
     }
+    /* Resolution can succeed while every result is unusable. Failing here beats
+     * handing back a target that looks valid and can never connect. */
+    if (count == 0) {
+        set_error(error, error_cap, "upstream resolved to no usable addresses");
+        freeaddrinfo(resolved);
+        free(target);
+        return NULL;
+    }
     target->addresses = calloc(count, sizeof *target->addresses);
     if (!target->addresses) {
         set_error(error, error_cap, "could not allocate resolved upstream addresses");

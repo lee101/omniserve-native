@@ -11,6 +11,10 @@ __pycache__/
 performance/*.callgrind.out
 performance/*.massif.out
 
+# Locally built shared object used by matte/ctypes_candidate.py. The .npy
+# fixtures under matte/fixtures/ are golden reference data and ARE committed.
+matte/libomatte.so
+
 # Training data, checkpoints, and generated model artifacts never belong in
 # the source repository. Publish reviewed artifacts to a dedicated model repo.
 data/
@@ -27,3 +31,12 @@ artifacts/
 .env.*
 !.env.example
 secrets/
+
+# Host-local on-call automation: agent state, cooldown stamps, and logs are
+# machine-specific. The signals it consumes (/metrics, /errors) are part of the
+# gateway's documented API and are specified in the README.
+monitoring/
+
+# Matting eval harness: local venv and caches (the .npy fixtures are committed).
+matte/.venv/
+matte/__pycache__/

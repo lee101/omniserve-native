@@ -1,0 +1,58 @@
+# Curated to be actionable rather than exhaustive. The goal is that a clean run
+# means something, so checks that fire on unavoidable idioms in this codebase are
+# off with the reason recorded:
+#
+#   cert-dcl37-c / bugprone-reserved-identifier — every translation unit needs
+#     _GNU_SOURCE for memmem/strcasestr/pthread_condattr_setclock.
+#   cert-err33-c — snprintf into a fixed error buffer is deliberately unchecked;
+#     truncating a diagnostic string is not a failure worth branching on.
+#   cert-err34-c — configuration comes from the environment, where atoi's "0 on
+#     garbage" is the wanted behaviour: every caller substitutes its default.
+#   bugprone-not-null-terminated-result — the response builders are
+#     length-counted (ohttp_stream_write takes an explicit length) and are never
+#     read as C strings, so NUL termination is not part of their contract.
+#   bugprone-easily-swappable-parameters — fires on every (buf, cap) pair.
+#   clang-analyzer-valist.Uninitialized — false positive on the va_copy sizing
+#     pass in oproxy.c's append_fmt; va_start/va_copy/va_end are correctly paired.
+#   clang-analyzer-optin.portability.UnixAPI — reports 0-byte allocations whose
+#     dimensions are already rejected at the entry point (omatte_estimate_fb);
+#     the analyzer does not carry that constraint far enough.
+#     optin.performance.Padding stays ON — it caught a real 8-byte hole.
+#   bugprone-multi-level-implicit-pointer-conversion — dlsym and the JSON token
+#     walkers legitimately pass void** through void*.
+#   bugprone-narrowing-conversions — timestamps and token counts are formatted
+#     into JSON as doubles on purpose.
+#   bugprone-assignment-in-if-condition — used for the idiomatic
+#     "assign then test" over lookup helpers that return -1.
+#   readability-* / modernize-* — no C++ here, and formatting is not enforced.
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  cert-*,
+  misc-*,
+  performance-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-macro-parentheses,
+  -bugprone-reserved-identifier,
+  -bugprone-suspicious-include,
+  -bugprone-not-null-terminated-result,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -bugprone-narrowing-conversions,
+  -bugprone-assignment-in-if-condition,
+  -clang-analyzer-valist.Uninitialized,
+  -clang-analyzer-optin.portability.UnixAPI,
+  -cert-dcl37-c,
+  -cert-dcl51-cpp,
+  -cert-err33-c,
+  -cert-err34-c,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -clang-analyzer-security.insecureAPI.strcpy,
+  -misc-include-cleaner,
+  -misc-no-recursion
+
+# Only our own sources. llama.cpp, stable-diffusion.cpp, and the stb headers are
+# vendored third-party code and are not ours to fix.
+HeaderFilterRegex: '.*/omniserve-native/(include|src|tools)/.*'
+WarningsAsErrors: '*'
+FormatStyle: none

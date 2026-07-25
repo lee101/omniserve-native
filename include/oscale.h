@@ -54,30 +54,33 @@ typedef enum {
 const char *oscale_reason_name(oscale_reason reason);
 const char *oscale_action_name(oscale_action action);
 
+/* Field order is deliberate: every value the controller reads on each tick is
+ * grouped first so the decision inputs share a cache line and the struct has no
+ * interior padding. The identity strings are only touched when acting, so they
+ * sit at the end. */
 typedef struct {
-    /* Identity of the rentable unit. */
-    char name[24];          /* lane key, e.g. "tts" */
-    char cog_template[64];  /* app.nz cog template or model id */
-    char hardware[24];      /* gpu-rtx4090, gpu-rtx5090, ... */
-
     /* Economics. */
     double price_usd_hr;        /* what the instance costs us per hour */
     double revenue_usd_per_req; /* what one served overflow request is worth */
     double seconds_per_req;     /* how long one request occupies an instance */
     double margin;              /* required value/cost ratio before renting */
 
-    /* Eligibility and pressure. */
-    unsigned tier_mask;         /* tiers whose demand may rent hardware */
-    int scale_up_queue_depth;   /* eligible waiters needed to consider renting */
+    /* Pressure thresholds and lifecycle windows. */
     double scale_up_queue_ms;   /* worst eligible wait needed to consider it */
-
-    /* Caps and lifecycle. */
-    int max_instances;
     double max_usd_hr;          /* lane spend ceiling */
     double cooldown_s;          /* minimum gap between scale actions */
     double idle_scale_down_s;   /* idle time before releasing an instance */
     double max_instance_ttl_s;  /* absolute lifetime, billing backstop */
+
+    unsigned tier_mask;         /* tiers whose demand may rent hardware */
+    int scale_up_queue_depth;   /* eligible waiters needed to consider renting */
+    int max_instances;
     bool enabled;
+
+    /* Identity of the rentable unit. */
+    char name[24];          /* lane key, e.g. "tts" */
+    char cog_template[64];  /* app.nz cog template or model id */
+    char hardware[24];      /* gpu-rtx4090, gpu-rtx5090, ... */
 } oscale_policy;
 
 typedef struct {
@@ -88,10 +91,10 @@ typedef struct {
 } oscale_observation;
 
 typedef struct {
-    bool active;
     double started_s;
     double last_used_s;
     char endpoint[256];   /* control-plane handle, empty while provisioning */
+    bool active;
     bool ready;
 } oscale_instance;
 

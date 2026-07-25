@@ -70,4 +70,38 @@ void ohttp_stream_end(ohttp_request *req);
 bool ohttp_raw_write(ohttp_request *req, const void *data, size_t len);
 void ohttp_force_close(ohttp_request *req);
 
+/*
+ * Response accounting.
+ *
+ * An on-call agent needs to know that the gateway is returning 5xx, on which
+ * route, and how recently — without scraping logs, which is both slow and
+ * ambiguous once several services share a journal. Own responses are recorded
+ * where the status is written; proxied responses are recorded by reading the
+ * status line of the first relayed write, so an upstream 500 is not invisible
+ * just because the bytes passed through verbatim.
+ */
+
+#define OHTTP_ERROR_RING 32
+
+typedef struct {
+    unsigned long long total;
+    unsigned long long informational; /* 1xx */
+    unsigned long long success;       /* 2xx */
+    unsigned long long redirect;      /* 3xx */
+    unsigned long long client_error;  /* 4xx */
+    unsigned long long server_error;  /* 5xx */
+} ohttp_response_stats;
+
+typedef struct {
+    int status;
+    long at_unix;
+    char method[8];
+    char path[104];
+} ohttp_error_event;
+
+void ohttp_response_snapshot(ohttp_response_stats *out);
+
+/* Copies up to max recent 5xx events, newest first. Returns the count. */
+int ohttp_recent_errors(ohttp_error_event *out, int max);
+
 #endif

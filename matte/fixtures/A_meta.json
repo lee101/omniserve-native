@@ -1,0 +1,85 @@
+{
+  "case": "A",
+  "seed": 20260725,
+  "shape": {
+    "h": 64,
+    "w": 64,
+    "depth": 3
+  },
+  "image_shape": [
+    64,
+    64,
+    3
+  ],
+  "alpha_shape": [
+    64,
+    64
+  ],
+  "dtype": "float32",
+  "layout": "C-contiguous, image/fg/bg are HWC RGB in [0,1], alpha is HW in [0,1]",
+  "params": {
+    "regularization": 1e-05,
+    "n_small_iterations": 10,
+    "n_big_iterations": 2,
+    "small_size": 32,
+    "gradient_weight": 1.0
+  },
+  "return_background": true,
+  "pymatting_version": "1.1.15",
+  "numpy_version": "2.4.6",
+  "python_version": "3.14.0",
+  "pyramid_levels": [
+    {
+      "i_level": 0,
+      "h": 1,
+      "w": 1,
+      "n_iter": 10
+    },
+    {
+      "i_level": 1,
+      "h": 2,
+      "w": 2,
+      "n_iter": 10
+    },
+    {
+      "i_level": 2,
+      "h": 4,
+      "w": 4,
+      "n_iter": 10
+    },
+    {
+      "i_level": 3,
+      "h": 8,
+      "w": 8,
+      "n_iter": 10
+    },
+    {
+      "i_level": 4,
+      "h": 16,
+      "w": 16,
+      "n_iter": 10
+    },
+    {
+      "i_level": 5,
+      "h": 32,
+      "w": 32,
+      "n_iter": 10
+    },
+    {
+      "i_level": 6,
+      "h": 64,
+      "w": 64,
+      "n_iter": 2
+    }
+  ],
+  "md5": {
+    "A_image": "6e6e84229643d5ece8e3a3a5f103a78d",
+    "A_alpha": "b33c61c64710ac9f829b1b8955f7a766",
+    "A_fg_ref": "d6651fba7f57c7bfc8e41d60f18297c3",
+    "A_bg_ref": "f4c9683aa41e0aa4b3b36c4029281178"
+  },
+  "pure_python_spec_check": {
+    "fg_max_abs_diff": 1.9073486328125e-06,
+    "bg_max_abs_diff": 1.1324882507324219e-06
+  }
+}

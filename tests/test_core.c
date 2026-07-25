@@ -6,10 +6,12 @@
 #include "oscale.h"
 #include "osched.h"
 #include "otext.h"
+#include "omatte.h"
 #include "otune.h"
 
 #include <arpa/inet.h>
 #include <assert.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -97,6 +99,8 @@ static void test_openapi(void) {
         "/api/v1/audio-extraction", "/api/v1/generate",
         "/api/v1/generate-large", "/api/v1/image-caption",
         "/v1/animations/generations", "/v1/3d/generations",
+        "/v1/images/backgrounds",
+        "/v1/images/background-removals/jobs",
         "/v1/images/background-removals",
         "/v1/3d/assets/{job}/{file}",
         "/v1/engines/{engine_name}/completions",
@@ -506,8 +510,10 @@ static void test_scale_defaults_to_zero(void) {
     CHECK(oscale_add_lane(s, &background) == 1);
     oscale_lane *batch_lane = oscale_lane_by_name(s, "batch");
     CHECK(batch_lane != NULL);
-    CHECK((batch_lane->policy.tier_mask & OSCALE_TIER_BIT(TIER_BACKGROUND)) == 0);
-    CHECK(batch_lane->policy.tier_mask == OSCALE_TIERS_PAID_ONLY);
+    if (batch_lane) {
+        CHECK((batch_lane->policy.tier_mask & OSCALE_TIER_BIT(TIER_BACKGROUND)) == 0);
+        CHECK(batch_lane->policy.tier_mask == OSCALE_TIERS_PAID_ONLY);
+    }
 
     oscale_observation obs;
     memset(&obs, 0, sizeof obs);
@@ -829,8 +835,108 @@ static void test_capacity_controller(void) {
     osched_destroy(sched);
 }
 
+static void test_response_accounting(void) {
+    ohttp_response_stats before;
+    ohttp_response_snapshot(&before);
+    /* test_http_server has already driven traffic through the server, so the
+     * counters must be non-zero and internally consistent. */
+    CHECK(before.total > 0);
+    CHECK(before.total == before.informational + before.success + before.redirect +
+                          before.client_error + before.server_error);
+
+    ohttp_error_event events[OHTTP_ERROR_RING];
+    int count = ohttp_recent_errors(events, OHTTP_ERROR_RING);
+    CHECK(count >= 0 && count <= OHTTP_ERROR_RING);
+    for (int i = 0; i < count; i++) {
+        /* Only 5xx is ringed, and every entry must be attributable. */
+        CHECK(events[i].status >= 500 && events[i].status <= 599);
+        CHECK(events[i].at_unix > 0);
+    }
+    CHECK(ohttp_recent_errors(events, 0) == 0);
+    CHECK(ohttp_recent_errors(NULL, 4) == 0);
+}
+
+/* Foreground estimation: an opaque matte must return the image unchanged, and
+ * the parallel red-black sweep must land on the same answer as the sequential
+ * one regardless of thread count. */
+static void test_matte(void) {
+    enum { H = 24, W = 20, D = 3 };
+    static float image[H * W * D];
+    static float alpha[H * W];
+    static float fg[H * W * D];
+    static float bg[H * W * D];
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            const int i = y * W + x;
+            /* Left half is a red object, right half a green backdrop. */
+            const bool inside = x < W / 2;
+            image[i * D + 0] = inside ? 0.85f : 0.05f;
+            image[i * D + 1] = inside ? 0.15f : 0.90f;
+            image[i * D + 2] = inside ? 0.20f : 0.10f;
+            alpha[i] = inside ? 1.0f : 0.0f;
+        }
+    }
+
+    omatte_params params = omatte_default_params();
+    CHECK(omatte_estimate_fb(image, alpha, H, W, D, &params, fg, bg) == 0);
+    for (int i = 0; i < H * W; i++) {
+        if (alpha[i] < 1.0f) continue;
+        for (int c = 0; c < D; c++) {
+            CHECK(fabsf(fg[i * D + c] - image[i * D + c]) < 1e-2f);
+        }
+    }
+
+    /* Semi-transparent edge: alpha ramps across the middle column so the solver
+     * has to separate the two colours instead of copying the composite. */
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            const int i = y * W + x;
+            const float a = (float)x / (float)(W - 1);
+            alpha[i] = a;
+            for (int c = 0; c < D; c++) {
+                const float front = c == 0 ? 0.85f : (c == 1 ? 0.15f : 0.20f);
+                const float back = c == 0 ? 0.05f : (c == 1 ? 0.90f : 0.10f);
+                image[i * D + c] = a * front + (1.0f - a) * back;
+            }
+        }
+    }
+
+    static float fg_seq[H * W * D];
+    static float fg_par_one[H * W * D];
+    static float fg_par_many[H * W * D];
+
+    params.order = OMATTE_ORDER_SEQUENTIAL;
+    CHECK(omatte_estimate_fb(image, alpha, H, W, D, &params, fg_seq, NULL) == 0);
+
+    params.order = OMATTE_ORDER_RED_BLACK;
+    params.threads = 1;
+    CHECK(omatte_estimate_fb(image, alpha, H, W, D, &params, fg_par_one, NULL) == 0);
+    params.threads = 8;
+    CHECK(omatte_estimate_fb(image, alpha, H, W, D, &params, fg_par_many, NULL) == 0);
+
+    for (int i = 0; i < H * W * D; i++) {
+        /* Thread count must not change the result at all. */
+        CHECK(fg_par_one[i] == fg_par_many[i]);
+        /* And the two sweep orders must agree to within solver noise. */
+        CHECK(fabsf(fg_seq[i] - fg_par_one[i]) < 5e-2f);
+    }
+
+    omatte_composite(fg_seq, alpha, NULL, H, W, D, bg);
+    for (int i = 0; i < H * W; i++) {
+        CHECK(bg[i * D] >= 0.0f && bg[i * D] <= 1.0f);
+    }
+
+    CHECK(omatte_estimate_fb(NULL, alpha, H, W, D, &params, fg, bg) == -1);
+    CHECK(omatte_estimate_fb(image, alpha, 0, W, D, &params, fg, bg) == -1);
+    if (!omatte_cuda_available()) {
+        CHECK(omatte_estimate_fb_cuda(image, alpha, H, W, D, &params, fg, bg) == -3);
+    }
+}
+
 int main(void) {
     test_json();
+    test_matte();
     test_tier_parse();
     test_completion_spacing();
     test_openapi();
@@ -847,6 +953,7 @@ int main(void) {
     test_tune_profiles();
     test_capacity_controller();
     test_http_server();
+    test_response_accounting();
     if (failures) {
         fprintf(stderr, "%d failures\n", failures);
         return 1;

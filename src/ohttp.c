@@ -18,10 +18,80 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include <time.h>
+
 #define OHTTP_INLINE_BUFFER 4096
 #define OHTTP_MAX_BUFFER (OHTTP_MAX_BODY + (64u << 10))
 
 typedef enum { CONN_READING, CONN_DISPATCHED, CONN_CLOSED } conn_state;
+
+/* Process-global, like the NVML handle in osched.c: one gateway per process, so
+ * threading a server pointer through every response path would buy nothing. */
+static atomic_ullong resp_total;
+static atomic_ullong resp_by_class[6]; /* index by status/100, 0 unused */
+static pthread_mutex_t error_ring_lock = PTHREAD_MUTEX_INITIALIZER;
+static ohttp_error_event error_ring[OHTTP_ERROR_RING];
+static unsigned error_ring_next;
+static unsigned long long error_ring_seen;
+
+static void record_status(const ohttp_request *req, int status) {
+    if (status < 100 || status > 599) return;
+    atomic_fetch_add_explicit(&resp_total, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&resp_by_class[status / 100], 1, memory_order_relaxed);
+    if (status < 500) return;
+    pthread_mutex_lock(&error_ring_lock);
+    ohttp_error_event *slot = &error_ring[error_ring_next % OHTTP_ERROR_RING];
+    memset(slot, 0, sizeof *slot);
+    slot->status = status;
+    slot->at_unix = (long)time(NULL);
+    if (req) {
+        size_t method_len = req->method_len < sizeof slot->method - 1
+            ? req->method_len : sizeof slot->method - 1;
+        memcpy(slot->method, req->method, method_len);
+        size_t path_len = req->path_len < sizeof slot->path - 1
+            ? req->path_len : sizeof slot->path - 1;
+        memcpy(slot->path, req->path, path_len);
+    }
+    error_ring_next++;
+    error_ring_seen++;
+    pthread_mutex_unlock(&error_ring_lock);
+}
+
+/* Proxied responses are relayed verbatim, so the only place the status appears
+ * is the first bytes of the upstream response. */
+static void record_relayed_status(ohttp_request *req, const void *data, size_t len) {
+    if (len < 12 || memcmp(data, "HTTP/1.", 7) != 0) return;
+    const char *p = (const char *)data + 8;
+    while (p < (const char *)data + len && *p == ' ') p++;
+    if (p + 3 > (const char *)data + len) return;
+    if (p[0] < '0' || p[0] > '9' || p[1] < '0' || p[1] > '9' || p[2] < '0' || p[2] > '9') return;
+    record_status(req, (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0'));
+}
+
+void ohttp_response_snapshot(ohttp_response_stats *out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    out->total = atomic_load_explicit(&resp_total, memory_order_relaxed);
+    out->informational = atomic_load_explicit(&resp_by_class[1], memory_order_relaxed);
+    out->success = atomic_load_explicit(&resp_by_class[2], memory_order_relaxed);
+    out->redirect = atomic_load_explicit(&resp_by_class[3], memory_order_relaxed);
+    out->client_error = atomic_load_explicit(&resp_by_class[4], memory_order_relaxed);
+    out->server_error = atomic_load_explicit(&resp_by_class[5], memory_order_relaxed);
+}
+
+int ohttp_recent_errors(ohttp_error_event *out, int max) {
+    if (!out || max <= 0) return 0;
+    pthread_mutex_lock(&error_ring_lock);
+    int have = (int)(error_ring_seen < OHTTP_ERROR_RING ? error_ring_seen : OHTTP_ERROR_RING);
+    int count = have < max ? have : max;
+    for (int i = 0; i < count; i++) {
+        /* Newest first: walk backwards from the write cursor. */
+        unsigned index = (error_ring_next - 1u - (unsigned)i) % OHTTP_ERROR_RING;
+        out[i] = error_ring[index];
+    }
+    pthread_mutex_unlock(&error_ring_lock);
+    return count;
+}
 
 struct ohttp_conn {
     int fd;
@@ -36,6 +106,7 @@ struct ohttp_conn {
     bool continue_sent;
     bool streaming;
     bool chunked_out;
+    bool status_recorded; /* one status per request, even across many raw writes */
     pthread_mutex_t ownership_lock;
     struct ohttp_server *srv;
     struct ohttp_conn *next_job;
@@ -218,6 +289,7 @@ void ohttp_respond(ohttp_request *req, int status, const char *content_type,
         { .iov_base = (void *)body, .iov_len = body_len },
     };
     if (!writev_all(c->fd, iov, body_len ? 2 : 1)) c->keep_alive = false;
+    record_status(req, status);
 }
 
 void ohttp_respond_str(ohttp_request *req, int status, const char *content_type,
@@ -242,6 +314,7 @@ void ohttp_stream_begin(ohttp_request *req, int status, const char *content_type
                       status, status_text(status), content_type,
                       c->keep_alive ? "keep-alive" : "close");
     write_all(c->fd, head, (size_t)hn);
+    record_status(req, status);
 }
 
 bool ohttp_stream_write(ohttp_request *req, const char *data, size_t len) {
@@ -265,6 +338,10 @@ void ohttp_stream_end(ohttp_request *req) {
 
 bool ohttp_raw_write(ohttp_request *req, const void *data, size_t len) {
     if (!req || !req->conn) return false;
+    if (!req->conn->status_recorded) {
+        req->conn->status_recorded = true;
+        record_relayed_status(req, data, len);
+    }
     return write_all(req->conn->fd, data, len);
 }
 
@@ -275,7 +352,7 @@ void ohttp_force_close(ohttp_request *req) {
 static bool parse_request(struct ohttp_conn *c, ohttp_request *req) {
     char *end = memmem(c->buf, c->buf_len, "\r\n\r\n", 4);
     if (!end) {
-        if (c->buf_len > 64 * 1024) return false;
+        if (c->buf_len > (64u << 10)) return false;
         c->need_total = 0;
         return true;
     }
@@ -409,6 +486,7 @@ static void *worker_main(void *arg) {
                 break;
             }
             size_t consumed = c->need_total;
+            c->status_recorded = false;
             srv->cfg.handler(&req, srv->cfg.user);
             if (!c->keep_alive) {
                 alive = false;

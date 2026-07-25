@@ -1,0 +1,71 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-${presetName}"
+    },
+    {
+      "name": "dev",
+      "inherits": "base",
+      "displayName": "dev (fast rebuilds, no LTO)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "ONATIVE_LTO": "OFF",
+        "ONATIVE_NATIVE_ARCH": "ON",
+        "WITH_LLAMA": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "release (LTO, native arch)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ONATIVE_LTO": "ON",
+        "ONATIVE_NATIVE_ARCH": "ON",
+        "WITH_LLAMA": "ON"
+      }
+    },
+    {
+      "name": "sanitize",
+      "inherits": "base",
+      "displayName": "sanitize (ASan + UBSan, no external runtimes)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -g",
+        "ONATIVE_LTO": "OFF",
+        "WITH_LLAMA": "OFF",
+        "WITH_SD": "OFF"
+      }
+    },
+    {
+      "name": "ci",
+      "inherits": "base",
+      "displayName": "ci (portable, warnings are errors)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_FLAGS": "-Werror",
+        "ONATIVE_LTO": "OFF",
+        "ONATIVE_NATIVE_ARCH": "OFF",
+        "WITH_LLAMA": "OFF",
+        "WITH_SD": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "sanitize", "configurePreset": "sanitize" },
+    { "name": "ci", "configurePreset": "ci" }
+  ],
+  "testPresets": [
+    { "name": "dev", "configurePreset": "dev", "output": { "outputOnFailure": true } },
+    { "name": "sanitize", "configurePreset": "sanitize", "output": { "outputOnFailure": true } },
+    { "name": "ci", "configurePreset": "ci", "output": { "outputOnFailure": true } }
+  ]
+}

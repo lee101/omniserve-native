@@ -13,7 +13,30 @@ option(ONATIVE_PROFILE "Keep symbols and frame pointers in optimized profiling b
 
 add_compile_options(-Wall -Wextra -pthread)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(-fno-plt)
+    # -Wshadow and the prototype warnings catch the two mistakes that actually
+    # bite in a threaded C server: a local quietly masking shared state, and a
+    # call through an unchecked implicit declaration.
+    add_compile_options(-fno-plt -Wshadow -Wstrict-prototypes -Wmissing-prototypes
+                        -Wvla -Wpointer-arith -Wwrite-strings -Wundef
+                        -Wold-style-definition -Wredundant-decls)
+endif()
+
+# Faster links and rebuilds when the tooling is present. None of this changes
+# generated code; LTO stays under ONATIVE_LTO so a dev build can skip it (it is
+# the dominant incremental cost: ~4.0s to ~1.4s on this tree).
+find_program(ONATIVE_CCACHE ccache)
+if(ONATIVE_CCACHE)
+    set(CMAKE_C_COMPILER_LAUNCHER "${ONATIVE_CCACHE}")
+    message(STATUS "using ccache: ${ONATIVE_CCACHE}")
+endif()
+find_program(ONATIVE_MOLD mold)
+find_program(ONATIVE_LLD ld.lld)
+if(ONATIVE_MOLD)
+    add_link_options(-fuse-ld=mold)
+    message(STATUS "using mold linker")
+elseif(ONATIVE_LLD)
+    add_link_options(-fuse-ld=lld)
+    message(STATUS "using lld linker")
 endif()
 if(ONATIVE_NATIVE_ARCH AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-march=native -mtune=native)
@@ -34,10 +57,18 @@ endif()
 
 option(WITH_LLAMA "Link llama.cpp for LLM inference" ON)
 option(WITH_SD "Link stable-diffusion.cpp for image generation" OFF)
+# Foreground estimation / colour decontamination. The CPU path is always built;
+# the CUDA kernel is opt-in because CI has no nvcc.
+option(WITH_MATTE_CUDA "Build the CUDA foreground-estimation kernel" OFF)
+if(WITH_MATTE_CUDA)
+    set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90;120" CACHE STRING "CUDA archs for the matte kernel")
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+endif()
 set(LLAMA_DIR "${CMAKE_SOURCE_DIR}/../llama.cpp" CACHE PATH "llama.cpp checkout")
 set(SD_DIR "${CMAKE_SOURCE_DIR}/../stable-diffusion.cpp" CACHE PATH "stable-diffusion.cpp checkout")
 
-set(CORE_SRC src/ocapacity.c src/ohttp.c src/ojson.c src/oproxy.c src/osched.c
+set(CORE_SRC src/ocapacity.c src/ohttp.c src/ojson.c src/omatte.c src/oproxy.c src/osched.c
              src/oscale.c src/otext.c src/otune.c)
 
 add_library(onative_core STATIC ${CORE_SRC})
@@ -50,15 +81,17 @@ target_link_libraries(omniserve-native PRIVATE onative_core)
 
 if(WITH_LLAMA AND EXISTS "${LLAMA_DIR}/build/bin/libllama.so")
     target_compile_definitions(omniserve-native PRIVATE USE_LLAMA)
-    target_include_directories(omniserve-native PRIVATE "${LLAMA_DIR}/include" "${LLAMA_DIR}/ggml/include")
+    target_include_directories(omniserve-native SYSTEM PRIVATE "${LLAMA_DIR}/include" "${LLAMA_DIR}/ggml/include")
     target_link_libraries(omniserve-native PRIVATE "${LLAMA_DIR}/build/bin/libllama.so" "${LLAMA_DIR}/build/bin/libggml.so")
     set_target_properties(omniserve-native PROPERTIES BUILD_RPATH "${LLAMA_DIR}/build/bin")
 endif()
 
 if(WITH_SD AND EXISTS "${SD_DIR}/build/bin/libstable-diffusion.so")
     target_compile_definitions(omniserve-native PRIVATE USE_SD "OMNISERVE_SD_LIB_DEFAULT=\"${SD_DIR}/build/bin/libstable-diffusion.so\"")
-    target_include_directories(omniserve-native BEFORE PRIVATE "${SD_DIR}/ggml/examples")
-    target_include_directories(omniserve-native PRIVATE "${SD_DIR}/include")
+    # SYSTEM so the vendored stb/sd headers do not trip our own strict warning
+    # set; they are third-party code and are not ours to fix.
+    target_include_directories(omniserve-native SYSTEM BEFORE PRIVATE "${SD_DIR}/ggml/examples")
+    target_include_directories(omniserve-native SYSTEM PRIVATE "${SD_DIR}/include")
     target_include_directories(omniserve-native SYSTEM PRIVATE "${SD_DIR}/thirdparty")
 endif()
 
@@ -81,7 +114,44 @@ if(Python3_Interpreter_FOUND)
         NAME asr_router
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_asr_router.py"
     )
+    add_test(
+        NAME birefnet_jobs
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_birefnet_jobs.py"
+    )
+    add_test(
+        NAME object_store
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_object_store.py"
+    )
+    # Skips itself when numpy or libomatte.so is missing (CPU-only CI).
+    add_test(
+        NAME matte_decontamination
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_matte_decontamination.py"
+    )
+    set_tests_properties(matte_decontamination PROPERTIES
+        ENVIRONMENT "OMATTE_LIB=$<TARGET_FILE:omatte>")
 endif()
+
+if(WITH_MATTE_CUDA)
+    target_sources(onative_core PRIVATE cuda/omatte_cuda.cu)
+    target_compile_definitions(onative_core PUBLIC OMATTE_WITH_CUDA)
+    target_link_libraries(onative_core PUBLIC CUDA::cudart)
+endif()
+
+# Shared build of just the matting library, for the Python workers (ctypes).
+add_library(omatte SHARED src/omatte.c)
+target_include_directories(omatte PUBLIC include)
+target_link_libraries(omatte PUBLIC pthread m)
+set_target_properties(omatte PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(WITH_MATTE_CUDA)
+    target_sources(omatte PRIVATE cuda/omatte_cuda.cu)
+    target_compile_definitions(omatte PUBLIC OMATTE_WITH_CUDA)
+    target_link_libraries(omatte PUBLIC CUDA::cudart)
+    set_target_properties(omatte PROPERTIES CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+endif()
+
+add_executable(omatte_cli tools/omatte_cli.c)
+target_include_directories(omatte_cli PRIVATE include)
+target_link_libraries(omatte_cli PRIVATE onative_core)
 
 add_executable(onative_bench tools/bench_http.c)
 target_link_libraries(onative_bench PRIVATE pthread)

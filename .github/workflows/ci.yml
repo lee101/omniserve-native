@@ -8,13 +8,91 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  # Portable build: no CUDA, no llama.cpp checkout, warnings are errors. This is
+  # the gate — everything below adds signal, but this is what must never break.
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: cmake --preset ci
+      - name: Build
+        run: cmake --build --preset ci
+      - name: Test
+        run: ctest --preset ci
+
+  # The scheduler, the capacity controller, and the HTTP reactor are all
+  # threaded, so the sanitizers are where real defects surface.
+  sanitize:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: ["address,undefined", "thread"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: >
+          cmake -S . -B build-san -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_FLAGS="-fsanitize=${{ matrix.sanitizer }} -fno-omit-frame-pointer -g"
+          -DONATIVE_LTO=OFF -DWITH_LLAMA=OFF -DWITH_SD=OFF
+      - name: Build
+        run: cmake --build build-san -j2
+      - name: Test
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          ASAN_OPTIONS: abort_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build-san --output-on-failure
+
+  analyze:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Configure
-        run: cmake -S . -B build -DWITH_LLAMA=OFF -DWITH_SD=OFF -DONATIVE_LTO=OFF
-      - name: Build
-        run: cmake --build build -j2
-      - name: Test
-        run: ctest --test-dir build --output-on-failure
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y ninja-build cppcheck clang-tidy
+      - name: Configure with compile database
+        run: >
+          cmake -S . -B build-analyze -G Ninja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          -DONATIVE_LTO=OFF -DWITH_LLAMA=OFF -DWITH_SD=OFF
+      - name: cppcheck
+        run: >
+          cppcheck --project=build-analyze/compile_commands.json
+          --enable=warning,performance,portability
+          --inline-suppr --error-exitcode=1 --quiet
+          --suppress=missingIncludeSystem
+      # Check list lives in .clang-tidy so CI and editors agree.
+      - name: clang-tidy
+        run: clang-tidy -p build-analyze src/*.c tools/*.c
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint scripts
+        run: shellcheck -S warning scripts/*.sh
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile and run worker/tool tests
+        run: |
+          python -m compileall -q tools workers
+          for t in tests/test_*.py; do python "$t"; done

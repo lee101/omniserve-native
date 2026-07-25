@@ -23,6 +23,7 @@ typedef struct {
     const char *secret;
     oproxy_target *llm_upstream;
     oproxy_target *image_upstream;
+    oproxy_target *art_upstream;
     oproxy_target *birefnet_upstream;
     oproxy_target *tts_upstream;
     oproxy_target *stt_upstream;
@@ -35,6 +36,7 @@ typedef struct {
     int upstream_timeout_ms;
     int llm_permits;
     int image_permits;
+    int art_permits;
     int birefnet_permits;
     int tts_permits;
     int stt_permits;
@@ -122,6 +124,92 @@ static void handle_health(ohttp_request *req) {
     ohttp_respond_str(req, 200, "application/json", body);
 }
 
+/* Prometheus text exposition. The on-call monitor scrapes this rather than
+ * parsing logs: a counter it can diff between polls is unambiguous about
+ * whether new 5xx happened since the last check. */
+static void handle_metrics(ohttp_request *req, app_state *app) {
+    ohttp_response_stats responses;
+    ohttp_response_snapshot(&responses);
+    osched_stats stats;
+    osched_snapshot(app->sched, &stats);
+    ollm_placement placement;
+    ollm_placement_snapshot(&placement);
+    bool degraded = ollm_ready() && placement.gpu_requested && !placement.on_gpu;
+    double vram_free = -1.0, vram_total = -1.0;
+    bool vram_ok = ogpu_memory_gib(&vram_free, &vram_total);
+
+    char body[4096];
+    size_t len = (size_t)snprintf(body, sizeof body,
+        "# HELP omniserve_responses_total HTTP responses by status class.\n"
+        "# TYPE omniserve_responses_total counter\n"
+        "omniserve_responses_total{class=\"2xx\"} %llu\n"
+        "omniserve_responses_total{class=\"3xx\"} %llu\n"
+        "omniserve_responses_total{class=\"4xx\"} %llu\n"
+        "omniserve_responses_total{class=\"5xx\"} %llu\n"
+        "# HELP omniserve_gpu_degraded Embedded model requested GPU layers but runs on CPU.\n"
+        "# TYPE omniserve_gpu_degraded gauge\n"
+        "omniserve_gpu_degraded %d\n"
+        "# HELP omniserve_vram_free_gib Free device memory, -1 when the driver is unreachable.\n"
+        "# TYPE omniserve_vram_free_gib gauge\n"
+        "omniserve_vram_free_gib %.3f\n"
+        "omniserve_vram_total_gib %.3f\n"
+        "# HELP omniserve_admission_slots Configured and in-use admission slots.\n"
+        "# TYPE omniserve_admission_slots gauge\n"
+        "omniserve_admission_slots{state=\"total\"} %d\n"
+        "omniserve_admission_slots{state=\"used\"} %d\n"
+        "# HELP omniserve_admission_timeouts_total Requests rejected after waiting.\n"
+        "# TYPE omniserve_admission_timeouts_total counter\n"
+        "omniserve_admission_timeouts_total{tier=\"paid\"} %lu\n"
+        "omniserve_admission_timeouts_total{tier=\"sub\"} %lu\n"
+        "omniserve_admission_timeouts_total{tier=\"free\"} %lu\n"
+        "omniserve_admission_timeouts_total{tier=\"background\"} %lu\n"
+        "# HELP omniserve_queue_ms_max Worst observed admission wait.\n"
+        "# TYPE omniserve_queue_ms_max gauge\n"
+        "omniserve_queue_ms_max{tier=\"paid\"} %.1f\n"
+        "omniserve_queue_ms_max{tier=\"free\"} %.1f\n",
+        responses.success, responses.redirect, responses.client_error, responses.server_error,
+        degraded ? 1 : 0, vram_ok ? vram_free : -1.0, vram_ok ? vram_total : -1.0,
+        stats.slots, stats.used_slots,
+        (unsigned long)stats.timed_out[TIER_PAID], (unsigned long)stats.timed_out[TIER_SUB],
+        (unsigned long)stats.timed_out[TIER_FREE], (unsigned long)stats.timed_out[TIER_BACKGROUND],
+        stats.queue_ms_max[TIER_PAID], stats.queue_ms_max[TIER_FREE]);
+
+    /* Rented-capacity spend, so an alert can fire on cost as well as on errors. */
+    for (int i = 0; i < oscale_lane_count(app->scale) && len < sizeof body; i++) {
+        const oscale_lane *lane = oscale_lane_at(app->scale, i);
+        if (!lane) continue;
+        len += (size_t)snprintf(body + len, sizeof body - len,
+            "omniserve_capacity_spend_rate_usd_hr{lane=\"%.20s\"} %.3f\n"
+            "omniserve_capacity_instances{lane=\"%.20s\"} %d\n",
+            lane->policy.name, oscale_lane_spend_rate_usd_hr(lane),
+            lane->policy.name, oscale_ready_instances(lane));
+    }
+    ohttp_respond(req, 200, "text/plain; version=0.0.4", body, len);
+}
+
+/* Recent 5xx with route and age, so an agent has somewhere to start without
+ * correlating a shared journal. */
+static void handle_errors(ohttp_request *req) {
+    ohttp_error_event events[OHTTP_ERROR_RING];
+    int count = ohttp_recent_errors(events, OHTTP_ERROR_RING);
+    ohttp_response_stats responses;
+    ohttp_response_snapshot(&responses);
+    char body[4096];
+    size_t len = (size_t)snprintf(body, sizeof body,
+                                  "{\"server_error_total\":%llu,\"recent\":[",
+                                  responses.server_error);
+    long now = (long)time(NULL);
+    for (int i = 0; i < count && len < sizeof body; i++) {
+        len += (size_t)snprintf(body + len, sizeof body - len,
+                                "%s{\"status\":%d,\"method\":\"%.7s\",\"path\":\"%.103s\","
+                                "\"age_s\":%ld}",
+                                i ? "," : "", events[i].status, events[i].method,
+                                events[i].path, now - events[i].at_unix);
+    }
+    if (len < sizeof body) snprintf(body + len, sizeof body - len, "]}");
+    ohttp_respond_str(req, 200, "application/json", body);
+}
+
 /* Separate from /health so a load balancer can drain a CPU-degraded instance
  * without the liveness probe killing it in a restart loop. */
 static void handle_readyz(ohttp_request *req) {
@@ -154,7 +242,10 @@ static void handle_status(ohttp_request *req, app_state *app) {
     ollm_placement_snapshot(&placement);
     double vram_free = -1.0, vram_total = -1.0;
     bool vram_ok = ogpu_memory_gib(&vram_free, &vram_total);
-    char body[8192];
+    /* Zero-initialised because the capacity object below is appended by seeking
+     * to strlen(body); starting from a known state keeps that arithmetic sound
+     * even if the first format is ever truncated. */
+    char body[8192] = {0};
     snprintf(body, sizeof body,
              "{\"vram_free_gib\":%.2f,\"vram_total_gib\":%.2f,\"vram_available\":%s,"
              "\"gpu\":{\"device_present\":%s,\"requested\":%s,\"placement\":\"%s\","
@@ -164,9 +255,9 @@ static void handle_status(ohttp_request *req, app_state *app) {
              "\"diffusion\":{\"ready\":%s,\"model\":\"%s\"},"
              /* Key order must track the argument order below, which matches the
               * permits object: llm, image, birefnet, tts, stt, ... */
-             "\"upstreams\":{\"llm\":%s,\"image\":%s,\"birefnet\":%s,\"tts\":%s,\"stt\":%s,"
+             "\"upstreams\":{\"llm\":%s,\"image\":%s,\"art\":%s,\"birefnet\":%s,\"tts\":%s,\"stt\":%s,"
              "\"embedding\":%s,\"multimodal\":%s,\"animation\":%s,\"threed\":%s,\"aux\":%s},"
-             "\"permits\":{\"llm\":%d,\"image\":%d,\"birefnet\":%d,\"tts\":%d,\"stt\":%d,"
+             "\"permits\":{\"llm\":%d,\"image\":%d,\"art\":%d,\"birefnet\":%d,\"tts\":%d,\"stt\":%d,"
              "\"embedding\":%d,\"multimodal\":%d,\"animation\":%d,\"threed\":%d,\"aux\":%d},"
              "\"proxy_pool\":{"
              "\"llm\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
@@ -194,13 +285,15 @@ static void handle_status(ohttp_request *req, app_state *app) {
              oembed_ready() ? "true" : "false", oembed_model_name(),
              osd_ready() ? "true" : "false", osd_model_name(),
              app->llm_upstream ? "true" : "false", app->image_upstream ? "true" : "false",
+             app->art_upstream ? "true" : "false",
              app->birefnet_upstream ? "true" : "false",
              app->tts_upstream ? "true" : "false", app->stt_upstream ? "true" : "false",
              app->embedding_upstream ? "true" : "false",
              app->multimodal_upstream ? "true" : "false",
              app->animation_upstream ? "true" : "false",
              app->threed_upstream ? "true" : "false", app->aux_upstream ? "true" : "false",
-             app->llm_permits, app->image_permits, app->birefnet_permits, app->tts_permits, app->stt_permits,
+             app->llm_permits, app->image_permits, app->art_permits, app->birefnet_permits,
+             app->tts_permits, app->stt_permits,
              app->embedding_permits, app->multimodal_permits, app->animation_permits,
              app->threed_permits, app->aux_permits,
              llm_proxy.idle_connections, llm_proxy.connections_opened,
@@ -263,6 +356,8 @@ static void handle_models(ohttp_request *req, const app_state *app) {
                                     "upstream-llm", "llm", "proxy");
     if (app->image_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_IMAGE_MODEL") ?:
                                       "upstream-image", "diffusion", "proxy");
+    if (app->art_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_ART_MODEL") ?:
+                                    "Tongyi-MAI/Z-Image-Turbo", "background-art", "proxy-background");
     if (app->birefnet_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_BIREFNET_MODEL") ?:
                                          "ZhengPeng7/BiRefNet", "background-removal", "proxy-c-hot-path");
     if (app->tts_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_TTS_MODEL") ?:
@@ -1254,6 +1349,8 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/readyz") || ohttp_path_is(req, "/readiness_check")) {
         handle_readyz(req); return;
     }
+    if (ohttp_path_is(req, "/metrics")) { handle_metrics(req, app); return; }
+    if (ohttp_path_is(req, "/errors")) { handle_errors(req); return; }
     if (ohttp_path_is(req, "/status") || ohttp_path_is(req, "/backend_status")) { handle_status(req, app); return; }
     if (ohttp_path_is(req, "/v1/models")) {
         if (!ohttp_method_is(req, "GET")) { respond_error(req, 405, "GET required"); return; }
@@ -1344,6 +1441,40 @@ static void route(ohttp_request *req, void *user) {
                                             "/v1/images/generations"));
         }
         else handle_images(req, app);
+        return;
+    }
+    if (ohttp_path_is(req, "/v1/images/backgrounds") ||
+        ohttp_path_is(req, "/api/v1/art")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        /* Batch scene art is never interactive: pin it to the background tier so
+         * it only ever runs on slots nothing else wants. */
+        handle_proxy_as_tier(
+            req, app, app->art_upstream, app->art_permits, "application/json",
+            configured_path("OMNISERVE_NATIVE_ART_PATH", "/v1/images/generations"),
+            TIER_BACKGROUND);
+        return;
+    }
+    /* Async cutouts: POST /jobs enqueues, GET /jobs/{id} polls. Both are cheap
+     * HTTP calls - the worker owns the GPU queue - so they take a single permit
+     * at the caller's own tier instead of the whole background capacity, or a
+     * poll would block behind the very job it is asking about. */
+    if (path_starts_with(req, "/v1/images/background-removals/jobs")) {
+        const bool is_post = ohttp_method_is(req, "POST");
+        if (!is_post && !ohttp_method_is(req, "GET")) {
+            respond_error(req, 405, "GET or POST required");
+            return;
+        }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        char mapped_path[1024];
+        int mapped_len = snprintf(mapped_path, sizeof mapped_path, "%.*s",
+                                  (int)req->path_len, req->path);
+        if (mapped_len <= 0 || mapped_len >= (int)sizeof mapped_path) {
+            respond_error(req, 414, "path too long");
+            return;
+        }
+        handle_proxy_as_tier(req, app, app->birefnet_upstream, 1,
+                             is_post ? "application/json" : NULL, mapped_path, -1);
         return;
     }
     if (ohttp_path_is(req, "/v1/images/background-removals") ||
@@ -1519,6 +1650,7 @@ int main(int argc, char **argv) {
             puts("usage: omniserve-native [--port PORT]\n"
                  "environment: OMNISERVE_NATIVE_LLM_GGUF, _EMBEDDING_GGUF, _SD_MODEL,\n"
                  "             _SECRET, _SLOTS, _LLM_UPSTREAM, _IMAGE_UPSTREAM,\n"
+                 "             _ART_UPSTREAM, _ART_PATH, _ART_PERMITS,\n"
                  "             _BIREFNET_UPSTREAM, _TTS_UPSTREAM, _STT_UPSTREAM,\n"
                  "             _EMBEDDING_UPSTREAM, _BIREFNET_PERMITS,\n"
                  "             _MULTIMODAL_UPSTREAM, _ANIMATION_UPSTREAM, _AUX_UPSTREAM");
@@ -1534,6 +1666,7 @@ int main(int argc, char **argv) {
     if (slots > 64) slots = 64;
     app.llm_permits = configured_permits("OMNISERVE_NATIVE_LLM_PERMITS", 1, slots);
     app.image_permits = configured_permits("OMNISERVE_NATIVE_IMAGE_PERMITS", slots, slots);
+    app.art_permits = configured_permits("OMNISERVE_NATIVE_ART_PERMITS", slots, slots);
     app.birefnet_permits = configured_permits("OMNISERVE_NATIVE_BIREFNET_PERMITS", 1, slots);
     app.tts_permits = configured_permits("OMNISERVE_NATIVE_TTS_PERMITS", 1, slots);
     app.stt_permits = configured_permits("OMNISERVE_NATIVE_STT_PERMITS", 1, slots);
@@ -1557,6 +1690,7 @@ int main(int argc, char **argv) {
     const char *unified_upstream = getenv("OMNISERVE_NATIVE_UPSTREAM");
     const char *llm_upstream = getenv("OMNISERVE_NATIVE_LLM_UPSTREAM");
     const char *image_upstream = getenv("OMNISERVE_NATIVE_IMAGE_UPSTREAM");
+    const char *art_upstream = getenv("OMNISERVE_NATIVE_ART_UPSTREAM");
     const char *birefnet_upstream = getenv("OMNISERVE_NATIVE_BIREFNET_UPSTREAM");
     const char *tts_upstream = getenv("OMNISERVE_NATIVE_TTS_UPSTREAM");
     const char *stt_upstream = getenv("OMNISERVE_NATIVE_STT_UPSTREAM");
@@ -1568,6 +1702,7 @@ int main(int argc, char **argv) {
     const char *aux_upstream = getenv("OMNISERVE_NATIVE_AUX_UPSTREAM");
     if (!llm_upstream) llm_upstream = unified_upstream;
     if (!image_upstream) image_upstream = unified_upstream;
+    if (!art_upstream) art_upstream = image_upstream;
     if (!birefnet_upstream) birefnet_upstream = unified_upstream;
     if (!tts_upstream) tts_upstream = unified_upstream;
     if (!stt_upstream) stt_upstream = unified_upstream;
@@ -1586,6 +1721,7 @@ int main(int argc, char **argv) {
 } while (0)
     CREATE_UPSTREAM(llm_upstream, llm_upstream, "LLM");
     CREATE_UPSTREAM(image_upstream, image_upstream, "image");
+    CREATE_UPSTREAM(art_upstream, art_upstream, "background art");
     CREATE_UPSTREAM(birefnet_upstream, birefnet_upstream, "birefnet");
     CREATE_UPSTREAM(tts_upstream, tts_upstream, "TTS");
     CREATE_UPSTREAM(stt_upstream, stt_upstream, "STT");
@@ -1690,6 +1826,7 @@ int main(int argc, char **argv) {
     int rc = ohttp_join(srv);
     oproxy_target_destroy(app.llm_upstream);
     oproxy_target_destroy(app.image_upstream);
+    oproxy_target_destroy(app.art_upstream);
     oproxy_target_destroy(app.birefnet_upstream);
     oproxy_target_destroy(app.tts_upstream);
     oproxy_target_destroy(app.stt_upstream);

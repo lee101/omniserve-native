@@ -18,13 +18,37 @@ and external runtimes retain their own licenses.
 
 ## Build
 
+Presets carry the right flags for each purpose; use `dev` while working and
+`release` to ship.
+
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DONATIVE_NATIVE_ARCH=ON \
-  -DWITH_LLAMA=ON -DWITH_SD=ON
-# expects ../llama.cpp built with -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120
-cmake --build build -j
-./build/onative_tests                  # core tests; also built with ASan/UBSan in CI
+cmake --preset dev && cmake --build --preset dev && ctest --preset dev
+cmake --preset release && cmake --build --preset release   # LTO, -march=native
+cmake --preset sanitize && ctest --preset sanitize         # ASan + UBSan
+cmake --preset ci                                          # portable, -Werror
 ```
+
+`release` expects `../llama.cpp` built with `-DGGML_CUDA=ON
+-DCMAKE_CUDA_ARCHITECTURES=120`; `sanitize` and `ci` build with `WITH_LLAMA=OFF`
+so they need no CUDA and no external checkout.
+
+The presets use Ninja, and CMake picks up `mold`/`lld` and `ccache` when they are
+installed. `dev` differs from `release` only in dropping LTO, which is the whole
+incremental cost: touching `src/main.c` rebuilds in **2.5s** under `dev` versus
+**3.8s** under `release`. Warnings are broader than `-Wall -Wextra` alone
+(`-Wshadow`, `-Wstrict-prototypes`, `-Wmissing-prototypes`, `-Wvla`,
+`-Wpointer-arith`, `-Wwrite-strings`, `-Wundef`, `-Wold-style-definition`,
+`-Wredundant-decls`) and the tree is clean under all of them; vendored llama.cpp
+and stable-diffusion.cpp headers are included as `SYSTEM` so third-party code
+cannot fail our build.
+
+CI (`.github/workflows/ci.yml`) runs the portable build under both gcc and clang
+with `-Werror`, the test suite under ASan+UBSan and under TSan (the scheduler,
+the capacity controller, and the HTTP reactor are all threaded), plus `cppcheck`
+and `clang-tidy`. The clang-tidy check list lives in `.clang-tidy` and is
+curated so a clean run means something: every disabled check records why, and
+`clang-analyzer-optin.performance.Padding` stays on because it caught a real
+8-byte hole in a per-thread job struct.
 
 ## Run
 
@@ -96,6 +120,37 @@ for the process lifetime.
 The packaged unit orders after `nvidia-persistenced.service` and waits for
 `nvidia-smi -L` before starting. Without that ordering a cold boot reaches
 `network.target` before the driver stack is usable.
+
+## Observability and automated on-call
+
+`GET /metrics` is Prometheus text and `GET /errors` is the recent-failure ring.
+Both exist so a monitor never has to scrape logs: on a box sharing a journal with
+a dozen services, a log line is ambiguous about which process produced it, while
+a counter you can diff between two polls is not.
+
+- `/metrics` — responses by status class, `omniserve_gpu_degraded`,
+  `omniserve_vram_free_gib` (`-1` when the driver is unreachable), admission
+  slots, per-tier admission timeouts, worst queue wait, and per-lane rented-
+  capacity spend rate.
+- `/errors` — the last 32 5xx responses with method, path, and age in seconds.
+  Own responses are recorded where the status is written; **proxied** responses
+  are recorded by reading the status line of the first relayed write, so an
+  upstream 500 is not invisible just because the bytes passed through verbatim.
+
+`monitoring/` (gitignored, host-local) drives those signals into an autonomous
+on-call loop: `oncall.sh` polls every 120s and wakes a coding agent **only** when
+new 5xx appeared since the last poll, `/readyz` went 503, or the process stopped
+answering. A cooldown prevents agent storms and a lockfile prevents overlapping
+runs. `monitoring/ONCALL.md` is the agent's brief — what the service is, how to
+attribute a 5xx (own bug vs upstream vs capacity vs degradation), the
+build/test/restart/quality-bench sequence that must pass before anything counts
+as fixed, and the hard rules: never weaken a check to silence an alert, never arm
+a billable capacity lane, never restart another service unless `/errors`
+attributes the failure to it, never commit.
+
+Deliberately not escalated: 4xx at any volume (clients sending bad requests is
+not an outage), admission timeouts alone (that is load, not a defect), and a
+single transient 5xx below the threshold.
 
 ## Per-device tuning
 
