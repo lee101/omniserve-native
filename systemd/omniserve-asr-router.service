@@ -1,0 +1,19 @@
+[Unit]
+Description=OmniServe capacity-aware local/remote ASR router
+After=network.target omniserve-asr-worker.service
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/nvme0n1-disk/code/omniserve-native
+Environment=OMNISERVE_ASR_LOCAL_UPSTREAM=http://127.0.0.1:9097
+# Set this to the existing managed API worker or another OpenAI-compatible STT
+# service. Leaving it empty makes local-only failures explicit.
+Environment=OMNISERVE_ASR_FALLBACK_UPSTREAM=http://127.0.0.1:9083
+Environment=OMNISERVE_ASR_GATEWAY_STATUS=http://127.0.0.1:8791/status
+ExecStart=/usr/bin/python3 /nvme0n1-disk/code/omniserve-native/workers/asr_router.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

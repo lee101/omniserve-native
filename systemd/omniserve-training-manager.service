@@ -1,0 +1,22 @@
+[Unit]
+Description=OmniServe interruptible ASR training manager
+After=network.target
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/nvme0n1-disk/code/omniserve-native
+Environment=OMNISERVE_TRAINING_STATE_DIR=/nvme0n1-disk/models/dictatorflow-training/state
+Environment=OMNISERVE_TRAINING_MIN_FREE_VRAM_GIB=18
+Environment=OMNISERVE_TRAINING_GATEWAY_STATUS=http://127.0.0.1:8791/status
+Environment=OMNISERVE_TRAINING_ASR_WORKER=http://127.0.0.1:9097
+ExecStart=/nvme0n1-disk/code/omniserve-native/.venv/bin/python workers/asr_training_manager.py
+Nice=15
+IOSchedulingClass=idle
+CPUWeight=10
+IOWeight=10
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

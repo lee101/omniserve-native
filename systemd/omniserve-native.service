@@ -1,0 +1,57 @@
+[Unit]
+Description=omniserve-native C gateway (port 8791)
+# On a cold boot the CUDA driver stack is not ready when network.target is
+# reached. Starting first made llama.cpp fall back to CPU silently, which
+# serves at a fraction of GPU throughput while still reporting healthy.
+After=network.target nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/nvme0n1-disk/code/omniserve-native
+# Belt and braces: persistenced being up does not guarantee the device is
+# enumerable yet. The gateway also refuses to start on CPU when GPU layers
+# were requested, so Restart=always retries until the GPU appears.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do nvidia-smi -L | grep -q GPU && exit 0; sleep 2; done; echo "no GPU after 120s" >&2; exit 1'
+Environment=OMNISERVE_NATIVE_BIND=127.0.0.1
+Environment=OMNISERVE_NATIVE_PORT=8791
+Environment=OMNISERVE_NATIVE_LLM_GGUF=/nvme0n1-disk/models/omniserve-native/gemma-roleplay-v2-q8_0.gguf
+Environment=OMNISERVE_NATIVE_NGL=999
+Environment=OMNISERVE_NATIVE_CTX=8192
+Environment=OMNISERVE_NATIVE_LLM_CONTEXTS=2
+# Halves the per-context KV cache with no measured quality change; see
+# performance/quality.md. Forces flash attention, which llama.cpp requires for
+# a quantized V cache.
+Environment=OMNISERVE_NATIVE_KV_TYPE=q8_0
+Environment=OMNISERVE_NATIVE_IMAGE_UPSTREAM=http://127.0.0.1:8790
+Environment=OMNISERVE_NATIVE_TTS_UPSTREAM=http://127.0.0.1:9083
+Environment=OMNISERVE_NATIVE_STT_UPSTREAM=http://127.0.0.1:9096
+Environment=OMNISERVE_NATIVE_TRAINING_UPSTREAM=http://127.0.0.1:9098
+Environment=OMNISERVE_NATIVE_TRAINING_PERMITS=8
+Environment=OMNISERVE_NATIVE_TRAINING_SWAP_EMBEDDED_MODELS=1
+Environment=OMNISERVE_NATIVE_EMBEDDING_UPSTREAM=http://127.0.0.1:9083
+Environment=OMNISERVE_NATIVE_EMBEDDING_GGUF=/nvme0n1-disk/models/omniserve-native/gte-modernbert-base-q8_0.gguf
+Environment=OMNISERVE_NATIVE_EMBEDDING_POOLING=cls
+Environment=OMNISERVE_NATIVE_MULTIMODAL_UPSTREAM=http://127.0.0.1:9083
+Environment=OMNISERVE_NATIVE_3D_UPSTREAM=http://127.0.0.1:9093
+Environment=OMNISERVE_NATIVE_3D_MODEL=microsoft/TRELLIS.2-4B
+Environment=OMNISERVE_NATIVE_3D_SWAP_EMBEDDED_MODELS=1
+Environment=OMNISERVE_NATIVE_AUX_UPSTREAM=http://127.0.0.1:9083
+Environment=OMNISERVE_NATIVE_CHAT_COMPAT_PROXY=1
+Environment=OMNISERVE_NATIVE_MODELS_COMPAT_PROXY=1
+Environment=OMNISERVE_NATIVE_SLOTS=8
+Environment=OMNISERVE_NATIVE_LLM_PERMITS=1
+Environment=OMNISERVE_NATIVE_IMAGE_PERMITS=4
+Environment=OMNISERVE_NATIVE_TTS_PERMITS=2
+Environment=OMNISERVE_NATIVE_STT_PERMITS=2
+Environment=OMNISERVE_NATIVE_EMBEDDING_PERMITS=1
+Environment=OMNISERVE_NATIVE_MULTIMODAL_PERMITS=2
+Environment=OMNISERVE_NATIVE_3D_PERMITS=8
+Environment=OMNISERVE_NATIVE_AUX_PERMITS=1
+ExecStart=/nvme0n1-disk/code/omniserve-native/build-full/omniserve-native --port 8791
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

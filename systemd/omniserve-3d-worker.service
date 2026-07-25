@@ -1,0 +1,29 @@
+[Unit]
+Description=OmniServe background TRELLIS.2/Pixal3D worker
+After=network.target
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/nvme0n1-disk/code/omniserve-native
+Environment=OMNISERVE_3D_BIND=127.0.0.1
+Environment=OMNISERVE_3D_PORT=9093
+Environment=OMNISERVE_3D_PUBLIC_BASE=http://127.0.0.1:8791/v1/3d
+Environment=OMNISERVE_3D_MIN_FREE_MIB=23040
+Environment=OMNISERVE_3D_GPU_COORDINATORS=http://127.0.0.1:8100
+Environment=OMNISERVE_3D_GPU_COORDINATOR_TIMEOUT_S=180
+Environment=OMNISERVE_3D_GPU_HOLD_SECONDS=1200
+Environment=OMNISERVE_3D_TRELLIS_REPO=/nvme0n1-disk/code/TRELLIS.2
+Environment=OMNISERVE_3D_PYTHON=/nvme0n1-disk/code/TRELLIS.2/.venv/bin/python
+Environment=ATTN_BACKEND=xformers
+Environment=CUDA_HOME=/usr/local/cuda-12.9
+Environment=HF_HOME=/nvme0n1-disk/models/huggingface
+Environment=HF_HUB_DISABLE_XET=1
+Environment=OMNISERVE_3D_OUTPUT_DIR=/nvme0n1-disk/models/omniserve-3d/outputs
+Environment=OMNISERVE_3D_MANIFEST=/nvme0n1-disk/code/hiresnz2/simplexgen/data/object-catalog/generated_3d_objects.jsonl
+ExecStart=/usr/bin/python3 /nvme0n1-disk/code/omniserve-native/workers/trellis2_worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

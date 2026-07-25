@@ -1,0 +1,10 @@
+accelerate
+datasets[audio]
+fastapi
+huggingface_hub
+jiwer
+python-multipart
+soundfile
+torch
+transformers
+uvicorn

@@ -1,0 +1,18 @@
+[Unit]
+Description=OmniServe lazy local ASR worker
+After=network.target nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/nvme0n1-disk/code/omniserve-native
+Environment=HF_HOME=/nvme0n1-disk/models/huggingface
+Environment=OMNISERVE_ASR_MODEL=nvidia/parakeet-ctc-0.6b
+Environment=OMNISERVE_ASR_DEVICE=auto
+ExecStart=/nvme0n1-disk/code/omniserve-native/.venv/bin/python -m uvicorn workers.asr_worker:app --host 127.0.0.1 --port 9097
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

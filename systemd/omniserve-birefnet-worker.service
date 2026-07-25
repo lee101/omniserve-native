@@ -1,0 +1,19 @@
+[Unit]
+Description=OmniServe BiRefNet background-removal worker
+After=network-online.target
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/nvme0n1-disk/code/omniserve-native
+Environment=HF_HOME=/nvme0n1-disk/models/huggingface
+Environment=BIREFNET_MODEL=ZhengPeng7/BiRefNet
+Environment=BIREFNET_INPUT_SIZE=1024
+Environment=BIREFNET_PORT=9094
+ExecStart=/nvme0n1-disk/code/omniserve-native/.venv/bin/python workers/birefnet_worker.py
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

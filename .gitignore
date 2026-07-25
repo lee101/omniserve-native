@@ -1,0 +1,29 @@
+build*/
+.cache/
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+*.pid
+*.sock
+.coverage
+.pytest_cache/
+performance/*.callgrind.out
+performance/*.massif.out
+
+# Training data, checkpoints, and generated model artifacts never belong in
+# the source repository. Publish reviewed artifacts to a dedicated model repo.
+data/
+training-state/
+checkpoints/
+artifacts/
+*.nemo
+*.safetensors
+*.onnx
+*.gguf
+
+# Local credentials and machine-specific configuration.
+.env
+.env.*
+!.env.example
+secrets/

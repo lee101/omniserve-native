@@ -1,0 +1,12 @@
+[Unit]
+Description=Run one queued OmniServe background training segment
+After=omniserve-native.service omniserve-training-manager.service
+
+[Service]
+Type=oneshot
+User=administrator
+# The request goes through the C gateway so it owns every background permit.
+# 404 (no job) and 503 (not enough VRAM) are normal and retried by the timer.
+ExecStart=/usr/bin/curl --silent --show-error --max-time 86400 -X POST http://127.0.0.1:8791/v1/training/jobs/run
+Nice=15
+IOSchedulingClass=idle

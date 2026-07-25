@@ -1,0 +1,382 @@
+# omniserve-native
+
+Native C inference server for one GPU: llama.cpp LLM/ModernBERT embeddings + stable-diffusion.cpp diffusion, or existing Gemma/vLLM, image, 3D, multimodal, TTS, and STT workers behind one tier-priority scheduler. OpenAI-compatible HTTP, zero Python in the gateway hot path. Every OmniServe-owned gateway runtime source file is C; llama.cpp, stable-diffusion.cpp, CUDA, and optional model-specific 3D workers remain external runtimes behind stable HTTP boundaries.
+
+The source is available under the [Apache License 2.0](LICENSE). Model weights
+and external runtimes retain their own licenses.
+
+- `src/ohttp.c` — epoll reactor + worker pool HTTP/1.1 (SO_REUSEPORT, keep-alive, chunked/SSE streaming, TCP_NODELAY)
+- `src/ojson.c` — allocation-light JSON tokenizer + escape helpers
+- `src/oproxy.c` — resolved-once HTTP/1.1 connection pools + framed raw relay; preserves chunked/SSE TTFT and binary responses
+- `src/osched.c` — paid/sub/free/background weighted admission (FIFO within tier, background only on idle) + NVML VRAM via dlopen
+- `src/oscale.c` — pure cost/priority decision engine for rented overflow capacity (paid-only, scale-to-zero, spend caps, hard TTL)
+- `src/ocapacity.c` — controller thread: samples admission pressure, asks oscale, warms cogs through app.nz on loopback
+- `src/otune.c` — per-device batch/KV/flash-attention profiles (blackwell, hopper, ada, ampere, turing, cpu)
+- `src/backend_llama.c` — embedded libllama (CUDA sm_120), prefix-aware parallel context pool, chunked long-prompt prefill, Gemma 4/Qwen chat formatting, streaming token callback, and encoder-only embeddings with an independent CPU/GPU placement policy
+- `src/backend_sd.c` — embedded stable-diffusion.cpp (`-DWITH_SD=ON`), allocation-efficient PNG output
+- `/docs` + `/openapi.json` — self-contained API docs (text-generator.io pattern: static spec, human page)
+
+## Build
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DONATIVE_NATIVE_ARCH=ON \
+  -DWITH_LLAMA=ON -DWITH_SD=ON
+# expects ../llama.cpp built with -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build build -j
+./build/onative_tests                  # core tests; also built with ASan/UBSan in CI
+```
+
+## Run
+
+```bash
+OMNISERVE_NATIVE_LLM_GGUF=/nvme0n1-disk/models/qwen3-0.6b-q8.gguf \
+OMNISERVE_NATIVE_EMBEDDING_GGUF=/nvme0n1-disk/models/omniserve-native/modernbert-base-q8_0.gguf \
+OMNISERVE_NATIVE_SD_MODEL=/models/sd-turbo.safetensors \
+OMNISERVE_NATIVE_SECRET=... \
+./build/omniserve-native --port 8791
+```
+
+Or use it as the fast shared gateway in front of the current production workers:
+
+```bash
+OMNISERVE_NATIVE_LLM_UPSTREAM=http://127.0.0.1:8300 \
+OMNISERVE_NATIVE_IMAGE_UPSTREAM=http://127.0.0.1:8100 \
+OMNISERVE_NATIVE_BIREFNET_UPSTREAM=http://127.0.0.1:9094 \
+OMNISERVE_NATIVE_TTS_UPSTREAM=http://127.0.0.1:9083 \
+OMNISERVE_NATIVE_STT_UPSTREAM=http://127.0.0.1:9083 \
+OMNISERVE_NATIVE_EMBEDDING_UPSTREAM=http://127.0.0.1:9083 \
+OMNISERVE_NATIVE_MULTIMODAL_UPSTREAM=http://127.0.0.1:9083 \
+OMNISERVE_NATIVE_ANIMATION_UPSTREAM=http://127.0.0.1:9092 \
+OMNISERVE_NATIVE_3D_UPSTREAM=http://127.0.0.1:9093 \
+OMNISERVE_NATIVE_AUX_UPSTREAM=http://127.0.0.1:9083 \
+OMNISERVE_NATIVE_SLOTS=4 \
+OMNISERVE_NATIVE_LLM_PERMITS=1 \
+OMNISERVE_NATIVE_IMAGE_PERMITS=4 \
+./build/omniserve-native --port 8791
+```
+
+`OMNISERVE_NATIVE_UPSTREAM` sets one unified fallback; modality-specific values override it. Upstream DNS is resolved once and `OMNISERVE_NATIVE_UPSTREAM_IDLE` controls the per-modality idle connection pool (default: worker count).
+
+Other tuning: `OMNISERVE_NATIVE_PORT`, `BIND`, `SLOTS`, `SECRET`, `LLM_GGUF`, `LLM_CONTEXTS`, `NGL`, `CTX`, `BATCH`, `UBATCH`, `KV_TYPE` (`f16` default, `q8_0` halves the KV cache at no measured quality cost — see `performance/quality.md`), `FLASH_ATTN` (auto; forced on for a quantized cache because llama.cpp requires it for a quantized V), `EMBEDDING_GGUF`, `EMBEDDING_NGL` (defaults to CPU), `EMBEDDING_CTX`, `EMBEDDING_POOLING` (`mean` default, `cls` for retrieval finetunes like gte-modernbert), `EMBEDDING_THREADS`, `SD_MODEL`, `ADMISSION_TIMEOUT_S`, `UPSTREAM_TIMEOUT_MS`, `REACTORS`, `WORKERS`, and per-modality `LLM_PERMITS`, `IMAGE_PERMITS`, `TTS_PERMITS`, `STT_PERMITS`, `EMBEDDING_PERMITS`, `MULTIMODAL_PERMITS`, `ANIMATION_PERMITS`, `3D_PERMITS`, and `AUX_PERMITS`.
+
+## Local-first ASR and background fine-tuning
+
+Point `OMNISERVE_NATIVE_STT_UPSTREAM` at `workers/asr_router.py` to prefer a
+lazy local Parakeet worker on NVIDIA CUDA, AMD ROCm, or CPU. The router checks
+worker health and free VRAM, and replays transient capacity failures to the
+configured managed STT fallback. DictatorFlow can use the gateway first via
+`OMNISERVE_STT_URL`; its existing provider chain remains available if the
+whole local route is down.
+
+Fine-tuning runs through `OMNISERVE_NATIVE_TRAINING_UPSTREAM` and the forced
+background `/v1/training/jobs/run` route. It owns every scheduler permit only
+while the machine is idle. When interactive work queues, the trainer saves a
+checkpoint and exits rather than pausing while retaining VRAM. See
+[`docs/asr-training.md`](docs/asr-training.md) for setup, explicit public-model
+consent, WER release gates, and Hugging Face publication.
+
+Worker APIs sometimes use different paths for the same operation. Configure `IMAGE_GENERATE_PATH`, `TTS_PATH`, `TTS_OPENAI_PATH`, `STT_FILE_PATH`, `STT_URL_PATH`, `STT_OPENAI_PATH`, and `CAPTION_PATH` (all with the `OMNISERVE_NATIVE_` prefix) to rewrite only the upstream request path while preserving the public path and query string. This avoids false-positive route support from blind same-path proxying.
+
+## GPU placement is checked, not assumed
+
+A CUDA init failure makes llama.cpp load the weights on CPU and keep reporting
+ready, which serves text at a fraction of GPU throughput and holds the whole
+model in host RAM. When `OMNISERVE_NATIVE_NGL` asks for offloaded layers and no
+GPU backend device is registered, the gateway logs the reason and exits so the
+supervisor retries; `OMNISERVE_NATIVE_ALLOW_CPU_FALLBACK=1` overrides that for
+deliberate CPU deployments. `/status` reports `gpu.placement`, `gpu.device`,
+`gpu.kv_type`, and `gpu.degraded`; `/health` stays 200 with a `status` of `ok`
+or `degraded` so a liveness probe cannot restart-loop the process, while
+`/readyz` returns 503 when the embedded model is on CPU so a load balancer can
+drain it. `vram_available` distinguishes "the driver says 0 free" from "the
+driver is unreachable" — the NVML handle is retried with a backoff instead of
+being resolved once, so a transient driver outage no longer poisons VRAM gating
+for the process lifetime.
+
+The packaged unit orders after `nvidia-persistenced.service` and waits for
+`nvidia-smi -L` before starting. Without that ordering a cold boot reaches
+`network.target` before the driver stack is usable.
+
+## Per-device tuning
+
+Batch geometry that saturates a 5090 stalls a T4, so `src/otune.c` keys the
+defaults off the backend's device description and `/status.tune` reports which
+profile was applied. Anything set explicitly always wins, so
+`OMNISERVE_NATIVE_BATCH`/`UBATCH`/`KV_TYPE`/`FLASH_ATTN` still override.
+
+| Class | Devices | batch/ubatch | KV | Flash attn | Contexts |
+| --- | --- | --- | --- | --- | ---: |
+| blackwell | RTX 5090, B200 | 4096 / 1024 | q8_0 | on | 4 |
+| hopper | H100, H200 | 4096 / 1024 | q8_0 | on | 6 |
+| ada | RTX 4090, L40S | 2048 / 512 | q8_0 | on | 3 |
+| ampere | RTX 3090, A100, A40 | 2048 / 512 | f16 | on | 2 |
+| turing | T4, RTX 2080 | 1024 / 256 | f16 | off | 1 |
+| cpu | no GPU device | 512 / 128 | f16 | off | 1 |
+
+On this 5090, a 5.6k-token prefill improved from a median of 30.9 ms to 21.0 ms
+(1.47x, n=45 per configuration, interleaved A/B/A/B so host-load drift cannot be
+mistaken for the result). Best case barely moved (14.3 ms to 13.0 ms): wider
+batches cut the number of prefill iterations, so the gain is in robustness under
+contention rather than in peak throughput.
+
+## Cost- and priority-guided overflow capacity
+
+The local GPU is sunk cost, so it is always tried first. Renting a remote
+4090/5090 cog is only worth it when paid traffic is queueing behind a saturated
+local device *and* the overflow it would absorb is worth more than the instance
+costs. `src/oscale.c` is the decision engine and is pure — it takes an
+observation and a clock and returns hold/up/down — so the expensive-if-wrong
+logic is unit tested without a GPU, a network, or a provider account.
+`src/ocapacity.c` is the controller that samples the admission scheduler and
+drives the control plane.
+
+Invariants, in the order they are enforced:
+
+1. **Every lane defaults to zero instances and to disabled.** A lane has to be
+   armed per modality, and an armed lane with no template or no per-request
+   value is refused at startup with a log line rather than silently arming.
+2. **Best-effort traffic never rents hardware.** The default tier mask is paid
+   only. `TIER_BACKGROUND` is stripped in `oscale_add_lane`, so a misconfigured
+   tier list cannot turn a batch backlog into a bill. Text generation has no
+   lane at all: the local model serves it, and LLM overflow is best-effort by
+   policy.
+3. **Local capacity wins.** While the scheduler has a free permit, renting is
+   refused with `local-has-room` no matter how deep the paid queue looks.
+4. **Pressure must be sustained**, past both a queue-depth and a worst-wait
+   threshold.
+5. **The rent must pay for itself.** An instance can serve `3600 /
+   seconds_per_req` requests an hour; the value counted is the *lesser* of that
+   capacity and the observed eligible backlog, so a huge backlog is not a blank
+   cheque and a thin one is refused as `not-worth-it`. Value must clear
+   `price_usd_hr × margin` (default 1.5x).
+6. **Caps and hysteresis**: `MAX_INSTANCES`, a lane `MAX_USD_HR` ceiling, and a
+   cooldown between actions. Hard ceilings are reported ahead of the cooldown so
+   the refusal names the real constraint.
+7. **Scale-to-zero, with a hard TTL.** An instance is released after
+   `IDLE_S` idle, and unconditionally at `TTL_S` even while busy and under
+   pressure — an instance that outlives its lifetime is the failure mode that
+   bills forever. Releasing also happens on shutdown and on a disabled lane.
+
+Pod lifecycle deliberately stays in app.nz, which already owns provisioning,
+per-second billing, the idle reap, and the orphan reconciler. This controller
+only decides *whether* overflow is worth paying for and asks app.nz to warm it
+over loopback; it never talks to a GPU provider directly, and it holds no
+provider endpoint (the C data plane has no TLS by design). Scaling down is
+therefore "stop routing there and let the idle reap release the pod", which
+cannot leak a running instance if this process dies.
+
+```bash
+OMNISERVE_NATIVE_SCALE_CONTROL_BASE=http://127.0.0.1:8787 \
+OMNISERVE_NATIVE_SCALE_API_KEY=... \
+OMNISERVE_NATIVE_SCALE_TTS_ENABLED=1 \
+OMNISERVE_NATIVE_SCALE_TTS_TEMPLATE=appnz-tts \
+OMNISERVE_NATIVE_SCALE_TTS_HARDWARE=gpu-rtx4090 \
+OMNISERVE_NATIVE_SCALE_TTS_REVENUE_USD_PER_REQ=0.02 \
+OMNISERVE_NATIVE_SCALE_TTS_SECONDS_PER_REQ=3 \
+OMNISERVE_NATIVE_SCALE_TTS_MAX_USD_HR=0.34 \
+./build/omniserve-native --port 8791
+```
+
+Per-lane knobs, all prefixed `OMNISERVE_NATIVE_SCALE_<LANE>_` where `<LANE>` is
+`TTS`, `STT`, `IMAGE`, or `MULTIMODAL`: `ENABLED`, `TEMPLATE`, `HARDWARE`,
+`TIERS` (default `paid`), `PRICE_USD_HR` (defaults to the published list price
+for the hardware), `REVENUE_USD_PER_REQ`, `SECONDS_PER_REQ`, `MARGIN`,
+`QUEUE_DEPTH`, `QUEUE_MS`, `MAX_INSTANCES`, `MAX_USD_HR`, `COOLDOWN_S`,
+`IDLE_S`, and `TTL_S`. Controller-wide: `SCALE_CONTROL_BASE`, `SCALE_API_KEY`,
+`SCALE_POLL_S`, `SCALE_TIMEOUT_MS`.
+
+`/status.capacity` reports, per lane, instances, ready count, price, current
+spend rate, cumulative spend and instance-seconds, scale-up/down counts, TTL
+kills, and the reason behind the last decision — so a bill can always be traced
+back to the decision that caused it.
+
+Not yet wired: the request path does not route overflow traffic to a warmed
+instance. `ocapacity_overflow_endpoint()` exists and is tier-gated, but app.nz
+exposes remote cogs only as async predictions or a websocket session proxy,
+neither of which the C relay can use for a normal request. Routing needs a
+synchronous loopback passthrough (`/api/cogs/{id}/http/*`) on the app.nz side
+first; until then, arming a lane warms capacity without sending it traffic, so
+lanes ship disabled.
+
+## Routes
+
+`GET /health` `GET /readyz` `GET /status` `GET /v1/models` `GET /docs` `GET /openapi.json`
+
+- Text: `POST /v1/chat/completions`, `/v1/completions`, `/v1/engines/{engine}/completions`, `/api/v1/generate`, `/api/v1/generate-large`, `/api/v1/autocomplete`, and `/api/v1/summarization`
+- Embeddings: `POST /api/v1/feature-extraction` (legacy flat vector) and `/v1/embeddings` (OpenAI scalar or batched shape)
+- Image: `POST /v1/images/generations`
+- Background removal: `POST /v1/images/background-removals` or `/api/v1/birefnet`
+- TTS: `POST /v1/audio/speech` and `/api/v1/generate_speech`
+- STT: `POST /v1/audio/transcriptions`, `/api/v1/audio/transcribe`, `/api/v1/audio-file-extraction`, and `/api/v1/audio-extraction`
+- Multimodal: `POST /api/v1/image-caption`, `/api/v1/video-question`, `/api/v1/multimodal-generate`, and `/api/v1/voice-chat`
+- Animation: `POST /v1/animations/generations` proxies a configured NVIDIA ACE/Animation Graph adapter and is forcibly admitted as `background`, regardless of the caller's requested tier.
+- 3D: `POST /v1/3d/generations` proxies a configured TRELLIS.2/Pixal3D adapter and is forcibly admitted as `background`, regardless of the caller's requested tier.
+
+Configure the 3D worker with `OMNISERVE_NATIVE_3D_UPSTREAM`, optionally rewrite its path with `OMNISERVE_NATIVE_3D_PATH`, and label it with `OMNISERVE_NATIVE_3D_MODEL`. The route consumes every scheduler permit and therefore starts only when the OmniServe GPU is otherwise idle. With `OMNISERVE_NATIVE_3D_SWAP_EMBEDDED_MODELS=1` (the default), the gateway unloads its embedded LLM and embedding model only after that exclusive background admission, runs the one-shot 3D worker, reloads both models, and then reopens interactive admission. The supplied worker performs a second NVML free-VRAM check before loading the 4B checkpoint, defaults to TRELLIS.2 at 512³ on a 32 GB RTX 5090, and can publish GLB/WebP outputs into R2 plus a searchable JSONL manifest.
+
+Set `OMNISERVE_3D_PUBLIC_BASE` to the externally reachable gateway prefix used
+for non-R2 assets (the packaged service uses
+`http://127.0.0.1:8791/v1/3d` for same-host development). Do not derive public
+asset URLs from the HTTP `Host` header.
+
+On a shared GPU, set `OMNISERVE_3D_GPU_COORDINATORS` to a comma-separated list
+of peer service bases that implement `POST /admin/hold?seconds=N` and
+`POST /admin/release`. The 3D adapter acquires every bounded hold before its
+final free-VRAM check and releases them in reverse order on success or failure.
+The packaged service coordinates with the local Z-Image worker on port 8100,
+so an image cold-load cannot race TRELLIS.2 after background admission.
+Coordinator calls wait up to 180 seconds by default, configurable with
+`OMNISERVE_3D_GPU_COORDINATOR_TIMEOUT_S`, so an in-flight generation or model
+load can finish before the hold is acquired.
+
+For an RTX 5090, clone the official repository recursively and run the isolated
+Blackwell installer. It uses current CUDA 12.8 wheels with the local 12.9
+toolkit, builds custom operators for compute capability 12.0, and selects
+xFormers because the repository's older pinned FlashAttention package predates
+Blackwell:
+
+```bash
+git clone --branch main --recursive https://github.com/microsoft/TRELLIS.2.git /nvme0n1-disk/code/TRELLIS.2
+CUDA_HOME=/usr/local/cuda-12.9 ./workers/install_trellis2_blackwell.sh
+```
+
+TRELLIS.2 also requires Meta's gated
+[`facebook/dinov3-vitl16-pretrain-lvd1689m`](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m)
+image encoder. Accept its terms with the deployment account, then prefetch both
+repositories into the worker's shared cache:
+
+```bash
+HF_HOME=/nvme0n1-disk/models/huggingface hf download microsoft/TRELLIS.2-4B
+HF_HOME=/nvme0n1-disk/models/huggingface hf download facebook/dinov3-vitl16-pretrain-lvd1689m
+```
+
+The worker reports `model_dependency_missing` without taking a GPU hold when
+that gated encoder is absent. Configure `HF_HOME` on the large NVMe volume if
+the default Hugging Face cache is small. The packaged worker also sets
+`HF_HUB_DISABLE_XET=1`; on this host the standard resumable HTTP downloader is
+materially faster and more stable than Xet.
+
+Configure the animation adapter with `OMNISERVE_NATIVE_ANIMATION_UPSTREAM`, optionally rewrite its worker path with `OMNISERVE_NATIVE_ANIMATION_PATH`, and label it with `OMNISERVE_NATIVE_ANIMATION_MODEL`. The request carries the target rig family and bones plus `publish.r2`, `publish.searchable`, and `publish.collection`; the gateway also forces `X-Animation-Publish: r2-searchable`. The worker owns ACE command/animation-data conversion, BVH/GLB output, R2 upload, and atomic searchable-manifest updates. NVIDIA ACE currently provides Animation Graph, animation-data, gesture-command, and Audio2Face components rather than a general public text-to-full-body-motion model, so text planning belongs in that adapter instead of being represented as a native ACE model.
+
+The public text-generator.io OpenAPI surface—feature extraction, summarization, speech generation, file/URL transcription, text generation, large generation, image captioning, and legacy engine completion—is explicitly routed. Native worker endpoints for image creation, inpainting, style transfer, captioning, TTS, and STT are also admitted through the same scheduler.
+
+Proxied responses are relayed byte-for-byte after incremental framing validation, so `stream:true` stays streaming and WAV/PNG/multipart payloads are not JSON-reencoded. Content-Length and chunked responses retain downstream keep-alive; close-delimited responses close safely. Request bodies grow lazily up to the public edge's 80 MiB limit. Embedded image generation returns PNG bytes.
+
+## BiRefNet cutout worker
+
+BiRefNet runs as a persistent isolated CUDA worker while the gateway keeps the
+request hot path in C: weighted admission, connection reuse, incremental HTTP
+framing validation, and transparent PNG relay happen without Python JSON or
+image re-encoding in the gateway.
+
+```bash
+python -m venv .venv
+.venv/bin/pip install torch torchvision transformers accelerate pillow fastapi uvicorn requests
+HF_HOME=/nvme0n1-disk/models/huggingface \
+BIREFNET_MODEL=ZhengPeng7/BiRefNet \
+.venv/bin/python workers/birefnet_worker.py --port 9094
+
+OMNISERVE_NATIVE_BIREFNET_UPSTREAM=http://127.0.0.1:9094 \
+OMNISERVE_NATIVE_BIREFNET_PERMITS=1 \
+./build/omniserve-native --port 8791
+```
+
+The worker uses FP16, channels-last CUDA tensors, cuDNN benchmarking, TF32
+where applicable, inference mode, a persistent loaded model, and optional
+`BIREFNET_TORCH_COMPILE=1`. The default 1024-pixel inference size can be tuned
+with `BIREFNET_INPUT_SIZE`.
+
+In the text-generator.io deployment, nginx sends the public API to this C gateway. A managed CPU-only compatibility worker on port 9083 supplies TTS, STT, multimodal endpoints, and dynamic provider routing. Local-model callbacks carry `X-Omniserve-Internal: local` so provider routing cannot loop. OpenAI embeddings accept either one string or a batch of up to 256 strings.
+
+Upstreams must use plain `http://` on loopback or a private service mesh; terminate TLS at the public edge. Route every GPU-heavy public path through this gateway so its admission decision covers the full response lifetime.
+
+Auth mirrors text-generator.io: `secret`, `X-API-Key`, `X-Rapid-API-Key`, `Authorization: Bearer`, or `?secret=`; priority via `X-Omniserve-Tier: paid|sub|free|background`.
+
+With `SLOTS=N`, text/audio calls consume their configured modality permits, diffusion defaults to all N permits, and background calls only start on an otherwise idle GPU. This prevents a diffusion launch from racing Gemma for the last VRAM while retaining controlled text/audio concurrency. `/status` exposes permits, used capacity, queue maxima, timeouts, per-tier counters, and upstream pool reuse/failures.
+
+The production Gemma and CuteDSL image workers add a second residency handshake: the vLLM manager holds and unloads image admission throughout boot/wake, while an image cold-load sleeps vLLM and refuses to interrupt active text inference. The weighted gateway plus that two-sided handoff covers both request concurrency and model residency; either mechanism alone is insufficient on a 32 GB card.
+
+text-generator.io playground-compatible request:
+
+```bash
+curl localhost:8791/api/v1/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Hi I am bored so looking","number_of_results":1,"max_length":100,"max_sentences":1,"min_probability":0.7,"model":"best","enable_thinking":false}'
+```
+
+The embedded path honors `enable_thinking`, `min_probability`, `min_p`, `max_sentences`, and string/array stop sequences. Qwen no-thinking requests prefill the closed reasoning block, so reasoning tags do not leak into `generated_text` or consume output tokens. Repeated chat/system prefixes reuse the matching KV prefix; `usage.cached_prompt_tokens` reports the saving.
+
+## Model conversion
+
+The checked-in conversion workflow creates serving artifacts without mutating or duplicating the production Hugging Face checkpoints:
+
+```bash
+./scripts/convert_models.sh modernbert
+./scripts/convert_models.sh gemma
+./scripts/convert_models.sh qwen
+# or: ./scripts/convert_models.sh all
+```
+
+Outputs default to `/nvme0n1-disk/models/omniserve-native`. Override source/output paths with `ONATIVE_MODERNBERT_SOURCE`, `ONATIVE_GEMMA_SOURCE`, `ONATIVE_QWEN_SOURCE`, and `ONATIVE_MODEL_DIR`.
+
+| Capability | Artifact | Runtime |
+|---|---|---|
+| Gemma 4 roleplay text | `gemma-roleplay-v2-q8_0.gguf` (8,005,436,224 bytes) | embedded libllama |
+| Qwen 3.5 text | `qwen3.5-4b-text-q8_0.gguf` (4,482,403,104 bytes) | embedded libllama or llama.cpp worker |
+| Qwen 3.5 vision | `mmproj-qwen3.5-4b-f16.gguf` (672,423,488 bytes) | llama.cpp `mtmd` worker behind `OMNISERVE_NATIVE_MULTIMODAL_UPSTREAM` |
+| ModernBERT features (legacy contract) | `modernbert-base-q8_0.gguf` (160,208,000 bytes) | embedded libllama encoder, mean pooling |
+| Retrieval-grade features | `gte-modernbert-base-q8_0.gguf` (160,208,576 bytes) | embedded libllama encoder, `EMBEDDING_POOLING=cls` |
+| Diffusion | existing `.safetensors`/`.gguf` checkpoint | embedded stable-diffusion.cpp or image worker |
+| STT/TTS | existing Parakeet/Whisper and Supertonic/Kokoro assets | audio worker behind `OMNISERVE_NATIVE_STT_UPSTREAM`/`OMNISERVE_NATIVE_TTS_UPSTREAM` |
+
+ModernBERT conversion removes only the unused masked-language-model head. Audio models that are already ONNX/native-worker consumable and diffusion checkpoints already accepted by stable-diffusion.cpp do not benefit from being repackaged as text GGUFs. The gateway still owns authentication, weighted admission, timeouts, streaming, and connection pooling for those workers, so every public route passes through the same C scheduler.
+
+## Measured local results
+
+On this 72-thread RTX 5090 host, the native C load generator measured the loopback proxy at concurrency 32 improving from about 29k requests/s before pooling to 46–75k requests/s after resolved-once pooled relaying (host load causes run-to-run variance). Disabling the final pool in matched runs measured 15–18k requests/s. Persistent `/health` remained around 97–124k requests/s.
+
+For a repeated 60-token prompt on the bundled Qwen3 0.6B Q8 GGUF, embedded inference fell from 82.9 ms uncached to 19.6 ms with 59 cached prompt tokens. The converted Gemma 4 artifact was verified CPU-only through the C gateway with the playground-shaped `min_probability=0.7` request: HTTP 200 and a non-empty one-result array. A same-prefix one-token request fell from 4.2 s cold-prefill to 0.39 s with prefix reuse on CPU.
+
+The converted ModernBERT Q8 embedding matched the existing FP32 Python result at 0.99875 cosine similarity. Warm 8-thread feature extraction measured about 17 ms for a short input. The legacy route honors `num_features` (default 256); `/v1/embeddings` returns the full 768-dimensional mean-pooled vector unless `dimensions` is supplied.
+
+Reproduce transport measurements with `./scripts/bench.sh 8791 100000 32`; it uses `build/onative_bench`, a persistent-socket C client.
+
+## Quality bench
+
+Transport speed is only half of a serving regression. `./scripts/quality_bench.sh 8791`
+grades the live gateway on model behaviour: cold-prefill determinism,
+prefix-cache agreement and speedup, `max_tokens`/stop-sequence/`max_sentences`
+adherence, reasoning-tag leakage, a small graded task set, embedding
+determinism, batch-vs-scalar equality, legacy `num_features` truncation,
+paraphrase-vs-distractor separation, reference-vector drift, and image/audio
+container validity when those workers are configured. Scores are compared
+against `performance/quality-baseline.json` and the run exits non-zero on
+regression, so CI can gate on it:
+
+```bash
+./scripts/quality_bench.sh 8791 --update-baseline   # record the current models
+./scripts/quality_bench.sh 8791                     # gate a change
+./scripts/quality_bench.sh 8791 --suite embedding   # one suite
+```
+
+Measured findings, including the embedding-artifact comparison and the KV
+quantization result, are in `performance/quality.md`. Two of them matter for
+callers: the shipped `modernbert-base` mean-pooled vectors rank paraphrases at
+chance (swap to `gte-modernbert-base-q8_0` with `EMBEDDING_POOLING=cls`), and
+temperature-0 output is not byte-reproducible across prefix-cache states.
+
+## Fleet integration
+
+For the pure-C data plane, point the public edge directly at this server. During migration, omniserve (Python) can remain an optional catalog/eviction control plane while all inference traffic is pointed here:
+
+```bash
+OMNISERVE_PROXY_PROXY_LLM=http://127.0.0.1:8791
+OMNISERVE_PROXY_PROXY_IMAGE=http://127.0.0.1:8791
+```
+
+## Roadmap to theoretical-fastest on RTX 5090
+
+1. Continuous token-level batching across the prefix-aware context pool (parallel contexts remove the old global generation mutex; cross-request decode iteration batching is the next step).
+2. FP8/NVFP4 weights (Blackwell) — llama.cpp Q4_K/Q8 today; TensorRT-LLM backend as a second `obackend` impl for the big-model path.
+3. Diffusion: sd.cpp `--diffusion-flash-attn`, TAESD preview, step-distilled checkpoints (turbo 4-step); port the fused kernels from `../cutedsl/cutezimage/csrc` (rms/silu-gate/qk-norm, already 5090-tuned) into a custom ggml op.
+4. CUDA graph capture for the small-model path — cutedsl measured 21x on Chronos-2 from graph capture; same lever applies to short-seq LLM decode.

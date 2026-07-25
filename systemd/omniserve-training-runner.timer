@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume queued ASR training when the GPU is idle
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=30s
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
