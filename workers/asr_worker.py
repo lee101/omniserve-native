@@ -13,16 +13,23 @@ import io
 import os
 import tempfile
 import threading
+import wave
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 from transformers import pipeline
 
 
 MODEL_ID = os.getenv("OMNISERVE_ASR_MODEL", "nvidia/parakeet-ctc-0.6b")
+# The sample rate the ASR frontend expects. A clip already at this rate, mono
+# and 16-bit, can skip the disk round-trip entirely (see decode_pcm16_wav).
+TARGET_SAMPLE_RATE = 16000
+WARMUP = os.getenv("OMNISERVE_ASR_WARMUP", "0") == "1"
 DEVICE_REQUEST = os.getenv("OMNISERVE_ASR_DEVICE", "auto").lower()
 VRAM_REQUIRED_GIB = float(os.getenv("OMNISERVE_ASR_VRAM_REQUIRED_GIB", "3"))
 LOCK = threading.RLock()
@@ -65,22 +72,84 @@ def unload() -> None:
             torch.cuda.empty_cache()
 
 
+def decode_pcm16_wav(data: bytes) -> np.ndarray | None:
+    """Decode a mono 16-bit WAV already at TARGET_SAMPLE_RATE to float32 samples.
+
+    Returns None for anything else -- multichannel, another sample rate, another
+    bit depth, or a compressed container -- so those keep the tempfile path and
+    let soundfile/ffmpeg do the conversion. The point is to skip a disk write and
+    re-read for the format the desktop client already sends, without changing a
+    single sample: int16 / 32768.0 is exactly soundfile's float conversion, so
+    the model sees identical input and WER cannot move.
+    """
+    try:
+        with wave.open(io.BytesIO(data), "rb") as w:
+            if (
+                w.getnchannels() != 1
+                or w.getsampwidth() != 2
+                or w.getframerate() != TARGET_SAMPLE_RATE
+                or w.getcomptype() != "NONE"
+            ):
+                return None
+            frames = w.readframes(w.getnframes())
+    except (wave.Error, EOFError, OSError):
+        return None
+    if not frames:
+        return None
+    return np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+
+
 def transcribe_bytes(data: bytes, suffix: str) -> str:
     if not data:
         raise HTTPException(400, "empty audio")
-    # A named file lets soundfile/ffmpeg infer compressed input formats.
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
-        handle.write(data)
-        path = Path(handle.name)
-    try:
-        result = get_pipe()(str(path))
-    finally:
-        path.unlink(missing_ok=True)
+
+    pipe = get_pipe()
+    samples = decode_pcm16_wav(data)
+    if samples is not None:
+        result = pipe({"raw": samples, "sampling_rate": TARGET_SAMPLE_RATE})
+    else:
+        # A named file lets soundfile/ffmpeg infer compressed input formats.
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+            handle.write(data)
+            path = Path(handle.name)
+        try:
+            result = pipe(str(path))
+        finally:
+            path.unlink(missing_ok=True)
+
     text = result.get("text", "") if isinstance(result, dict) else str(result)
     text = text.strip()
     if not text:
         raise HTTPException(502, "model returned an empty transcript")
     return text
+
+
+async def transcribe_async(data: bytes, suffix: str) -> str:
+    """Run inference off the event loop.
+
+    The endpoints are async, so calling transcribe_bytes directly blocked the
+    whole ASGI loop for the duration of a transcription: concurrent requests
+    queued behind it and health checks stalled. A worker thread keeps the loop
+    responsive; the GIL is released inside torch during the actual compute.
+    """
+    return await run_in_threadpool(transcribe_bytes, data, suffix)
+
+
+@app.on_event("startup")
+def warmup() -> None:
+    """Optionally pay the model-load cost at boot instead of on a user's request.
+
+    Off by default so a held/training host does not pull weights into VRAM just
+    by starting the process.
+    """
+    if not WARMUP:
+        return
+    try:
+        pipe = get_pipe()
+        silence = np.zeros(TARGET_SAMPLE_RATE // 10, dtype=np.float32)
+        pipe({"raw": silence, "sampling_rate": TARGET_SAMPLE_RATE})
+    except Exception as exc:  # a failed warmup must not stop the worker booting
+        print(f"asr warmup skipped: {exc}", flush=True)
 
 
 @app.get("/health")
@@ -117,7 +186,7 @@ def release() -> dict[str, Any]:
 @app.post("/v1/audio/transcriptions")
 async def openai_transcribe(file: UploadFile = File(...)) -> dict[str, str]:
     suffix = Path(file.filename or "audio.wav").suffix or ".wav"
-    return {"text": transcribe_bytes(await file.read(), suffix)}
+    return {"text": await transcribe_async(await file.read(), suffix)}
 
 
 @app.post("/api/v1/audio/transcribe")
@@ -130,4 +199,4 @@ async def raw_transcribe(request: Request) -> JSONResponse:
         suffix = ".webm"
     elif "mpeg" in content_type or "mp3" in content_type:
         suffix = ".mp3"
-    return JSONResponse({"text": transcribe_bytes(await request.body(), suffix)})
+    return JSONResponse({"text": await transcribe_async(await request.body(), suffix)})
