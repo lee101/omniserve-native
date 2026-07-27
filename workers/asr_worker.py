@@ -25,7 +25,12 @@ from starlette.concurrency import run_in_threadpool
 from transformers import pipeline
 
 
-MODEL_ID = os.getenv("OMNISERVE_ASR_MODEL", "nvidia/parakeet-ctc-0.6b")
+# Default chosen by measurement, not by reputation: on the nine-clip DictatorFlow
+# corpus whisper-small.en scores 1.74% WER at RTF 0.18, while the previous
+# default (nvidia/parakeet-ctc-0.6b) scored 100% -- it returns "<unk>" for every
+# clip through the transformers ASR pipeline and needs NeMo, not this code path.
+# See performance/asr-models-final.json and tools/asr_model_bench.py.
+MODEL_ID = os.getenv("OMNISERVE_ASR_MODEL", "openai/whisper-small.en")
 # The sample rate the ASR frontend expects. A clip already at this rate, mono
 # and 16-bit, can skip the disk round-trip entirely (see decode_pcm16_wav).
 TARGET_SAMPLE_RATE = 16000
@@ -99,6 +104,16 @@ def decode_pcm16_wav(data: bytes) -> np.ndarray | None:
     return np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
 
 
+# Tokens a broken model/pipeline pairing emits instead of words.
+_DEGENERATE_TOKENS = {"<unk>", "<pad>", "<s>", "</s>", "\u2047"}
+
+
+def is_degenerate(text: str) -> bool:
+    """True when a transcript is only unknown/special tokens."""
+    parts = text.split()
+    return bool(parts) and all(p.lower() in _DEGENERATE_TOKENS for p in parts)
+
+
 def transcribe_bytes(data: bytes, suffix: str) -> str:
     if not data:
         raise HTTPException(400, "empty audio")
@@ -121,6 +136,11 @@ def transcribe_bytes(data: bytes, suffix: str) -> str:
     text = text.strip()
     if not text:
         raise HTTPException(502, "model returned an empty transcript")
+    if is_degenerate(text):
+        # A model wired to the wrong code path can decode every frame to <unk>
+        # and still return 200. That is worse than a crash: it looks like a
+        # transcript and scores 100% WER. Surface it instead of serving it.
+        raise HTTPException(502, f"model {MODEL_ID} returned a degenerate transcript ({text[:40]!r})")
     return text
 
 

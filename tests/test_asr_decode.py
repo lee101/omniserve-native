@@ -100,6 +100,37 @@ class TestFallbacks(unittest.TestCase):
         truncated = _wav([1, 2, 3, 4, 5])[:20]
         self.assertIsNone(decode_pcm16_wav(truncated))
 
+class TestDegenerateGuard(unittest.TestCase):
+    """A model wired to the wrong code path returns <unk> with HTTP 200.
+
+    That scores 100% WER while looking like a successful transcription, which is
+    exactly how nvidia/parakeet-ctc-0.6b behaved as the worker's default.
+    """
+
+    @staticmethod
+    def _load():
+        src = (Path(__file__).resolve().parents[1] / "workers" / "asr_worker.py").read_text()
+        start = src.index("_DEGENERATE_TOKENS")
+        end = src.index("def transcribe_bytes")
+        ns = {}
+        exec(compile(src[start:end], "asr_worker.py", "exec"), ns)
+        return ns["is_degenerate"]
+
+    def test_flags_unknown_token_output(self):
+        is_degenerate = self._load()
+        self.assertTrue(is_degenerate("<unk>"))
+        self.assertTrue(is_degenerate("<unk> <unk> <unk>"))
+        self.assertTrue(is_degenerate("<pad>"))
+
+    def test_allows_real_transcripts(self):
+        is_degenerate = self._load()
+        self.assertFalse(is_degenerate("hello world"))
+        self.assertFalse(is_degenerate(""))
+
+    def test_partial_unknowns_are_not_degenerate(self):
+        """A real transcript with one unknown word is still a transcript."""
+        is_degenerate = self._load()
+        self.assertFalse(is_degenerate("the <unk> brown fox"))
 
 if __name__ == "__main__":
     unittest.main()

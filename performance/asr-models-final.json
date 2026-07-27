@@ -1,0 +1,165 @@
+{
+  "corpus": "/nvme0n1-disk/code/dictator/e2e/audio/ground_truth.json",
+  "clips": 9,
+  "reference_words": 115,
+  "results": [
+    {
+      "backend": "parakeet-default",
+      "wer": 1.0,
+      "reference_words": 115,
+      "errors": 115,
+      "substitutions": 9,
+      "deletions": 106,
+      "insertions": 0,
+      "clips_failed": 0,
+      "audio_seconds": 49.33,
+      "wall_seconds": 22.47,
+      "rtf": 0.455,
+      "per_clip": [
+        {
+          "clip": "real_numbers.wav",
+          "wer": 1.0,
+          "reference": "testing 1 2 3 4 5 6 7 8 9 10",
+          "hypothesis": "unk",
+          "seconds": 3.626
+        },
+        {
+          "clip": "real_medium.wav",
+          "wer": 1.0,
+          "reference": "to record your voice using a microphone and save it as an mp3 file",
+          "hypothesis": "unk",
+          "seconds": 2.311
+        },
+        {
+          "clip": "real_long.wav",
+          "wer": 1.0,
+          "reference": "our voice recorder is a convenient and simple online tool that can be used right in your browser it allows you to record your voice using a microphone and save it as an mp3 file",
+          "hypothesis": "unk",
+          "seconds": 2.202
+        },
+        {
+          "clip": "real_pangram.wav",
+          "wer": 1.0,
+          "reference": "the quick brown fox jumps over the lazy dog",
+          "hypothesis": "unk",
+          "seconds": 1.906
+        },
+        {
+          "clip": "real_technical.wav",
+          "wer": 1.0,
+          "reference": "voice type is a speech to text application",
+          "hypothesis": "unk",
+          "seconds": 2.796
+        },
+        {
+          "clip": "real_natural.wav",
+          "wer": 1.0,
+          "reference": "i guess it's like what are the foundation models of 3d",
+          "hypothesis": "unk",
+          "seconds": 2.175
+        },
+        {
+          "clip": "synth_hello.wav",
+          "wer": 1.0,
+          "reference": "hello world testing one two three",
+          "hypothesis": "unk",
+          "seconds": 1.853
+        },
+        {
+          "clip": "synth_server.wav",
+          "wer": 1.0,
+          "reference": "configure the nginx reverse proxy with ssl termination on port 443",
+          "hypothesis": "unk",
+          "seconds": 2.931
+        },
+        {
+          "clip": "synth_code.wav",
+          "wer": 1.0,
+          "reference": "the function returns a boolean value indicating whether authentication succeeded",
+          "hypothesis": "unk",
+          "seconds": 2.667
+        }
+      ],
+      "spec": "hf:nvidia/parakeet-ctc-0.6b"
+    },
+    {
+      "backend": "whisper-small",
+      "wer": 0.0174,
+      "reference_words": 115,
+      "errors": 2,
+      "substitutions": 2,
+      "deletions": 0,
+      "insertions": 0,
+      "clips_failed": 0,
+      "audio_seconds": 49.33,
+      "wall_seconds": 8.81,
+      "rtf": 0.179,
+      "per_clip": [
+        {
+          "clip": "real_numbers.wav",
+          "wer": 0.0,
+          "reference": "testing 1 2 3 4 5 6 7 8 9 10",
+          "hypothesis": "testing 1 2 3 4 5 6 7 8 9 10",
+          "seconds": 1.481
+        },
+        {
+          "clip": "real_medium.wav",
+          "wer": 0.0714,
+          "reference": "to record your voice using a microphone and save it as an mp3 file",
+          "hypothesis": "to record your voice use a microphone and save it as an mp3 file",
+          "seconds": 1.035
+        },
+        {
+          "clip": "real_long.wav",
+          "wer": 0.0,
+          "reference": "our voice recorder is a convenient and simple online tool that can be used right in your browser it allows you to record your voice using a microphone and save it as an mp3 file",
+          "hypothesis": "our voice recorder is a convenient and simple online tool that can be used right in your browser it allows you to record your voice using a microphone and save it as an mp3 file",
+          "seconds": 1.581
+        },
+        {
+          "clip": "real_pangram.wav",
+          "wer": 0.1111,
+          "reference": "the quick brown fox jumps over the lazy dog",
+          "hypothesis": "the quick brown fox dumps over the lazy dog",
+          "seconds": 0.804
+        },
+        {
+          "clip": "real_technical.wav",
+          "wer": 0.0,
+          "reference": "voice type is a speech to text application",
+          "hypothesis": "voice type is a speech to text application",
+          "seconds": 0.705
+        },
+        {
+          "clip": "real_natural.wav",
+          "wer": 0.0,
+          "reference": "i guess it's like what are the foundation models of 3d",
+          "hypothesis": "i guess it's like what are the foundation models of 3d",
+          "seconds": 0.805
+        },
+        {
+          "clip": "synth_hello.wav",
+          "wer": 0.0,
+          "reference": "hello world testing one two three",
+          "hypothesis": "hello world testing one two three",
+          "seconds": 0.775
+        },
+        {
+          "clip": "synth_server.wav",
+          "wer": 0.0,
+          "reference": "configure the nginx reverse proxy with ssl termination on port 443",
+          "hypothesis": "configure the nginx reverse proxy with ssl termination on port 443",
+          "seconds": 0.984
+        },
+        {
+          "clip": "synth_code.wav",
+          "wer": 0.0,
+          "reference": "the function returns a boolean value indicating whether authentication succeeded",
+          "hypothesis": "the function returns a boolean value indicating whether authentication succeeded",
+          "seconds": 0.643
+        }
+      ],
+      "spec": "hf:openai/whisper-small.en"
+    }
+  ]
+}
