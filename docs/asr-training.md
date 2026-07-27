@@ -95,7 +95,9 @@ release. Before uploading weights:
 
 1. Revalidate consent and remove revoked samples.
 2. Run a speaker-disjoint private evaluation and a licensed public benchmark.
-3. Compare WER against the unchanged base model using identical normalization.
+3. Compare WER against the unchanged base model using identical normalization
+   (`tools/wer_bench.py` applies one canonical normalizer and refuses to
+   compare two reports that used different ones).
 4. Test memorization and inspect rare-name/proper-noun outputs.
 5. Complete the model card from `docs/asr-model-card-template.md`.
 6. Complete a release approval JSON and use `scripts/publish_asr_model.py`.
@@ -103,3 +105,36 @@ release. Before uploading weights:
 The publisher refuses corpus/audio files, requires explicit privacy, license,
 consent, model-card, and speaker-disjoint-evaluation approvals, and rejects a
 candidate whose declared WER is worse than its baseline.
+
+## Measuring the serving path
+
+`tools/wer_bench.py` measures the deployed HTTP endpoint rather than a model
+object, so a change to the serving path -- a new decoder, a batching change, or
+moving the hot path out of Python into the C gateway -- can be shown to be
+accuracy-neutral rather than assumed to be.
+
+```bash
+# record what the current path scores
+scripts/wer_bench.sh corpus.jsonl --out performance/wer-baseline.json
+
+# after the change, fail if accuracy moved
+scripts/wer_bench.sh corpus.jsonl \
+    --baseline performance/wer-baseline.json \
+    --max-wer-regression 0.005
+```
+
+Exit status is 0 when every gate passes and 1 when one fails, so it drops into
+CI unchanged. The report carries corpus WER, edit counts, latency percentiles,
+and RTF, and prints the RTF speedup next to the WER delta -- a speedup that
+costs accuracy shows up as both numbers moving at once, which is exactly the
+trade the gate exists to catch.
+
+Two details worth knowing:
+
+- **Corpus WER is the headline**, computed as total edits over total reference
+  words. The mean of per-clip WERs is reported separately because it weights a
+  three-word clip the same as a three-minute one.
+- **Normalization is fixed** (NFKC, casefold, strip punctuation, collapse
+  whitespace) and recorded in the report. Numbers and contractions are left
+  alone: rewriting them is opinionated, and applying it inconsistently between
+  baseline and candidate is how a WER comparison quietly stops meaning anything.

@@ -24,7 +24,8 @@ Environment=OMNISERVE_NATIVE_LLM_CONTEXTS=2
 # performance/quality.md. Forces flash attention, which llama.cpp requires for
 # a quantized V cache.
 Environment=OMNISERVE_NATIVE_KV_TYPE=q8_0
-Environment=OMNISERVE_NATIVE_IMAGE_UPSTREAM=http://127.0.0.1:8790
+Environment=OMNISERVE_NATIVE_IMAGE_UPSTREAM=http://127.0.0.1:8100
+Environment=OMNISERVE_NATIVE_IMAGE_GENERATE_PATH=/v1/images/generations
 Environment=OMNISERVE_NATIVE_TTS_UPSTREAM=http://127.0.0.1:9083
 Environment=OMNISERVE_NATIVE_STT_UPSTREAM=http://127.0.0.1:9096
 Environment=OMNISERVE_NATIVE_TRAINING_UPSTREAM=http://127.0.0.1:9098
