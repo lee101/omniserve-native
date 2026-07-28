@@ -68,7 +68,7 @@ endif()
 set(LLAMA_DIR "${CMAKE_SOURCE_DIR}/../llama.cpp" CACHE PATH "llama.cpp checkout")
 set(SD_DIR "${CMAKE_SOURCE_DIR}/../stable-diffusion.cpp" CACHE PATH "stable-diffusion.cpp checkout")
 
-set(CORE_SRC src/ocapacity.c src/ohttp.c src/ojson.c src/omatte.c src/oproxy.c src/osched.c
+set(CORE_SRC src/ocapacity.c src/ohttp.c src/ojson.c src/olog.c src/omatte.c src/oproxy.c src/osched.c
              src/oscale.c src/otext.c src/otune.c)
 
 add_library(onative_core STATIC ${CORE_SRC})

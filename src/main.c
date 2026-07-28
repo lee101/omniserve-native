@@ -3,6 +3,7 @@
 #include "ocapacity.h"
 #include "ohttp.h"
 #include "ojson.h"
+#include "olog.h"
 #include "oproxy.h"
 #include "oscale.h"
 #include "osched.h"
@@ -92,15 +93,17 @@ static bool authorized(const app_state *app, const ohttp_request *req) {
 /* Headers a reverse proxy, tunnel or load balancer adds on the way in. Their
  * presence proves the request was relayed, so the loopback peer address is the
  * relay's and says nothing about who originated the call. */
+static const char *const relayed_headers[] = {
+    "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded",
+    "X-Real-IP", "CF-Connecting-IP", "CF-Connecting-IPv6", "CF-Ray",
+    "CF-IPCountry", "CF-Worker", "CDN-Loop", "True-Client-IP",
+    "X-Original-Forwarded-For", "Via",
+};
+#define RELAYED_HEADER_COUNT (sizeof relayed_headers / sizeof relayed_headers[0])
+
 static bool request_via_proxy(const ohttp_request *req) {
-    static const char *relayed[] = {
-        "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded",
-        "X-Real-IP", "CF-Connecting-IP", "CF-Connecting-IPv6", "CF-Ray",
-        "CF-IPCountry", "CF-Worker", "CDN-Loop", "True-Client-IP",
-        "X-Original-Forwarded-For", "Via",
-    };
-    for (size_t i = 0; i < sizeof relayed / sizeof relayed[0]; i++)
-        if (ohttp_req_header(req, relayed[i], NULL)) return true;
+    for (size_t i = 0; i < RELAYED_HEADER_COUNT; i++)
+        if (ohttp_req_header(req, relayed_headers[i], NULL)) return true;
     return false;
 }
 
@@ -157,6 +160,8 @@ static void handle_health(ohttp_request *req) {
 static void handle_metrics(ohttp_request *req, app_state *app) {
     ohttp_response_stats responses;
     ohttp_response_snapshot(&responses);
+    unsigned long long log_dropped = 0;
+    olog_counters(NULL, &log_dropped);
     osched_stats stats;
     osched_snapshot(app->sched, &stats);
     ollm_placement placement;
@@ -180,6 +185,9 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
         "# TYPE omniserve_vram_free_gib gauge\n"
         "omniserve_vram_free_gib %.3f\n"
         "omniserve_vram_total_gib %.3f\n"
+        "# HELP omniserve_access_log_dropped_total Access log lines dropped because the ring was full.\n"
+        "# TYPE omniserve_access_log_dropped_total counter\n"
+        "omniserve_access_log_dropped_total %llu\n"
         "# HELP omniserve_admission_slots Configured and in-use admission slots.\n"
         "# TYPE omniserve_admission_slots gauge\n"
         "omniserve_admission_slots{state=\"total\"} %d\n"
@@ -196,7 +204,7 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
         "omniserve_queue_ms_max{tier=\"free\"} %.1f\n",
         responses.success, responses.redirect, responses.client_error, responses.server_error,
         degraded ? 1 : 0, vram_ok ? vram_free : -1.0, vram_ok ? vram_total : -1.0,
-        stats.slots, stats.used_slots,
+        log_dropped, stats.slots, stats.used_slots,
         (unsigned long)stats.timed_out[TIER_PAID], (unsigned long)stats.timed_out[TIER_SUB],
         (unsigned long)stats.timed_out[TIER_FREE], (unsigned long)stats.timed_out[TIER_BACKGROUND],
         stats.queue_ms_max[TIER_PAID], stats.queue_ms_max[TIER_FREE]);
@@ -753,6 +761,9 @@ static void handle_chat(ohttp_request *req, app_state *app) {
         respond_error(req, 503, "no LLM model loaded; start with OMNISERVE_NATIVE_LLM_GGUF");
         return;
     }
+    /* The served model is already known here; the inbound "model" field is
+     * never parsed, and no JSON parse is added on the hot path just to log it. */
+    olog_set_model(ollm_model_name());
     oj_tok *toks = malloc(sizeof(oj_tok) * MAX_TOKS);
     if (!toks) { respond_error(req, 500, "allocation failed"); return; }
     int n = oj_parse(req->body, req->body_len, toks, MAX_TOKS);
@@ -953,6 +964,7 @@ static void handle_completion(ohttp_request *req, app_state *app, bool legacy, b
         respond_error(req, 503, "no LLM model loaded or configured upstream");
         return;
     }
+    olog_set_model(ollm_model_name());
     oj_tok *toks = malloc(sizeof(oj_tok) * MAX_TOKS);
     if (!toks) { respond_error(req, 500, "allocation failed"); return; }
     int n = oj_parse(req->body, req->body_len, toks, MAX_TOKS);
@@ -1170,6 +1182,7 @@ static bool request_forces_local_model(const ohttp_request *req) {
 }
 
 static void handle_embedding(ohttp_request *req, bool openai_shape) {
+    olog_set_model(oembed_model_name());
     oj_tok *toks = malloc(sizeof(oj_tok) * MAX_TOKS);
     if (!toks) { respond_error(req, 500, "allocation failed"); return; }
     int n = oj_parse(req->body, req->body_len, toks, MAX_TOKS);
@@ -1845,6 +1858,16 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* The router owns the relay-header list and the internal predicate; the log
+     * borrows both, so a header added to request_via_proxy is logged the day it
+     * is added. Credential and X-Omniserve-* claim headers are a separate list
+     * in olog.c and are NOT coupled to this one: adding a new claim header to
+     * request_is_internal alone will not make it appear in hdrs=. */
+    olog_set_trust_headers(relayed_headers, RELAYED_HEADER_COUNT);
+    olog_set_internal_fn(request_is_internal);
+    olog_init();
+    if (olog_enabled()) fprintf(stderr, "access log: %s\n", olog_path());
+
     const char *reactors_env = getenv("OMNISERVE_NATIVE_REACTORS");
     ohttp_config cfg = {
         .port = port,
@@ -1863,6 +1886,7 @@ int main(int argc, char **argv) {
             port, ollm_model_name(), oembed_model_name(), osd_model_name(),
             ogpu_free_gib(), ogpu_total_gib());
     int rc = ohttp_join(srv);
+    olog_shutdown();
     oproxy_target_destroy(app.llm_upstream);
     oproxy_target_destroy(app.image_upstream);
     oproxy_target_destroy(app.art_upstream);

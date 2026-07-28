@@ -15,9 +15,11 @@ two answers are unambiguous, so no GPU is needed.
 import http.server
 import json
 import os
+import pathlib
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -105,12 +107,45 @@ def smuggling_cases(port):
     return failures
 
 
+def access_log_cases(port, log_dir):
+    """The access log runs against the gateway's real header list, so this also
+    pins that a bypass header is recorded by name and a credential never is."""
+    post(port, {
+        "Authorization": "Bearer supersecret123",
+        "X-API-Key": "topsecretkey456",
+        "X-Forwarded-For": "8.8.8.8",
+    })
+    text = ""
+    for _ in range(50):
+        text = "".join(
+            p.read_text(errors="replace")
+            for p in sorted(pathlib.Path(log_dir).glob("access.log*"))
+        )
+        # Earlier cases already logged this route, so wait for the marker that
+        # only this request can produce rather than for the path.
+        if "X-API-Key" in text:
+            break
+        time.sleep(0.1)
+    failures = 0
+    for secret in ("supersecret123", "topsecretkey456"):
+        if secret in text:
+            print(f"FAIL: access log leaked {secret}")
+            failures += 1
+    for marker in ("X-Forwarded-For", "Authorization", "X-API-Key",
+                   'path="/v1/chat/completions"'):
+        if marker not in text:
+            print(f"FAIL: access log missing {marker}")
+            failures += 1
+    return failures
+
+
 def main():
     binary = os.environ.get("OMNISERVE_NATIVE_BIN")
     if not binary or not os.path.exists(binary):
         print("skip: OMNISERVE_NATIVE_BIN not set")
         return 0
 
+    log_dir = tempfile.mkdtemp(prefix="omniserve-accesslog-")
     stub_port, gw_port = free_port(), free_port()
     stub = http.server.HTTPServer(("127.0.0.1", stub_port), Stub)
     threading.Thread(target=stub.serve_forever, daemon=True).start()
@@ -120,6 +155,8 @@ def main():
         "OMNISERVE_NATIVE_BIND": "127.0.0.1",
         "OMNISERVE_NATIVE_AUX_UPSTREAM": f"http://127.0.0.1:{stub_port}",
         "OMNISERVE_NATIVE_CHAT_COMPAT_PROXY": "1",
+        "OMNISERVE_ACCESS_LOG": "1",
+        "OMNISERVE_ACCESS_LOG_DIR": log_dir,
     }
     env.pop("OMNISERVE_NATIVE_LLM_GGUF", None)
     env.pop("OMNISERVE_NATIVE_LLM_UPSTREAM", None)
@@ -160,6 +197,7 @@ def main():
                 print(f"FAIL: {name}: went to the {where}: {body[:160]}")
                 failures += 1
         failures += smuggling_cases(gw_port)
+        failures += access_log_cases(gw_port, log_dir)
         if failures:
             return 1
         print("internal-trust tests passed")

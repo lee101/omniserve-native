@@ -59,6 +59,12 @@ const char *ohttp_req_header(const ohttp_request *req, const char *name, size_t 
  * this host also connects from loopback, so callers that grant privilege must
  * additionally require that no forwarding headers are present. */
 bool ohttp_req_peer_is_loopback(const ohttp_request *req);
+/* Presentation form of the peer address ("127.0.0.1", "unix", or "-"). Valid
+ * for the duration of the handler call. */
+const char *ohttp_req_peer_addr(const ohttp_request *req);
+/* Status recorded for the request so far, 0 if the handler has not responded
+ * yet. Reset at the start of every request on the connection. */
+int ohttp_req_status(const ohttp_request *req);
 bool ohttp_path_is(const ohttp_request *req, const char *path);
 bool ohttp_method_is(const ohttp_request *req, const char *method);
 
@@ -80,8 +86,12 @@ void ohttp_force_close(ohttp_request *req);
  * Response accounting.
  *
  * An on-call agent needs to know that the gateway is returning 5xx, on which
- * route, and how recently — without scraping logs, which is both slow and
- * ambiguous once several services share a journal. Own responses are recorded
+ * route, and how recently — a counter it can diff between polls answers that
+ * faster and less ambiguously than scraping a journal shared by several
+ * services, so this stays the alerting path. It is not a substitute for a
+ * per-request record: "which caller, with which trust headers, how long" is a
+ * different question, and olog.h answers it in a dedicated bounded file rather
+ * than in the journal. Own responses are recorded
  * where the status is written; proxied responses are recorded by reading the
  * status line of the first relayed write, so an upstream 500 is not invisible
  * just because the bytes passed through verbatim.

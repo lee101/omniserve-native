@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "ohttp.h"
 
+#include "olog.h"
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -26,6 +28,33 @@
 
 typedef enum { CONN_READING, CONN_DISPATCHED, CONN_CLOSED } conn_state;
 
+struct ohttp_conn {
+    int fd;
+    /* Presentation form of the accepted peer, captured once at accept: the
+     * access log must not call getpeername on every request. */
+    char peer_addr[46];
+    /* Recorded from the accepted socket, not from any header, so a client
+     * cannot claim to be local by asserting one. */
+    bool peer_loopback;
+    conn_state state;
+    char *buf;
+    char inline_buf[OHTTP_INLINE_BUFFER];
+    size_t buf_cap;
+    size_t buf_len;
+    size_t body_start;
+    size_t need_total;
+    bool keep_alive;
+    bool continue_sent;
+    bool streaming;
+    bool chunked_out;
+    bool status_recorded; /* one status per request, even across many raw writes */
+    int last_status;      /* what that status was, for the access log */
+    pthread_mutex_t ownership_lock;
+    struct ohttp_server *srv;
+    struct ohttp_conn *next_job;
+    struct ohttp_conn *next_all;
+};
+
 /* Process-global, like the NVML handle in osched.c: one gateway per process, so
  * threading a server pointer through every response path would buy nothing. */
 static atomic_ullong resp_total;
@@ -35,8 +64,15 @@ static ohttp_error_event error_ring[OHTTP_ERROR_RING];
 static unsigned error_ring_next;
 static unsigned long long error_ring_seen;
 
+static uint64_t monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 static void record_status(const ohttp_request *req, int status) {
     if (status < 100 || status > 599) return;
+    if (req && req->conn) req->conn->last_status = status;
     atomic_fetch_add_explicit(&resp_total, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&resp_by_class[status / 100], 1, memory_order_relaxed);
     if (status < 500) return;
@@ -94,28 +130,6 @@ int ohttp_recent_errors(ohttp_error_event *out, int max) {
     return count;
 }
 
-struct ohttp_conn {
-    int fd;
-    /* Recorded from the accepted socket, not from any header, so a client
-     * cannot claim to be local by asserting one. */
-    bool peer_loopback;
-    conn_state state;
-    char *buf;
-    char inline_buf[OHTTP_INLINE_BUFFER];
-    size_t buf_cap;
-    size_t buf_len;
-    size_t body_start;
-    size_t need_total;
-    bool keep_alive;
-    bool continue_sent;
-    bool streaming;
-    bool chunked_out;
-    bool status_recorded; /* one status per request, even across many raw writes */
-    pthread_mutex_t ownership_lock;
-    struct ohttp_server *srv;
-    struct ohttp_conn *next_job;
-    struct ohttp_conn *next_all;
-};
 
 struct ohttp_server {
     ohttp_config cfg;
@@ -271,8 +285,32 @@ static bool peer_is_loopback(const struct sockaddr *sa, socklen_t len) {
     return false;
 }
 
+static void peer_addr_text(const struct sockaddr *sa, socklen_t len, char *out, size_t cap) {
+    out[0] = 0;
+    if (!sa) return;
+    if (sa->sa_family == AF_UNIX) {
+        snprintf(out, cap, "unix");
+    } else if (sa->sa_family == AF_INET && len >= (socklen_t)sizeof(struct sockaddr_in)) {
+        const struct sockaddr_in *v4 = (const struct sockaddr_in *)sa;
+        inet_ntop(AF_INET, &v4->sin_addr, out, (socklen_t)cap);
+    } else if (sa->sa_family == AF_INET6 && len >= (socklen_t)sizeof(struct sockaddr_in6)) {
+        const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)sa;
+        inet_ntop(AF_INET6, &v6->sin6_addr, out, (socklen_t)cap);
+    }
+    if (!out[0]) snprintf(out, cap, "-");
+}
+
 bool ohttp_req_peer_is_loopback(const ohttp_request *req) {
     return req && req->conn && req->conn->peer_loopback;
+}
+
+const char *ohttp_req_peer_addr(const ohttp_request *req) {
+    if (!req || !req->conn || !req->conn->peer_addr[0]) return "-";
+    return req->conn->peer_addr;
+}
+
+int ohttp_req_status(const ohttp_request *req) {
+    return req && req->conn ? req->conn->last_status : 0;
 }
 
 const char *ohttp_req_header(const ohttp_request *req, const char *name, size_t *len) {
@@ -534,7 +572,15 @@ static void *worker_main(void *arg) {
             }
             size_t consumed = c->need_total;
             c->status_recorded = false;
+            c->last_status = 0;
+            bool logging = olog_enabled();
+            uint64_t started_ns = logging ? monotonic_ns() : 0;
+            if (logging) olog_set_model(NULL);
             srv->cfg.handler(&req, srv->cfg.user);
+            if (logging) {
+                olog_request(&req, c->last_status,
+                             (double)(monotonic_ns() - started_ns) / 1e6);
+            }
             if (!c->keep_alive) {
                 alive = false;
                 break;
@@ -626,6 +672,8 @@ static void *reactor_main(void *arg) {
                     pthread_mutex_init(&c->ownership_lock, NULL);
                     pthread_mutex_lock(&c->ownership_lock);
                     c->peer_loopback = peer_is_loopback((struct sockaddr *)&peer, peer_len);
+                    peer_addr_text((struct sockaddr *)&peer, peer_len, c->peer_addr,
+                                   sizeof c->peer_addr);
                     c->fd = fd;
                     c->buf = c->inline_buf;
                     c->buf_cap = sizeof c->inline_buf;

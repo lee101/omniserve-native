@@ -2,6 +2,7 @@
 #include "ocapacity.h"
 #include "ohttp.h"
 #include "ojson.h"
+#include "olog.h"
 #include "oproxy.h"
 #include "oscale.h"
 #include "osched.h"
@@ -19,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int failures;
@@ -954,6 +956,136 @@ static void test_matte(void) {
     }
 }
 
+/* Reads the whole access-log set (current file plus rotated generations) so an
+ * assertion cannot pass just because the interesting line rotated away. */
+static char *read_log_set(const char *dir, size_t *out_len) {
+    size_t cap = 1 << 20, len = 0;
+    char *all = malloc(cap);
+    if (!all) return NULL;
+    all[0] = 0;
+    for (int i = 0; i < OLOG_KEEP_FILES; i++) {
+        char path[512];
+        if (i == 0) snprintf(path, sizeof path, "%s/access.log", dir);
+        else snprintf(path, sizeof path, "%s/access.log.%d", dir, i);
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+        size_t n = fread(all + len, 1, cap - len - 1, f);
+        len += n;
+        all[len] = 0;
+        fclose(f);
+    }
+    if (out_len) *out_len = len;
+    return all;
+}
+
+static int log_files_present(const char *dir) {
+    int present = 0;
+    for (int i = 0; i <= OLOG_KEEP_FILES; i++) {
+        char path[512];
+        if (i == 0) snprintf(path, sizeof path, "%s/access.log", dir);
+        else snprintf(path, sizeof path, "%s/access.log.%d", dir, i);
+        struct stat st;
+        if (stat(path, &st) == 0) present++;
+    }
+    return present;
+}
+
+/* The access log is the one place a credential could leak to disk by accident,
+ * so the redaction is pinned here rather than left to review. */
+static void test_access_log(void) {
+    char dir[] = "/tmp/onative-accesslog-XXXXXX";
+    CHECK(mkdtemp(dir) != NULL);
+    setenv("OMNISERVE_ACCESS_LOG_DIR", dir, 1);
+    setenv("OMNISERVE_ACCESS_LOG_MAX_BYTES", "4096", 1);
+    setenv("OMNISERVE_ACCESS_LOG", "1", 1);
+    /* The gateway registers its real bypass-header list here; the test
+     * registers a stand-in to prove a registered header is logged by name. */
+    static const char *const test_trust_headers[] = { "X-Forwarded-For", "Via" };
+    olog_set_trust_headers(test_trust_headers, 2);
+    olog_init();
+    CHECK(olog_enabled());
+
+    echo_context context = { .target = NULL };
+    ohttp_config cfg = { .port = 18793, .reactor_threads = 1, .worker_threads = 2,
+                         .handler = echo_handler, .user = &context };
+    ohttp_server *srv = ohttp_start(&cfg);
+    CHECK(srv != NULL);
+    usleep(100000);
+
+    char *r = http_roundtrip(18793,
+        "POST /echo?token=querysecret789 HTTP/1.1\r\nHost: x\r\n"
+        "Authorization: Bearer supersecret123\r\nX-API-Key: topsecretkey456\r\n"
+        "X-Forwarded-For: 8.8.8.8\r\nX-Omniserve-Tier: paid\r\n"
+        "Content-Length: 2\r\nConnection: close\r\n\r\nhi", NULL);
+    CHECK(r && strstr(r, "200 OK"));
+    free(r);
+
+    /* A bare CR, a quote and a control byte in the path: one request must stay
+     * one line no matter what the client puts in the request target. */
+    r = http_roundtrip(18793,
+        "GET /inject\"\rmarker\x01x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
+    free(r);
+
+    olog_flush();
+    size_t len = 0;
+    char *log = read_log_set(dir, &len);
+    CHECK(log != NULL);
+    if (log) {
+        CHECK(strstr(log, "supersecret123") == NULL);
+        CHECK(strstr(log, "topsecretkey456") == NULL);
+        CHECK(strstr(log, "querysecret789") == NULL);
+        CHECK(strstr(log, "token=") == NULL);
+        CHECK(strstr(log, "Authorization") != NULL);
+        CHECK(strstr(log, "X-API-Key") != NULL);
+        CHECK(strstr(log, "X-Forwarded-For") != NULL);
+        CHECK(strstr(log, "X-Omniserve-Tier") != NULL);
+        CHECK(strstr(log, "path=\"/echo\"") != NULL);
+        CHECK(strstr(log, "status=200") != NULL);
+        /* Escaped, so the forged bytes cannot start a second record. */
+        CHECK(count_text(log, "/inject") == 1);
+        CHECK(strstr(log, "\\x0d") != NULL && strstr(log, "\\x01") != NULL);
+        CHECK(strstr(log, "marker\n") == NULL);
+        int lines = count_text(log, "\n");
+        CHECK(lines == 2);
+    }
+    free(log);
+
+    /* Rotation: 4 KiB cap, so a few hundred requests must still leave at most
+     * OLOG_KEEP_FILES files behind. */
+    for (int i = 0; i < 400; i++) {
+        char raw[256];
+        snprintf(raw, sizeof raw,
+                 "GET /rotate/%d HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", i);
+        free(http_roundtrip(18793, raw, NULL));
+    }
+    olog_flush();
+    usleep(50000);
+    CHECK(log_files_present(dir) <= OLOG_KEEP_FILES);
+    for (int i = 0; i <= OLOG_KEEP_FILES; i++) {
+        char path[512];
+        if (i == 0) snprintf(path, sizeof path, "%s/access.log", dir);
+        else snprintf(path, sizeof path, "%s/access.log.%d", dir, i);
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+        CHECK(i < OLOG_KEEP_FILES);
+        CHECK((size_t)st.st_size <= 4096 + OLOG_SLOT_BYTES);
+    }
+    unsigned long long emitted = 0, dropped = 0;
+    olog_counters(&emitted, &dropped);
+    CHECK(emitted + dropped >= 400);
+
+    ohttp_stop(srv);
+    CHECK(ohttp_join(srv) == 0);
+    olog_shutdown();
+    for (int i = 0; i <= OLOG_KEEP_FILES; i++) {
+        char path[512];
+        if (i == 0) snprintf(path, sizeof path, "%s/access.log", dir);
+        else snprintf(path, sizeof path, "%s/access.log.%d", dir, i);
+        unlink(path);
+    }
+    rmdir(dir);
+}
+
 int main(void) {
     test_json();
     test_matte();
@@ -974,6 +1106,7 @@ int main(void) {
     test_capacity_controller();
     test_http_server();
     test_response_accounting();
+    test_access_log();
     if (failures) {
         fprintf(stderr, "%d failures\n", failures);
         return 1;

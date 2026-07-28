@@ -124,9 +124,11 @@ The packaged unit orders after `nvidia-persistenced.service` and waits for
 ## Observability and automated on-call
 
 `GET /metrics` is Prometheus text and `GET /errors` is the recent-failure ring.
-Both exist so a monitor never has to scrape logs: on a box sharing a journal with
-a dozen services, a log line is ambiguous about which process produced it, while
-a counter you can diff between two polls is not.
+Both exist so a monitor never has to scrape the journal: on a box sharing one
+with a dozen services, a log line is ambiguous about which process produced it,
+while a counter you can diff between two polls is not. The access log below is
+the per-request record, kept in its own bounded file for forensics — it does not
+feed alerting.
 
 - `/metrics` — responses by status class, `omniserve_gpu_degraded`,
   `omniserve_vram_free_gib` (`-1` when the driver is unreachable), admission
@@ -136,6 +138,14 @@ a counter you can diff between two polls is not.
   Own responses are recorded where the status is written; **proxied** responses
   are recorded by reading the status line of the first relayed write, so an
   upstream 500 is not invisible just because the bytes passed through verbatim.
+
+- `access.log` — one line per request: timestamp, peer, method, path, model,
+  status, duration, the internal/external verdict, and which trust-relevant
+  headers were *present*. Never header values, never the body, never the query
+  string. It answers "who called and with what markers", which a counter cannot;
+  it is not an alerting path. Formatting is allocation-free, the write happens on
+  a drain thread, and retention is capped in-process at **4 x 8 MiB = 32 MiB**.
+  See [`docs/access-log.md`](docs/access-log.md).
 
 `monitoring/` (gitignored, host-local) drives those signals into an autonomous
 on-call loop: `oncall.sh` polls every 120s and wakes a coding agent **only** when
