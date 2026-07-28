@@ -144,7 +144,8 @@ feed alerting.
   headers were *present*. Never header values, never the body, never the query
   string. It answers "who called and with what markers", which a counter cannot;
   it is not an alerting path. Formatting is allocation-free, the write happens on
-  a drain thread, and retention is capped in-process at **4 x 8 MiB = 32 MiB**.
+  a drain thread, and retention is capped in-process at **4 x 32 MiB = 128 MiB**,
+  roughly a month at this gateway's measured rate.
   See [`docs/access-log.md`](docs/access-log.md).
 
 `monitoring/` (gitignored, host-local) drives those signals into an autonomous

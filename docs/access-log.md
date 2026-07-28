@@ -65,10 +65,10 @@ log itself at most every 10s while the count is changing.
 
 The drain thread batches up to 32 KiB per `write(2)`.
 
-## Retention: 32 MiB, hard
+## Retention: 128 MiB, hard (~1 month)
 
 Rotation is in-process, not logrotate — a cap enforced by a tool that may not be
-installed on a given box is not a cap. At 8 MiB the file is renamed
+installed on a given box is not a cap. At 32 MiB the file is renamed
 `access.log -> .1 -> .2 -> .3` and the oldest generation is overwritten.
 
 If the rename cannot happen at all — read-only directory, ENOSPC, the name held
@@ -82,10 +82,15 @@ indistinguishable from no traffic.
 The cap is per process. Two gateways pointed at the same directory would each
 enforce it independently against the same files; the systemd unit runs one.
 
-**4 files x 8 MiB = 32 MiB maximum on disk**, forever. That is deliberately
-modest: this host already carries ~1 GB of generated data, and an access log is
-not what should consume the rest. At ~100 B/line that is roughly 330k retained
-requests.
+**4 files x 32 MiB = 128 MiB maximum on disk**, forever. Still small against the
+~1 GB of generated data this host already carries.
+
+The size is set by the question the log exists to answer. Measured in production:
+~185 B/line at ~25k requests/day, so 128 MiB is roughly **a month** of history,
+about 700k requests. A 32 MiB cap would have expired at ~7 days — the same age as
+Cloudflare's edge retention, and therefore the same blind spot that made the
+bypass audit inconclusive. Retention below the edge window would have been
+retention that answers nothing.
 
 ## Configuration
 
@@ -93,7 +98,7 @@ requests.
 | --- | --- | --- |
 | `OMNISERVE_ACCESS_LOG` | on | `0`/`false`/`no` disables logging entirely |
 | `OMNISERVE_ACCESS_LOG_DIR` | `/var/log/omniserve` | Directory for `access.log`; created if missing, falls back to `/tmp/omniserve-access.log` with a stderr note if unusable |
-| `OMNISERVE_ACCESS_LOG_MAX_BYTES` | 8388608 | May only *lower* the per-file cap; the 32 MiB ceiling is not negotiable from the environment |
+| `OMNISERVE_ACCESS_LOG_MAX_BYTES` | 33554432 | May only *lower* the per-file cap; the 128 MiB ceiling is not negotiable from the environment |
 
 ## Measured overhead
 

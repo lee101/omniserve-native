@@ -23,11 +23,15 @@
  *
  * Retention is enforced in-process, not by logrotate: OLOG_MAX_FILE_BYTES per
  * file and OLOG_KEEP_FILES generations, so the access log can never occupy
- * more than 32 MiB no matter how long the gateway runs.
+ * more than 128 MiB no matter how long the gateway runs. The size is chosen
+ * against the question this log exists to answer: at the observed ~185 B/line
+ * and ~25k requests/day that is roughly a month of history. A smaller cap
+ * would expire at about the same age as Cloudflare's 7-day edge window, which
+ * is precisely the blind spot that made the bypass audit inconclusive.
  */
 
-#define OLOG_MAX_FILE_BYTES (8u << 20) /* 8 MiB per file */
-#define OLOG_KEEP_FILES 4              /* access.log + .1 .2 .3 = 32 MiB total */
+#define OLOG_MAX_FILE_BYTES (32u << 20) /* 32 MiB per file */
+#define OLOG_KEEP_FILES 4               /* access.log + .1 .2 .3 = 128 MiB total */
 #define OLOG_RING_SLOTS 4096u          /* power of two */
 #define OLOG_SLOT_BYTES 512u           /* 2 MiB of ring, fixed at startup */
 
