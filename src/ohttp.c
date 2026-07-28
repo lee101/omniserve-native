@@ -16,6 +16,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <time.h>
@@ -95,6 +96,9 @@ int ohttp_recent_errors(ohttp_error_event *out, int max) {
 
 struct ohttp_conn {
     int fd;
+    /* Recorded from the accepted socket, not from any header, so a client
+     * cannot claim to be local by asserting one. */
+    bool peer_loopback;
     conn_state state;
     char *buf;
     char inline_buf[OHTTP_INLINE_BUFFER];
@@ -245,6 +249,30 @@ static bool parse_content_length(const char *begin, const char *end, size_t *out
     }
     *out = value;
     return true;
+}
+
+/* Unknown or unexpected address families are treated as remote: failing closed
+ * costs an internal caller a header, failing open costs free GPU time. */
+static bool peer_is_loopback(const struct sockaddr *sa, socklen_t len) {
+    if (!sa) return false;
+    if (sa->sa_family == AF_UNIX) return true;
+    if (sa->sa_family == AF_INET && len >= (socklen_t)sizeof(struct sockaddr_in)) {
+        const struct sockaddr_in *v4 = (const struct sockaddr_in *)sa;
+        return (ntohl(v4->sin_addr.s_addr) >> 24) == 127u;
+    }
+    if (sa->sa_family == AF_INET6 && len >= (socklen_t)sizeof(struct sockaddr_in6)) {
+        const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)sa;
+        if (IN6_IS_ADDR_LOOPBACK(&v6->sin6_addr)) return true;
+        /* ::ffff:127.0.0.0/8 arrives on a dual-stack listener. */
+        if (IN6_IS_ADDR_V4MAPPED(&v6->sin6_addr))
+            return v6->sin6_addr.s6_addr[12] == 127u;
+        return false;
+    }
+    return false;
+}
+
+bool ohttp_req_peer_is_loopback(const ohttp_request *req) {
+    return req && req->conn && req->conn->peer_loopback;
 }
 
 const char *ohttp_req_header(const ohttp_request *req, const char *name, size_t *len) {
@@ -567,7 +595,10 @@ static void *reactor_main(void *arg) {
         for (int i = 0; i < n; i++) {
             if (events[i].data.ptr == NULL) {
                 for (;;) {
-                    int fd = accept4(srv->listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+                    struct sockaddr_storage peer = {0};
+                    socklen_t peer_len = sizeof peer;
+                    int fd = accept4(srv->listen_fd, (struct sockaddr *)&peer, &peer_len,
+                                     SOCK_NONBLOCK | SOCK_CLOEXEC);
                     if (fd < 0) break;
                     int one = 1;
                     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -575,6 +606,7 @@ static void *reactor_main(void *arg) {
                     if (!c) { close(fd); continue; }
                     pthread_mutex_init(&c->ownership_lock, NULL);
                     pthread_mutex_lock(&c->ownership_lock);
+                    c->peer_loopback = peer_is_loopback((struct sockaddr *)&peer, peer_len);
                     c->fd = fd;
                     c->buf = c->inline_buf;
                     c->buf_cap = sizeof c->inline_buf;

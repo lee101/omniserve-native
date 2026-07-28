@@ -89,7 +89,33 @@ static bool authorized(const app_state *app, const ohttp_request *req) {
     return false;
 }
 
+/* Headers a reverse proxy, tunnel or load balancer adds on the way in. Their
+ * presence proves the request was relayed, so the loopback peer address is the
+ * relay's and says nothing about who originated the call. */
+static bool request_via_proxy(const ohttp_request *req) {
+    static const char *relayed[] = {
+        "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded",
+        "X-Real-IP", "CF-Connecting-IP", "CF-Connecting-IPv6", "CF-Ray",
+        "CF-IPCountry", "CF-Worker", "CDN-Loop", "True-Client-IP",
+        "X-Original-Forwarded-For", "Via",
+    };
+    for (size_t i = 0; i < sizeof relayed / sizeof relayed[0]; i++)
+        if (ohttp_req_header(req, relayed[i], NULL)) return true;
+    return false;
+}
+
+/* "Internal" is a property of the connection, never of a header the client
+ * controls. A request qualifies only when it came from this host AND shows no
+ * sign of having been relayed, so a public caller cannot buy free GPU time by
+ * asserting X-Omniserve-Internal through the Cloudflare tunnel. */
+static bool request_is_internal(const ohttp_request *req) {
+    return ohttp_req_peer_is_loopback(req) && !request_via_proxy(req);
+}
+
 static otier request_tier(const ohttp_request *req) {
+    /* Priority is a privilege too: a public caller must not be able to claim
+     * the paid lane, so an untrusted X-Omniserve-Tier falls back to default. */
+    if (!request_is_internal(req)) return otier_parse_public(NULL, 0);
     size_t len = 0;
     const char *v = ohttp_req_header(req, "X-Omniserve-Tier", &len);
     return otier_parse_public(v, (int)len);
@@ -381,6 +407,15 @@ static void handle_models(ohttp_request *req, const app_state *app) {
 }
 
 static bool proxy_header_allowed(const ohttp_header *h) {
+    /* X-Omniserve-* carries trust decisions (internal, tier) that this gateway
+     * makes from the connection. Relaying an inbound copy would let a client
+     * assert them to an upstream that has no way to tell them apart, so they
+     * are dropped before the allowlist is consulted rather than merely left
+     * out of it — a later addition to the list cannot reintroduce the hole. */
+    static const char reserved[] = "X-Omniserve-";
+    if (h->name_len >= sizeof reserved - 1 &&
+        strncasecmp(h->name, reserved, sizeof reserved - 1) == 0)
+        return false;
     static const char *allowed[] = {
         "Accept", "Authorization", "secret", "X-API-Key", "X-Rapid-API-Key",
         "X-Request-ID", "Traceparent", "Tracestate", "OpenAI-Organization",
@@ -1128,6 +1163,7 @@ static bool env_flag(const char *name, int fallback) {
 }
 
 static bool request_forces_local_model(const ohttp_request *req) {
+    if (!request_is_internal(req)) return false;
     size_t value_len = 0;
     const char *value = ohttp_req_header(req, "X-Omniserve-Internal", &value_len);
     return value && value_len == 5 && strncasecmp(value, "local", 5) == 0;

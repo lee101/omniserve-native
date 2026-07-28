@@ -53,6 +53,12 @@ int ohttp_join(ohttp_server *srv);
 void ohttp_stop(ohttp_server *srv);
 
 const char *ohttp_req_header(const ohttp_request *req, const char *name, size_t *len);
+/* True when the request arrived over a loopback (or unix) socket. Derived from
+ * the accepted peer address, never from a header, so it cannot be spoofed by a
+ * client. It does not by itself mean "internal": a reverse proxy or tunnel on
+ * this host also connects from loopback, so callers that grant privilege must
+ * additionally require that no forwarding headers are present. */
+bool ohttp_req_peer_is_loopback(const ohttp_request *req);
 bool ohttp_path_is(const ohttp_request *req, const char *path);
 bool ohttp_method_is(const ohttp_request *req, const char *method);
 
