@@ -377,6 +377,21 @@ void ohttp_force_close(ohttp_request *req) {
     if (req && req->conn) req->conn->keep_alive = false;
 }
 
+/* RFC 9110 token. Notably excludes SP and HTAB, so `Content-Length : 5` and an
+ * obs-fold continuation line are rejected rather than skipped. */
+static bool name_is_token(const char *begin, const char *end) {
+    for (const char *p = begin; p < end; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') ||
+            /* strchr matches the terminator, so a NUL byte would pass. */
+            (ch && strchr("!#$%&'*+-.^_`|~", ch)))
+            continue;
+        return false;
+    }
+    return true;
+}
+
 static bool parse_request(struct ohttp_conn *c, ohttp_request *req) {
     char *end = memmem(c->buf, c->buf_len, "\r\n\r\n", 4);
     if (!end) {
@@ -422,32 +437,36 @@ static bool parse_request(struct ohttp_conn *c, ohttp_request *req) {
         line_end = memmem(p, head_len - (size_t)(p - c->buf), "\r\n", 2);
         if (!line_end || line_end == p) break;
         char *colon = memchr(p, ':', (size_t)(line_end - p));
-        if (colon) {
-            if (req->header_count >= OHTTP_MAX_HEADERS) return false;
-            ohttp_header *h = &req->headers[req->header_count++];
-            h->name = p;
-            h->name_len = (size_t)(colon - p);
-            char *v = colon + 1;
-            while (v < line_end && (*v == ' ' || *v == '\t')) v++;
-            h->value = v;
-            h->value_len = (size_t)(line_end - v);
-            if (h->name_len == 14 && strncasecmp(h->name, "Content-Length", 14) == 0) {
-                size_t parsed = 0;
-                if (!parse_content_length(v, line_end, &parsed) ||
-                    (have_content_length && parsed != content_length)) return false;
-                content_length = parsed;
-                have_content_length = true;
-            } else if (h->name_len == 17 && strncasecmp(h->name, "Transfer-Encoding", 17) == 0) {
-                /* The edge must dechunk requests. Treating an encoded body as a
-                 * second request would be a request-smuggling vulnerability. */
-                return false;
-            } else if (h->name_len == 10 && strncasecmp(h->name, "Connection", 10) == 0) {
-                if (header_has_token(v, line_end, "close")) c->keep_alive = false;
-                if (http_10 && header_has_token(v, line_end, "keep-alive")) c->keep_alive = true;
-            } else if (h->name_len == 6 && strncasecmp(h->name, "Expect", 6) == 0) {
-                if (!header_has_token(v, line_end, "100-continue")) return false;
-                expect_continue = true;
-            }
+        /* A field line this parser merely skips is one it does not agree with
+         * an intermediary about. `Content-Length : 5` is ignored here but may
+         * be framing to something upstream, and that disagreement is how
+         * request smuggling starts, so anything that is not a well-formed
+         * field line ends the request instead of being passed over. */
+        if (!colon || colon == p || !name_is_token(p, colon)) return false;
+        if (req->header_count >= OHTTP_MAX_HEADERS) return false;
+        ohttp_header *h = &req->headers[req->header_count++];
+        h->name = p;
+        h->name_len = (size_t)(colon - p);
+        char *v = colon + 1;
+        while (v < line_end && (*v == ' ' || *v == '\t')) v++;
+        h->value = v;
+        h->value_len = (size_t)(line_end - v);
+        if (h->name_len == 14 && strncasecmp(h->name, "Content-Length", 14) == 0) {
+            size_t parsed = 0;
+            if (!parse_content_length(v, line_end, &parsed) ||
+                (have_content_length && parsed != content_length)) return false;
+            content_length = parsed;
+            have_content_length = true;
+        } else if (h->name_len == 17 && strncasecmp(h->name, "Transfer-Encoding", 17) == 0) {
+            /* The edge must dechunk requests. Treating an encoded body as a
+             * second request would be a request-smuggling vulnerability. */
+            return false;
+        } else if (h->name_len == 10 && strncasecmp(h->name, "Connection", 10) == 0) {
+            if (header_has_token(v, line_end, "close")) c->keep_alive = false;
+            if (http_10 && header_has_token(v, line_end, "keep-alive")) c->keep_alive = true;
+        } else if (h->name_len == 6 && strncasecmp(h->name, "Expect", 6) == 0) {
+            if (!header_has_token(v, line_end, "100-continue")) return false;
+            expect_continue = true;
         }
         p = line_end + 2;
     }

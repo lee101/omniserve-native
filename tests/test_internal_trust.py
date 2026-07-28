@@ -62,6 +62,49 @@ def post(port, headers):
         return e.read().decode()
 
 
+def raw(port, head, body=b""):
+    """Send a hand-built request the http client would refuse to construct."""
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
+        s.sendall(head.replace("\n", "\r\n").encode() + b"\r\n" + body)
+        s.settimeout(10)
+        chunks = []
+        while True:
+            try:
+                b = s.recv(4096)
+            except socket.timeout:
+                break
+            if not b:
+                break
+            chunks.append(b)
+        return b"".join(chunks)
+
+
+def smuggling_cases(port):
+    """A field line this parser skips but an intermediary treats as framing is
+    how a smuggled second request gets onto the connection, and that second
+    request would carry no relay headers and so look internal."""
+    body = b'{"model":"any","messages":[],"max_tokens":1}'
+    failures = 0
+    cases = [
+        ("space before colon on Content-Length",
+         f"POST /v1/chat/completions HTTP/1.1\nHost: x\nContent-Length : {len(body)}\n"),
+        ("space before colon on Transfer-Encoding",
+         "POST /v1/chat/completions HTTP/1.1\nHost: x\nTransfer-Encoding : chunked\n"),
+        ("tab before colon on Content-Length",
+         f"POST /v1/chat/completions HTTP/1.1\nHost: x\nContent-Length\t: {len(body)}\n"),
+        ("obs-fold continuation line",
+         f"POST /v1/chat/completions HTTP/1.1\nHost: x\nContent-Length: {len(body)}\n\tsmuggled\n"),
+        ("field line with no colon",
+         "POST /v1/chat/completions HTTP/1.1\nHost: x\nGET /smuggled HTTP/1.1\n"),
+    ]
+    for name, head in cases:
+        reply = raw(port, head, body)
+        if reply:
+            print(f"FAIL: {name}: accepted instead of rejected: {reply[:120]!r}")
+            failures += 1
+    return failures
+
+
 def main():
     binary = os.environ.get("OMNISERVE_NATIVE_BIN")
     if not binary or not os.path.exists(binary):
@@ -116,6 +159,7 @@ def main():
                 where = "credit gate" if hit_upstream else "local model"
                 print(f"FAIL: {name}: went to the {where}: {body[:160]}")
                 failures += 1
+        failures += smuggling_cases(gw_port)
         if failures:
             return 1
         print("internal-trust tests passed")
