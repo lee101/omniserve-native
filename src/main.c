@@ -121,6 +121,7 @@ static void handle_health(ohttp_request *req) {
              degraded ? "degraded" : "ok",
              placement.gpu_device_present ? "true" : "false",
              placement.on_gpu ? "gpu" : "cpu", placement.device);
+    ohttp_force_close(req);
     ohttp_respond_str(req, 200, "application/json", body);
 }
 
@@ -220,6 +221,7 @@ static void handle_readyz(ohttp_request *req) {
              "{\"ready\":%s,\"status\":\"%s\",\"placement\":\"%s\",\"device\":\"%.80s\"}",
              degraded ? "false" : "true", degraded ? "degraded" : "ok",
              placement.on_gpu ? "gpu" : "cpu", placement.device);
+    ohttp_force_close(req);
     ohttp_respond_str(req, degraded ? 503 : 200, "application/json", body);
 }
 
@@ -336,6 +338,7 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  "\"capacity\":%s}",
                  placement.tune_class, placement.n_batch, placement.n_ubatch, capacity_json);
     }
+    ohttp_force_close(req);
     ohttp_respond_str(req, 200, "application/json", body);
 }
 

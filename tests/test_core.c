@@ -257,6 +257,11 @@ static void echo_handler(ohttp_request *req, void *user) {
         ohttp_respond_str(req, 200, "text/plain", "header-ok");
         return;
     }
+    if (ohttp_path_is(req, "/close")) {
+        ohttp_force_close(req);
+        ohttp_respond_str(req, 200, "text/plain", "bye");
+        return;
+    }
     ohttp_respond_str(req, 404, "text/plain", "nope");
 }
 
@@ -412,6 +417,21 @@ static void test_http_server(void) {
     CHECK(test_write_all(fd, req1, strlen(req1)));
     n = read(fd, buf, sizeof buf - 1);
     CHECK(n > 0);
+    close(fd);
+
+    fd = connect_local(18791);
+    CHECK(fd >= 0);
+    const char *close_req =
+        "GET /close HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi";
+    CHECK(test_write_all(fd, close_req, strlen(close_req)));
+    n = read(fd, buf, sizeof buf - 1);
+    CHECK(n > 0);
+    if (n > 0) {
+        buf[n] = 0;
+        CHECK(strstr(buf, "200 OK") && strstr(buf, "Connection: close"));
+        CHECK(count_text(buf, "HTTP/1.1 200 OK") == 1);
+    }
     close(fd);
 
     const char *pipelined =

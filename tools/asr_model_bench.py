@@ -37,6 +37,8 @@ from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import asr_stats as st
+import asr_textnorm as tn
 from wer_bench import Counts, align, audio_seconds, extract_text, normalize, post_audio, tokens
 
 
@@ -227,6 +229,9 @@ def build_backend(spec: str) -> Callable[[Path], str]:
 
 def score(name: str, run: Callable[[Path], str], corpus: list[tuple[Path, str]], verbose: bool) -> dict[str, Any]:
     total = Counts()
+    lenient_total = Counts()
+    clip_scores: list[st.ClipScore] = []
+    hyp_tokens: dict[str, list[str]] = {}
     clips: list[dict[str, Any]] = []
     wall = 0.0
     audio = 0.0
@@ -245,8 +250,13 @@ def score(name: str, run: Callable[[Path], str], corpus: list[tuple[Path, str]],
             continue
         elapsed = time.perf_counter() - started
 
-        counts = align(tokens(reference), tokens(hypothesis))
+        ref_toks, hyp_toks = tokens(reference), tokens(hypothesis)
+        counts = align(ref_toks, hyp_toks)
         total.add(counts)
+        clip_scores.append(st.ClipScore(counts.errors, counts.reference_words))
+        hyp_tokens[clip.name] = hyp_toks
+        lenient = align(tn.lenient_tokens(reference, tokens), tn.lenient_tokens(hypothesis, tokens))
+        lenient_total.add(lenient)
         wall += elapsed
         audio += audio_seconds(clip)
         clips.append(
@@ -285,7 +295,13 @@ def score(name: str, run: Callable[[Path], str], corpus: list[tuple[Path, str]],
         "audio_seconds": round(audio, 2),
         "wall_seconds": round(wall, 2),
         "rtf": round(wall / audio, 3) if audio else None,
+        # Formatting-only normalization: same words, different spelling. Shown
+        # next to the strict number so a gap between them is visible rather than
+        # silently baked into the headline.
+        "wer_lenient": round(lenient_total.wer(), 4),
         "per_clip": clips,
+        "_clip_scores": clip_scores,
+        "_hyp_tokens": hyp_tokens,
     }
 
 
@@ -296,6 +312,9 @@ def main() -> int:
     ap.add_argument("--backend", action="append", default=[], metavar="NAME=SPEC", required=True)
     ap.add_argument("--out", type=Path)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--resamples", type=int, default=10000, help="bootstrap resamples")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-ensemble", action="store_true", help="skip the ROVER row")
     args = ap.parse_args()
 
     corpus = load_corpus(args.corpus, args.audio_dir)
@@ -332,16 +351,90 @@ def main() -> int:
             )
 
     scored = [r for r in results if r.get("wer") is not None]
+
+    # ROVER: vote a combined transcript out of every scored backend. On a corpus
+    # where systems make *different* mistakes this lands below the best single
+    # system; where they share a blind spot it cannot help, and saying so is the
+    # point of measuring it rather than assuming.
+    if len(scored) >= 3 and not args.no_ensemble:
+        combined = Counts()
+        combined_scores = []
+        agreements = []
+        for clip, reference in corpus:
+            hyps = [r["_hyp_tokens"].get(clip.name) for r in scored]
+            hyps = [h for h in hyps if h is not None]
+            if len(hyps) < 3:
+                continue
+            voted = st.rover_combine(hyps)
+            agreements.append(st.agreement_rate(hyps))
+            c = align(tokens(reference), voted)
+            combined.add(c)
+            combined_scores.append(st.ClipScore(c.errors, c.reference_words))
+        if combined_scores:
+            results.append(
+                {
+                    "backend": f"rover({len(scored)} systems)",
+                    "spec": "ensemble",
+                    "wer": round(combined.wer(), 4),
+                    "errors": combined.errors,
+                    "reference_words": combined.reference_words,
+                    "rtf": None,
+                    "mean_agreement": round(sum(agreements) / len(agreements), 3),
+                    "_clip_scores": combined_scores,
+                    "_hyp_tokens": {},
+                }
+            )
+            scored = [r for r in results if r.get("wer") is not None]
+
     scored.sort(key=lambda r: r["wer"])
-    print("\n" + "=" * 62)
-    print(f"{'backend':<22}{'WER':>9}{'errors':>10}{'RTF':>9}")
-    print("-" * 62)
+
+    # Bootstrap CI per system. The interval is the honest version of the number.
     for r in scored:
-        print(f"{r['backend']:<22}{r['wer']:>9.4f}{r['errors']:>10}{str(r['rtf']):>9}")
+        cs = r.get("_clip_scores") or []
+        if cs:
+            ci = st.bootstrap_wer_ci(cs, resamples=args.resamples, seed=args.seed)
+            r["wer_ci_low"], r["wer_ci_high"] = round(ci.low, 4), round(ci.high, 4)
+
+    print("\n" + "=" * 78)
+    print(f"{'backend':<24}{'WER':>8}{'95% CI':>20}{'lenient':>10}{'errors':>8}{'RTF':>8}")
+    print("-" * 78)
+    for r in scored:
+        ci = (
+            f"[{r['wer_ci_low']:.3f}, {r['wer_ci_high']:.3f}]"
+            if "wer_ci_low" in r
+            else ""
+        )
+        lenient = f"{r['wer_lenient']:.4f}" if r.get("wer_lenient") is not None else "-"
+        print(
+            f"{r['backend']:<24}{r['wer']:>8.4f}{ci:>20}{lenient:>10}"
+            f"{r['errors']:>8}{str(r['rtf']):>8}"
+        )
     for r in results:
         if r.get("wer") is None:
             reason = r.get("error", "unavailable")
             print(f"{r['backend']:<22}{'n/a':>9}   {reason[:60]}")
+
+    # Pairwise paired-bootstrap against the leader: which gaps are real?
+    if len(scored) >= 2:
+        best = scored[0]
+        print("\nPaired bootstrap vs the leader (same resampled clips for both):")
+        for other in scored[1:]:
+            a, b = other.get("_clip_scores"), best.get("_clip_scores")
+            if not a or not b or len(a) != len(b):
+                continue
+            cmp = st.paired_bootstrap(a, b, resamples=args.resamples, seed=args.seed)
+            other["vs_leader"] = {
+                "leader": best["backend"],
+                "delta": round(cmp.delta, 4),
+                "ci": [round(cmp.low, 4), round(cmp.high, 4)],
+                "p_value": round(cmp.p_value, 4),
+                "significant": cmp.significant,
+            }
+            print("  " + cmp.verdict(other["backend"], best["backend"], 0.05))
+
+    for r in results:
+        r.pop("_clip_scores", None)
+        r.pop("_hyp_tokens", None)
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)

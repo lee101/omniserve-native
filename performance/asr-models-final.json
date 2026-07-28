@@ -4,85 +4,6 @@
   "reference_words": 115,
   "results": [
     {
-      "backend": "parakeet-default",
-      "wer": 1.0,
-      "reference_words": 115,
-      "errors": 115,
-      "substitutions": 9,
-      "deletions": 106,
-      "insertions": 0,
-      "clips_failed": 0,
-      "audio_seconds": 49.33,
-      "wall_seconds": 22.47,
-      "rtf": 0.455,
-      "per_clip": [
-        {
-          "clip": "real_numbers.wav",
-          "wer": 1.0,
-          "reference": "testing 1 2 3 4 5 6 7 8 9 10",
-          "hypothesis": "unk",
-          "seconds": 3.626
-        },
-        {
-          "clip": "real_medium.wav",
-          "wer": 1.0,
-          "reference": "to record your voice using a microphone and save it as an mp3 file",
-          "hypothesis": "unk",
-          "seconds": 2.311
-        },
-        {
-          "clip": "real_long.wav",
-          "wer": 1.0,
-          "reference": "our voice recorder is a convenient and simple online tool that can be used right in your browser it allows you to record your voice using a microphone and save it as an mp3 file",
-          "hypothesis": "unk",
-          "seconds": 2.202
-        },
-        {
-          "clip": "real_pangram.wav",
-          "wer": 1.0,
-          "reference": "the quick brown fox jumps over the lazy dog",
-          "hypothesis": "unk",
-          "seconds": 1.906
-        },
-        {
-          "clip": "real_technical.wav",
-          "wer": 1.0,
-          "reference": "voice type is a speech to text application",
-          "hypothesis": "unk",
-          "seconds": 2.796
-        },
-        {
-          "clip": "real_natural.wav",
-          "wer": 1.0,
-          "reference": "i guess it's like what are the foundation models of 3d",
-          "hypothesis": "unk",
-          "seconds": 2.175
-        },
-        {
-          "clip": "synth_hello.wav",
-          "wer": 1.0,
-          "reference": "hello world testing one two three",
-          "hypothesis": "unk",
-          "seconds": 1.853
-        },
-        {
-          "clip": "synth_server.wav",
-          "wer": 1.0,
-          "reference": "configure the nginx reverse proxy with ssl termination on port 443",
-          "hypothesis": "unk",
-          "seconds": 2.931
-        },
-        {
-          "clip": "synth_code.wav",
-          "wer": 1.0,
-          "reference": "the function returns a boolean value indicating whether authentication succeeded",
-          "hypothesis": "unk",
-          "seconds": 2.667
-        }
-      ],
-      "spec": "hf:nvidia/parakeet-ctc-0.6b"
-    },
-    {
       "backend": "whisper-small",
       "wer": 0.0174,
       "reference_words": 115,
@@ -92,74 +13,374 @@
       "insertions": 0,
       "clips_failed": 0,
       "audio_seconds": 49.33,
-      "wall_seconds": 8.81,
-      "rtf": 0.179,
+      "wall_seconds": 9.14,
+      "rtf": 0.185,
+      "wer_lenient": 0.0168,
       "per_clip": [
         {
           "clip": "real_numbers.wav",
           "wer": 0.0,
           "reference": "testing 1 2 3 4 5 6 7 8 9 10",
           "hypothesis": "testing 1 2 3 4 5 6 7 8 9 10",
-          "seconds": 1.481
+          "seconds": 1.928
         },
         {
           "clip": "real_medium.wav",
           "wer": 0.0714,
           "reference": "to record your voice using a microphone and save it as an mp3 file",
           "hypothesis": "to record your voice use a microphone and save it as an mp3 file",
-          "seconds": 1.035
+          "seconds": 0.909
         },
         {
           "clip": "real_long.wav",
           "wer": 0.0,
           "reference": "our voice recorder is a convenient and simple online tool that can be used right in your browser it allows you to record your voice using a microphone and save it as an mp3 file",
           "hypothesis": "our voice recorder is a convenient and simple online tool that can be used right in your browser it allows you to record your voice using a microphone and save it as an mp3 file",
-          "seconds": 1.581
+          "seconds": 1.671
         },
         {
           "clip": "real_pangram.wav",
           "wer": 0.1111,
           "reference": "the quick brown fox jumps over the lazy dog",
           "hypothesis": "the quick brown fox dumps over the lazy dog",
-          "seconds": 0.804
+          "seconds": 0.854
         },
         {
           "clip": "real_technical.wav",
           "wer": 0.0,
           "reference": "voice type is a speech to text application",
           "hypothesis": "voice type is a speech to text application",
-          "seconds": 0.705
+          "seconds": 0.763
         },
         {
           "clip": "real_natural.wav",
           "wer": 0.0,
           "reference": "i guess it's like what are the foundation models of 3d",
           "hypothesis": "i guess it's like what are the foundation models of 3d",
-          "seconds": 0.805
+          "seconds": 0.862
         },
         {
           "clip": "synth_hello.wav",
           "wer": 0.0,
           "reference": "hello world testing one two three",
           "hypothesis": "hello world testing one two three",
-          "seconds": 0.775
+          "seconds": 0.688
         },
         {
           "clip": "synth_server.wav",
           "wer": 0.0,
           "reference": "configure the nginx reverse proxy with ssl termination on port 443",
           "hypothesis": "configure the nginx reverse proxy with ssl termination on port 443",
-          "seconds": 0.984
+          "seconds": 0.747
         },
         {
           "clip": "synth_code.wav",
           "wer": 0.0,
           "reference": "the function returns a boolean value indicating whether authentication succeeded",
           "hypothesis": "the function returns a boolean value indicating whether authentication succeeded",
-          "seconds": 0.643
+          "seconds": 0.717
         }
       ],
-      "spec": "hf:openai/whisper-small.en"
+      "spec": "hf:openai/whisper-small.en",
+      "wer_ci_low": 0.0,
+      "wer_ci_high": 0.0465
+    },
+    {
+      "backend": "whisper-medium",
+      "wer": 0.0348,
+      "reference_words": 115,
+      "errors": 4,
+      "substitutions": 2,
+      "deletions": 2,
+      "insertions": 0,
+      "clips_failed": 0,
+      "audio_seconds": 49.33,
+      "wall_seconds": 11.72,
+      "rtf": 0.238,
+      "wer_lenient": 0.0336,
+      "per_clip": [
+        {
+          "clip": "real_numbers.wav",
+          "wer": 0.0,
+          "reference": "testing 1 2 3 4 5 6 7 8 9 10",
+          "hypothesis": "testing 1 2 3 4 5 6 7 8 9 10",
+          "seconds": 1.454
+        },
+        {
+          "clip": "real_medium.wav",
+          "wer": 0.0,
+          "reference": "to record your voice using a microphone and save it as an mp3 file",
+          "hypothesis": "to record your voice using a microphone and save it as an mp3 file",
+          "seconds": 1.592
+        },
+        {
+          "clip": "real_long.wav",
+          "wer": 0.0286,
+          "reference": "our voice recorder is a convenient and simple online tool that can be used right in your browser it allows you to record your voice using a microphone and save it as an mp3 file",
+          "hypothesis": "my voice recorder is a convenient and simple online tool that can be used right in your browser it allows you to record your voice using a microphone and save it as an mp3 file",
+          "seconds": 2.835
+        },
+        {
+          "clip": "real_pangram.wav",
+          "wer": 0.0,
+          "reference": "the quick brown fox jumps over the lazy dog",
+          "hypothesis": "the quick brown fox jumps over the lazy dog",
+          "seconds": 0.87
+        },
+        {
+          "clip": "real_technical.wav",
+          "wer": 0.0,
+          "reference": "voice type is a speech to text application",
+          "hypothesis": "voice type is a speech to text application",
+          "seconds": 1.044
+        },
+        {
+          "clip": "real_natural.wav",
+          "wer": 0.0,
+          "reference": "i guess it's like what are the foundation models of 3d",
+          "hypothesis": "i guess it's like what are the foundation models of 3d",
+          "seconds": 1.069
+        },
+        {
+          "clip": "synth_hello.wav",
+          "wer": 0.5,
+          "reference": "hello world testing one two three",
+          "hypothesis": "hello world testing 123",
+          "seconds": 0.953
+        },
+        {
+          "clip": "synth_server.wav",
+          "wer": 0.0,
+          "reference": "configure the nginx reverse proxy with ssl termination on port 443",
+          "hypothesis": "configure the nginx reverse proxy with ssl termination on port 443",
+          "seconds": 0.958
+        },
+        {
+          "clip": "synth_code.wav",
+          "wer": 0.0,
+          "reference": "the function returns a boolean value indicating whether authentication succeeded",
+          "hypothesis": "the function returns a boolean value indicating whether authentication succeeded",
+          "seconds": 0.94
+        }
+      ],
+      "spec": "hf:openai/whisper-medium.en",
+      "wer_ci_low": 0.0,
+      "wer_ci_high": 0.1111,
+      "vs_leader": {
+        "leader": "whisper-small",
+        "delta": 0.0174,
+        "ci": [
+          -0.0381,
+          0.0952
+        ],
+        "p_value": 0.7196,
+        "significant": false
+      }
+    },
+    {
+      "backend": "whisper-base",
+      "wer": 0.0696,
+      "reference_words": 115,
+      "errors": 8,
+      "substitutions": 5,
+      "deletions": 2,
+      "insertions": 1,
+      "clips_failed": 0,
+      "audio_seconds": 49.33,
+      "wall_seconds": 6.35,
+      "rtf": 0.129,
+      "wer_lenient": 0.0672,
+      "per_clip": [
+        {
+          "clip": "real_numbers.wav",
+          "wer": 0.0,
+          "reference": "testing 1 2 3 4 5 6 7 8 9 10",
+          "hypothesis": "testing 1 2 3 4 5 6 7 8 9 10",
+          "seconds": 0.744
+        },
+        {
+          "clip": "real_medium.wav",
+          "wer": 0.0,
+          "reference": "to record your voice using a microphone and save it as an mp3 file",
+          "hypothesis": "to record your voice using a microphone and save it as an mp3 file",
+          "seconds": 0.686
+        },
+        {
+          "clip": "real_long.wav",
+          "wer": 0.0286,
+          "reference": "our voice recorder is a convenient and simple online tool that can be used right in your browser it allows you to record your voice using a microphone and save it as an mp3 file",
+          "hypothesis": "my voice recorder is a convenient and simple online tool that can be used right in your browser it allows you to record your voice using a microphone and save it as an mp3 file",
+          "seconds": 1.168
+        },
+        {
+          "clip": "real_pangram.wav",
+          "wer": 0.0,
+          "reference": "the quick brown fox jumps over the lazy dog",
+          "hypothesis": "the quick brown fox jumps over the lazy dog",
+          "seconds": 0.732
+        },
+        {
+          "clip": "real_technical.wav",
+          "wer": 0.125,
+          "reference": "voice type is a speech to text application",
+          "hypothesis": "voice type in a speech to text application",
+          "seconds": 0.578
+        },
+        {
+          "clip": "real_natural.wav",
+          "wer": 0.0,
+          "reference": "i guess it's like what are the foundation models of 3d",
+          "hypothesis": "i guess it's like what are the foundation models of 3d",
+          "seconds": 0.72
+        },
+        {
+          "clip": "synth_hello.wav",
+          "wer": 0.5,
+          "reference": "hello world testing one two three",
+          "hypothesis": "hello world testing 123",
+          "seconds": 0.503
+        },
+        {
+          "clip": "synth_server.wav",
+          "wer": 0.0,
+          "reference": "configure the nginx reverse proxy with ssl termination on port 443",
+          "hypothesis": "configure the nginx reverse proxy with ssl termination on port 443",
+          "seconds": 0.657
+        },
+        {
+          "clip": "synth_code.wav",
+          "wer": 0.3,
+          "reference": "the function returns a boolean value indicating whether authentication succeeded",
+          "hypothesis": "the function returns a boolean while indicating where the authentication succeeded",
+          "seconds": 0.567
+        }
+      ],
+      "spec": "hf:openai/whisper-base.en",
+      "wer_ci_low": 0.0136,
+      "wer_ci_high": 0.1687,
+      "vs_leader": {
+        "leader": "whisper-small",
+        "delta": 0.0522,
+        "ci": [
+          -0.0164,
+          0.1566
+        ],
+        "p_value": 0.194,
+        "significant": false
+      }
+    },
+    {
+      "backend": "distil-small",
+      "wer": 0.0609,
+      "reference_words": 115,
+      "errors": 7,
+      "substitutions": 4,
+      "deletions": 3,
+      "insertions": 0,
+      "clips_failed": 0,
+      "audio_seconds": 49.33,
+      "wall_seconds": 5.33,
+      "rtf": 0.108,
+      "wer_lenient": 0.0588,
+      "per_clip": [
+        {
+          "clip": "real_numbers.wav",
+          "wer": 0.3636,
+          "reference": "testing 1 2 3 4 5 6 7 8 9 10",
+          "hypothesis": "testing 12345 5 6 7 8 9 10",
+          "seconds": 0.691
+        },
+        {
+          "clip": "real_medium.wav",
+          "wer": 0.0,
+          "reference": "to record your voice using a microphone and save it as an mp3 file",
+          "hypothesis": "to record your voice using a microphone and save it as an mp3 file",
+          "seconds": 0.606
+        },
+        {
+          "clip": "real_long.wav",
+          "wer": 0.0286,
+          "reference": "our voice recorder is a convenient and simple online tool that can be used right in your browser it allows you to record your voice using a microphone and save it as an mp3 file",
+          "hypothesis": "my voice recorder is a convenient and simple online tool that can be used right in your browser it allows you to record your voice using a microphone and save it as an mp3 file",
+          "seconds": 0.808
+        },
+        {
+          "clip": "real_pangram.wav",
+          "wer": 0.1111,
+          "reference": "the quick brown fox jumps over the lazy dog",
+          "hypothesis": "the quick brown fox dumps over the lazy dog",
+          "seconds": 0.565
+        },
+        {
+          "clip": "real_technical.wav",
+          "wer": 0.0,
+          "reference": "voice type is a speech to text application",
+          "hypothesis": "voice type is a speech to text application",
+          "seconds": 0.441
+        },
+        {
+          "clip": "real_natural.wav",
+          "wer": 0.0,
+          "reference": "i guess it's like what are the foundation models of 3d",
+          "hypothesis": "i guess it's like what are the foundation models of 3d",
+          "seconds": 0.604
+        },
+        {
+          "clip": "synth_hello.wav",
+          "wer": 0.0,
+          "reference": "hello world testing one two three",
+          "hypothesis": "hello world testing one two three",
+          "seconds": 0.446
+        },
+        {
+          "clip": "synth_server.wav",
+          "wer": 0.0909,
+          "reference": "configure the nginx reverse proxy with ssl termination on port 443",
+          "hypothesis": "configure the enginex reverse proxy with ssl termination on port 443",
+          "seconds": 0.594
+        },
+        {
+          "clip": "synth_code.wav",
+          "wer": 0.0,
+          "reference": "the function returns a boolean value indicating whether authentication succeeded",
+          "hypothesis": "the function returns a boolean value indicating whether authentication succeeded",
+          "seconds": 0.575
+        }
+      ],
+      "spec": "hf:distil-whisper/distil-small.en",
+      "wer_ci_low": 0.0118,
+      "wer_ci_high": 0.1477,
+      "vs_leader": {
+        "leader": "whisper-small",
+        "delta": 0.0435,
+        "ci": [
+          -0.0123,
+          0.1325
+        ],
+        "p_value": 0.2538,
+        "significant": false
+      }
+    },
+    {
+      "backend": "rover(4 systems)",
+      "spec": "ensemble",
+      "wer": 0.0174,
+      "errors": 2,
+      "reference_words": 115,
+      "rtf": null,
+      "mean_agreement": 0.939,
+      "wer_ci_low": 0.0,
+      "wer_ci_high": 0.0368,
+      "vs_leader": {
+        "leader": "whisper-small",
+        "delta": 0.0,
+        "ci": [
+          -0.0291,
+          0.0182
+        ],
+        "p_value": 1.0,
+        "significant": false
+      }
     }
   ]
 }
