@@ -7,7 +7,9 @@
 #include "oproxy.h"
 #include "oscale.h"
 #include "osched.h"
+#include "ohost.h"
 #include "otext.h"
+#include "ovram.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -49,6 +51,7 @@ typedef struct {
     int aux_permits;
     oscale *scale;
     ocapacity *capacity;
+    ovram *vram;
 } app_state;
 
 extern const char *DOCS_HTML;
@@ -218,6 +221,30 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
             "omniserve_capacity_instances{lane=\"%.20s\"} %d\n",
             lane->policy.name, oscale_lane_spend_rate_usd_hr(lane),
             lane->policy.name, oscale_ready_instances(lane));
+    }
+
+    /* Headroom, not free memory, is what decides whether a co-tenant can batch,
+     * so it is the number worth graphing. A denial rate that climbs while
+     * headroom stays high means leases are being held, not that VRAM ran out. */
+    if (app->vram && len < sizeof body) {
+        ovram_stats vs;
+        ovram_snapshot(app->vram, &vs);
+        len += (size_t)snprintf(body + len, sizeof body - len,
+            "# HELP omniserve_vram_headroom_mb Device memory the broker would grant now.\n"
+            "# TYPE omniserve_vram_headroom_mb gauge\n"
+            "omniserve_vram_headroom_mb %d\n"
+            "omniserve_vram_leased_mb %d\n"
+            "omniserve_vram_reserved_mb %d\n"
+            "omniserve_vram_leases %d\n"
+            "# HELP omniserve_vram_lease_total Broker lease outcomes.\n"
+            "# TYPE omniserve_vram_lease_total counter\n"
+            "omniserve_vram_lease_total{outcome=\"granted\"} %llu\n"
+            "omniserve_vram_lease_total{outcome=\"partial\"} %llu\n"
+            "omniserve_vram_lease_total{outcome=\"denied\"} %llu\n"
+            "omniserve_vram_lease_total{outcome=\"released\"} %llu\n"
+            "omniserve_vram_lease_total{outcome=\"expired\"} %llu\n",
+            vs.headroom_mb, vs.leased_mb, vs.reserved_mb, vs.lease_count,
+            vs.grants, vs.partial_grants, vs.denials, vs.releases, vs.expirations);
     }
     ohttp_respond(req, 200, "text/plain; version=0.0.4", body, len);
 }
@@ -1390,6 +1417,106 @@ static void handle_summarization(ohttp_request *req, app_state *app) {
     ollm_result_free(&result);
 }
 
+static void handle_host_memory(ohttp_request *req) {
+    char body[512];
+    ohost_status_json(body, sizeof body);
+    ohttp_respond_str(req, 200, "application/json", body);
+}
+
+static void handle_vram_status(ohttp_request *req, app_state *app) {
+    if (!app->vram) { respond_error(req, 503, "vram broker is not enabled"); return; }
+    char body[512];
+    ovram_status_json(app->vram, body, sizeof body);
+    ohttp_respond_str(req, 200, "application/json", body);
+}
+
+static void handle_vram_lease(ohttp_request *req, app_state *app) {
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    if (!app->vram) { respond_error(req, 503, "vram broker is not enabled"); return; }
+    /* Leasing hands one tenant headroom at every other tenant's expense, so it
+     * stays on the same trust boundary as the paid tier: loopback and not
+     * forwarded. A public caller could otherwise starve the local device by
+     * leasing it all and never releasing. */
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+
+    oj_tok *toks = malloc(sizeof(oj_tok) * 64);
+    if (!toks) { respond_error(req, 500, "out of memory"); return; }
+    int n = oj_parse(req->body, req->body_len, toks, 64);
+    if (n <= 0 || toks[0].type != OJ_OBJECT) {
+        free(toks);
+        respond_error(req, 400, "body must be a JSON object");
+        return;
+    }
+
+    char owner[32] = "anon";
+    int owner_tok = oj_obj_get(req->body, toks, n, 0, "owner");
+    if (owner_tok >= 0) oj_unescape(req->body, &toks[owner_tok], owner, sizeof owner);
+
+    int mb_tok = oj_obj_get(req->body, toks, n, 0, "mb");
+    int mb = mb_tok >= 0 ? (int)oj_number(req->body, &toks[mb_tok], 0) : 0;
+    int min_tok = oj_obj_get(req->body, toks, n, 0, "min_mb");
+    int min_mb = min_tok >= 0 ? (int)oj_number(req->body, &toks[min_tok], 0) : 0;
+    int ttl_tok = oj_obj_get(req->body, toks, n, 0, "ttl_s");
+    double ttl_s = ttl_tok >= 0 ? oj_number(req->body, &toks[ttl_tok], 0) : 0;
+
+    /* An internal caller may name its own tier here; request_tier already
+     * refuses to honour the header for anyone else, and this endpoint is
+     * internal-only, so the two agree. */
+    otier tier = request_tier(req);
+    int tier_tok = oj_obj_get(req->body, toks, n, 0, "tier");
+    if (tier_tok >= 0) {
+        char name[16] = {0};
+        oj_unescape(req->body, &toks[tier_tok], name, sizeof name);
+        tier = otier_parse(name, (int)strlen(name));
+    }
+    free(toks);
+
+    if (mb <= 0) { respond_error(req, 400, "mb must be positive"); return; }
+
+    char id[40] = {0};
+    int granted = ovram_lease(app->vram, owner, mb, min_mb, tier, ttl_s, id, sizeof id);
+    char body[320];
+    if (granted > 0) {
+        /* Reported so the holder knows when the broker will take the headroom
+         * back; without it a caller cannot tell a live lease from a stale one. */
+        double effective_ttl = ttl_s > 0.0 ? ttl_s : ovram_default_ttl_s(app->vram);
+        snprintf(body, sizeof body,
+                 "{\"granted\":true,\"lease_id\":\"%s\",\"mb\":%d,\"tier\":\"%s\","
+                 "\"expires_in_s\":%d}",
+                 id, granted, otier_name(tier), (int)effective_ttl);
+    } else {
+        /* A denial is a normal answer, not a fault: the caller's fallback path
+         * is exactly what "no headroom" should trigger, and a 5xx here would
+         * make a healthy broker look broken to every monitor watching it. */
+        snprintf(body, sizeof body,
+                 "{\"granted\":false,\"mb\":0,\"reason\":\"no_headroom\",\"tier\":\"%s\"}",
+                 otier_name(tier));
+    }
+    ohttp_respond_str(req, 200, "application/json", body);
+}
+
+static void handle_vram_release(ohttp_request *req, app_state *app) {
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    if (!app->vram) { respond_error(req, 503, "vram broker is not enabled"); return; }
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+
+    oj_tok *toks = malloc(sizeof(oj_tok) * 32);
+    if (!toks) { respond_error(req, 500, "out of memory"); return; }
+    int n = oj_parse(req->body, req->body_len, toks, 32);
+    char id[40] = {0};
+    if (n > 0 && toks[0].type == OJ_OBJECT) {
+        int id_tok = oj_obj_get(req->body, toks, n, 0, "lease_id");
+        if (id_tok >= 0) oj_unescape(req->body, &toks[id_tok], id, sizeof id);
+    }
+    free(toks);
+
+    /* Releasing an id the broker has already expired is success from the
+     * caller's side: the headroom is back either way, and reporting a failure
+     * would push callers into retry loops that cannot achieve anything. */
+    ovram_release(app->vram, id);
+    ohttp_respond_str(req, 200, "application/json", "{\"released\":true}");
+}
+
 static void route(ohttp_request *req, void *user) {
     app_state *app = user;
     if (ohttp_method_is(req, "OPTIONS")) {
@@ -1404,6 +1531,10 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/metrics")) { handle_metrics(req, app); return; }
     if (ohttp_path_is(req, "/errors")) { handle_errors(req); return; }
     if (ohttp_path_is(req, "/status") || ohttp_path_is(req, "/backend_status")) { handle_status(req, app); return; }
+    if (ohttp_path_is(req, "/v1/gpu/vram")) { handle_vram_status(req, app); return; }
+    if (ohttp_path_is(req, "/v1/host/memory")) { handle_host_memory(req); return; }
+    if (ohttp_path_is(req, "/v1/gpu/lease")) { handle_vram_lease(req, app); return; }
+    if (ohttp_path_is(req, "/v1/gpu/release")) { handle_vram_release(req, app); return; }
     if (ohttp_path_is(req, "/v1/models")) {
         if (!ohttp_method_is(req, "GET")) { respond_error(req, 405, "GET required"); return; }
         if (app->aux_upstream && env_flag("OMNISERVE_NATIVE_MODELS_COMPAT_PROXY", 0))
@@ -1730,6 +1861,47 @@ int main(int argc, char **argv) {
     app.aux_permits = configured_permits("OMNISERVE_NATIVE_AUX_PERMITS", 1, slots);
     const char *admission_env = getenv("OMNISERVE_NATIVE_ADMISSION_TIMEOUT_S");
     app.sched = osched_create(slots, admission_env ? atof(admission_env) : 30.0);
+    if (env_flag("OMNISERVE_NATIVE_VRAM_BROKER", 1)) {
+        const char *keep_env = getenv("OMNISERVE_NATIVE_VRAM_KEEP_FREE_MB");
+        const char *ttl_env = getenv("OMNISERVE_NATIVE_VRAM_LEASE_TTL_S");
+        app.vram = ovram_create(keep_env ? atoi(keep_env) : 1024,
+                                ttl_env ? atof(ttl_env) : 120.0);
+        /* Declares memory a co-tenant will grow into but has not taken yet.
+         * Memory a tenant already holds must not be listed: the driver's free
+         * figure has counted it once already. Format: "name:mb,name:mb". */
+        const char *reserve_env = getenv("OMNISERVE_NATIVE_VRAM_RESERVE");
+        if (app.vram && reserve_env && reserve_env[0]) {
+            char buf[512];
+            snprintf(buf, sizeof buf, "%s", reserve_env);
+            for (char *save = NULL, *tok = strtok_r(buf, ",", &save); tok;
+                 tok = strtok_r(NULL, ",", &save)) {
+                char *colon = strchr(tok, ':');
+                if (!colon) continue;
+                *colon = '\0';
+                if (!ovram_reserve(app.vram, tok, atoi(colon + 1))) {
+                    fprintf(stderr, "vram reservation rejected: %s\n", tok);
+                }
+            }
+        }
+    }
+
+    /* Warm the weights the broker may later ask us to drop. Defaults to the
+     * models this process already loads, so the common case needs no config;
+     * an explicit list can add files owned by co-tenants. */
+    if (env_flag("OMNISERVE_NATIVE_RAM_PREFETCH_ENABLED", 1)) {
+        const char *keep_pct_env = getenv("OMNISERVE_NATIVE_RAM_KEEP_FREE_PCT");
+        int keep_pct = keep_pct_env ? atoi(keep_pct_env) : 5;
+        const char *paths = getenv("OMNISERVE_NATIVE_RAM_PREFETCH");
+        char derived[1024];
+        if (!paths || !paths[0]) {
+            const char *llm = getenv("OMNISERVE_NATIVE_LLM_GGUF");
+            const char *embed = getenv("OMNISERVE_NATIVE_EMBEDDING_GGUF");
+            snprintf(derived, sizeof derived, "%s%s%s",
+                     llm ? llm : "", (llm && embed) ? "," : "", embed ? embed : "");
+            paths = derived;
+        }
+        if (paths[0]) ohost_prefetch_start(paths, keep_pct);
+    }
     app.secret = getenv("OMNISERVE_NATIVE_SECRET");
     const char *workers_env = getenv("OMNISERVE_NATIVE_WORKERS");
     int workers = workers_env ? atoi(workers_env) : 32;
@@ -1904,5 +2076,6 @@ int main(int argc, char **argv) {
     oembed_shutdown();
     ollm_shutdown();
     osched_destroy(app.sched);
+    ovram_destroy(app.vram);
     return rc;
 }

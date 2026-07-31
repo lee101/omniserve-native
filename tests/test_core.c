@@ -9,6 +9,8 @@
 #include "otext.h"
 #include "omatte.h"
 #include "otune.h"
+#include "ovram.h"
+#include "ohost.h"
 
 #include <arpa/inet.h>
 #include <assert.h>
@@ -1086,7 +1088,102 @@ static void test_access_log(void) {
     rmdir(dir);
 }
 
+/* The deterministic entry points take the clock and the device figure as
+ * arguments precisely so the arbitration policy is provable without a GPU. */
+static void test_vram_arbitration(void) {
+    char id_a[40], id_b[40];
+    ovram *v = ovram_create(1024, 60.0);
+    CHECK(v != NULL);
+
+    /* 8192 free, 1024 floor for background: 7168 grantable. */
+    CHECK(ovram_headroom_at(v, TIER_BACKGROUND, 100.0, 8192) == 7168);
+
+    /* The whole point: a granted lease is subtracted from what the next caller
+     * sees, so two tenants cannot size against the same free bytes. */
+    int a = ovram_lease_at(v, "zimage", 4096, 1024, TIER_BACKGROUND, 60.0, 100.0, 8192,
+                           id_a, sizeof id_a);
+    CHECK(a == 4096);
+    CHECK(ovram_headroom_at(v, TIER_BACKGROUND, 100.0, 8192) == 3072);
+
+    /* Asking beyond headroom yields a partial grant when min_mb still fits. */
+    int b = ovram_lease_at(v, "other", 8192, 1024, TIER_BACKGROUND, 60.0, 100.0, 8192,
+                           id_b, sizeof id_b);
+    CHECK(b == 3072);
+    CHECK(ovram_headroom_at(v, TIER_BACKGROUND, 100.0, 8192) == 0);
+
+    /* Below min_mb is a denial, and a denial must not mint a lease id. */
+    char id_c[40] = "dirty";
+    CHECK(ovram_lease_at(v, "third", 2048, 2048, TIER_BACKGROUND, 60.0, 100.0, 8192,
+                         id_c, sizeof id_c) == 0);
+    CHECK(id_c[0] == '\0');
+
+    /* Paid dips further into the floor than background may, so interactive
+     * traffic is not starved by batch work holding every lease. */
+    CHECK(ovram_headroom_at(v, TIER_PAID, 100.0, 8192) > 0);
+
+    CHECK(ovram_release(v, id_a));
+    CHECK(!ovram_release(v, id_a));
+    CHECK(ovram_headroom_at(v, TIER_BACKGROUND, 100.0, 8192) == 4096);
+
+    /* A tenant that dies between lease and release must not strand headroom. */
+    CHECK(ovram_expire_at(v, 100.0 + 61.0) == 1);
+    CHECK(ovram_headroom_at(v, TIER_BACKGROUND, 200.0, 8192) == 7168);
+
+    /* An unreadable driver denies rather than guessing a free figure. */
+    CHECK(ovram_headroom_at(v, TIER_PAID, 200.0, -1) == 0);
+    CHECK(ovram_lease_at(v, "zimage", 512, 0, TIER_PAID, 60.0, 200.0, -1,
+                         id_a, sizeof id_a) == 0);
+
+    /* Declared future growth is withheld from everyone. */
+    CHECK(ovram_reserve(v, "netwrck", 2048));
+    CHECK(ovram_headroom_at(v, TIER_BACKGROUND, 200.0, 8192) == 5120);
+    CHECK(ovram_reserve(v, "netwrck", 0));
+    CHECK(ovram_headroom_at(v, TIER_BACKGROUND, 200.0, 8192) == 7168);
+
+    /* id_a was released and id_b expired above, so nothing is outstanding.
+     * That matters because ovram_snapshot reads the real clock: a fake-clock
+     * lease still held here would be reaped by it and skew the counters. */
+    ovram_stats st;
+    ovram_snapshot(v, &st);
+    CHECK(st.grants == 2 && st.partial_grants == 1 && st.denials == 2);
+    CHECK(st.releases == 1 && st.expirations == 1);
+    CHECK(st.lease_count == 0);
+
+    ovram_destroy(v);
+}
+
+static void test_host_prefetch_policy(void) {
+    ohost_meminfo mi = {0};
+    mi.mem_total_kb = 256L * 1024 * 1024;      /* 256 GiB */
+    mi.mem_available_kb = 128L * 1024 * 1024;  /* 128 GiB */
+
+    /* 5% floor of 256 GiB is 12.8 GiB, leaving 115.2 GiB spare. */
+    long long headroom = ohost_headroom_bytes(&mi, 5);
+    CHECK(headroom == (128LL * 1024 * 1024 - 256LL * 1024 * 1024 * 5 / 100) * 1024);
+
+    /* A file smaller than the headroom is warmed whole; a larger one is
+     * truncated to the headroom rather than warmed until the box swaps. */
+    CHECK(ohost_plan_bytes(8LL * 1024 * 1024 * 1024, headroom) == 8LL * 1024 * 1024 * 1024);
+    CHECK(ohost_plan_bytes(headroom * 4, headroom) == headroom);
+
+    /* At or under the floor nothing is warmed at all, and a zero-percent floor
+     * still cannot plan past what is actually available. */
+    mi.mem_available_kb = 4L * 1024 * 1024;
+    CHECK(ohost_headroom_bytes(&mi, 5) == 0);
+    CHECK(ohost_plan_bytes(1024, ohost_headroom_bytes(&mi, 5)) == 0);
+    CHECK(ohost_headroom_bytes(&mi, 0) == 4LL * 1024 * 1024 * 1024);
+
+    /* Reading the real /proc must agree with itself. */
+    ohost_meminfo live;
+    if (ohost_read_meminfo(&live)) {
+        CHECK(live.mem_total_kb > 0);
+        CHECK(live.mem_available_kb <= live.mem_total_kb);
+    }
+}
+
 int main(void) {
+    test_host_prefetch_policy();
+    test_vram_arbitration();
     test_json();
     test_matte();
     test_tier_parse();

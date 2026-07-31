@@ -262,7 +262,63 @@ exposes remote cogs only as async predictions or a websocket session proxy,
 neither of which the C relay can use for a normal request. Routing needs a
 synchronous loopback passthrough (`/api/cogs/{id}/http/*`) on the app.nz side
 first; until then, arming a lane warms capacity without sending it traffic, so
-lanes ship disabled.
+lanes ship disabled. Standing remote endpoints, below, are a separate mechanism
+and are routed today — they need no provisioning, so none of this applies.
+
+## VRAM brokering between co-tenants
+
+Four processes hold VRAM on this box and each sizes its workload from
+`cudaMemGetInfo`. That read misleads in two directions at once: a caching
+allocator's retained blocks look used, so a tenant under-sizes against memory
+that is in fact reusable; and it is stale the moment two tenants read it
+concurrently, so both size a batch against the same free bytes and the second
+OOMs. The observed symptom was the image server pinned to a live microbatch of 1
+for 40k consecutive jobs.
+
+The fix is arbitration, not more accurate measurement. A tenant asks for
+headroom and is told a number it may rely on until the lease expires; granted
+but not yet materialised memory is subtracted from what the next caller sees,
+which is what `cudaMemGetInfo` structurally cannot do. Every lease carries a
+TTL, evaluated on every call rather than on a timer, so a tenant that dies
+between lease and release cannot strand headroom and a broker whose reclaim
+depends on its own liveness cannot leak exactly when it is least able to say so.
+
+The broker never allocates, frees, or touches device memory — it hands out
+permission, and enforcement stays with the tenant that owns the allocation. A
+broker that could evict another process's memory would need privileges no
+inference server should hold.
+
+Higher tiers may dip further into the keep-free floor, so interactive paid
+traffic is not starved by background batch work already holding leases. Leasing
+costs every other tenant headroom, so `/v1/gpu/lease` and `/v1/gpu/release` sit
+on the same trust boundary as the paid tier: loopback callers only, never
+forwarded. A denial is a normal `200` with `"granted": false` — the caller's
+fallback path is exactly what "no headroom" should trigger, and a 5xx would make
+a healthy broker look broken to every monitor watching it.
+
+```bash
+OMNISERVE_NATIVE_VRAM_BROKER=1
+OMNISERVE_NATIVE_VRAM_KEEP_FREE_MB=1024     # floor for unbrokered scratch allocations
+OMNISERVE_NATIVE_VRAM_LEASE_TTL_S=120
+OMNISERVE_NATIVE_VRAM_RESERVE=netwrck:2048  # growth a co-tenant will take but has not yet
+```
+
+`_VRAM_RESERVE` declares memory a tenant will grow into. Memory it already holds
+must not be listed: the driver's free figure has counted it once already.
+
+Giving memory back is only cheap if reloading is cheap, so the same decision has
+a host-side half. `OMNISERVE_NATIVE_RAM_PREFETCH_ENABLED` (default on) warms the
+weights the broker may later ask this process to drop, defaulting to the models
+it already loads. Warming is advisory `posix_fadvise(WILLNEED)`, never
+`MAP_POPULATE`: the kernel stays free to drop the pages under real pressure,
+which is correct, since a prefetch that can evict a running process's working
+set has turned an optimisation into an outage. Between 64 MiB chunks the loop
+rechecks `MemAvailable` against `OMNISERVE_NATIVE_RAM_KEEP_FREE_PCT` (default 5)
+and stops rather than pushing the box toward swap.
+
+`omniserve_vram_headroom_mb` is the number worth graphing, not free memory:
+headroom is what decides whether a co-tenant can batch. A denial rate climbing
+while headroom stays high means leases are being held, not that VRAM ran out.
 
 ## Routes
 
@@ -275,6 +331,7 @@ lanes ship disabled.
 - TTS: `POST /v1/audio/speech` and `/api/v1/generate_speech`
 - STT: `POST /v1/audio/transcriptions`, `/api/v1/audio/transcribe`, `/api/v1/audio-file-extraction`, and `/api/v1/audio-extraction`
 - Multimodal: `POST /api/v1/image-caption`, `/api/v1/video-question`, `/api/v1/multimodal-generate`, and `/api/v1/voice-chat`
+- Device memory: `GET /v1/gpu/vram` (broker state), `GET /v1/host/memory` (page-cache warming state), and `POST /v1/gpu/lease` / `POST /v1/gpu/release` (loopback callers only)
 - Animation: `POST /v1/animations/generations` proxies a configured NVIDIA ACE/Animation Graph adapter and is forcibly admitted as `background`, regardless of the caller's requested tier.
 - 3D: `POST /v1/3d/generations` proxies a configured TRELLIS.2/Pixal3D adapter and is forcibly admitted as `background`, regardless of the caller's requested tier.
 

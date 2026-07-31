@@ -19,11 +19,29 @@ Environment=OMNISERVE_NATIVE_PORT=8791
 Environment=OMNISERVE_NATIVE_LLM_GGUF=/nvme0n1-disk/models/omniserve-native/gemma-roleplay-v2-q8_0.gguf
 Environment=OMNISERVE_NATIVE_NGL=999
 Environment=OMNISERVE_NATIVE_CTX=8192
-Environment=OMNISERVE_NATIVE_LLM_CONTEXTS=2
+# One context per admitted request. LLM_PERMITS below is 1, so a second
+# context could never be scheduled while it cost a full KV + compute buffer
+# (1.36 GiB measured) that the image lane needs to batch at all.
+Environment=OMNISERVE_NATIVE_LLM_CONTEXTS=1
 # Halves the per-context KV cache with no measured quality change; see
 # performance/quality.md. Forces flash attention, which llama.cpp requires for
 # a quantized V cache.
 Environment=OMNISERVE_NATIVE_KV_TYPE=q8_0
+# The blackwell profile's 4096/1024 geometry reserves a 1119 MiB compute
+# buffer. Roleplay prompts are short, so the prefill width is not the
+# bottleneck; the VRAM it holds is.
+Environment=OMNISERVE_NATIVE_BATCH=1024
+Environment=OMNISERVE_NATIVE_UBATCH=256
+# VRAM broker. Co-tenants ask for headroom instead of each racing to read
+# cudaMemGetInfo; the floor is what unbrokered scratch allocations (notably the
+# search server's per-query score buffer) rely on always being there.
+Environment=OMNISERVE_NATIVE_VRAM_BROKER=1
+Environment=OMNISERVE_NATIVE_VRAM_KEEP_FREE_MB=1024
+Environment=OMNISERVE_NATIVE_VRAM_LEASE_TTL_S=120
+# Page-cache warming for the weights the broker may ask us to drop, so an
+# unload/reload cycle costs seconds rather than a cold read of 8 GB.
+Environment=OMNISERVE_NATIVE_RAM_PREFETCH_ENABLED=1
+Environment=OMNISERVE_NATIVE_RAM_KEEP_FREE_PCT=5
 Environment=OMNISERVE_NATIVE_IMAGE_UPSTREAM=http://127.0.0.1:8100
 Environment=OMNISERVE_NATIVE_IMAGE_GENERATE_PATH=/v1/images/generations
 Environment=OMNISERVE_NATIVE_TTS_UPSTREAM=http://127.0.0.1:9083
