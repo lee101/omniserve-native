@@ -175,7 +175,7 @@ profile was applied. Anything set explicitly always wins, so
 | blackwell | RTX 5090, B200 | 4096 / 1024 | q8_0 | on | 4 |
 | hopper | H100, H200 | 4096 / 1024 | q8_0 | on | 6 |
 | ada | RTX 4090, L40S | 2048 / 512 | q8_0 | on | 3 |
-| ampere | RTX 3090, A100, A40 | 2048 / 512 | f16 | on | 2 |
+| ampere | RTX 3090, A100, A40 | 2048 / 512 | q8_0 | on | 3 |
 | turing | T4, RTX 2080 | 1024 / 256 | f16 | off | 1 |
 | cpu | no GPU device | 512 / 128 | f16 | off | 1 |
 
@@ -184,6 +184,17 @@ On this 5090, a 5.6k-token prefill improved from a median of 30.9 ms to 21.0 ms
 mistaken for the result). Best case barely moved (14.3 ms to 13.0 ms): wider
 batches cut the number of prefill iterations, so the gain is in robustness under
 contention rather than in peak throughput.
+
+The ampere row carries a quantized KV cache for the same reason the ada row
+does: a 3090 hits the same 24 GB wall, and llama.cpp compiles the `q8_0`/`q8_0`
+flash-attention case for every architecture that has flash attention at all, so
+there is no kernel gap between the two classes. `performance/quality.md`
+measures that swap as quality-neutral, and a 3090 is bandwidth-bound at decode,
+so halving KV traffic is a throughput win on top of the extra context it fits.
+Unlike the blackwell row, this one is reasoned from the measured KV table and
+llama.cpp's kernel matrix rather than benchmarked on Ampere silicon — this host
+has none. `OMNISERVE_NATIVE_KV_TYPE=f16` restores the old behaviour without a
+rebuild.
 
 ## Cost- and priority-guided overflow capacity
 

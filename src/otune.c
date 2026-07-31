@@ -64,20 +64,23 @@ void otune_profile_for(const char *device_description, otune_profile *out) {
         out->parallel_contexts = 6;
         break;
     case OTUNE_DEVICE_ADA:
-        /* 24 GB is the binding constraint, not compute: quantized KV is what
-         * makes more than two contexts fit beside the weights. */
+    case OTUNE_DEVICE_AMPERE:
+        /* One profile because the two classes agree on everything this
+         * function keys off. 24 GB is the binding constraint on both, not
+         * compute, and quantized KV is what makes more than two contexts fit
+         * beside the weights. llama.cpp compiles the q8_0/q8_0
+         * flash-attention case for every architecture that has flash
+         * attention at all, so Ampere has no kernel reason to carry a cache
+         * twice the size — and a 3090 is bandwidth-bound at decode, so
+         * halving KV traffic is a throughput win on top of the context it
+         * buys. They stay separate classes because /status.tune has to name
+         * the card truthfully, and because the next thing worth tuning may
+         * well differ between them. */
         out->n_batch = 2048;
         out->n_ubatch = 512;
         out->kv_type = "q8_0";
         out->flash_attn = true;
         out->parallel_contexts = 3;
-        break;
-    case OTUNE_DEVICE_AMPERE:
-        out->n_batch = 2048;
-        out->n_ubatch = 512;
-        out->kv_type = "f16";
-        out->flash_attn = true;
-        out->parallel_contexts = 2;
         break;
     case OTUNE_DEVICE_TURING:
         /* Small, bandwidth-bound, and without the newer attention kernels:

@@ -59,7 +59,17 @@ Same prompts, same seeds, `qwen3-0.6b-q8` at `n_ctx=8192`, two contexts:
 q8_0 halves the KV cache with no measured quality change — identical accuracy,
 identical contract checks, and the same greedy divergence point. Flash
 attention is enabled automatically for a quantized cache because llama.cpp
-requires it for a quantized V. On Gemma 4 the win is smaller in absolute terms
+requires it for a quantized V.
+
+This table is why the `ampere` profile in `src/otune.c` now defaults to `q8_0`
+as well. Two facts carry it across: the numbers above say the swap is
+quality-neutral, and llama.cpp compiles `FATTN_VEC_CASES_ALL_D(Q8_0, Q8_0)`
+outside the `GGML_CUDA_FA_ALL_QUANTS` guard, so the kernel exists on every
+architecture with flash attention rather than only on the newer ones. What is
+*not* claimed is a measurement on Ampere silicon — this host has a 5090 and no
+3090 — so the accuracy claim is transferred from the table and the speed claim
+is an inference from a 3090 being bandwidth-bound at decode. Re-run this bench
+on a 3090 before treating either as measured there. On Gemma 4 the win is smaller in absolute terms
 because sliding-window attention already keeps the cache small (448 MiB per
 context at 8192), but it still buys roughly one extra parallel context per
 GiB freed.

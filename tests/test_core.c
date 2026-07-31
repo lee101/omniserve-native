@@ -752,6 +752,14 @@ static void test_tune_profiles(void) {
 
     otune_profile_for("NVIDIA RTX 3090", &profile);
     CHECK(profile.device_class == OTUNE_DEVICE_AMPERE);
+    /* A 3090 hits the same 24 GB wall as a 4090 and runs the same quantized
+     * flash-attention kernels, so it gets the same KV cache. A profile that
+     * enables a quantized cache without flash attention would fail to load a
+     * context at all: llama.cpp requires FA for a quantized V. */
+    CHECK(strcmp(profile.kv_type, "q8_0") == 0);
+    CHECK(profile.flash_attn);
+    CHECK(profile.parallel_contexts == 3);
+
     otune_profile_for("NVIDIA H100 PCIe", &profile);
     CHECK(profile.device_class == OTUNE_DEVICE_HOPPER);
     otune_profile_for("cpu", &profile);
@@ -762,6 +770,24 @@ static void test_tune_profiles(void) {
     otune_profile_for("Some Future Accelerator", &profile);
     CHECK(profile.device_class == OTUNE_DEVICE_UNKNOWN);
     CHECK(profile.n_batch > 0 && profile.n_ubatch > 0 && profile.kv_type != NULL);
+
+    /* Holds for every profile, not just the ones spelled out above: a
+     * quantized V without flash attention is a context llama.cpp refuses to
+     * create, and a micro-batch wider than the batch is a config it silently
+     * clamps. Both are easy to introduce while tuning one card. */
+    static const char *const devices[] = {
+        "NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 4090", "NVIDIA RTX 3090",
+        "NVIDIA A100-SXM4-80GB", "NVIDIA H100 PCIe", "Tesla T4", "cpu",
+        "Some Future Accelerator",
+    };
+    for (size_t i = 0; i < sizeof devices / sizeof *devices; i++) {
+        otune_profile_for(devices[i], &profile);
+        CHECK(profile.n_ubatch > 0 && profile.n_ubatch <= profile.n_batch);
+        CHECK(profile.parallel_contexts >= 1);
+        if (strcmp(profile.kv_type, "f16") != 0 && strcmp(profile.kv_type, "bf16") != 0) {
+            CHECK(profile.flash_attn);
+        }
+    }
 }
 
 static int fake_warm_calls;
