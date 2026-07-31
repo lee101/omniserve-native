@@ -492,6 +492,20 @@ For a repeated 60-token prompt on the bundled Qwen3 0.6B Q8 GGUF, embedded infer
 
 The converted ModernBERT Q8 embedding matched the existing FP32 Python result at 0.99875 cosine similarity. Warm 8-thread feature extraction measured about 17 ms for a short input. The legacy route honors `num_features` (default 256); `/v1/embeddings` returns the full 768-dimensional mean-pooled vector unless `dimensions` is supplied.
 
+A proxied request now costs two socket writes instead of four. The upstream
+request head and body go out in one `sendmsg` rather than a `sendto` each, and
+the response headers plus whatever body arrived in the same read — which for a
+small proxied response is all of it — are relayed downstream in one write rather
+than a header the client waits behind. Verified by tracing a single proxied
+`POST`: `sendto(137) + sendto(43)` and `write(285) + write(61)` became
+`sendmsg(180)` and `write(346)`, the same bytes in half the syscalls and half
+the segments.
+
+Throughput was not re-measured for that change: this host sits at load 90 of 72
+cores serving production traffic, and back-to-back runs of the *unchanged*
+binary varied between 22k and 15k requests/s — wider than the effect being
+measured. The syscall counts are deterministic, and are what is claimed here.
+
 Reproduce transport measurements with `./scripts/bench.sh 8791 100000 32`; it uses `build/onative_bench`, a persistent-socket C client.
 
 ## Quality bench

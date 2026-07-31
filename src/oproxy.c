@@ -15,6 +15,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -355,6 +356,35 @@ static bool socket_write_all(int fd, const void *data, size_t len, int64_t deadl
     return true;
 }
 
+/* Head and body in one syscall. Sending them separately puts a small JSON body
+ * in its own segment behind an already-sent header, so the upstream's delayed
+ * ACK can gate the request that has not finished arriving yet. */
+static bool socket_writev_all(int fd, struct iovec *iov, int iov_count, int64_t deadline) {
+    while (iov_count > 0) {
+        if (iov_count == 1) return socket_write_all(fd, iov[0].iov_base, iov[0].iov_len, deadline);
+        struct msghdr msg = {0};
+        msg.msg_iov = iov;
+        msg.msg_iovlen = (size_t)iov_count;
+        ssize_t n = sendmsg(fd, &msg, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) && wait_fd(fd, POLLOUT, deadline)) continue;
+            return false;
+        }
+        if (n == 0) return false;
+        while (iov_count > 0 && (size_t)n >= iov[0].iov_len) {
+            n -= (ssize_t)iov[0].iov_len;
+            iov++;
+            iov_count--;
+        }
+        if (iov_count > 0 && n > 0) {
+            iov[0].iov_base = (char *)iov[0].iov_base + n;
+            iov[0].iov_len -= (size_t)n;
+        }
+    }
+    return true;
+}
+
 static ssize_t socket_read(int fd, void *data, size_t len, int64_t deadline) {
     for (;;) {
         ssize_t n = recv(fd, data, len, 0);
@@ -389,20 +419,34 @@ static bool append_bytes(char **buf, size_t *len, size_t *cap,
 }
 
 static bool append_fmt(char **buf, size_t *len, size_t *cap, const char *fmt, ...) {
-    va_list ap;
+    /* Formats straight into the slack already reserved, and only re-formats on
+     * the rare call that does not fit. Sizing with a throwaway vsnprintf first
+     * would format every header twice, and a request head is built one header
+     * at a time. */
+    size_t room = *cap > *len ? *cap - *len : 0;
+    va_list ap, retry;
     va_start(ap, fmt);
-    va_list copy;
-    va_copy(copy, ap);
-    int needed = vsnprintf(NULL, 0, fmt, copy);
-    va_end(copy);
-    if (needed < 0 || (size_t)needed > SIZE_MAX - *len - 1 ||
-        !reserve_bytes(buf, *len + (size_t)needed + 1, cap)) {
-        va_end(ap);
+    va_copy(retry, ap);
+    int needed = vsnprintf(room ? *buf + *len : NULL, room, fmt, ap);
+    va_end(ap);
+    if (needed < 0 || (size_t)needed > SIZE_MAX - *len - 1) {
+        va_end(retry);
         return false;
     }
-    vsnprintf(*buf + *len, (size_t)needed + 1, fmt, ap);
+    /* Strictly less: the terminating NUL has to have landed too, or the tail
+     * of the value was truncated. */
+    if ((size_t)needed < room) {
+        va_end(retry);
+        *len += (size_t)needed;
+        return true;
+    }
+    if (!reserve_bytes(buf, *len + (size_t)needed + 1, cap)) {
+        va_end(retry);
+        return false;
+    }
+    vsnprintf(*buf + *len, (size_t)needed + 1, fmt, retry);
+    va_end(retry);
     *len += (size_t)needed;
-    va_end(ap);
     return true;
 }
 
@@ -658,8 +702,11 @@ bool oproxy_target_relay(oproxy_target *target,
         return false;
     }
 
-    bool ok = socket_write_all(fd, head, head_len, deadline) &&
-              (!body_len || socket_write_all(fd, body, body_len, deadline));
+    struct iovec request_iov[2] = {
+        { .iov_base = head, .iov_len = head_len },
+        { .iov_base = (void *)body, .iov_len = body_len },
+    };
+    bool ok = socket_writev_all(fd, request_iov, body && body_len ? 2 : 1, deadline);
     free(head);
     if (!ok) {
         set_error(error, error_cap, "timed out writing upstream request");
@@ -723,7 +770,6 @@ bool oproxy_target_relay(oproxy_target *target,
         out->downstream_close = framing.connection_close ||
                                 (!framing.no_body && !framing.chunked && !framing.has_content_length);
     }
-    ok = relay_bytes(sink, sink_user, response, response_header_len, out, error, error_cap);
     size_t buffered_body = response_len - response_header_len;
     const char *buffered = response + response_header_len;
     bool complete = framing.no_body;
@@ -731,28 +777,39 @@ bool oproxy_target_relay(oproxy_target *target,
     size_t remaining = framing.has_content_length ? framing.content_length : 0;
     chunk_parser chunks = { .state = CHUNK_SIZE };
 
-    if (ok && !complete && framing.has_content_length) {
+    /* The headers and whatever body arrived with them sit contiguously in one
+     * buffer, and a small proxied response usually arrives whole in that first
+     * read. Deciding how much of it is relayable before relaying anything
+     * makes that one downstream write instead of a header the client waits
+     * behind. */
+    size_t lead = response_header_len;
+    const char *overrun = NULL;
+    bool framing_ok = true;
+
+    if (!complete && framing.has_content_length) {
         size_t take = buffered_body < remaining ? buffered_body : remaining;
-        ok = relay_bytes(sink, sink_user, buffered, take, out, error, error_cap);
+        lead += take;
         remaining -= take;
-        if (buffered_body != take) {
-            set_error(error, error_cap, "upstream sent bytes beyond Content-Length");
-            ok = false;
-        }
+        if (buffered_body != take) overrun = "upstream sent bytes beyond Content-Length";
         complete = remaining == 0;
-    } else if (ok && !complete && framing.chunked) {
+    } else if (!complete && framing.chunked) {
         size_t consumed = 0;
-        ok = chunk_feed(&chunks, buffered, buffered_body, &consumed) &&
-             relay_bytes(sink, sink_user, buffered, consumed, out, error, error_cap);
-        if (ok && consumed != buffered_body) {
-            set_error(error, error_cap, "upstream sent bytes beyond chunked response");
-            ok = false;
+        framing_ok = chunk_feed(&chunks, buffered, buffered_body, &consumed);
+        if (framing_ok) {
+            lead += consumed;
+            if (consumed != buffered_body) overrun = "upstream sent bytes beyond chunked response";
+            complete = chunks.state == CHUNK_DONE;
         }
-        complete = chunks.state == CHUNK_DONE;
-    } else if (ok && !complete && buffered_body) {
-        ok = relay_bytes(sink, sink_user, buffered, buffered_body, out, error, error_cap);
-    } else if (ok && complete && buffered_body) {
-        set_error(error, error_cap, "upstream sent a body for a bodyless response");
+    } else if (!complete) {
+        lead += buffered_body;
+    } else if (buffered_body) {
+        overrun = "upstream sent a body for a bodyless response";
+    }
+
+    ok = relay_bytes(sink, sink_user, response, lead, out, error, error_cap);
+    if (ok && !framing_ok) ok = false;
+    if (ok && overrun) {
+        set_error(error, error_cap, overrun);
         ok = false;
     }
     if (response != initial) free(response);
