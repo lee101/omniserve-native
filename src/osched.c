@@ -93,6 +93,29 @@ static void unlink_waiter(osched *s, waiter *me) {
     if (*p) *p = me->next;
 }
 
+bool osched_try_acquire_n(osched *s, otier tier, int permits) {
+    if (!s || tier < TIER_PAID || tier > TIER_BACKGROUND || permits <= 0 || permits > s->slots) {
+        return false;
+    }
+    pthread_mutex_lock(&s->lock);
+    /* Deliberately refuses when anyone is queued, even with slots free. This
+     * is the admission point for callers that have somewhere else to go, and
+     * jumping the queue would let them take the slot the waiter has already
+     * paid for in latency. */
+    bool available = tier == TIER_BACKGROUND
+        ? s->active == 0 && s->used_slots == 0
+        : s->used_slots + permits <= s->slots;
+    if (s->waiters || !available) {
+        pthread_mutex_unlock(&s->lock);
+        return false;
+    }
+    s->active++;
+    s->used_slots += permits;
+    s->served[tier]++;
+    pthread_mutex_unlock(&s->lock);
+    return true;
+}
+
 bool osched_acquire_n(osched *s, otier tier, int permits) {
     if (!s || tier < TIER_PAID || tier > TIER_BACKGROUND || permits <= 0 || permits > s->slots) {
         return false;

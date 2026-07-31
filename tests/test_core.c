@@ -1181,7 +1181,30 @@ static void test_host_prefetch_policy(void) {
     }
 }
 
+/* Overflow routing hinges entirely on try-acquire refusing rather than waiting,
+ * so its refusal conditions are the contract worth pinning down. */
+static void test_sched_try_acquire(void) {
+    osched *s = osched_create(2, 5.0);
+    CHECK(osched_try_acquire_n(s, TIER_PAID, 2));
+    /* Saturated: the caller is expected to go elsewhere, not to block. */
+    CHECK(!osched_try_acquire_n(s, TIER_PAID, 1));
+    osched_release_n(s, TIER_PAID, 2);
+    CHECK(osched_try_acquire_n(s, TIER_PAID, 1));
+
+    /* Background still demands an idle device, not merely a free slot. */
+    CHECK(!osched_try_acquire_n(s, TIER_BACKGROUND, 2));
+    osched_release_n(s, TIER_PAID, 1);
+    CHECK(osched_try_acquire_n(s, TIER_BACKGROUND, 2));
+    osched_release_n(s, TIER_BACKGROUND, 2);
+
+    CHECK(!osched_try_acquire_n(s, TIER_PAID, 3));  /* more than total slots */
+    CHECK(!osched_try_acquire_n(s, TIER_PAID, 0));
+    CHECK(!osched_try_acquire_n(NULL, TIER_PAID, 1));
+    osched_destroy(s);
+}
+
 int main(void) {
+    test_sched_try_acquire();
     test_host_prefetch_policy();
     test_vram_arbitration();
     test_json();

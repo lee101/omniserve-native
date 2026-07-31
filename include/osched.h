@@ -22,6 +22,10 @@ void osched_release(osched *s, otier tier);
  * capacity while diffusion/video reserve the entire device. */
 bool osched_acquire_n(osched *s, otier tier, int permits);
 void osched_release_n(osched *s, otier tier, int permits);
+
+/* Non-blocking admission for callers with an alternative, so a saturated local
+ * device sends them to overflow immediately instead of after a queue wait. */
+bool osched_try_acquire_n(osched *s, otier tier, int permits);
 int osched_capacity(const osched *s);
 
 typedef struct {

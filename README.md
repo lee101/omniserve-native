@@ -265,6 +265,36 @@ first; until then, arming a lane warms capacity without sending it traffic, so
 lanes ship disabled. Standing remote endpoints, below, are a separate mechanism
 and are routed today — they need no provisioning, so none of this applies.
 
+## Standing remote endpoints
+
+Distinct from the rented lanes above: no provisioning, no per-hour bill, just a
+URL that is already serving. Two things send a request there instead of queueing
+it locally.
+
+1. **A saturated local lane.** With an overflow configured, admission becomes
+   non-blocking (`osched_try_acquire_n`). Waiting out an admission timeout buys
+   nothing the remote would not have already delivered. Without an overflow the
+   blocking acquire is unchanged. Try-acquire also refuses while anyone is
+   queued even if a slot is free, so a caller with somewhere else to go cannot
+   jump ahead of one that has already paid the latency.
+2. **A local backend that failed before writing anything.** Once bytes are on
+   the wire it is too late — retrying would splice a second response onto a
+   partial one — so the retry is gated on `response_started`. The local permit
+   is released first, so the retry cannot hold the device it just failed to use.
+
+Paid tier only unless `OMNISERVE_NATIVE_OVERFLOW_TIERS` says otherwise, for the
+same reason the rented lanes are: free traffic must never be able to spend
+money. `omniserve_overflow_total{cause="saturated"|"local_failed"}` separates the
+two causes, because they call for opposite responses — the first says buy local
+capacity, the second says fix a backend.
+
+```bash
+OMNISERVE_NATIVE_IMAGE_OVERFLOW_UPSTREAM=https://... \
+OMNISERVE_NATIVE_STT_OVERFLOW_UPSTREAM=https://... \
+OMNISERVE_NATIVE_TTS_OVERFLOW_UPSTREAM=https://... \
+OMNISERVE_NATIVE_OVERFLOW_TIERS=paid
+```
+
 ## VRAM brokering between co-tenants
 
 Four processes hold VRAM on this box and each sizes its workload from

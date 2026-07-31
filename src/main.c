@@ -52,6 +52,16 @@ typedef struct {
     oscale *scale;
     ocapacity *capacity;
     ovram *vram;
+    /* Standing remote endpoints, distinct from oscale's rented instances: no
+     * provisioning, no per-hour bill to reason about, just somewhere to send
+     * work when the local device is full. Paid-only by default for the same
+     * reason oscale is: free traffic must never be able to spend money. */
+    oproxy_target *image_overflow;
+    oproxy_target *stt_overflow;
+    oproxy_target *tts_overflow;
+    unsigned overflow_tier_mask;
+    unsigned long long overflow_saturated;
+    unsigned long long overflow_failover;
 } app_state;
 
 extern const char *DOCS_HTML;
@@ -245,6 +255,15 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
             "omniserve_vram_lease_total{outcome=\"expired\"} %llu\n",
             vs.headroom_mb, vs.leased_mb, vs.reserved_mb, vs.lease_count,
             vs.grants, vs.partial_grants, vs.denials, vs.releases, vs.expirations);
+    }
+
+    if (len < sizeof body) {
+        len += (size_t)snprintf(body + len, sizeof body - len,
+            "# HELP omniserve_overflow_total Requests sent to a standing remote endpoint.\n"
+            "# TYPE omniserve_overflow_total counter\n"
+            "omniserve_overflow_total{cause=\"saturated\"} %llu\n"
+            "omniserve_overflow_total{cause=\"local_failed\"} %llu\n",
+            app->overflow_saturated, app->overflow_failover);
     }
     ohttp_respond(req, 200, "text/plain; version=0.0.4", body, len);
 }
@@ -618,6 +637,17 @@ static void reload_embedded_models_after_background(void) {
     }
 }
 
+/* The standing remote for a lane, or NULL when the lane has none or this tier
+ * is not allowed to use it. Keyed off the local target so callers do not have
+ * to carry a lane name they otherwise never need. */
+static oproxy_target *overflow_for(const app_state *app, const oproxy_target *local, otier tier) {
+    if (!(app->overflow_tier_mask & (1u << (unsigned)tier))) return NULL;
+    if (local == app->image_upstream) return app->image_overflow;
+    if (local == app->stt_upstream) return app->stt_overflow;
+    if (local == app->tts_upstream) return app->tts_overflow;
+    return NULL;
+}
+
 static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_target *upstream,
                                  int modality_permits, const char *default_content_type,
                                  const char *path_override, int tier_override) {
@@ -627,15 +657,35 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
     }
     otier tier = tier_override >= 0 ? (otier)tier_override : request_tier(req);
     int permits = tier == TIER_BACKGROUND ? osched_capacity(app->sched) : modality_permits;
-    if (!osched_acquire_n(app->sched, tier, permits)) {
+
+    /* With a remote available, queueing locally is the wrong default: the wait
+     * buys nothing the remote would not have already delivered. Without one,
+     * behaviour is unchanged and the blocking acquire still applies. */
+    oproxy_target *local = upstream;
+    oproxy_target *overflow = overflow_for(app, local, tier);
+    bool on_overflow = false;
+    if (overflow) {
+        if (!osched_try_acquire_n(app->sched, tier, permits)) {
+            upstream = overflow;
+            on_overflow = true;
+            app->overflow_saturated++;
+            /* A remote does not consume the local device, so it is admitted
+             * without a slot. The remote's own capacity is its concern. */
+            permits = 0;
+        }
+    }
+    if (!on_overflow && !osched_acquire_n(app->sched, tier, permits)) {
         respond_error(req, 503, "admission timeout; retry");
         return;
     }
+    /* Keyed off the local target: a lane that can overflow is never one of
+     * these, but reading the reassigned pointer here would be a trap for
+     * whoever adds an overflow to the 3D lane later. */
     bool swap_embedded_models =
         tier == TIER_BACKGROUND &&
-        ((upstream == app->threed_upstream &&
+        ((local == app->threed_upstream &&
           env_flag("OMNISERVE_NATIVE_3D_SWAP_EMBEDDED_MODELS", 1)) ||
-         (upstream == app->training_upstream &&
+         (local == app->training_upstream &&
           env_flag("OMNISERVE_NATIVE_TRAINING_SWAP_EMBEDDED_MODELS", 1)));
     if (swap_embedded_models) unload_embedded_models_for_background();
 
@@ -688,6 +738,29 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
         proxy_sink_raw, req,
         &result, error, sizeof error);
     if (swap_embedded_models) reload_embedded_models_after_background();
+
+    /* A local backend that failed before writing anything is the other case
+     * worth spending a remote on. Once bytes are on the wire it is too late:
+     * retrying would splice a second response onto a partial one. The local
+     * slot is released first so the retry cannot hold the device it just
+     * failed to use. */
+    if (!ok && !result.response_started && !on_overflow && overflow) {
+        osched_release_n(app->sched, tier, permits);
+        permits = 0;
+        app->overflow_failover++;
+        fprintf(stderr, "local upstream failed (%s); retrying on overflow\n", error);
+        ok = oproxy_target_relay(
+            overflow,
+            req->method, req->method_len,
+            upstream_path, upstream_path_len,
+            req->query, req->query_len,
+            req->body, req->body_len,
+            content_type, content_type_len,
+            forwarded, forwarded_n,
+            app->upstream_timeout_ms,
+            proxy_sink_raw, req,
+            &result, error, sizeof error);
+    }
     osched_release_n(app->sched, tier, permits);
 
     if (!ok) {
@@ -1955,7 +2028,32 @@ int main(int argc, char **argv) {
     CREATE_UPSTREAM(animation_upstream, animation_upstream, "animation");
     CREATE_UPSTREAM(threed_upstream, threed_upstream, "3D");
     CREATE_UPSTREAM(aux_upstream, aux_upstream, "auxiliary");
+    /* Read once into a local like every other upstream above: the macro
+     * expands its url argument twice, so a getenv() passed inline would be
+     * called twice and the null check would not cover the dereference. */
+    const char *image_overflow_url = getenv("OMNISERVE_NATIVE_IMAGE_OVERFLOW_UPSTREAM");
+    const char *stt_overflow_url = getenv("OMNISERVE_NATIVE_STT_OVERFLOW_UPSTREAM");
+    const char *tts_overflow_url = getenv("OMNISERVE_NATIVE_TTS_OVERFLOW_UPSTREAM");
+    CREATE_UPSTREAM(image_overflow, image_overflow_url, "image overflow");
+    CREATE_UPSTREAM(stt_overflow, stt_overflow_url, "STT overflow");
+    CREATE_UPSTREAM(tts_overflow, tts_overflow_url, "TTS overflow");
 #undef CREATE_UPSTREAM
+    /* Defaults to paid only. Widening this is a decision to let cheaper
+     * traffic reach a metered endpoint, so it must be written down, not
+     * inferred from the fact that a URL happens to be configured. */
+    app.overflow_tier_mask = OSCALE_TIER_BIT(TIER_PAID);
+    const char *overflow_tiers = getenv("OMNISERVE_NATIVE_OVERFLOW_TIERS");
+    if (overflow_tiers && overflow_tiers[0]) {
+        unsigned mask = 0;
+        char buf[128];
+        snprintf(buf, sizeof buf, "%s", overflow_tiers);
+        for (char *save = NULL, *tok = strtok_r(buf, ",", &save); tok;
+             tok = strtok_r(NULL, ",", &save)) {
+            while (*tok == ' ') tok++;
+            mask |= OSCALE_TIER_BIT(otier_parse(tok, (int)strlen(tok)));
+        }
+        app.overflow_tier_mask = mask;
+    }
     const char *upstream_timeout = getenv("OMNISERVE_NATIVE_UPSTREAM_TIMEOUT_MS");
     app.upstream_timeout_ms = upstream_timeout ? atoi(upstream_timeout) : 600000;
 
@@ -2071,6 +2169,9 @@ int main(int argc, char **argv) {
     oproxy_target_destroy(app.animation_upstream);
     oproxy_target_destroy(app.threed_upstream);
     oproxy_target_destroy(app.aux_upstream);
+    oproxy_target_destroy(app.image_overflow);
+    oproxy_target_destroy(app.stt_overflow);
+    oproxy_target_destroy(app.tts_overflow);
     ocapacity_stop(app.capacity);
     oscale_destroy(app.scale);
     oembed_shutdown();

@@ -42,6 +42,14 @@ Environment=OMNISERVE_NATIVE_VRAM_LEASE_TTL_S=120
 # unload/reload cycle costs seconds rather than a cold read of 8 GB.
 Environment=OMNISERVE_NATIVE_RAM_PREFETCH_ENABLED=1
 Environment=OMNISERVE_NATIVE_RAM_KEEP_FREE_PCT=5
+# Standing remote endpoints, used when the local lane is saturated or the local
+# backend fails before responding. Paid tier only unless _OVERFLOW_TIERS says
+# otherwise. Deliberately unset: images2.netwrck.com serves the older Proteus
+# API (/create_and_upload_image), not /v1/images/generations, so it needs a
+# translating adapter before it can stand in for the local image lane.
+# Environment=OMNISERVE_NATIVE_IMAGE_OVERFLOW_UPSTREAM=
+# Environment=OMNISERVE_NATIVE_STT_OVERFLOW_UPSTREAM=
+# Environment=OMNISERVE_NATIVE_OVERFLOW_TIERS=paid
 Environment=OMNISERVE_NATIVE_IMAGE_UPSTREAM=http://127.0.0.1:8100
 Environment=OMNISERVE_NATIVE_IMAGE_GENERATE_PATH=/v1/images/generations
 Environment=OMNISERVE_NATIVE_TTS_UPSTREAM=http://127.0.0.1:9083
