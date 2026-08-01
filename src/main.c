@@ -257,6 +257,26 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
             vs.grants, vs.partial_grants, vs.denials, vs.releases, vs.expirations);
     }
 
+    /* Drafted against accepted, not a ratio: a rate alone cannot distinguish
+     * speculation that is off from speculation that is landing perfectly. */
+    if (len < sizeof body) {
+        ollm_placement spec_placement;
+        ollm_placement_snapshot(&spec_placement);
+        len += (size_t)snprintf(body + len, sizeof body - len,
+            "# HELP omniserve_llm_spec_tokens_total Speculative draft tokens by outcome.\n"
+            "# TYPE omniserve_llm_spec_tokens_total counter\n"
+            "omniserve_llm_spec_tokens_total{outcome=\"drafted\"} %llu\n"
+            "omniserve_llm_spec_tokens_total{outcome=\"accepted\"} %llu\n"
+            "# HELP omniserve_llm_spec_calls_saved_total Model calls speculation avoided.\n"
+            "# TYPE omniserve_llm_spec_calls_saved_total counter\n"
+            "omniserve_llm_spec_calls_saved_total %llu\n"
+            "omniserve_llm_spec_rounds_total %llu\n"
+            "omniserve_llm_spec_draft_max %d\n",
+            spec_placement.spec_drafted, spec_placement.spec_accepted,
+            spec_placement.spec_saved_calls, spec_placement.spec_rounds,
+            spec_placement.spec_draft_max);
+    }
+
     if (len < sizeof body) {
         len += (size_t)snprintf(body + len, sizeof body - len,
             "# HELP omniserve_overflow_total Requests sent to a standing remote endpoint.\n"
@@ -413,10 +433,17 @@ static void handle_status(ohttp_request *req, app_state *app) {
     if (len > 1 && body[len - 1] == '}') {
         char capacity_json[2048];
         ocapacity_status_json(app->capacity, capacity_json, sizeof capacity_json);
+        double acceptance = placement.spec_drafted
+            ? (double)placement.spec_accepted / (double)placement.spec_drafted : 0.0;
         snprintf(body + len - 1, sizeof body - (len - 1),
                  ",\"tune\":{\"class\":\"%s\",\"n_batch\":%d,\"n_ubatch\":%d},"
+                 "\"speculation\":{\"draft_max\":%d,\"rounds\":%llu,\"drafted\":%llu,"
+                 "\"accepted\":%llu,\"acceptance\":%.3f,\"calls_saved\":%llu},"
                  "\"capacity\":%s}",
-                 placement.tune_class, placement.n_batch, placement.n_ubatch, capacity_json);
+                 placement.tune_class, placement.n_batch, placement.n_ubatch,
+                 placement.spec_draft_max, placement.spec_rounds, placement.spec_drafted,
+                 placement.spec_accepted, acceptance, placement.spec_saved_calls,
+                 capacity_json);
     }
     ohttp_force_close(req);
     ohttp_respond_str(req, 200, "application/json", body);

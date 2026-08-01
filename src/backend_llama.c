@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "obackend.h"
+#include "ospec.h"
 #include "otext.h"
 #include "otune.h"
 
@@ -53,6 +54,29 @@ static char g_model_name[256];
 static int g_ctx_len;
 static int g_batch_size;
 static int g_ubatch_size;
+
+/* Speculation settings and fleet-wide counters. The counters are the only way
+ * to tell "speculation is off" from "speculation is running and never landing",
+ * which look identical from latency alone. */
+static int g_spec_draft_max;
+static int g_spec_probe_interval;
+static int g_spec_patience;
+static ospec_config g_spec_cfg;
+static pthread_mutex_t g_spec_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long long g_spec_drafted;
+static unsigned long long g_spec_accepted;
+static unsigned long long g_spec_rounds;
+static unsigned long long g_spec_saved_calls;
+
+static void spec_record(const ospec_governor *g) {
+    if (!g || g->rounds == 0) return;
+    pthread_mutex_lock(&g_spec_lock);
+    g_spec_rounds += g->rounds;
+    g_spec_drafted += g->drafted;
+    g_spec_accepted += g->accepted;
+    g_spec_saved_calls += g->saved_calls;
+    pthread_mutex_unlock(&g_spec_lock);
+}
 
 static struct llama_model *g_embed_model;
 static const struct llama_vocab *g_embed_vocab;
@@ -203,6 +227,39 @@ bool ollm_init(const char *model_path, int n_gpu_layers, int ctx_len, int parall
     if (g_batch_size > g_ctx_len) g_batch_size = g_ctx_len;
     if (g_ubatch_size < 1) g_ubatch_size = 1;
     if (g_ubatch_size > g_batch_size) g_ubatch_size = g_batch_size;
+
+    /* Off unless asked for. Speculation trades arithmetic for model calls, and
+     * that is only a trade worth making where decode is bandwidth-bound: on CPU
+     * the wider verify batch costs proportionally more work and buys nothing,
+     * which is what measuring it on this host showed. The GPU case is the one
+     * the technique exists for, but this host's GPU is fully committed to
+     * co-tenants, so it is unmeasured here and therefore not a default.
+     * scripts/spec_bench.sh flips it on and reports whether it paid.
+     *
+     * A drafted token only rides along cheaply while the verify batch still
+     * fits in one micro-batch; past that the round splits and the saving is
+     * gone, so the ubatch is a hard ceiling. */
+    const char *spec_env = getenv("OMNISERVE_NATIVE_SPEC_DRAFT");
+    g_spec_draft_max = spec_env ? atoi(spec_env) : 0;
+    if (g_spec_draft_max < 0) g_spec_draft_max = 0;
+    if (g_spec_draft_max > g_ubatch_size - 1) g_spec_draft_max = g_ubatch_size - 1;
+    if (g_spec_draft_max > 16) g_spec_draft_max = 16;
+    const char *probe_env = getenv("OMNISERVE_NATIVE_SPEC_PROBE");
+    g_spec_probe_interval = probe_env ? atoi(probe_env) : 32;
+    if (g_spec_probe_interval < 1) g_spec_probe_interval = 1;
+    /* Defaults to a device where a wrong guess is nearly free, because that is
+     * the only kind of device worth turning speculation on for at all. */
+    const char *patience_env = getenv("OMNISERVE_NATIVE_SPEC_PATIENCE");
+    g_spec_patience = patience_env ? atoi(patience_env) : 4;
+    if (g_spec_patience < 1) g_spec_patience = 1;
+    ospec_config_default(&g_spec_cfg);
+    const char *min_ngram_env = getenv("OMNISERVE_NATIVE_SPEC_MIN_NGRAM");
+    const char *max_ngram_env = getenv("OMNISERVE_NATIVE_SPEC_MAX_NGRAM");
+    if (min_ngram_env) g_spec_cfg.min_ngram = atoi(min_ngram_env);
+    if (max_ngram_env) g_spec_cfg.max_ngram = atoi(max_ngram_env);
+    if (g_spec_cfg.min_ngram < 1) g_spec_cfg.min_ngram = 1;
+    if (g_spec_cfg.max_ngram < g_spec_cfg.min_ngram) g_spec_cfg.max_ngram = g_spec_cfg.min_ngram;
+
     g_slot_count = parallel_contexts > 0 ? parallel_contexts : 1;
     g_slots = calloc((size_t)g_slot_count, sizeof *g_slots);
     if (!g_slots) {
@@ -265,6 +322,13 @@ void ollm_placement_snapshot(ollm_placement *out) {
     snprintf(out->tune_class, sizeof out->tune_class, "%s", g_tune_class);
     out->n_batch = g_batch_size;
     out->n_ubatch = g_ubatch_size;
+    out->spec_draft_max = g_spec_draft_max;
+    pthread_mutex_lock(&g_spec_lock);
+    out->spec_rounds = g_spec_rounds;
+    out->spec_drafted = g_spec_drafted;
+    out->spec_accepted = g_spec_accepted;
+    out->spec_saved_calls = g_spec_saved_calls;
+    pthread_mutex_unlock(&g_spec_lock);
 }
 
 static int common_prefix(const ollm_slot *slot, const llama_token *tokens, int count) {
@@ -312,6 +376,103 @@ static void cache_prompt(ollm_slot *slot, const llama_token *tokens, int count) 
     }
     memcpy(slot->cached_tokens, tokens, (size_t)count * sizeof *tokens);
     slot->cached_count = count;
+}
+
+/* One decode round, speculative or not, returning how many tokens it produced
+ * into out_tokens/out_probs (0 on a decode failure).
+ *
+ * The exactness argument lives here. Every token returned was drawn by the
+ * sampler from the real model's distribution at its own position; a drafted
+ * token is never emitted because the drafter proposed it, only kept when the
+ * sampler independently chose the same id. Sampling position j+1 is legitimate
+ * precisely because position j's draft was confirmed, which is what makes the
+ * logits at j+1 the ones sequential decoding would have produced. At
+ * temperature 0 that yields the identical token sequence; above it, the
+ * identical distribution.
+ *
+ * n_past is the number of tokens already in the KV cache and is advanced by the
+ * tokens this round commits. `previous` is the last token sampled but not yet
+ * in the cache.
+ */
+static int decode_round(struct llama_context *ctx, struct llama_sampler *smpl,
+                        const probability_capture *sampled,
+                        llama_token previous, int *n_past,
+                        const llama_token *context, int context_len,
+                        ospec_governor *gov,
+                        llama_token *out_tokens, float *out_probs, int out_cap) {
+    if (out_cap <= 0) return 0;
+
+    /* Straight after the prefill there is nothing to decode: the logits for the
+     * next token are already the ones the prompt left behind. */
+    if (previous == LLAMA_TOKEN_NULL) {
+        out_tokens[0] = llama_sampler_sample(smpl, ctx, -1);
+        out_probs[0] = sampled->probability;
+        return 1;
+    }
+
+    llama_token draft[16];
+    int draft_len = 0;
+    int want = gov ? ospec_governor_next(gov) : 0;
+    if (want > 0 && g_spec_draft_max > 0) {
+        int cap = want < g_spec_draft_max ? want : g_spec_draft_max;
+        if (cap > (int)(sizeof draft / sizeof *draft)) cap = (int)(sizeof draft / sizeof *draft);
+        if (cap > out_cap - 1) cap = out_cap - 1;
+        if (cap > 0) {
+            draft_len = ospec_draft(&g_spec_cfg, context, context_len, draft, cap);
+        }
+    }
+
+    if (draft_len <= 0) {
+        struct llama_batch one = llama_batch_get_one(&previous, 1);
+        if (llama_decode(ctx, one) != 0) return 0;
+        (*n_past)++;
+        out_tokens[0] = llama_sampler_sample(smpl, ctx, -1);
+        out_probs[0] = sampled->probability;
+        if (gov) ospec_governor_observe(gov, 0, 0);
+        return 1;
+    }
+
+    /* The verify batch is `previous` followed by the draft, every position
+     * asked for logits: a draft is only useful if the token after it can be
+     * sampled without running the model again. */
+    struct llama_batch batch = llama_batch_init(draft_len + 1, 0, 1);
+    if (!batch.token) return 0;
+    batch.n_tokens = draft_len + 1;
+    for (int i = 0; i < draft_len + 1; i++) {
+        batch.token[i] = i == 0 ? previous : draft[i - 1];
+        batch.pos[i] = (llama_pos)(*n_past + i);
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = 1;
+    }
+    int rc = llama_decode(ctx, batch);
+    llama_batch_free(batch);
+    if (rc != 0) return 0;
+
+    int produced = 0;
+    int matched = 0;
+    for (int i = 0; i <= draft_len && produced < out_cap; i++) {
+        llama_token tok = llama_sampler_sample(smpl, ctx, i);
+        out_tokens[produced] = tok;
+        out_probs[produced] = sampled->probability;
+        produced++;
+        /* Stop at end-of-generation rather than sampling past it: the caller is
+         * about to discard everything after it, and sampling also advances the
+         * penalty sampler's history. */
+        if (llama_vocab_is_eog(g_vocab, tok)) break;
+        if (i == draft_len || tok != draft[i]) break;
+        matched++;
+    }
+
+    /* Committed: `previous` plus the drafts the sampler agreed with. The
+     * remaining drafted positions were written to the cache by the decode and
+     * have to come back out, or the next round would attend to tokens that were
+     * never generated. */
+    *n_past += matched + 1;
+    llama_memory_t memory = llama_get_memory(ctx);
+    if (matched < draft_len) llama_memory_seq_rm(memory, 0, *n_past, -1);
+    if (gov) ospec_governor_observe(gov, draft_len, matched);
+    return produced;
 }
 
 static void release_slot(ollm_slot *slot) {
@@ -657,19 +818,52 @@ bool ollm_chat(const ochat_req *req, otoken_cb on_token, void *user, ochat_resul
 
     llama_token previous = LLAMA_TOKEN_NULL;
     float cumulative_probability = 1.0f;
+
+    /* The n-gram drafter looks the generated text up in the whole context, so
+     * the prompt and the reply so far have to live in one array. Sized once for
+     * the worst case: a realloc here would invalidate the pointer mid-round. */
+    int context_len = n_tokens;
+    llama_token *context = malloc((size_t)(n_tokens + max_new + 1) * sizeof *context);
+    if (!context) {
+        llama_sampler_free(smpl);
+        free(text);
+        free(tokens);
+        release_slot(slot);
+        return false;
+    }
+    memcpy(context, tokens, (size_t)n_tokens * sizeof *context);
+
+    ospec_governor gov;
+    ospec_governor_init(&gov, g_spec_draft_max, g_spec_probe_interval, g_spec_patience);
+    int n_past = n_tokens;
+    llama_token round_tokens[17];
+    float round_probs[17];
+    int round_count = 0, round_pos = 0;
+
     for (int i = 0; i < max_new; i++) {
         if (!ok) break;
-        if (previous != LLAMA_TOKEN_NULL) {
-            struct llama_batch token_batch = llama_batch_get_one(&previous, 1);
-            if (llama_decode(ctx, token_batch) != 0) {
+        if (round_pos >= round_count) {
+            round_count = decode_round(ctx, smpl, &sampled, previous, &n_past,
+                                       context, context_len,
+                                       g_spec_draft_max > 0 ? &gov : NULL,
+                                       round_tokens, round_probs,
+                                       (int)(sizeof round_tokens / sizeof *round_tokens));
+            round_pos = 0;
+            if (round_count <= 0) {
                 ok = i > 0;
                 out->finish_reason = "error";
                 break;
             }
         }
-        llama_token tok = llama_sampler_sample(smpl, ctx, -1);
+        llama_token tok = round_tokens[round_pos];
+        float token_probability = round_probs[round_pos];
+        round_pos++;
+        previous = tok;
         if (llama_vocab_is_eog(g_vocab, tok)) break;
-        cumulative_probability *= sampled.probability;
+        /* Recorded before the stop checks so the drafter sees exactly the token
+         * sequence the model produced, whether or not the caller keeps it. */
+        context[context_len++] = tok;
+        cumulative_probability *= token_probability;
         /* textgen semantics: the token that crosses the threshold is kept */
         bool min_prob_stop = req->min_probability > 0.0f &&
                              cumulative_probability < req->min_probability;
@@ -737,7 +931,6 @@ bool ollm_chat(const ochat_req *req, otoken_cb on_token, void *user, ochat_resul
             out->finish_reason = "min_probability";
             break;
         }
-        previous = tok;
     }
 
     if (on_token && !cancelled && text_len > streamed_len &&
@@ -745,6 +938,10 @@ bool ollm_chat(const ochat_req *req, otoken_cb on_token, void *user, ochat_resul
         out->finish_reason = "cancelled";
     }
 
+    spec_record(&gov);
+    out->drafted_tokens = (int)gov.drafted;
+    out->accepted_drafts = (int)gov.accepted;
+    free(context);
     llama_sampler_free(smpl);
     free(tokens);
     out->elapsed_ms = now_ms() - t0;

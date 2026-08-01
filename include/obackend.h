@@ -45,6 +45,11 @@ typedef struct {
     int prompt_tokens;
     int cached_prompt_tokens;
     int completion_tokens;
+    /* Speculation, per request: how many tokens were guessed and how many the
+     * sampler independently agreed with. Zero for both means speculation never
+     * ran, which is a different situation from guessing and missing. */
+    int drafted_tokens;
+    int accepted_drafts;
     double elapsed_ms;
     const char *finish_reason;
 } ochat_result;
@@ -63,6 +68,13 @@ typedef struct {
     int n_batch;
     int n_ubatch;
     bool flash_attn;
+    /* Speculation, since the run: a draft length of 0 means it is off, which
+     * looks the same from latency as running and never landing. */
+    int spec_draft_max;
+    unsigned long long spec_rounds;
+    unsigned long long spec_drafted;
+    unsigned long long spec_accepted;
+    unsigned long long spec_saved_calls;
 } ollm_placement;
 
 /* Contexts this device class can keep resident beside the weights. Advisory:

@@ -196,6 +196,67 @@ llama.cpp's kernel matrix rather than benchmarked on Ampere silicon — this hos
 has none. `OMNISERVE_NATIVE_KV_TYPE=f16` restores the old behaviour without a
 rebuild.
 
+## Speculative decoding
+
+Decoding one token at a time is bandwidth-bound, not compute-bound: the whole
+weight matrix is read to produce a single token, and reading it for a batch of
+five costs barely more. A decode step therefore has spare token-slots in it that
+are already paid for. `src/ospec.c` spends them on guesses.
+
+The guesses come from the context, not from a second model: the longest suffix
+of what has been written so far is looked up in what came before, and whatever
+followed it last time becomes the draft. That costs no VRAM, which matters on a
+device where the LLM shares memory with an image model — a draft model would
+need a lease from the broker above before it could hold anything. The verify
+loop is the same one a draft model would drive, so adding one later changes the
+draft source, not the design.
+
+It is not a quality setting. Every token is sampled from the real model's
+distribution at its own position and a drafted token is kept only when the
+sampler independently chose the same id, so nothing is emitted because the
+drafter proposed it. What a hit buys is the right to reuse logits that were
+computed anyway. A miss costs a wider batch that produced one token; the
+governor in `ospec.h` turns speculation off for a request that keeps missing and
+probes occasionally in case that changes.
+
+**Off by default** (`OMNISERVE_NATIVE_SPEC_DRAFT=0`), because the premise is
+hardware-dependent and only half of it is measured here:
+
+- **CPU: measured, and it does not pay.** 20.4 tok/s off, 19.5 tok/s on
+  (`qwen3-0.6b-q8`). The calls were saved and the seconds were not, because CPU
+  decode is compute-bound and the wider verify batch costs what it saves.
+- **GPU: unmeasured on this host.** This is the case the technique exists for,
+  but all 32 GB is committed to co-tenants (an image server, two search
+  servers, and the gateway's own Gemma), so there was no room to load a model
+  and measure. Shipping it on by default would be asserting a speedup nobody
+  measured.
+
+How much it can pay is measurable regardless, because acceptance is a property
+of the model and prompt rather than the device. On `qwen3-0.6b-q8`, 15% of
+tokens cost no model call on copy-heavy prompts and 7% on open-ended ones. So
+the honest expectation on a GPU is single-digit to mid-teens percent, not a
+multiple — drafting out of the context is free but weak. A small draft model
+corrected by the big one is the version that gets a multiple, and it needs a
+lease from the VRAM broker before it can hold anything, which is the order these
+two landed in.
+
+`./scripts/spec_bench.sh <model.gguf> [ngl] [draft]` settles it in one run: it
+reports wall clock, the acceptance rate the model achieved, and how many model
+calls speculation avoided, for both arms. Acceptance is a property of the model
+and prompt; whether saved calls become saved seconds is a property of the
+hardware. If it pays, the default is one value in `ollm_init`.
+
+`performance/quality.md` records how the implementation was verified, and why
+greedy output is *not* bit-reproducible when speculation fires. Knobs:
+`SPEC_DRAFT` (tokens per round, capped by the micro-batch), `SPEC_MIN_NGRAM`,
+`SPEC_MAX_NGRAM`, `SPEC_PROBE`, and `SPEC_PATIENCE` — how many consecutive
+missed rounds to sit through before giving up. Patience is the one setting that
+depends on the hardware rather than the model: quitting after one miss is right
+where a miss is expensive and forfeits most of the win where it is not. `/status.speculation` and
+`omniserve_llm_spec_*` report drafted, accepted and calls saved — separately,
+because an acceptance rate alone cannot distinguish speculation that is off from
+speculation that is landing perfectly.
+
 ## Cost- and priority-guided overflow capacity
 
 The local GPU is sunk cost, so it is always tried first. Renting a remote

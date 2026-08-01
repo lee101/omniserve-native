@@ -11,6 +11,7 @@
 #include "otune.h"
 #include "ovram.h"
 #include "ohost.h"
+#include "ospec.h"
 
 #include <arpa/inet.h>
 #include <assert.h>
@@ -1114,6 +1115,158 @@ static void test_access_log(void) {
     rmdir(dir);
 }
 
+/* The draft policy takes plain token ids, so what it proposes is provable
+ * without a model behind it. */
+static void test_spec_draft(void) {
+    ospec_config cfg;
+    ospec_config_default(&cfg);
+    int32_t draft[8];
+
+    /* "the quick brown fox ... the quick brown" continues "fox". Everything
+     * after the match is offered, not just the part that is obviously
+     * predictive: a wrong tail costs a batch slot that was already paid for,
+     * and the caller's cap is the real bound. */
+    const int32_t repeat[] = {10, 11, 12, 13, 14, 15, 10, 11, 12};
+    int n = ospec_draft(&cfg, repeat, 9, draft, 8);
+    CHECK(n == 6);
+    CHECK(draft[0] == 13 && draft[1] == 14 && draft[2] == 15);
+
+    /* Capped by the caller's budget, not by what is available. */
+    CHECK(ospec_draft(&cfg, repeat, 9, draft, 2) == 2);
+    CHECK(draft[0] == 13 && draft[1] == 14);
+
+    /* No repeat, so nothing is proposed. Returning a guess here would be worse
+     * than returning none: it would be rejected and cost a wider batch. */
+    const int32_t unique[] = {1, 2, 3, 4, 5, 6, 7, 8};
+    CHECK(ospec_draft(&cfg, unique, 8, draft, 8) == 0);
+
+    /* A match shorter than min_ngram is coincidence and must not be drafted
+     * from; with min_ngram 3 a repeated pair is not enough. */
+    const int32_t pair[] = {1, 2, 9, 9, 9, 1, 2};
+    CHECK(ospec_draft(&cfg, pair, 7, draft, 8) == 0);
+
+    /* The suffix must not match itself: the last n tokens are the needle. */
+    const int32_t tail_only[] = {4, 5, 6};
+    CHECK(ospec_draft(&cfg, tail_only, 3, draft, 8) == 0);
+
+    /* A pattern that has already repeated once is predicted to repeat again:
+     * the match at the start is followed by the pattern itself. */
+    const int32_t at_end[] = {7, 8, 9, 7, 8, 9};
+    n = ospec_draft(&cfg, at_end, 6, draft, 8);
+    CHECK(n == 3 && draft[0] == 7 && draft[1] == 8 && draft[2] == 9);
+
+    /* Two candidate matches: the longer one wins even though the shorter one
+     * sits closer to the end. Here the 4-gram 2,3,4,5 predicts 99, while the
+     * 3-gram 3,4,5 also occurs later predicting 77. */
+    const int32_t both[] = {2, 3, 4, 5, 99, 0, 3, 4, 5, 77, 0, 2, 3, 4, 5};
+    n = ospec_draft(&cfg, both, 15, draft, 4);
+    CHECK(n >= 1 && draft[0] == 99);
+
+    /* Among equally long matches the most recent wins. */
+    const int32_t recent[] = {1, 2, 3, 50, 0, 0, 1, 2, 3, 60, 0, 0, 1, 2, 3};
+    n = ospec_draft(&cfg, recent, 15, draft, 1);
+    CHECK(n == 1 && draft[0] == 60);
+
+    /* Degenerate inputs must not read out of bounds. */
+    CHECK(ospec_draft(&cfg, NULL, 5, draft, 8) == 0);
+    CHECK(ospec_draft(&cfg, repeat, 0, draft, 8) == 0);
+    CHECK(ospec_draft(&cfg, repeat, 9, draft, 0) == 0);
+    CHECK(ospec_draft(NULL, repeat, 9, draft, 8) == 0);
+}
+
+/* The governor is what keeps a bad draft source from costing anything, so its
+ * back-off and its recovery are both worth pinning down. */
+static void test_spec_governor(void) {
+    ospec_governor g;
+    ospec_governor_init(&g, 4, 8, 1);
+
+    /* Starts optimistic: the first rounds are the cheapest place to find out
+     * whether this request copies from its context. */
+    CHECK(ospec_governor_next(&g) == 4);
+
+    /* Everything accepted: the draft was too short for the round trip. */
+    ospec_governor_observe(&g, 4, 4);
+    CHECK(g.length == 4);  /* already at max */
+
+    /* Partial acceptance settles on the length that actually landed. */
+    ospec_governor_observe(&g, 4, 2);
+    CHECK(ospec_governor_next(&g) == 2);
+    ospec_governor_observe(&g, 2, 2);
+    CHECK(ospec_governor_next(&g) == 3);  /* all accepted, grow */
+
+    /* A miss turns speculation off outright rather than tapering. Composing
+     * text stays composing text for many tokens, and each wasted round is a
+     * wider batch that produced one token. */
+    ospec_governor_observe(&g, 3, 0);
+    CHECK(g.length == 0);
+
+    /* Off means free: for a whole interval no draft is even requested, so a
+     * request that never copies stops paying for speculation entirely. Each
+     * next() is one round of the probe clock, so the count below is the
+     * interval exactly. */
+    int probes = 0;
+    for (int i = 0; i < 8; i++) {
+        if (ospec_governor_next(&g) > 0) probes++;
+        ospec_governor_observe(&g, 0, 0);
+    }
+    CHECK(probes == 0);
+
+    /* Then exactly one probe comes due. */
+    CHECK(ospec_governor_next(&g) == 1);
+
+    /* A probe that lands brings speculation back, cautiously, so a request
+     * that starts inventing and later starts quoting is not stuck at one
+     * token per model call. */
+    ospec_governor_observe(&g, 1, 1);
+    CHECK(g.length == 1);
+    CHECK(ospec_governor_next(&g) == 1);
+    ospec_governor_observe(&g, 1, 1);
+    CHECK(g.length == 2);
+
+    /* Patience is the one hardware-dependent number here: on a device where a
+     * wrong guess is nearly free, quitting after one miss forfeits most of the
+     * win. With patience 3 the first two misses shorten the draft instead of
+     * abandoning it. */
+    ospec_governor patient;
+    ospec_governor_init(&patient, 4, 8, 3);
+    CHECK(ospec_governor_next(&patient) == 4);
+    ospec_governor_observe(&patient, 4, 0);
+    CHECK(patient.length == 2);   /* halved, still speculating */
+    ospec_governor_observe(&patient, 2, 0);
+    CHECK(patient.length == 1);
+    ospec_governor_observe(&patient, 1, 0);
+    CHECK(patient.length == 0);   /* third strike */
+
+    /* A landed draft anywhere in between clears the miss count, so speculation
+     * survives an isolated miss inside a passage that is otherwise quoted. */
+    ospec_governor_init(&patient, 4, 8, 3);
+    ospec_governor_observe(&patient, 4, 0);
+    ospec_governor_observe(&patient, 2, 2);
+    CHECK(patient.misses == 0);
+    ospec_governor_observe(&patient, 3, 0);
+    ospec_governor_observe(&patient, 1, 0);
+    CHECK(patient.length > 0);    /* two misses, patience 3, still alive */
+
+    /* Accounting: accepted tokens are model calls that did not happen. */
+    ospec_governor g2;
+    ospec_governor_init(&g2, 4, 8, 1);
+    ospec_governor_observe(&g2, 4, 3);
+    ospec_governor_observe(&g2, 3, 1);
+    CHECK(g2.drafted == 7 && g2.accepted == 4 && g2.saved_calls == 4);
+    CHECK(ospec_acceptance_rate(&g2) > 0.57 && ospec_acceptance_rate(&g2) < 0.58);
+
+    /* Nothing drafted yet is a rate of zero, not a division by zero. */
+    ospec_governor g3;
+    ospec_governor_init(&g3, 4, 8, 1);
+    CHECK(ospec_acceptance_rate(&g3) == 0.0);
+    CHECK(ospec_acceptance_rate(NULL) == 0.0);
+
+    /* An accept count larger than the draft is a caller bug; clamp rather than
+     * letting it inflate the saved-call figure the dashboards read. */
+    ospec_governor_observe(&g3, 2, 9);
+    CHECK(g3.accepted == 2 && g3.saved_calls == 2);
+}
+
 /* The deterministic entry points take the clock and the device figure as
  * arguments precisely so the arbitration policy is provable without a GPU. */
 static void test_vram_arbitration(void) {
@@ -1231,6 +1384,8 @@ static void test_sched_try_acquire(void) {
 
 int main(void) {
     test_sched_try_acquire();
+    test_spec_draft();
+    test_spec_governor();
     test_host_prefetch_policy();
     test_vram_arbitration();
     test_json();

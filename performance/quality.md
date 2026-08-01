@@ -74,6 +74,68 @@ because sliding-window attention already keeps the cache small (448 MiB per
 context at 8192), but it still buys roughly one extra parallel context per
 GiB freed.
 
+## Speculative decoding
+
+`OMNISERVE_NATIVE_SPEC_DRAFT=k` drafts up to `k` tokens per round from the
+context itself — the longest suffix of what has been written so far is looked up
+in what came before, and whatever followed it last time becomes the guess — then
+confirms them all in one decode of width `k+1`. Off by default; see the README
+for why.
+
+It is not a quality setting. Every token is sampled from the real model's
+distribution at its own position, and a drafted token is only kept when the
+sampler independently chose the same id, so nothing is ever emitted because the
+drafter proposed it. What that buys is the right to reuse logits that were
+computed anyway instead of running the model again.
+
+The plumbing was verified by construction rather than by inspection, on CPU with
+`qwen3-0.6b-q8` at temperature 0:
+
+| Arm | Configuration | Result |
+| --- | --- | --- |
+| `base` | speculation off | reference |
+| `never` | on, `MIN_NGRAM=999` so no draft is ever found | **byte-identical to base** |
+| `loose` | on, `MIN_NGRAM=1` so nearly every round drafts and nearly every draft is rejected | coherent throughout |
+| `spec` | on, shipping settings | copy-heavy prompt byte-identical; creative prompt diverged at char 217/348, stayed fluent |
+
+`never` matching `base` exactly is what rules out a bug in the restructured
+decode loop: every round took the same single-token path the old code took.
+`loose` is the hardest test of the KV trim, because a rejected draft has to be
+removed from the cache before the next round attends to it — text after a
+rejection stays coherent, which a mis-trimmed cache would not produce.
+
+### How much it lands
+
+Acceptance is a property of the model and the prompt, so it is measurable on CPU
+even though the speedup is not. `qwen3-0.6b-q8`, draft 4, 420 generated tokens
+per row:
+
+| Workload | Drafted | Accepted | Acceptance | Tokens that cost no model call |
+| --- | ---: | ---: | ---: | ---: |
+| copy-heavy (repeat / fix-a-typo / extract-then-repeat) | 98 | 65 | 0.66 | **15%** |
+| open-ended (poem, invent a name, describe a planet) | 50 | 28 | 0.56 | **7%** |
+
+That is the honest ceiling for drafting out of the context alone: it is free in
+VRAM, and it is weak. 15% fewer model calls on the workloads it suits — which
+are the shapes `/api/v1/summarization` and `/api/v1/autocomplete` actually see —
+is worth having on a GPU and is nowhere near the 2-3x a draft model delivers. A
+draft model is the upgrade, and it needs a VRAM lease before it can hold
+anything, which is why the broker came first.
+
+Wall clock on CPU for the same run: 20.4 tok/s off, 19.5 tok/s on. The calls
+were saved and the seconds were not, because CPU decode is compute-bound and the
+wider verify batch costs what it saves. This is the measurement that keeps
+speculation off by default.
+
+**Greedy output is not bit-reproducible when speculation fires**, and the
+obvious claim that it should be is wrong on real hardware. Verifying `k` drafts
+is one matmul of width `k+1` where there would have been `k+1` of width 1, and a
+wider matmul sums in a different order; the logits differ in their last bits and
+a near-tied argmax lands on the other token. The copy-heavy prompt above came
+out identical because its logits are not near-tied; the poem diverged because
+they are. This is the same effect as `llm.prefix_cache_agreement` below, and it
+is why that is tracked as a score rather than asserted as determinism.
+
 ## Prefix cache and determinism
 
 `llm.cold_determinism` passes: two full prefills of the same prompt at
