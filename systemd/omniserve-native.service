@@ -3,8 +3,8 @@ Description=omniserve-native C gateway (port 8791)
 # On a cold boot the CUDA driver stack is not ready when network.target is
 # reached. Starting first made llama.cpp fall back to CPU silently, which
 # serves at a fraction of GPU throughput while still reporting healthy.
-After=network.target nvidia-persistenced.service
-Wants=nvidia-persistenced.service
+After=network.target nvidia-persistenced.service omniserve.service
+Wants=nvidia-persistenced.service omniserve.service
 
 [Service]
 Type=simple
@@ -17,8 +17,12 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do nvidia-smi -L | grep -q GPU &&
 Environment=OMNISERVE_NATIVE_BIND=127.0.0.1
 Environment=OMNISERVE_NATIVE_PORT=8791
 Environment=OMNISERVE_NATIVE_LLM_GGUF=/nvme0n1-disk/models/omniserve-native/gemma-roleplay-v2-q8_0.gguf
-Environment=OMNISERVE_NATIVE_NGL=999
-Environment=OMNISERVE_NATIVE_CTX=8192
+# This host's current image/search resident set cannot fit the smallest valid
+# hybrid Gemma split plus its context. Lower hybrid splits exceed llama.cpp's
+# split-input limit, so use deliberate CPU placement instead of crash-looping
+# or silently reporting an absent model.
+Environment=OMNISERVE_NATIVE_NGL=0
+Environment=OMNISERVE_NATIVE_CTX=4096
 # One context per admitted request. LLM_PERMITS below is 1, so a second
 # context could never be scheduled while it cost a full KV + compute buffer
 # (1.36 GiB measured) that the image lane needs to batch at all.
@@ -50,10 +54,17 @@ Environment=OMNISERVE_NATIVE_RAM_KEEP_FREE_PCT=5
 # Environment=OMNISERVE_NATIVE_IMAGE_OVERFLOW_UPSTREAM=
 # Environment=OMNISERVE_NATIVE_STT_OVERFLOW_UPSTREAM=
 # Environment=OMNISERVE_NATIVE_OVERFLOW_TIERS=paid
-Environment=OMNISERVE_NATIVE_IMAGE_UPSTREAM=http://127.0.0.1:8100
+# The Python OmniServe control plane owns Z-Image/LoRA routing and proxies the
+# managed worker on 8100. Keep the public native data plane out of that worker.
+Environment=OMNISERVE_NATIVE_IMAGE_UPSTREAM=http://127.0.0.1:8790
 Environment=OMNISERVE_NATIVE_IMAGE_GENERATE_PATH=/v1/images/generations
+Environment=OMNISERVE_NATIVE_BIREFNET_UPSTREAM=http://127.0.0.1:9094
+Environment=OMNISERVE_NATIVE_BIREFNET_PERMITS=1
 Environment=OMNISERVE_NATIVE_TTS_UPSTREAM=http://127.0.0.1:9083
 Environment=OMNISERVE_NATIVE_STT_UPSTREAM=http://127.0.0.1:9096
+Environment=OMNISERVE_NATIVE_FORECAST_UPSTREAM=http://127.0.0.1:8101
+Environment=OMNISERVE_NATIVE_FORECAST_MODEL=amazon/chronos-2
+Environment=OMNISERVE_NATIVE_FORECAST_PERMITS=2
 Environment=OMNISERVE_NATIVE_TRAINING_UPSTREAM=http://127.0.0.1:9098
 Environment=OMNISERVE_NATIVE_TRAINING_PERMITS=8
 Environment=OMNISERVE_NATIVE_TRAINING_SWAP_EMBEDDED_MODELS=1
