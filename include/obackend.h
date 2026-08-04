@@ -107,18 +107,38 @@ void oembed_result_free(oembed_result *r);
 void oembed_shutdown(void);
 
 typedef struct {
+    const char *path;
+    float scale;
+} oimg_lora;
+
+typedef struct {
     const char *prompt;
     const char *negative_prompt;
     int width;
     int height;
     int steps;
-    long seed;
+    int batch_count;
+    float guidance_scale;
+    int64_t seed;
+    bool teleport;
+    int teleport_start_step;
+    const oimg_lora *loras;
+    size_t lora_count;
 } oimg_req;
 
 typedef struct {
     unsigned char *png;
     size_t png_len;
+    unsigned char **images;
+    size_t *image_lens;
+    size_t image_count;
+    const char *format;
     double elapsed_ms;
+    bool teleport_requested;
+    bool teleport_used;
+    bool teleport_cache_hit;
+    int teleport_capture_step;
+    int teleport_resume_step;
 } oimg_result;
 
 bool osd_init(const char *model_path);

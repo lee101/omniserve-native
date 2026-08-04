@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #include "stable-diffusion.h"
@@ -18,11 +19,43 @@ typedef void (*fn_ctx_params_init)(sd_ctx_params_t *);
 typedef sd_ctx_t *(*fn_new_sd_ctx)(const sd_ctx_params_t *);
 typedef void (*fn_img_params_init)(sd_img_gen_params_t *);
 typedef bool (*fn_generate_image)(sd_ctx_t *, const sd_img_gen_params_t *, sd_image_t **, int *);
+typedef void (*fn_free_images)(sd_image_t *, int);
+typedef void (*fn_latent_params_init)(sd_latent_replay_params_t *);
+typedef bool (*fn_generate_image_with_latent)(sd_ctx_t *, const sd_img_gen_params_t *,
+                                              sd_latent_replay_params_t *, sd_image_t **, int *);
+typedef void (*fn_free_latent)(sd_latent_t *);
+typedef size_t (*fn_webp_encode_rgb)(const unsigned char *, int, int, int, float,
+                                     unsigned char **);
+typedef void (*fn_webp_free)(void *);
 
 static fn_ctx_params_init p_ctx_params_init;
 static fn_new_sd_ctx p_new_sd_ctx;
 static fn_img_params_init p_img_params_init;
 static fn_generate_image p_generate_image;
+static fn_free_images p_free_images;
+static fn_latent_params_init p_latent_params_init;
+static fn_generate_image_with_latent p_generate_image_with_latent;
+static fn_free_latent p_free_latent;
+static fn_webp_encode_rgb p_webp_encode_rgb;
+static fn_webp_free p_webp_free;
+static bool g_webp_enabled = true;
+static float g_webp_quality = 85.0f;
+
+static void webp_lib_load(void) {
+    static const char *const candidates[] = {
+        "libwebp.so.7", "libwebp.so.6", "libwebp.so", NULL,
+    };
+    for (int i = 0; candidates[i]; ++i) {
+        void *lib = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
+        if (!lib) continue;
+        p_webp_encode_rgb = (fn_webp_encode_rgb)dlsym(lib, "WebPEncodeRGB");
+        p_webp_free = (fn_webp_free)dlsym(lib, "WebPFree");
+        if (p_webp_encode_rgb && p_webp_free) return;
+        p_webp_encode_rgb = NULL;
+        p_webp_free = NULL;
+        dlclose(lib);
+    }
+}
 
 static bool sd_lib_load(void) {
     const char *path = getenv("OMNISERVE_NATIVE_SD_LIB");
@@ -42,12 +75,33 @@ static bool sd_lib_load(void) {
     p_new_sd_ctx = (fn_new_sd_ctx)dlsym(lib, "new_sd_ctx");
     p_img_params_init = (fn_img_params_init)dlsym(lib, "sd_img_gen_params_init");
     p_generate_image = (fn_generate_image)dlsym(lib, "generate_image");
-    return p_ctx_params_init && p_new_sd_ctx && p_img_params_init && p_generate_image;
+    p_free_images = (fn_free_images)dlsym(lib, "free_sd_images");
+    p_latent_params_init = (fn_latent_params_init)dlsym(lib, "sd_latent_replay_params_init");
+    p_generate_image_with_latent = (fn_generate_image_with_latent)dlsym(lib, "generate_image_with_latent");
+    p_free_latent = (fn_free_latent)dlsym(lib, "free_sd_latent");
+    return p_ctx_params_init && p_new_sd_ctx && p_img_params_init && p_generate_image && p_free_images;
 }
 
 static sd_ctx_t *g_sd;
 static pthread_mutex_t g_sd_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_sd_name[256];
+
+typedef struct {
+    char *prompt;
+    char *negative_prompt;
+    int width;
+    int height;
+    int steps;
+    float guidance_scale;
+    int64_t seed;
+    int resume_step;
+    sd_latent_t *latent;
+    unsigned long long tick;
+} latent_cache_entry;
+
+static latent_cache_entry *g_latent_cache;
+static int g_latent_cache_size;
+static unsigned long long g_latent_cache_tick;
 
 static double now_ms(void) {
     struct timespec ts;
@@ -55,18 +109,142 @@ static double now_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
 
+static bool sd_env_flag(const char *name, bool fallback) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return fallback;
+    return value[0] == '1' || value[0] == 't' || value[0] == 'T' ||
+           value[0] == 'y' || value[0] == 'Y';
+}
+
+static int sd_env_int(const char *name, int fallback, int minimum, int maximum) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return fallback;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (!end || *end || parsed < minimum || parsed > maximum) return fallback;
+    return (int)parsed;
+}
+
+static float sd_env_float(const char *name, float fallback, float minimum, float maximum) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return fallback;
+    char *end = NULL;
+    float parsed = strtof(value, &end);
+    if (!end || end == value || *end || parsed < minimum || parsed > maximum) return fallback;
+    return parsed;
+}
+
+static bool latent_api_ready(void) {
+    return p_latent_params_init && p_generate_image_with_latent && p_free_latent &&
+           g_latent_cache && g_latent_cache_size > 0;
+}
+
+static bool cache_key_equal(const latent_cache_entry *entry, const oimg_req *req,
+                            int resume_step) {
+    const char *negative = req->negative_prompt ? req->negative_prompt : "";
+    return entry->latent && entry->width == req->width && entry->height == req->height &&
+           entry->steps == req->steps && entry->guidance_scale == req->guidance_scale &&
+           entry->seed == req->seed && entry->resume_step == resume_step &&
+           strcmp(entry->prompt, req->prompt) == 0 &&
+           strcmp(entry->negative_prompt, negative) == 0;
+}
+
+static latent_cache_entry *cache_find(const oimg_req *req, int resume_step) {
+    for (int i = 0; i < g_latent_cache_size; i++) {
+        if (cache_key_equal(&g_latent_cache[i], req, resume_step)) {
+            g_latent_cache[i].tick = ++g_latent_cache_tick;
+            return &g_latent_cache[i];
+        }
+    }
+    return NULL;
+}
+
+static void cache_entry_clear(latent_cache_entry *entry) {
+    if (entry->latent && p_free_latent) p_free_latent(entry->latent);
+    free(entry->prompt);
+    free(entry->negative_prompt);
+    memset(entry, 0, sizeof *entry);
+}
+
+static bool cache_insert(const oimg_req *req, int resume_step, sd_latent_t *latent) {
+    latent_cache_entry *slot = NULL;
+    for (int i = 0; i < g_latent_cache_size; i++) {
+        if (!g_latent_cache[i].latent) {
+            slot = &g_latent_cache[i];
+            break;
+        }
+        if (!slot || g_latent_cache[i].tick < slot->tick) slot = &g_latent_cache[i];
+    }
+    if (!slot) return false;
+    char *prompt = strdup(req->prompt);
+    char *negative = strdup(req->negative_prompt ? req->negative_prompt : "");
+    if (!prompt || !negative) {
+        free(prompt);
+        free(negative);
+        return false;
+    }
+    cache_entry_clear(slot);
+    slot->prompt = prompt;
+    slot->negative_prompt = negative;
+    slot->width = req->width;
+    slot->height = req->height;
+    slot->steps = req->steps;
+    slot->guidance_scale = req->guidance_scale;
+    slot->seed = req->seed;
+    slot->resume_step = resume_step;
+    slot->latent = latent;
+    slot->tick = ++g_latent_cache_tick;
+    return true;
+}
+
 bool osd_init(const char *model_path) {
     if (!sd_lib_load()) return false;
     sd_ctx_params_t params;
     p_ctx_params_init(&params);
-    params.model_path = model_path;
+    const char *diffusion = getenv("OMNISERVE_NATIVE_SD_DIFFUSION_MODEL");
+    const char *vae = getenv("OMNISERVE_NATIVE_SD_VAE");
+    const char *llm = getenv("OMNISERVE_NATIVE_SD_LLM");
+    const char *taesd = getenv("OMNISERVE_NATIVE_SD_TAESD");
+    const char *max_vram = getenv("OMNISERVE_NATIVE_SD_MAX_VRAM");
+    const char *backend = getenv("OMNISERVE_NATIVE_SD_BACKEND");
+    const char *params_backend = getenv("OMNISERVE_NATIVE_SD_PARAMS_BACKEND");
+    if (diffusion && diffusion[0]) {
+        params.diffusion_model_path = diffusion;
+    } else {
+        params.model_path = model_path;
+    }
+    if (vae && vae[0]) params.vae_path = vae;
+    if (llm && llm[0]) params.llm_path = llm;
+    if (taesd && taesd[0]) params.taesd_path = taesd;
+    if (max_vram && max_vram[0]) params.max_vram = max_vram;
+    if (backend && backend[0]) params.backend = backend;
+    if (params_backend && params_backend[0]) params.params_backend = params_backend;
     params.n_threads = -1;
+    params.flash_attn = sd_env_flag("OMNISERVE_NATIVE_SD_FLASH_ATTN", true);
+    params.diffusion_flash_attn = sd_env_flag("OMNISERVE_NATIVE_SD_DIFFUSION_FLASH_ATTN", true);
+    params.stream_layers = sd_env_flag("OMNISERVE_NATIVE_SD_STREAM_LAYERS", false);
+    params.enable_mmap = sd_env_flag("OMNISERVE_NATIVE_SD_MMAP", true);
+    params.eager_load = sd_env_flag("OMNISERVE_NATIVE_SD_EAGER_LOAD", false);
+    params.auto_fit = sd_env_flag("OMNISERVE_NATIVE_SD_AUTO_FIT", false);
+    const char *model_args = getenv("OMNISERVE_NATIVE_SD_MODEL_ARGS");
+    if (model_args && model_args[0]) params.model_args = model_args;
     g_sd = p_new_sd_ctx(&params);
     if (!g_sd) return false;
-    const char *slash = strrchr(model_path, '/');
-    snprintf(g_sd_name, sizeof g_sd_name, "%s", slash ? slash + 1 : model_path);
+    const char *named_path = diffusion && diffusion[0] ? diffusion : model_path;
+    const char *slash = strrchr(named_path, '/');
+    snprintf(g_sd_name, sizeof g_sd_name, "%s", slash ? slash + 1 : named_path);
     char *dot = strrchr(g_sd_name, '.');
     if (dot) *dot = 0;
+    g_latent_cache_size = sd_env_int("OMNISERVE_NATIVE_SD_TELEPORT_CACHE_SIZE", 64, 0, 256);
+    if (g_latent_cache_size > 0 && p_latent_params_init &&
+        p_generate_image_with_latent && p_free_latent) {
+        g_latent_cache = calloc((size_t)g_latent_cache_size, sizeof *g_latent_cache);
+        if (!g_latent_cache) g_latent_cache_size = 0;
+    }
+    const char *format = getenv("OMNISERVE_NATIVE_SD_IMAGE_FORMAT");
+    g_webp_enabled = !format || !format[0] || strcasecmp(format, "png") != 0;
+    g_webp_quality = sd_env_float("OMNISERVE_NATIVE_SD_WEBP_QUALITY", 85.0f, 1.0f, 100.0f);
+    if (g_webp_enabled) webp_lib_load();
     return true;
 }
 
@@ -121,36 +299,146 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     params.width = req->width > 0 ? req->width : 768;
     params.height = req->height > 0 ? req->height : 768;
     params.sample_params.sample_steps = req->steps > 0 ? req->steps : 4;
+    /* Zero is intentional for distilled Flux/Z-Image pipelines. Treating it as
+     * an unset sentinel changes both image quality and the latent replay key. */
+    params.sample_params.guidance.txt_cfg = req->guidance_scale;
     params.seed = req->seed;
+    params.batch_count = req->batch_count > 0 ? req->batch_count : 1;
+    sd_lora_t *loras = NULL;
+    if (req->lora_count) {
+        loras = calloc(req->lora_count, sizeof *loras);
+        if (!loras) return false;
+        for (size_t i = 0; i < req->lora_count; ++i) {
+            loras[i].path = req->loras[i].path;
+            loras[i].multiplier = req->loras[i].scale;
+        }
+        params.loras = loras;
+        params.lora_count = (uint32_t)req->lora_count;
+    }
+
+    out->teleport_requested = req->teleport;
+    out->teleport_capture_step = -1;
+    out->teleport_resume_step = 0;
 
     pthread_mutex_lock(&g_sd_lock);
     double started = now_ms();
     sd_image_t *images = NULL;
     int image_count = 0;
-    bool ok = p_generate_image(g_sd, &params, &images, &image_count);
+    bool ok = false;
+    if (req->teleport && params.batch_count == 1 && req->lora_count == 0 &&
+        req->steps > 1 && latent_api_ready()) {
+        int default_resume = sd_env_int("OMNISERVE_NATIVE_SD_TELEPORT_START_STEP", 7, 1, 99);
+        int resume_step = req->teleport_start_step > 0
+            ? req->teleport_start_step : default_resume;
+        if (resume_step >= req->steps) resume_step = req->steps - 1;
+        latent_cache_entry *cached = cache_find(req, resume_step);
+        sd_latent_replay_params_t replay;
+        p_latent_params_init(&replay);
+        sd_latent_t *captured = NULL;
+        if (cached) {
+            replay.resume_latent = cached->latent;
+        } else {
+            replay.capture_step = resume_step - 1;
+            replay.captured_latent_out = &captured;
+        }
+        ok = p_generate_image_with_latent(g_sd, &params, &replay, &images, &image_count);
+        if (ok) {
+            out->teleport_used = true;
+            out->teleport_cache_hit = replay.cache_hit;
+            out->teleport_capture_step = resume_step - 1;
+            out->teleport_resume_step = replay.resume_step;
+            if (captured && !cache_insert(req, resume_step, captured)) p_free_latent(captured);
+        } else {
+            if (captured) p_free_latent(captured);
+            if (cached) cache_entry_clear(cached);
+        }
+    }
+    if (!ok) {
+        if (images) p_free_images(images, image_count);
+        images = NULL;
+        image_count = 0;
+        ok = p_generate_image(g_sd, &params, &images, &image_count);
+    }
     out->elapsed_ms = now_ms() - started;
     pthread_mutex_unlock(&g_sd_lock);
+    free(loras);
 
-    if (!ok || image_count <= 0 || !images) return false;
-    png_sink sink = {0};
-    int encoded = stbi_write_png_to_func(
-        png_write, &sink, (int)images[0].width, (int)images[0].height,
-        (int)images[0].channel, images[0].data,
-        (int)(images[0].width * images[0].channel));
-    for (int i = 0; i < image_count; i++) free(images[i].data);
-    free(images);
-    if (!encoded || sink.failed || !sink.data) {
-        free(sink.data);
+    if (!ok || image_count <= 0 || !images) {
+        if (images) p_free_images(images, image_count);
         return false;
     }
-    out->png = sink.data;
-    out->png_len = sink.len;
+    out->images = calloc((size_t)image_count, sizeof *out->images);
+    out->image_lens = calloc((size_t)image_count, sizeof *out->image_lens);
+    if (!out->images || !out->image_lens) {
+        p_free_images(images, image_count);
+        free(out->images);
+        free(out->image_lens);
+        out->images = NULL;
+        out->image_lens = NULL;
+        return false;
+    }
+    bool use_webp = g_webp_enabled && p_webp_encode_rgb && p_webp_free;
+    for (int i = 0; i < image_count; ++i) {
+        if (use_webp && images[i].channel == 3) {
+            out->image_lens[i] = p_webp_encode_rgb(
+                images[i].data, (int)images[i].width, (int)images[i].height,
+                (int)(images[i].width * images[i].channel), g_webp_quality,
+                &out->images[i]);
+            if (!out->image_lens[i] || !out->images[i]) use_webp = false;
+        } else {
+            use_webp = false;
+        }
+        if (!use_webp) break;
+    }
+    if (!use_webp) {
+        for (int i = 0; i < image_count; ++i) {
+            if (out->images[i]) p_webp_free(out->images[i]);
+            out->images[i] = NULL;
+            out->image_lens[i] = 0;
+        }
+        for (int i = 0; i < image_count; ++i) {
+            png_sink sink = {0};
+            int encoded = stbi_write_png_to_func(
+                png_write, &sink, (int)images[i].width, (int)images[i].height,
+                (int)images[i].channel, images[i].data,
+                (int)(images[i].width * images[i].channel));
+            if (!encoded || sink.failed || !sink.data) {
+                free(sink.data);
+                p_free_images(images, image_count);
+                out->image_count = (size_t)i;
+                osd_result_free(out);
+                return false;
+            }
+            out->images[i] = sink.data;
+            out->image_lens[i] = sink.len;
+        }
+    }
+    p_free_images(images, image_count);
+    out->image_count = (size_t)image_count;
+    out->png = out->images[0];
+    out->png_len = out->image_lens[0];
+    out->format = use_webp ? "webp" : "png";
     return true;
 }
 
 void osd_result_free(oimg_result *result) {
-    free(result->png);
+    if (result->images) {
+        for (size_t i = 0; i < result->image_count; ++i) {
+            if (result->format && strcmp(result->format, "webp") == 0 && p_webp_free) {
+                p_webp_free(result->images[i]);
+            } else {
+                free(result->images[i]);
+            }
+        }
+        free(result->images);
+        free(result->image_lens);
+    } else {
+        free(result->png);
+    }
     result->png = NULL;
+    result->images = NULL;
+    result->image_lens = NULL;
+    result->image_count = 0;
 }
 
 #endif

@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "ocapacity.h"
 #include "ohttp.h"
+#include "oimage.h"
 #include "ojson.h"
 #include "olog.h"
 #include "oproxy.h"
@@ -69,6 +70,162 @@ static void test_json(void) {
     free(buf);
 }
 
+static void test_image_contract(void) {
+    const char *body = "{\"prompt\":\"red cube\",\"negative_prompt\":\"blur\","
+                       "\"size\":\"768x512\",\"width\":1024,\"steps\":8,"
+                       "\"guidance_scale\":1.5,\"seed\":42,\"n\":1}";
+    oimage_request request;
+    char error[160];
+    CHECK(oimage_request_parse(body, strlen(body), &request, error, sizeof error));
+    CHECK(request.generation.prompt && strcmp(request.generation.prompt, "red cube") == 0);
+    CHECK(request.generation.negative_prompt && strcmp(request.generation.negative_prompt, "blur") == 0);
+    CHECK(request.generation.width == 1024 && request.generation.height == 512);
+    CHECK(request.generation.steps == 8);
+    CHECK(fabsf(request.generation.guidance_scale - 1.5f) < 0.0001f);
+    CHECK(request.generation.seed == 42);
+    CHECK(request.generation.lora_count == 0);
+    oimage_request_free(&request);
+
+    const char *loras = "{\"prompt\":\"cat\",\"loras\":["
+                        "{\"path\":\"/models/a.safetensors\",\"scale\":0.75},"
+                        "\"/models/b.safetensors\"]}";
+    CHECK(oimage_request_parse(loras, strlen(loras), &request, error, sizeof error));
+    CHECK(request.direct_lora_paths);
+    CHECK(request.generation.lora_count == 2);
+    CHECK(strcmp(request.generation.loras[0].path, "/models/a.safetensors") == 0);
+    CHECK(fabsf(request.generation.loras[0].scale - 0.75f) < 0.0001f);
+    CHECK(strcmp(request.generation.loras[1].path, "/models/b.safetensors") == 0);
+    CHECK(request.generation.loras[1].scale == 1.0f);
+    oimage_request_free(&request);
+
+    char lora_dir[] = "/tmp/omniserve-lora-XXXXXX";
+    CHECK(mkdtemp(lora_dir) != NULL);
+    char lora_path[512];
+    snprintf(lora_path, sizeof lora_path, "%s/pixel_art.safetensors", lora_dir);
+    FILE *lora_file = fopen(lora_path, "wb");
+    CHECK(lora_file != NULL);
+    if (lora_file) fclose(lora_file);
+    setenv("OMNISERVE_NATIVE_LORA_DIR", lora_dir, 1);
+    const char *lora_id = "{\"prompt\":\"cat\",\"lora_id\":\"pixel_art\",\"lora_scale\":0.8}";
+    CHECK(oimage_request_parse(lora_id, strlen(lora_id), &request, error, sizeof error));
+    CHECK(!request.direct_lora_paths);
+    CHECK(request.generation.lora_count == 1);
+    CHECK(strcmp(request.generation.loras[0].path, lora_path) == 0);
+    CHECK(fabsf(request.generation.loras[0].scale - 0.8f) < 0.0001f);
+    oimage_request_free(&request);
+    char named_lora_path[512];
+    snprintf(named_lora_path, sizeof named_lora_path, "%s/Z Image.safetensors", lora_dir);
+    lora_file = fopen(named_lora_path, "wb");
+    CHECK(lora_file != NULL);
+    if (lora_file) fclose(lora_file);
+    const char *named_lora = "{\"prompt\":\"cat\",\"lora_id\":\"z_style\","
+                             "\"lora_filename\":\"Z Image.safetensors\"}";
+    CHECK(oimage_request_parse(named_lora, strlen(named_lora), &request, error, sizeof error));
+    CHECK(request.generation.lora_count == 1);
+    CHECK(strcmp(request.generation.loras[0].path, named_lora_path) == 0);
+    oimage_request_free(&request);
+    const char *unsafe_filename = "{\"prompt\":\"cat\",\"lora_id\":\"z_style\","
+                                  "\"lora_filename\":\"../secret.safetensors\"}";
+    CHECK(!oimage_request_parse(unsafe_filename, strlen(unsafe_filename),
+                                &request, error, sizeof error));
+    char escaped_lora_path[512];
+    snprintf(escaped_lora_path, sizeof escaped_lora_path, "%s/escape.safetensors", lora_dir);
+    CHECK(symlink("/etc/passwd", escaped_lora_path) == 0);
+    const char *escaped_lora = "{\"prompt\":\"cat\",\"lora_id\":\"z_style\","
+                               "\"lora_filename\":\"escape.safetensors\"}";
+    CHECK(!oimage_request_parse(escaped_lora, strlen(escaped_lora),
+                                &request, error, sizeof error));
+    const char *unsafe_lora_id = "{\"prompt\":\"cat\",\"lora_id\":\"../secret\"}";
+    CHECK(!oimage_request_parse(unsafe_lora_id, strlen(unsafe_lora_id),
+                                &request, error, sizeof error));
+    unsetenv("OMNISERVE_NATIVE_LORA_DIR");
+    unlink(escaped_lora_path);
+    unlink(named_lora_path);
+    unlink(lora_path);
+    rmdir(lora_dir);
+
+    const char *exact_seed = "{\"prompt\":\"cat\",\"guidance_scale\":0,"
+                             "\"seed\":9007199254740993}";
+    CHECK(oimage_request_parse(exact_seed, strlen(exact_seed), &request, error, sizeof error));
+    CHECK(request.generation.guidance_scale == 0.0f);
+    CHECK(request.generation.seed == INT64_C(9007199254740993));
+    oimage_request_free(&request);
+
+    const char *aliases = "{\"prompt\":\"cat\",\"num_inference_steps\":7}";
+    CHECK(oimage_request_parse(aliases, strlen(aliases), &request, error, sizeof error));
+    CHECK(request.generation.width == 1024 && request.generation.height == 1024);
+    CHECK(request.generation.steps == 7 && request.generation.seed == 0);
+    oimage_request_free(&request);
+
+    const char *bad_size = "{\"prompt\":\"cat\",\"size\":\"513x512\"}";
+    CHECK(!oimage_request_parse(bad_size, strlen(bad_size), &request, error, sizeof error));
+    CHECK(strstr(error, "64-pixel") != NULL);
+    const char *bad_batch = "{\"prompt\":\"cat\",\"n\":2}";
+    CHECK(!oimage_request_parse(bad_batch, strlen(bad_batch), &request, error, sizeof error));
+    setenv("OMNISERVE_NATIVE_SD_MAX_BATCH", "4", 1);
+    CHECK(oimage_request_parse(bad_batch, strlen(bad_batch), &request, error, sizeof error));
+    CHECK(request.count == 2 && request.generation.batch_count == 2);
+    oimage_request_free(&request);
+    unsetenv("OMNISERVE_NATIVE_SD_MAX_BATCH");
+    const char *bad_guidance = "{\"prompt\":\"cat\",\"guidance_scale\":NaN}";
+    CHECK(!oimage_request_parse(bad_guidance, strlen(bad_guidance), &request, error, sizeof error));
+    const char *bad_seed = "{\"prompt\":\"cat\",\"seed\":9223372036854775808}";
+    CHECK(!oimage_request_parse(bad_seed, strlen(bad_seed), &request, error, sizeof error));
+    const char *bad_negative = "{\"prompt\":\"cat\",\"negative_prompt\":42}";
+    CHECK(!oimage_request_parse(bad_negative, strlen(bad_negative), &request, error, sizeof error));
+    const char *bad_teleport = "{\"prompt\":\"cat\",\"teleport\":\"true\"}";
+    CHECK(!oimage_request_parse(bad_teleport, strlen(bad_teleport), &request, error, sizeof error));
+    const char *bad_teleport_step =
+        "{\"prompt\":\"cat\",\"steps\":9,\"teleport_start_step\":0}";
+    CHECK(!oimage_request_parse(bad_teleport_step, strlen(bad_teleport_step),
+                                &request, error, sizeof error));
+
+    const char *teleport = "{\"prompt\":\"cat\",\"steps\":9,\"teleport\":true,\"teleport_start_step\":7}";
+    CHECK(oimage_request_parse(teleport, strlen(teleport), &request, error, sizeof error));
+    CHECK(request.generation.teleport && request.generation.teleport_start_step == 7);
+    oimage_request_free(&request);
+
+    const unsigned char image[] = {'a', 'b', 'c'};
+    oimg_result image_result = {
+        .png = (unsigned char *)image,
+        .png_len = sizeof image,
+        .elapsed_ms = 12.6,
+        .teleport_requested = true,
+        .teleport_used = true,
+        .teleport_cache_hit = true,
+        .teleport_capture_step = 6,
+        .teleport_resume_step = 7,
+    };
+    char *json = NULL;
+    size_t json_len = 0;
+    CHECK(oimage_openai_response(&image_result, "z-image", 42,
+                                 &json, &json_len));
+    CHECK(json && json_len == strlen(json));
+    CHECK(strstr(json, "\"b64_json\":\"YWJj\"") != NULL);
+    CHECK(strstr(json, "\"seed\":42") != NULL);
+    CHECK(strstr(json, "\"inference_time_ms\":13") != NULL);
+    CHECK(strstr(json, "\"cache_hit\":true") != NULL);
+    CHECK(strstr(json, "\"resume_step\":7") != NULL);
+    oj_tok response_tokens[32];
+    CHECK(oj_parse(json, json_len, response_tokens, 32) > 0);
+    free(json);
+
+    unsigned char *batch_images[] = {(unsigned char *)image, (unsigned char *)image};
+    size_t batch_lens[] = {sizeof image, sizeof image};
+    oimg_result batch_result = {
+        .images = batch_images,
+        .image_lens = batch_lens,
+        .image_count = 2,
+        .format = "webp",
+        .elapsed_ms = 10.0,
+    };
+    CHECK(oimage_openai_response(&batch_result, "z-image", 7, &json, &json_len));
+    CHECK(strstr(json, "\"format\":\"webp\"") != NULL);
+    CHECK(strstr(json, "\"seed\":7") != NULL);
+    CHECK(strstr(json, "\"seed\":8") != NULL);
+    free(json);
+}
+
 static void test_tier_parse(void) {
     CHECK(otier_parse("paid", 4) == TIER_PAID);
     CHECK(otier_parse("SUB", 3) == TIER_SUB);
@@ -105,8 +262,12 @@ static void test_openapi(void) {
         "/api/v1/generate-large", "/api/v1/image-caption",
         "/v1/animations/generations", "/v1/3d/generations",
         "/v1/images/backgrounds",
+        "/v1/images/foreground-generations/jobs",
+        "/v1/images/foreground-generations/jobs/{job_id}",
         "/v1/images/background-removals/jobs",
         "/v1/images/background-removals",
+        "/v1/images/captions", "/v1/images/classifications",
+        "/v1/classifications", "/v1/video/generations", "/loras",
         "/v1/3d/assets/{job}/{file}",
         "/v1/engines/{engine_name}/completions",
     };
@@ -167,6 +328,90 @@ static void test_sched_priority(void) {
     osched_destroy(s);
 }
 
+/* Saturation is the case the queue exists for, so it is the case worth testing.
+ * Many more threads than slots, mixed tiers, every one of them hammering the
+ * admission path: the cap must hold exactly, and nobody may be lost - a handoff
+ * that signals the wrong waiter shows up here as a thread that never wakes. */
+typedef struct {
+    osched *s;
+    otier tier;
+    int rounds;
+    _Atomic int *inflight;
+    _Atomic int *peak;
+    _Atomic int *admitted;
+} sched_stress_job;
+
+static void *sched_stress_worker(void *arg) {
+    sched_stress_job *j = arg;
+    for (int i = 0; i < j->rounds; i++) {
+        if (!osched_acquire_n(j->s, j->tier, 1)) continue;
+        int now = atomic_fetch_add(j->inflight, 1) + 1;
+        int seen = atomic_load(j->peak);
+        while (now > seen && !atomic_compare_exchange_weak(j->peak, &seen, now)) {
+        }
+        atomic_fetch_add(j->admitted, 1);
+        atomic_fetch_sub(j->inflight, 1);
+        osched_release_n(j->s, j->tier, 1);
+    }
+    return NULL;
+}
+
+static void test_sched_saturation(void) {
+    enum { THREADS = 48, SLOTS = 4, ROUNDS = 200 };
+    osched *s = osched_create(SLOTS, 30);
+    _Atomic int inflight = 0, peak = 0, admitted = 0;
+    static const otier tiers[3] = {TIER_PAID, TIER_SUB, TIER_FREE};
+
+    pthread_t workers[THREADS];
+    sched_stress_job jobs[THREADS];
+    for (int i = 0; i < THREADS; i++) {
+        jobs[i] = (sched_stress_job){ .s = s, .tier = tiers[i % 3], .rounds = ROUNDS,
+                                      .inflight = &inflight, .peak = &peak,
+                                      .admitted = &admitted };
+        CHECK(pthread_create(&workers[i], NULL, sched_stress_worker, &jobs[i]) == 0);
+    }
+    for (int i = 0; i < THREADS; i++) pthread_join(workers[i], NULL);
+
+    CHECK(atomic_load(&admitted) == THREADS * ROUNDS);
+    CHECK(atomic_load(&peak) <= SLOTS);
+    CHECK(atomic_load(&inflight) == 0);
+    CHECK(osched_active(s) == 0);
+
+    osched_stats st;
+    osched_snapshot(s, &st);
+    CHECK(st.used_slots == 0);
+    CHECK(st.waiting[TIER_PAID] == 0 && st.waiting[TIER_FREE] == 0);
+    CHECK(st.served[TIER_PAID] + st.served[TIER_SUB] + st.served[TIER_FREE] ==
+          (long)THREADS * ROUNDS);
+    CHECK(st.timed_out[TIER_PAID] == 0 && st.timed_out[TIER_FREE] == 0);
+    osched_destroy(s);
+}
+
+/* A waiter that gives up must not take the slot it was queued for with it, and
+ * must leave the queue in a state where the next one still gets promoted. */
+static void test_sched_timeout_releases_the_queue(void) {
+    osched *s = osched_create(1, 0.05);
+    CHECK(osched_acquire(s, TIER_FREE));
+
+    atomic_int order = 0;
+    sched_job late = { .s = s, .tier = TIER_FREE, .order = &order, .hold_us = 0 };
+    pthread_t thread;
+    pthread_create(&thread, NULL, sched_worker, &late);
+    pthread_join(thread, NULL);
+    CHECK(late.got == -1);  /* timed out while the slot was held */
+
+    osched_stats st;
+    osched_snapshot(s, &st);
+    CHECK(st.timed_out[TIER_FREE] == 1);
+    CHECK(st.waiting[TIER_FREE] == 0);
+    CHECK(st.used_slots == 1);  /* still exactly the one live holder */
+
+    osched_release(s, TIER_FREE);
+    CHECK(osched_acquire(s, TIER_PAID));
+    osched_release(s, TIER_PAID);
+    osched_destroy(s);
+}
+
 static void test_sched_timeout(void) {
     osched *s = osched_create(1, 1);
     CHECK(osched_acquire(s, TIER_FREE));
@@ -220,10 +465,80 @@ static bool relay_to_http_client(const void *data, size_t len, void *user) {
 
 typedef struct {
     oproxy_target *target;
+    oproxy_target *bare_target;
 } echo_context;
+
+typedef struct {
+    uint16_t port;
+    const char *response;
+    atomic_bool ready;
+    atomic_bool failed;
+} raw_http_context;
+
+static void *raw_http_server(void *arg) {
+    raw_http_context *context = arg;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        atomic_store(&context->failed, true);
+        atomic_store(&context->ready, true);
+        return NULL;
+    }
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(context->port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(fd, 1) != 0) {
+        close(fd);
+        atomic_store(&context->failed, true);
+        atomic_store(&context->ready, true);
+        return NULL;
+    }
+    atomic_store(&context->ready, true);
+    int client = accept(fd, NULL, NULL);
+    if (client >= 0) {
+        char buf[1024];
+        ssize_t ignored = read(client, buf, sizeof buf);
+        (void)ignored;
+        const char *p = context->response;
+        size_t remaining = strlen(context->response);
+        while (remaining) {
+            ssize_t n = write(client, p, remaining);
+            if (n <= 0) break;
+            p += n;
+            remaining -= (size_t)n;
+        }
+        close(client);
+    } else {
+        atomic_store(&context->failed, true);
+    }
+    close(fd);
+    return NULL;
+}
 
 static void echo_handler(ohttp_request *req, void *user) {
     echo_context *context = user;
+    if (ohttp_path_is(req, "/relay-bare")) {
+        oproxy_result result;
+        char error[128];
+        bool ok = oproxy_target_relay(
+            context->bare_target,
+            req->method, req->method_len,
+            "/bare", 5,
+            req->query, req->query_len,
+            req->body, req->body_len,
+            "application/json", 16,
+            NULL, 0, 2000,
+            relay_to_http_client, req,
+            &result, error, sizeof error);
+        if (!ok && !result.response_started) {
+            ohttp_respond_str(req, 502, "text/plain", error);
+        } else if (!ok || result.downstream_close) {
+            ohttp_force_close(req);
+        }
+        return;
+    }
     if (ohttp_path_is(req, "/relay") || ohttp_path_is(req, "/relay-stream")) {
         const char *target = ohttp_path_is(req, "/relay-stream") ? "/stream" : "/echo";
         oproxy_result result;
@@ -369,8 +684,11 @@ static void test_http_server(void) {
     echo_context context = {
         .target = oproxy_target_create("http://127.0.0.1:18791", 4,
                                        target_error, sizeof target_error),
+        .bare_target = oproxy_target_create("http://127.0.0.1:18792", 1,
+                                            target_error, sizeof target_error),
     };
     CHECK(context.target != NULL);
+    CHECK(context.bare_target != NULL);
     ohttp_config cfg = { .port = 18791, .reactor_threads = 1, .worker_threads = 4,
                          .handler = echo_handler, .user = &context };
     ohttp_server *srv = ohttp_start(&cfg);
@@ -396,6 +714,26 @@ static void test_http_server(void) {
 
     r = http_roundtrip(18791, "POST /relay?source=gateway HTTP/1.1\r\nHost: x\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"relay\":true}", NULL);
     CHECK(r && strstr(r, "HTTP/1.1 200 OK") && strstr(r, "{\"relay\":true}"));
+    free(r);
+
+    raw_http_context raw_context = {
+        .port = 18792,
+        .response = "HTTP/1.1 401 Unauthorized\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: 20\r\n"
+                    "Connection: close\r\n\r\n"
+                    "{\"detail\":\"invalid\"}",
+    };
+    pthread_t raw_thread;
+    pthread_create(&raw_thread, NULL, raw_http_server, &raw_context);
+    while (!atomic_load(&raw_context.ready)) usleep(1000);
+    CHECK(!atomic_load(&raw_context.failed));
+    r = http_roundtrip(18791, "POST /relay-bare HTTP/1.1\r\nHost: x\r\nOrigin: https://text-generator.io\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}", NULL);
+    pthread_join(raw_thread, NULL);
+    CHECK(r && strstr(r, "HTTP/1.1 401 Unauthorized"));
+    CHECK(r && strstr(r, "Access-Control-Allow-Origin: *"));
+    CHECK(r && strstr(r, "Content-Type: application/json\r\n"));
+    CHECK(r && strstr(r, "{\"detail\":\"invalid\"}"));
     free(r);
 
     r = http_roundtrip(18791, "GET /relay-stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
@@ -487,6 +825,7 @@ static void test_http_server(void) {
     ohttp_stop(srv);
     CHECK(ohttp_join(srv) == 0);
     oproxy_target_destroy(context.target);
+    oproxy_target_destroy(context.bare_target);
 }
 
 /* A lane that is already justified and under pressure, so each test can turn
@@ -1389,12 +1728,15 @@ int main(void) {
     test_host_prefetch_policy();
     test_vram_arbitration();
     test_json();
+    test_image_contract();
     test_matte();
     test_tier_parse();
     test_completion_spacing();
     test_openapi();
     test_sched_priority();
     test_sched_timeout();
+    test_sched_timeout_releases_the_queue();
+    test_sched_saturation();
     test_sched_weighted_capacity();
     test_scale_defaults_to_zero();
     test_scale_only_for_eligible_tiers();

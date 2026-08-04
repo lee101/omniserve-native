@@ -2,6 +2,7 @@
 #include "obackend.h"
 #include "ocapacity.h"
 #include "ohttp.h"
+#include "oimage.h"
 #include "ojson.h"
 #include "olog.h"
 #include "oproxy.h"
@@ -30,6 +31,7 @@ typedef struct {
     oproxy_target *birefnet_upstream;
     oproxy_target *tts_upstream;
     oproxy_target *stt_upstream;
+    oproxy_target *forecast_upstream;
     oproxy_target *training_upstream;
     oproxy_target *embedding_upstream;
     oproxy_target *multimodal_upstream;
@@ -43,12 +45,14 @@ typedef struct {
     int birefnet_permits;
     int tts_permits;
     int stt_permits;
+    int forecast_permits;
     int training_permits;
     int embedding_permits;
     int multimodal_permits;
     int animation_permits;
     int threed_permits;
     int aux_permits;
+    bool prefer_embedded_image;
     oscale *scale;
     ocapacity *capacity;
     ovram *vram;
@@ -134,7 +138,11 @@ static otier request_tier(const ohttp_request *req) {
     if (!request_is_internal(req)) return otier_parse_public(NULL, 0);
     size_t len = 0;
     const char *v = ohttp_req_header(req, "X-Omniserve-Tier", &len);
-    return otier_parse_public(v, (int)len);
+    /* Internal callers are the only callers allowed to request the true
+     * background lane.  otier_parse_public deliberately collapses background
+     * to free, which would let a batch image occupy ordinary serving capacity
+     * instead of waiting for an otherwise-idle GPU. */
+    return otier_parse(v, (int)len);
 }
 
 static void respond_error(ohttp_request *req, int status, const char *msg) {
@@ -328,13 +336,14 @@ static void handle_readyz(ohttp_request *req) {
 static void handle_status(ohttp_request *req, app_state *app) {
     osched_stats stats;
     osched_snapshot(app->sched, &stats);
-    oproxy_stats llm_proxy, image_proxy, birefnet_proxy, tts_proxy, stt_proxy;
+    oproxy_stats llm_proxy, image_proxy, birefnet_proxy, tts_proxy, stt_proxy, forecast_proxy;
     oproxy_stats embedding_proxy, multimodal_proxy, animation_proxy, threed_proxy, aux_proxy;
     oproxy_target_snapshot(app->llm_upstream, &llm_proxy);
     oproxy_target_snapshot(app->image_upstream, &image_proxy);
     oproxy_target_snapshot(app->birefnet_upstream, &birefnet_proxy);
     oproxy_target_snapshot(app->tts_upstream, &tts_proxy);
     oproxy_target_snapshot(app->stt_upstream, &stt_proxy);
+    oproxy_target_snapshot(app->forecast_upstream, &forecast_proxy);
     oproxy_target_snapshot(app->embedding_upstream, &embedding_proxy);
     oproxy_target_snapshot(app->multimodal_upstream, &multimodal_proxy);
     oproxy_target_snapshot(app->animation_upstream, &animation_proxy);
@@ -357,9 +366,9 @@ static void handle_status(ohttp_request *req, app_state *app) {
              "\"diffusion\":{\"ready\":%s,\"model\":\"%s\"},"
              /* Key order must track the argument order below, which matches the
               * permits object: llm, image, birefnet, tts, stt, ... */
-             "\"upstreams\":{\"llm\":%s,\"image\":%s,\"art\":%s,\"birefnet\":%s,\"tts\":%s,\"stt\":%s,"
+             "\"upstreams\":{\"llm\":%s,\"image\":%s,\"art\":%s,\"birefnet\":%s,\"tts\":%s,\"stt\":%s,\"forecast\":%s,"
              "\"embedding\":%s,\"multimodal\":%s,\"animation\":%s,\"threed\":%s,\"aux\":%s},"
-             "\"permits\":{\"llm\":%d,\"image\":%d,\"art\":%d,\"birefnet\":%d,\"tts\":%d,\"stt\":%d,"
+             "\"permits\":{\"llm\":%d,\"image\":%d,\"art\":%d,\"birefnet\":%d,\"tts\":%d,\"stt\":%d,\"forecast\":%d,"
              "\"embedding\":%d,\"multimodal\":%d,\"animation\":%d,\"threed\":%d,\"aux\":%d},"
              "\"proxy_pool\":{"
              "\"llm\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
@@ -367,6 +376,7 @@ static void handle_status(ohttp_request *req, app_state *app) {
              "\"birefnet\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"tts\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"stt\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
+             "\"forecast\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"embedding\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"multimodal\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"animation\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
@@ -390,12 +400,13 @@ static void handle_status(ohttp_request *req, app_state *app) {
              app->art_upstream ? "true" : "false",
              app->birefnet_upstream ? "true" : "false",
              app->tts_upstream ? "true" : "false", app->stt_upstream ? "true" : "false",
+             app->forecast_upstream ? "true" : "false",
              app->embedding_upstream ? "true" : "false",
              app->multimodal_upstream ? "true" : "false",
              app->animation_upstream ? "true" : "false",
              app->threed_upstream ? "true" : "false", app->aux_upstream ? "true" : "false",
              app->llm_permits, app->image_permits, app->art_permits, app->birefnet_permits,
-             app->tts_permits, app->stt_permits,
+             app->tts_permits, app->stt_permits, app->forecast_permits,
              app->embedding_permits, app->multimodal_permits, app->animation_permits,
              app->threed_permits, app->aux_permits,
              llm_proxy.idle_connections, llm_proxy.connections_opened,
@@ -408,6 +419,8 @@ static void handle_status(ohttp_request *req, app_state *app) {
              tts_proxy.connections_reused, tts_proxy.failures,
              stt_proxy.idle_connections, stt_proxy.connections_opened,
              stt_proxy.connections_reused, stt_proxy.failures,
+             forecast_proxy.idle_connections, forecast_proxy.connections_opened,
+             forecast_proxy.connections_reused, forecast_proxy.failures,
              embedding_proxy.idle_connections, embedding_proxy.connections_opened,
              embedding_proxy.connections_reused, embedding_proxy.failures,
              multimodal_proxy.idle_connections, multimodal_proxy.connections_opened,
@@ -474,6 +487,8 @@ static void handle_models(ohttp_request *req, const app_state *app) {
                                     "upstream-tts", "tts", "proxy");
     if (app->stt_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_STT_MODEL") ?:
                                     "upstream-stt", "stt", "proxy");
+    if (app->forecast_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_FORECAST_MODEL") ?:
+                                         "amazon/chronos-2", "forecast", "proxy");
     if (app->embedding_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_EMBEDDING_MODEL") ?:
                                           "upstream-embedding", "embedding", "proxy");
     if (app->multimodal_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_MULTIMODAL_MODEL") ?:
@@ -1246,38 +1261,46 @@ static void handle_images(ohttp_request *req, app_state *app) {
         respond_error(req, 503, "no diffusion model loaded; start with OMNISERVE_NATIVE_SD_MODEL");
         return;
     }
-    oj_tok *toks = malloc(sizeof(oj_tok) * MAX_TOKS);
-    if (!toks) { respond_error(req, 500, "allocation failed"); return; }
-    int n = oj_parse(req->body, req->body_len, toks, MAX_TOKS);
-    if (n <= 0 || toks[0].type != OJ_OBJECT) { free(toks); respond_error(req, 400, "invalid JSON body"); return; }
-    int p = oj_obj_get(req->body, toks, n, 0, "prompt");
-    if (p < 0 || toks[p].type != OJ_STRING) { free(toks); respond_error(req, 400, "prompt required"); return; }
-    char *prompt = oj_strdup(req->body, &toks[p]);
-    if (!prompt) { free(toks); respond_error(req, 500, "allocation failed"); return; }
-
-    oimg_req ireq = { .prompt = prompt, .width = 768, .height = 768, .steps = 4, .seed = -1 };
-    int t = oj_obj_get(req->body, toks, n, 0, "width");
-    if (t >= 0) ireq.width = (int)oj_number(req->body, &toks[t], 768);
-    t = oj_obj_get(req->body, toks, n, 0, "height");
-    if (t >= 0) ireq.height = (int)oj_number(req->body, &toks[t], 768);
-    t = oj_obj_get(req->body, toks, n, 0, "steps");
-    if (t >= 0) ireq.steps = (int)oj_number(req->body, &toks[t], 4);
-
-    free(toks);
+    oimage_request image_request;
+    char parse_error[160];
+    if (!oimage_request_parse(req->body, req->body_len, &image_request,
+                              parse_error, sizeof parse_error)) {
+        respond_error(req, 400, parse_error);
+        return;
+    }
+    if (image_request.direct_lora_paths && !request_is_internal(req)) {
+        oimage_request_free(&image_request);
+        respond_error(req, 403, "public image requests must use a cache-validated lora_id");
+        return;
+    }
     otier tier = request_tier(req);
     int permits = tier == TIER_BACKGROUND ? osched_capacity(app->sched) : app->image_permits;
     if (!osched_acquire_n(app->sched, tier, permits)) {
-        free(prompt);
+        oimage_request_free(&image_request);
         respond_error(req, 503, "admission timeout; retry");
         return;
     }
     oimg_result result;
-    bool ok = osd_generate(&ireq, &result);
+    bool ok = osd_generate(&image_request.generation, &result);
     osched_release_n(app->sched, tier, permits);
-    free(prompt);
-    if (!ok) { respond_error(req, 500, "image generation failed"); return; }
-    ohttp_respond(req, 200, "image/png", (const char *)result.png, result.png_len);
+    if (!ok) {
+        oimage_request_free(&image_request);
+        respond_error(req, 500, "image generation failed");
+        return;
+    }
+    char *json = NULL;
+    size_t json_len = 0;
+    ok = oimage_openai_response(&result, osd_model_name(),
+                                image_request.generation.seed,
+                                &json, &json_len);
     osd_result_free(&result);
+    oimage_request_free(&image_request);
+    if (!ok) {
+        respond_error(req, 500, "image response encoding failed");
+        return;
+    }
+    ohttp_respond(req, 200, "application/json", json, json_len);
+    free(json);
 }
 
 static bool path_starts_with(const ohttp_request *req, const char *prefix) {
@@ -1306,6 +1329,38 @@ static bool request_forces_local_model(const ohttp_request *req) {
     size_t value_len = 0;
     const char *value = ohttp_req_header(req, "X-Omniserve-Internal", &value_len);
     return value && value_len == 5 && strncasecmp(value, "local", 5) == 0;
+}
+
+static bool request_has_structured_chat_content(const ohttp_request *req) {
+    /* Embedded llama.cpp currently accepts string message content only. OpenAI
+     * image/audio messages encode content as an array of typed parts, so detect
+     * that shape before entering the local parser and send it to the configured
+     * Gemma multimodal worker instead. Text-only typed arrays follow the same
+     * path, preserving the OpenAI contract rather than dropping the message. */
+    oj_tok *toks = malloc(sizeof(oj_tok) * MAX_TOKS);
+    if (!toks) return false;
+    int n = oj_parse(req->body, req->body_len, toks, MAX_TOKS);
+    if (n <= 0 || toks[0].type != OJ_OBJECT) {
+        free(toks);
+        return false;
+    }
+    int messages = oj_obj_get(req->body, toks, n, 0, "messages");
+    if (messages < 0 || toks[messages].type != OJ_ARRAY) {
+        free(toks);
+        return false;
+    }
+    bool structured = false;
+    for (int i = 0; i < toks[messages].size; i++) {
+        int message = oj_arr_at(toks, n, messages, i);
+        if (message < 0 || toks[message].type != OJ_OBJECT) continue;
+        int content = oj_obj_get(req->body, toks, n, message, "content");
+        if (content >= 0 && toks[content].type == OJ_ARRAY) {
+            structured = true;
+            break;
+        }
+    }
+    free(toks);
+    return structured;
 }
 
 static void handle_embedding(ohttp_request *req, bool openai_shape) {
@@ -1654,7 +1709,10 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/v1/chat/completions")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
-        if (app->aux_upstream && env_flag("OMNISERVE_NATIVE_CHAT_COMPAT_PROXY", 0) &&
+        if (request_has_structured_chat_content(req)) {
+            oproxy_target *target = app->multimodal_upstream ? app->multimodal_upstream : app->aux_upstream;
+            handle_proxy(req, app, target, app->multimodal_permits, "application/json");
+        } else if (app->aux_upstream && env_flag("OMNISERVE_NATIVE_CHAT_COMPAT_PROXY", 0) &&
             !request_forces_local_model(req)) {
             handle_proxy(req, app, app->aux_upstream, app->llm_permits, "application/json");
         } else if (app->llm_upstream) {
@@ -1717,13 +1775,56 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/v1/images/generations")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
-        if (app->image_upstream) {
+        if (app->image_upstream &&
+            !(app->prefer_embedded_image && osd_ready())) {
             handle_proxy_as(req, app, app->image_upstream, app->image_permits,
                             "application/json",
                             configured_path("OMNISERVE_NATIVE_IMAGE_GENERATE_PATH",
                                             "/v1/images/generations"));
         }
         else handle_images(req, app);
+        return;
+    }
+    /* OmniServe's vision/video control-plane surface is part of the public
+     * native gateway too. Keep one upstream and preserve the exact path so
+     * models, LoRAs, validation and capacity decisions stay centralized. */
+    if (ohttp_path_is(req, "/v1/images/captions") ||
+        ohttp_path_is(req, "/v1/images/classifications") ||
+        ohttp_path_is(req, "/v1/classifications")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_proxy_as(req, app, app->image_upstream, app->image_permits,
+                        "application/json", NULL);
+        return;
+    }
+    if (ohttp_path_is(req, "/v1/video/generations")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        /* Video is a batch-sized model. It may use idle capacity but must not
+         * occupy interactive slots while image, speech or text work waits. */
+        handle_proxy_as_tier(req, app, app->image_upstream, app->image_permits,
+                             "application/json", NULL, TIER_BACKGROUND);
+        return;
+    }
+    if (ohttp_path_is(req, "/loras")) {
+        if (!ohttp_method_is(req, "GET")) { respond_error(req, 405, "GET required"); return; }
+        handle_proxy_as(req, app, app->image_upstream, 1, NULL, NULL);
+        return;
+    }
+    /* Style transfer over an existing backdrop, same lane and same tier as the
+     * art above. The cutout worker uses this to restyle the backdrop it solved
+     * for rather than inventing an unrelated one, so the replacement inherits
+     * the original's lighting. GET, because that is the upstream's shape. */
+    if (ohttp_path_is(req, "/v1/images/backgrounds/style")) {
+        if (!ohttp_method_is(req, "GET") && !ohttp_method_is(req, "POST")) {
+            respond_error(req, 405, "GET or POST required");
+            return;
+        }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_proxy_as_tier(
+            req, app, app->art_upstream, app->art_permits, NULL,
+            configured_path("OMNISERVE_NATIVE_ART_STYLE_PATH", "/style_transfer_and_upload_image"),
+            TIER_BACKGROUND);
         return;
     }
     if (ohttp_path_is(req, "/v1/images/backgrounds") ||
@@ -1743,6 +1844,24 @@ static void route(ohttp_request *req, void *user) {
      * at the caller's own tier instead of the whole background capacity, or a
      * poll would block behind the very job it is asking about. */
     if (path_starts_with(req, "/v1/images/background-removals/jobs")) {
+        const bool is_post = ohttp_method_is(req, "POST");
+        if (!is_post && !ohttp_method_is(req, "GET")) {
+            respond_error(req, 405, "GET or POST required");
+            return;
+        }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        char mapped_path[1024];
+        int mapped_len = snprintf(mapped_path, sizeof mapped_path, "%.*s",
+                                  (int)req->path_len, req->path);
+        if (mapped_len <= 0 || mapped_len >= (int)sizeof mapped_path) {
+            respond_error(req, 414, "path too long");
+            return;
+        }
+        handle_proxy_as_tier(req, app, app->birefnet_upstream, 1,
+                             is_post ? "application/json" : NULL, mapped_path, -1);
+        return;
+    }
+    if (path_starts_with(req, "/v1/images/foreground-generations/jobs")) {
         const bool is_post = ohttp_method_is(req, "POST");
         if (!is_post && !ohttp_method_is(req, "GET")) {
             respond_error(req, 405, "GET or POST required");
@@ -1889,6 +2008,16 @@ static void route(ohttp_request *req, void *user) {
         handle_proxy(req, app, app->stt_upstream, app->stt_permits, NULL);
         return;
     }
+    if (ohttp_path_is(req, "/forecast") || ohttp_path_is(req, "/forecast_batch") ||
+        ohttp_path_is(req, "/v1/forecasts")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        const char *mapped_path = ohttp_path_is(req, "/v1/forecasts")
+            ? configured_path("OMNISERVE_NATIVE_FORECAST_PATH", "/forecast") : NULL;
+        handle_proxy_as(req, app, app->forecast_upstream, app->forecast_permits,
+                        "application/json", mapped_path);
+        return;
+    }
     if (ohttp_path_is(req, "/api/v1/generate-bulk") ||
         ohttp_path_is(req, "/api/v1/generate-batch-csv") ||
         ohttp_path_is(req, "/api/discord")) {
@@ -1935,6 +2064,7 @@ int main(int argc, char **argv) {
                  "             _SECRET, _SLOTS, _LLM_UPSTREAM, _IMAGE_UPSTREAM,\n"
                  "             _ART_UPSTREAM, _ART_PATH, _ART_PERMITS,\n"
                  "             _BIREFNET_UPSTREAM, _TTS_UPSTREAM, _STT_UPSTREAM,\n"
+                 "             _FORECAST_UPSTREAM, _FORECAST_PERMITS,\n"
                  "             _EMBEDDING_UPSTREAM, _BIREFNET_PERMITS,\n"
                  "             _MULTIMODAL_UPSTREAM, _ANIMATION_UPSTREAM, _AUX_UPSTREAM");
             return 0;
@@ -1953,6 +2083,7 @@ int main(int argc, char **argv) {
     app.birefnet_permits = configured_permits("OMNISERVE_NATIVE_BIREFNET_PERMITS", 1, slots);
     app.tts_permits = configured_permits("OMNISERVE_NATIVE_TTS_PERMITS", 1, slots);
     app.stt_permits = configured_permits("OMNISERVE_NATIVE_STT_PERMITS", 1, slots);
+    app.forecast_permits = configured_permits("OMNISERVE_NATIVE_FORECAST_PERMITS", 1, slots);
     app.training_permits = configured_permits("OMNISERVE_NATIVE_TRAINING_PERMITS", slots, slots);
     app.embedding_permits = configured_permits("OMNISERVE_NATIVE_EMBEDDING_PERMITS", 1, slots);
     app.multimodal_permits = configured_permits("OMNISERVE_NATIVE_MULTIMODAL_PERMITS", 1, slots);
@@ -2003,6 +2134,7 @@ int main(int argc, char **argv) {
         if (paths[0]) ohost_prefetch_start(paths, keep_pct);
     }
     app.secret = getenv("OMNISERVE_NATIVE_SECRET");
+    app.prefer_embedded_image = env_flag("OMNISERVE_NATIVE_IMAGE_PREFER_EMBEDDED", 0);
     const char *workers_env = getenv("OMNISERVE_NATIVE_WORKERS");
     int workers = workers_env ? atoi(workers_env) : 32;
     if (workers < 1) workers = 1;
@@ -2018,6 +2150,7 @@ int main(int argc, char **argv) {
     const char *birefnet_upstream = getenv("OMNISERVE_NATIVE_BIREFNET_UPSTREAM");
     const char *tts_upstream = getenv("OMNISERVE_NATIVE_TTS_UPSTREAM");
     const char *stt_upstream = getenv("OMNISERVE_NATIVE_STT_UPSTREAM");
+    const char *forecast_upstream = getenv("OMNISERVE_NATIVE_FORECAST_UPSTREAM");
     const char *training_upstream = getenv("OMNISERVE_NATIVE_TRAINING_UPSTREAM");
     const char *embedding_upstream = getenv("OMNISERVE_NATIVE_EMBEDDING_UPSTREAM");
     const char *multimodal_upstream = getenv("OMNISERVE_NATIVE_MULTIMODAL_UPSTREAM");
@@ -2030,6 +2163,7 @@ int main(int argc, char **argv) {
     if (!birefnet_upstream) birefnet_upstream = unified_upstream;
     if (!tts_upstream) tts_upstream = unified_upstream;
     if (!stt_upstream) stt_upstream = unified_upstream;
+    if (!forecast_upstream) forecast_upstream = unified_upstream;
     if (!aux_upstream) aux_upstream = unified_upstream;
     if (!embedding_upstream) embedding_upstream = aux_upstream;
     if (!multimodal_upstream) multimodal_upstream = aux_upstream ? aux_upstream : image_upstream;
@@ -2049,6 +2183,7 @@ int main(int argc, char **argv) {
     CREATE_UPSTREAM(birefnet_upstream, birefnet_upstream, "birefnet");
     CREATE_UPSTREAM(tts_upstream, tts_upstream, "TTS");
     CREATE_UPSTREAM(stt_upstream, stt_upstream, "STT");
+    CREATE_UPSTREAM(forecast_upstream, forecast_upstream, "forecast");
     CREATE_UPSTREAM(training_upstream, training_upstream, "training");
     CREATE_UPSTREAM(embedding_upstream, embedding_upstream, "embedding");
     CREATE_UPSTREAM(multimodal_upstream, multimodal_upstream, "multimodal");
@@ -2128,6 +2263,7 @@ int main(int argc, char **argv) {
         }
     }
     const char *sd = getenv("OMNISERVE_NATIVE_SD_MODEL");
+    if (!sd || !sd[0]) sd = getenv("OMNISERVE_NATIVE_SD_DIFFUSION_MODEL");
     if (sd && sd[0]) {
         fprintf(stderr, "loading diffusion %s\n", sd);
         if (!osd_init(sd)) fprintf(stderr, "diffusion load failed\n");
@@ -2190,6 +2326,7 @@ int main(int argc, char **argv) {
     oproxy_target_destroy(app.birefnet_upstream);
     oproxy_target_destroy(app.tts_upstream);
     oproxy_target_destroy(app.stt_upstream);
+    oproxy_target_destroy(app.forecast_upstream);
     oproxy_target_destroy(app.training_upstream);
     oproxy_target_destroy(app.embedding_upstream);
     oproxy_target_destroy(app.multimodal_upstream);

@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "defaults": {
+    "steps": 9,
+    "guidance_scale": 0.0,
+    "auto_lora": false,
+    "enhance_prompt": false,
+    "quality_retry": false,
+    "low_priority": true
+  },
+  "gates": {
+    "clip_image_cosine_min": 0.70,
+    "clip_prompt_delta_min": -0.04,
+    "aesthetic_delta_min": -0.75,
+    "candidate_entropy_min": 3.0,
+    "candidate_stddev_min": 8.0
+  },
+  "cases": [
+    {
+      "id": "product_glass_robot",
+      "category": "product",
+      "prompt": "cinematic product photo of a translucent glass robot toy on a white seamless studio background",
+      "size": "512x512",
+      "seed": 4201
+    },
+    {
+      "id": "pixel_game_asset",
+      "category": "game",
+      "prompt": "minecraft dirt block inventory icon, centered, crisp pixel game asset, plain background",
+      "size": "512x512",
+      "seed": 4202
+    },
+    {
+      "id": "portrait_hands",
+      "category": "people",
+      "prompt": "documentary portrait of a ceramic artist shaping clay on a wheel, both hands clearly visible, warm workshop light",
+      "size": "512x768",
+      "seed": 4203
+    },
+    {
+      "id": "fantasy_character",
+      "category": "character",
+      "prompt": "full body fantasy elf ranger in detailed practical leather armor, forest ruins, natural anatomy, cinematic concept art",
+      "size": "512x768",
+      "seed": 4204
+    },
+    {
+      "id": "neon_city",
+      "category": "environment",
+      "prompt": "wide cyberpunk street market in neon rain, layered depth, readable silhouettes, cinematic night photography",
+      "size": "768x512",
+      "seed": 4205
+    },
+    {
+      "id": "fintech_card",
+      "category": "ebank",
+      "prompt": "premium fintech debit card floating above a dark emerald glass surface, restrained gold accents, polished product advertising, no logos",
+      "size": "768x512",
+      "seed": 4206
+    },
+    {
+      "id": "racing_key_art",
+      "category": "v5games",
+      "prompt": "dynamic racing game key art, futuristic electric sports car cornering on a coastal circuit at sunset, clean composition, no text",
+      "size": "768x512",
+      "seed": 4207
+    },
+    {
+      "id": "typography_sign",
+      "category": "text",
+      "prompt": "minimal studio photograph of a red cube beside a white sign that reads EXACTLY: BUILD FAST, TEST DEEP",
+      "size": "512x512",
+      "seed": 4208
+    }
+  ]
+}
