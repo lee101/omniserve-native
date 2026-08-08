@@ -1,0 +1,34 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: make test all
+      - name: Package Linux x86_64 artifact
+        run: |
+          mkdir -p dist/omniserve-native-linux-x86_64/models
+          install -m 0755 build/omniserve dist/omniserve-native-linux-x86_64/omniserve
+          install -m 0644 models/models.csv dist/omniserve-native-linux-x86_64/models/models.csv
+          cp README.md dist/omniserve-native-linux-x86_64/
+          tar -C dist -czf dist/omniserve-native-linux-x86_64.tar.gz omniserve-native-linux-x86_64
+          sha256sum dist/omniserve-native-linux-x86_64.tar.gz > dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omniserve-native-linux-x86_64
+          path: |
+            dist/omniserve-native-linux-x86_64.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error

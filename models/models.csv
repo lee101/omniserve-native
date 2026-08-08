@@ -1,5 +1,6 @@
 # id,label,weights_mib,runtime_mib
 qwen2.5-7b-q4,Qwen 2.5 7B Q4,4608,1536
+qwen2.5-7b-qlora,Qwen 2.5 7B QLoRA chat,4608,2048
 llama-3.1-8b-q4,Llama 3.1 8B Q4,5120,1792
 qwen2.5-14b-q4,Qwen 2.5 14B Q4,9216,2048
 llama-3.1-70b-q4,Llama 3.1 70B Q4,43008,4096
