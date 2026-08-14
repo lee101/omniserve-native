@@ -1,0 +1,57 @@
+FROM ubuntu:22.04 AS native-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY src/jobs.c src/jobs.h src/jobctl.c ./src/
+RUN cc -D_POSIX_C_SOURCE=200809L -Isrc -std=c17 -Wall -Wextra -Wpedantic -Werror -O2 \
+    src/jobctl.c src/jobs.c -lsqlite3 -o /out-omni-job
+
+FROM ghcr.io/lee101/h3-cog@sha256:632903993661f8e63c79d67dadbe28e300081d88c9c1dc22376f4cb95ad0c353
+
+# WebM alpha is carried as a separate VP9 plane. Both directions are required:
+# encoding alone is insufficient for the worker's post-mux validation.
+RUN /usr/bin/ffmpeg -hide_banner -encoders 2>&1 | grep -q 'libvpx-vp9' \
+    && /usr/bin/ffmpeg -hide_banner -decoders 2>&1 | grep -q 'libvpx-vp9'
+
+# The video person-routing workload imports both packages at runtime.
+RUN python -m pip install --no-cache-dir ultralytics opencv-python-headless
+
+ARG RVM_URL=https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_resnet50_fp32.torchscript
+ARG RVM_SHA256=072adec3c75a1af773ec35d8b595612f8e3472b7a4b8a210684432b493376852
+ARG RVM_SOURCE_COMMIT=53d74c6826735f01f4406b5ca9075eee27bec094
+ARG RVM_STATE_URL=https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_resnet50.pth
+ARG RVM_STATE_SHA256=c191a807251164c073dce5fa408e7a816070d539b882b2a3150330a9fec112ce
+ARG PERSON_DETECTOR_URL=https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt
+ARG PERSON_DETECTOR_SHA256=0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1
+
+RUN mkdir -p /opt/models /opt/omniserve/bin \
+    && curl -fL --retry 3 "$RVM_URL" -o /opt/models/rvm_resnet50_fp32.torchscript \
+    && echo "$RVM_SHA256  /opt/models/rvm_resnet50_fp32.torchscript" | sha256sum -c - \
+    && curl -fL --retry 3 "$RVM_STATE_URL" -o /opt/models/rvm_resnet50.pth \
+    && echo "$RVM_STATE_SHA256  /opt/models/rvm_resnet50.pth" | sha256sum -c - \
+    && curl -fL --retry 3 "$PERSON_DETECTOR_URL" -o /opt/models/yolo11n.pt \
+    && echo "$PERSON_DETECTOR_SHA256  /opt/models/yolo11n.pt" | sha256sum -c - \
+    && mkdir -p /opt/robust-video-matting \
+    && curl -fL --retry 3 "https://github.com/PeterL1n/RobustVideoMatting/archive/$RVM_SOURCE_COMMIT.tar.gz" \
+       | tar -xz --strip-components=1 -C /opt/robust-video-matting
+
+COPY --from=native-builder /out-omni-job /opt/omniserve/bin/omni-job
+COPY runtime /opt/omniserve/runtime
+COPY workloads /opt/omniserve/workloads
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/opt/omniserve \
+    RVM_BACKBONE=resnet50 \
+    RVM_MODEL_PATH=/opt/models/rvm_resnet50_fp32.torchscript \
+    RVM_STATE_PATH=/opt/models/rvm_resnet50.pth \
+    RVM_SOURCE_PATH=/opt/robust-video-matting \
+    RVM_TORCH_COMPILE=0 \
+    RVM_CHUNK_FRAMES=8 \
+    PERSON_DETECTOR_PATH=/opt/models/yolo11n.pt \
+    TORCHINDUCTOR_CACHE_DIR=/runpod-volume/omniserve/torchinductor \
+    VIDEO_BACKGROUND_CACHE=/runpod-volume/omniserve/video-matting \
+    OMNISERVE_WORKLOAD_MANIFEST=/opt/omniserve/workloads/workloads.json \
+    OMNISERVE_DEFAULT_WORKLOAD=video-matting
+
+ENTRYPOINT ["python", "-u", "/opt/omniserve/runtime/handler.py"]

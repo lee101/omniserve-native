@@ -4,3 +4,6 @@ qwen2.5-7b-qlora,Qwen 2.5 7B QLoRA chat,4608,2048
 llama-3.1-8b-q4,Llama 3.1 8B Q4,5120,1792
 qwen2.5-14b-q4,Qwen 2.5 14B Q4,9216,2048
 llama-3.1-70b-q4,Llama 3.1 70B Q4,43008,4096
+anima-2.9b-offload,Anima 2.9B BF16 (CPU offload),7680,10240
+anima-2.9b-bf16,Anima 2.9B BF16 (full CUDA compile),10240,14336
+video-matting-rvm,Video Matting RVM ResNet50,105,1695

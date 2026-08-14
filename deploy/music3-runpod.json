@@ -1,0 +1,15 @@
+{
+  "name": "omniserve-minimax-music3",
+  "workersMin": 0,
+  "workersMax": 2,
+  "idleTimeout": 30,
+  "flashboot": true,
+  "scalerType": "REQUEST_COUNT",
+  "scalerValue": 1,
+  "executionTimeoutMs": 2400000,
+  "allowedCudaVersions": ["13.0"],
+  "minCudaVersion": "13.0",
+  "gpuTypeIds": [
+    "NVIDIA H200"
+  ]
+}

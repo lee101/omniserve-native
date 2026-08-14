@@ -1,0 +1,12 @@
+{
+  "video-matting": {
+    "module": "workloads.video_matting",
+    "required_mib": 1800,
+    "aliases": ["video_background_removal", "video-background-removal", "matting"]
+  },
+  "h3-video": {
+    "module": "workloads.h3_video",
+    "required_mib": 43000,
+    "aliases": ["h3", "video-generation", "minimax-h3"]
+  }
+}

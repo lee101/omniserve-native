@@ -1,0 +1,20 @@
+{
+  "name": "omniserve-native",
+  "workersMin": 0,
+  "workersMax": 3,
+  "idleTimeout": 5,
+  "flashboot": true,
+  "scalerType": "REQUEST_COUNT",
+  "scalerValue": 1,
+  "executionTimeoutMs": 900000,
+  "allowedCudaVersions": ["13.0"],
+  "minCudaVersion": "13.0",
+  "gpuTypeIds": [
+    "NVIDIA A40",
+    "NVIDIA RTX A6000",
+    "NVIDIA RTX 6000 Ada Generation",
+    "NVIDIA L40",
+    "NVIDIA L40S"
+  ],
+  "notes": "Multi-region OmniServe pool with one worker per active request and a 15-minute runaway bound. Workload plugins declare VRAM requirements and release hooks; set OMNISERVE_RUNPOD_USE_NETWORK_VOLUME=1 for regional shared caches."
+}

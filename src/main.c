@@ -173,14 +173,28 @@ static void handle_client(int fd, const Model *models, size_t count, char *activ
 }
 
 int main(int argc, char **argv) {
-    const char *models_path = "models/models.csv", *listen_address = "127.0.0.1"; Model models[MAX_MODELS]; size_t count = 0; char active[64] = ""; Settings settings = {0}; int listener, option = 1; struct sockaddr_in address = { .sin_family = AF_INET, .sin_port = htons(8080) };
-    for (int index = 1; index < argc; index += 2) { if (index + 1 >= argc) { fprintf(stderr, "usage: omniserve [--models PATH] [--listen ADDRESS]\n"); return 2; } if (strcmp(argv[index], "--models") == 0) models_path = argv[index + 1]; else if (strcmp(argv[index], "--listen") == 0) listen_address = argv[index + 1]; else { fprintf(stderr, "unknown option: %s\n", argv[index]); return 2; } }
+    const char *models_path = "models/models.csv", *listen_address = "127.0.0.1";
+    unsigned port = 8080;
+    Model models[MAX_MODELS]; size_t count = 0; char active[64] = ""; Settings settings = {0}; int listener, option = 1;
+    struct sockaddr_in address = { .sin_family = AF_INET };
+    for (int index = 1; index < argc; index += 2) {
+        if (index + 1 >= argc) { fprintf(stderr, "usage: omniserve [--models PATH] [--listen ADDRESS] [--port 1024-65535]\n"); return 2; }
+        if (strcmp(argv[index], "--models") == 0) models_path = argv[index + 1];
+        else if (strcmp(argv[index], "--listen") == 0) listen_address = argv[index + 1];
+        else if (strcmp(argv[index], "--port") == 0) {
+            char tail = 0;
+            if (sscanf(argv[index + 1], "%u%c", &port, &tail) != 1 || port < 1024 || port > 65535) {
+                fprintf(stderr, "invalid port: %s\n", argv[index + 1]); return 2;
+            }
+        } else { fprintf(stderr, "unknown option: %s\n", argv[index]); return 2; }
+    }
+    address.sin_port = htons((uint16_t)port);
     copy_env(settings.local_url, sizeof(settings.local_url), "OMNISERVE_LOCAL_UPSTREAM"); copy_env(settings.remote_url, sizeof(settings.remote_url), "OMNISERVE_REMOTE_UPSTREAM"); copy_env(settings.remote_bearer, sizeof(settings.remote_bearer), "OMNISERVE_REMOTE_BEARER_TOKEN"); copy_env(settings.frontdoor_token, sizeof(settings.frontdoor_token), "OMNISERVE_FRONTDOOR_TOKEN");
     breaker_init(&settings.local_breaker, env_unsigned("OMNISERVE_CIRCUIT_FAILURES", 3), env_unsigned("OMNISERVE_CIRCUIT_COOLDOWN_SECONDS", 30)); breaker_init(&settings.remote_breaker, env_unsigned("OMNISERVE_CIRCUIT_FAILURES", 3), env_unsigned("OMNISERVE_CIRCUIT_COOLDOWN_SECONDS", 30));
     if (load_models(models_path, models, MAX_MODELS, &count) != 0) { fprintf(stderr, "cannot load model catalog: %s\n", models_path); return 1; }
     if (inet_pton(AF_INET, listen_address, &address.sin_addr) != 1) { fprintf(stderr, "--listen must be an IPv4 address\n"); return 2; }
     signal(SIGPIPE, SIG_IGN); listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0 || setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option)) != 0 || bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 || listen(listener, 16) != 0) { perror("server setup"); return 1; }
-    printf("OmniServe listening on http://%s:8080\n", listen_address);
+    printf("OmniServe listening on http://%s:%u\n", listen_address, port);
     for (;;) { int client = accept(listener, NULL, NULL); if (client >= 0) { handle_client(client, models, count, active, &settings); close(client); } else if (errno != EINTR) perror("accept"); }
 }
