@@ -17,10 +17,10 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do nvidia-smi -L | grep -q GPU &&
 Environment=OMNISERVE_NATIVE_BIND=127.0.0.1
 Environment=OMNISERVE_NATIVE_PORT=8791
 Environment=OMNISERVE_NATIVE_LLM_GGUF=/nvme0n1-disk/models/omniserve-native/gemma-roleplay-v2-q8_0.gguf
-# This host's current image/search resident set cannot fit the smallest valid
-# hybrid Gemma split plus its context. Lower hybrid splits exceed llama.cpp's
-# split-input limit, so use deliberate CPU placement instead of crash-looping
-# or silently reporting an absent model.
+# Keep Gemma on CPU in the shared image profile. Full GPU offload leaves less
+# than the VAE decoder's scratch requirement once Z-Image and the search
+# tenants are resident, causing generation to finish denoising and then return
+# HTTP 500 during decode. Hybrid splits exceed this GGUF's split-input limit.
 Environment=OMNISERVE_NATIVE_NGL=0
 Environment=OMNISERVE_NATIVE_CTX=4096
 # One context per admitted request. LLM_PERMITS below is 1, so a second
@@ -54,9 +54,41 @@ Environment=OMNISERVE_NATIVE_RAM_KEEP_FREE_PCT=5
 # Environment=OMNISERVE_NATIVE_IMAGE_OVERFLOW_UPSTREAM=
 # Environment=OMNISERVE_NATIVE_STT_OVERFLOW_UPSTREAM=
 # Environment=OMNISERVE_NATIVE_OVERFLOW_TIERS=paid
-# The Python OmniServe control plane owns Z-Image/LoRA routing and proxies the
-# managed worker on 8100. Keep the public native data plane out of that worker.
+# Embedded Z-Image-Turbo Q4 is the primary image path. Python :8100 stays as
+# LoRA/catalog/worker fallback via IMAGE_WORKER_UPSTREAM; :8790 remains for
+# control-plane image routes that are not yet native.
+Environment=OMNISERVE_NATIVE_SD_DIFFUSION_MODEL=/nvme0n1-disk/models/omniserve-native/zimage-q4/z_image_turbo-Q4_K.gguf
+Environment=OMNISERVE_NATIVE_SD_VAE=/nvme0n1-disk/models/omniserve-native/zimage-q4/split_files/vae/ae.safetensors
+Environment=OMNISERVE_NATIVE_SD_LLM=/nvme0n1-disk/models/omniserve-native/zimage-q4/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
+Environment=OMNISERVE_NATIVE_SD_STREAM_LAYERS=1
+Environment=OMNISERVE_NATIVE_SD_MMAP=1
+Environment=OMNISERVE_NATIVE_SD_EAGER_LOAD=0
+# The search tenant starts after this service and keeps about 4 GiB resident.
+# Budgeting the diffusion graph at 8 GiB left only ~55 MiB once all tenants
+# were warm, so every image size failed before denoising. stable-diffusion.cpp
+# only enables stream_layers when diffusion parameters live on CPU; without
+# this backend assignment the previous stream flag was silently ignored.
+Environment=OMNISERVE_NATIVE_SD_PARAMS_BACKEND=cpu
+Environment=OMNISERVE_NATIVE_SD_MAX_VRAM=2
+Environment=OMNISERVE_NATIVE_SD_ZERO_GUIDANCE=1.0
+# A full-frame 1024px VAE decode exceeds the remaining CUDA headroom on this
+# shared profile after denoising has completed. Use the decoder's overlapped
+# latent tiling so requested 1024x1024 images do not fail at the final stage.
+Environment=OMNISERVE_NATIVE_SD_VAE_TILING=1
+Environment=OMNISERVE_NATIVE_SD_VAE_TILE_X=64
+Environment=OMNISERVE_NATIVE_SD_VAE_TILE_Y=64
+Environment=OMNISERVE_NATIVE_SD_TELEPORT_CACHE_SIZE=32
+Environment=OMNISERVE_NATIVE_IMAGE_PREFER_EMBEDDED=1
+# RA1 fal_zimage LoRAs resolve by basename under this cache-only directory.
+Environment=OMNISERVE_NATIVE_LORA_DIR=/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache
+Environment=OMNISERVE_NATIVE_LORA_REGISTRY=/nvme0n1-disk/code/cutedsl-site/inference/lora_registry.json
+Environment=OMNISERVE_NATIVE_SD_IMAGE_FORMAT=webp
+Environment=OMNISERVE_NATIVE_SD_MAX_BATCH=1
 Environment=OMNISERVE_NATIVE_IMAGE_UPSTREAM=http://127.0.0.1:8790
+Environment=OMNISERVE_NATIVE_IMAGE_WORKER_UPSTREAM=http://127.0.0.1:8100
+# A RunPod adapter for SAM2 object selection and SDXL inpainting. Keep unset
+# until the scale-to-zero image-editor pool is deployed.
+# Environment=OMNISERVE_NATIVE_IMAGE_EDITOR_UPSTREAM=https://image-editor-adapter.example/v1
 Environment=OMNISERVE_NATIVE_IMAGE_GENERATE_PATH=/v1/images/generations
 Environment=OMNISERVE_NATIVE_BIREFNET_UPSTREAM=http://127.0.0.1:9094
 Environment=OMNISERVE_NATIVE_BIREFNET_PERMITS=1
@@ -80,7 +112,8 @@ Environment=OMNISERVE_NATIVE_CHAT_COMPAT_PROXY=1
 Environment=OMNISERVE_NATIVE_MODELS_COMPAT_PROXY=1
 Environment=OMNISERVE_NATIVE_SLOTS=8
 Environment=OMNISERVE_NATIVE_LLM_PERMITS=1
-Environment=OMNISERVE_NATIVE_IMAGE_PERMITS=4
+# Embedded diffusion shares the 5090 with the LLM; keep image concurrency tight.
+Environment=OMNISERVE_NATIVE_IMAGE_PERMITS=1
 Environment=OMNISERVE_NATIVE_TTS_PERMITS=2
 Environment=OMNISERVE_NATIVE_STT_PERMITS=2
 Environment=OMNISERVE_NATIVE_EMBEDDING_PERMITS=1

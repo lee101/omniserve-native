@@ -9,8 +9,10 @@ per request so all VRAM is returned when a background job finishes.
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -304,6 +306,72 @@ def run_job(payload: dict, server_base: str) -> tuple[int, dict]:
     )
 
 
+# TRELLIS.2 segments its input itself when handed an opaque image, with a
+# general-purpose salient-object model. Feeding it a BiRefNet cutout that has
+# already been colour-decontaminated is strictly better in two ways: the matte is
+# sharper on hair and thin structures, and the RGB under the soft edge is the
+# subject's own colour rather than the subject blended with whatever it was
+# photographed against. That second one matters more than it sounds - the
+# backdrop colour in the edge band gets baked into the generated texture and
+# then lit, so a green-screened figure comes back with a green rim that no
+# amount of retexturing removes.
+CUTOUT_BASE = os.getenv("OMNISERVE_3D_CUTOUT_BASE", "http://127.0.0.1:8791").rstrip("/")
+CUTOUT_PATH = os.getenv("OMNISERVE_3D_CUTOUT_PATH", "/v1/images/background-removals")
+CUTOUT_SECRET = os.getenv("OMNISERVE_3D_CUTOUT_SECRET", os.getenv("OMNISERVE_NATIVE_SECRET", ""))
+CUTOUT_TIMEOUT = int(os.getenv("OMNISERVE_3D_CUTOUT_TIMEOUT", "180"))
+CUTOUT_ENABLED = os.getenv("OMNISERVE_3D_CUTOUT", "1") == "1"
+
+
+def prepare_cutout(source_path: Path, job_dir: Path) -> Path:
+    """Replaces the source with a background-removed RGBA version.
+
+    Best effort by design: a cutout service that is down, slow or unhelpful must
+    not fail a 3D job that would have worked without it, so every failure path
+    returns the original image and logs why.
+    """
+    if not CUTOUT_ENABLED:
+        return source_path
+    try:
+        from PIL import Image
+    except ImportError:
+        return source_path
+
+    try:
+        with source_path.open("rb") as handle:
+            data = handle.read()
+        if Image.open(io.BytesIO(data)).mode in {"RGBA", "LA"}:
+            # Already cut out by the caller; segmenting it again would only
+            # erode the matte it already has.
+            return source_path
+    except Exception as error:
+        print(f"3d cutout skipped (unreadable source): {error}", flush=True)
+        return source_path
+
+    payload = json.dumps({
+        "image_url": "data:image/png;base64," + base64.b64encode(data).decode(),
+        "output_format": "png",
+        "decontaminate": True,
+    }).encode()
+    headers = {"Content-Type": "application/json", "Accept": "image/png"}
+    if CUTOUT_SECRET:
+        headers["Authorization"] = f"Bearer {CUTOUT_SECRET}"
+
+    try:
+        request = Request(f"{CUTOUT_BASE}{CUTOUT_PATH}", data=payload, headers=headers)
+        with urlopen(request, timeout=CUTOUT_TIMEOUT) as response:
+            cutout = response.read()
+        image = Image.open(io.BytesIO(cutout))
+        if image.mode != "RGBA":
+            raise ValueError(f"cutout came back as {image.mode}, not RGBA")
+    except Exception as error:
+        print(f"3d cutout skipped: {error}", flush=True)
+        return source_path
+
+    cutout_path = job_dir / "source-cutout.png"
+    image.save(cutout_path, format="PNG")
+    return cutout_path
+
+
 def run_validated_job(
     payload: dict,
     server_base: str,
@@ -342,6 +410,7 @@ def run_validated_job(
 
     try:
         download_image(image_url, source_path)
+        source_path = prepare_cutout(source_path, job_dir)
         command = [
             python,
             str(runner),

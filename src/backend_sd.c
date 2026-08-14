@@ -301,7 +301,19 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     params.sample_params.sample_steps = req->steps > 0 ? req->steps : 4;
     /* Zero is intentional for distilled Flux/Z-Image pipelines. Treating it as
      * an unset sentinel changes both image quality and the latent replay key. */
-    params.sample_params.guidance.txt_cfg = req->guidance_scale;
+    params.sample_params.guidance.txt_cfg = req->guidance_scale == 0.0f
+        ? sd_env_float("OMNISERVE_NATIVE_SD_ZERO_GUIDANCE", 0.0f, 0.0f, 30.0f)
+        : req->guidance_scale;
+    params.vae_tiling_params.enabled = sd_env_flag(
+        "OMNISERVE_NATIVE_SD_VAE_TILING", params.vae_tiling_params.enabled);
+    if (params.vae_tiling_params.enabled) {
+        params.vae_tiling_params.tile_size_x = sd_env_int(
+            "OMNISERVE_NATIVE_SD_VAE_TILE_X", 32, 32, 4096);
+        params.vae_tiling_params.tile_size_y = sd_env_int(
+            "OMNISERVE_NATIVE_SD_VAE_TILE_Y", 32, 32, 4096);
+        params.vae_tiling_params.target_overlap = sd_env_float(
+            "OMNISERVE_NATIVE_SD_VAE_TILE_OVERLAP", 0.5f, 0.0f, 0.95f);
+    }
     params.seed = req->seed;
     params.batch_count = req->batch_count > 0 ? req->batch_count : 1;
     sd_lora_t *loras = NULL;

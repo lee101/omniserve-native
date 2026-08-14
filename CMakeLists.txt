@@ -80,6 +80,13 @@ add_executable(omniserve-native src/main.c src/docs.c src/backend_llama.c src/ba
 target_include_directories(omniserve-native PRIVATE include)
 target_link_libraries(omniserve-native PRIVATE onative_core)
 
+# Capacity-aware local/managed ASR selection.  Keeping this relay in the same C
+# data plane removes the Python HTTP server from every transcription request;
+# model inference remains isolated in its model-specific worker.
+add_executable(omniserve-asr-router src/asr_router.c)
+target_include_directories(omniserve-asr-router PRIVATE include)
+target_link_libraries(omniserve-asr-router PRIVATE onative_core)
+
 if(WITH_LLAMA AND EXISTS "${LLAMA_DIR}/build/bin/libllama.so")
     target_compile_definitions(omniserve-native PRIVATE USE_LLAMA)
     target_include_directories(omniserve-native SYSTEM PRIVATE "${LLAMA_DIR}/include" "${LLAMA_DIR}/ggml/include")
@@ -116,6 +123,12 @@ if(Python3_Interpreter_FOUND)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_asr_router.py"
     )
     add_test(
+        NAME asr_router_native
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_asr_router_native.py"
+    )
+    set_tests_properties(asr_router_native PROPERTIES
+        ENVIRONMENT "OMNISERVE_ASR_ROUTER_BIN=$<TARGET_FILE:omniserve-asr-router>")
+    add_test(
         NAME birefnet_jobs
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_birefnet_jobs.py"
     )
@@ -141,6 +154,12 @@ if(Python3_Interpreter_FOUND)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_forecast_routing.py"
     )
     set_tests_properties(forecast_routing PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    add_test(
+        NAME image_worker_routing
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_image_worker_routing.py"
+    )
+    set_tests_properties(image_worker_routing PROPERTIES
         ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
     # Skips itself when numpy or libomatte.so is missing (CPU-only CI).
     add_test(

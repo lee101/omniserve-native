@@ -1,0 +1,89 @@
+{
+  "base": "http://127.0.0.1:8791",
+  "model": {
+    "llm": "gemma-roleplay-v2-q8_0",
+    "embedding": "gte-modernbert-base-q8_0",
+    "diffusion": "none"
+  },
+  "gpu": {
+    "device_present": true,
+    "requested": true,
+    "placement": "gpu",
+    "device": "NVIDIA GeForce RTX 5090",
+    "kv_type": "q8_0",
+    "flash_attn": true,
+    "degraded": false
+  },
+  "checks": [
+    {
+      "check": "llm.reachable",
+      "ok": true,
+      "detail": "http=200 52ms"
+    },
+    {
+      "check": "llm.cold_determinism",
+      "ok": true,
+      "detail": "identical"
+    },
+    {
+      "check": "llm.prefix_cache_agreement",
+      "ok": true,
+      "detail": "diverges at char 17/17",
+      "score": 1.0
+    },
+    {
+      "check": "llm.prefix_cache_not_corrupt",
+      "ok": true,
+      "detail": "agreement=1.000"
+    },
+    {
+      "check": "llm.prefix_cache_active",
+      "ok": true,
+      "detail": "cached_prompt_tokens=35 cold=88ms warm=74ms (cold reported 19)"
+    },
+    {
+      "check": "llm.prefix_cache_speedup",
+      "ok": true,
+      "detail": "88ms -> 74ms",
+      "score": 1.1918919787954605
+    },
+    {
+      "check": "llm.max_tokens_honored",
+      "ok": true,
+      "detail": "completion_tokens=16"
+    },
+    {
+      "check": "llm.stop_sequence_honored",
+      "ok": true,
+      "detail": "text='Count: one two '"
+    },
+    {
+      "check": "llm.legacy_generate",
+      "ok": true,
+      "detail": "http=200 56ms text='Hi I am bored so looking for something'"
+    },
+    {
+      "check": "llm.max_sentences_honored",
+      "ok": true,
+      "detail": "terminators=0"
+    },
+    {
+      "check": "llm.no_reasoning_leak",
+      "ok": true,
+      "detail": "text='Hi I am bored so looking for something'"
+    },
+    {
+      "check": "llm.task_accuracy",
+      "ok": true,
+      "detail": "7/8; missed How many letters are in the ->'10'",
+      "score": 0.875
+    }
+  ],
+  "metrics": {
+    "llm.prefix_cache_agreement": 1.0,
+    "llm.prefix_cache_speedup": 1.191892,
+    "llm.task_accuracy": 0.875
+  },
+  "failures": [],
+  "regressions": []
+}

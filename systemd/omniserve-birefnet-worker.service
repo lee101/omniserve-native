@@ -10,6 +10,30 @@ Environment=HF_HOME=/nvme0n1-disk/models/huggingface
 Environment=BIREFNET_MODEL=ZhengPeng7/BiRefNet
 Environment=BIREFNET_INPUT_SIZE=1024
 Environment=BIREFNET_PORT=9094
+Environment=BIREFNET_JOB_WORKERS=2
+# Background removal must coexist with the resident LLM/search/image lanes.
+# The cached model is fast enough for this batch endpoint on CPU and never
+# competes for the card's last few GiB of scratch space.
+Environment=BIREFNET_DEVICE=cpu
+Environment=TORCH_HOME=/nvme0n1-disk/models/torch
+Environment=RVM_SOURCE_PATH=/nvme0n1-disk/models/robust-video-matting
+Environment=RVM_BACKBONE=resnet50
+Environment=RVM_STATE_PATH=/nvme0n1-disk/models/robust-video-matting/rvm_resnet50.pth
+Environment=RVM_TORCHSCRIPT_PATH=/nvme0n1-disk/models/robust-video-matting/rvm_resnet50_fp32.torchscript
+# Inductor has a 45-110s cold start and was slightly slower than eager for the
+# resident RVM workload on the production RTX 5090. Keep it available for
+# profiling, but do not put that latency on interactive jobs by default.
+Environment=RVM_TORCH_COMPILE=0
+Environment=RVM_TORCH_COMPILE_MODE=default
+Environment=RVM_CHUNK_FRAMES=8
+Environment=RVM_MIN_FREE_MIB=1536
+Environment=PERSON_DETECTOR_SAMPLES=8
+Environment=PERSON_DETECTOR_CONFIDENCE=0.35
+Environment=VIDEO_MATTING_MAX_PENDING=2
+Environment=VIDEO_MATTING_IDLE_RELEASE_SECONDS=300
+Environment=OMNISERVE_EVENTS_PATH=/nvme0n1-disk/data/omniserve-monitor/events.jsonl
+Environment=OMNISERVE_EVENTS_MAX_BYTES=8388608
+Environment=TORCHINDUCTOR_CACHE_DIR=/nvme0n1-disk/models/torch/inductor-rvm
 ExecStart=/nvme0n1-disk/code/omniserve-native/.venv/bin/python workers/birefnet_worker.py
 Restart=on-failure
 RestartSec=3

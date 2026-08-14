@@ -61,6 +61,12 @@ int omatte_estimate_fb(const float *image, const float *alpha, int h, int w, int
 void omatte_composite(const float *fg, const float *alpha, const float *background_rgb,
                       int h, int w, int depth, float *out);
 
+/* Composites the estimated foreground over a full background *image* of the
+ * same size. background may be NULL, in which case background_rgb (depth
+ * floats) is used, and if that is NULL too the backdrop is black. */
+void omatte_composite_image(const float *fg, const float *alpha, const float *background,
+                            const float *background_rgb, int h, int w, int depth, float *out);
+
 /* True when the library was built with the CUDA backend available. */
 bool omatte_cuda_available(void);
 
@@ -68,6 +74,50 @@ bool omatte_cuda_available(void);
  * order. Returns -3 when the build has no CUDA support. */
 int omatte_estimate_fb_cuda(const float *image, const float *alpha, int h, int w, int depth,
                             const omatte_params *params, float *out_f, float *out_b);
+
+/*
+ * Device-pointer entry points.
+ *
+ * The host-pointer call above owns four copies the caller usually does not need:
+ * BiRefNet produces its alpha on the GPU and the composite is consumed there
+ * too, so staging image/alpha down and F/B back up is pure round trip. These
+ * take pointers that are already device memory and never touch the host.
+ *
+ * `stream` is a cudaStream_t, declared void * so callers (and this header) do
+ * not need the CUDA headers. Pass NULL to use omatte's own private stream; pass
+ * the caller's stream to keep the pass ordered against its own work without a
+ * device-wide sync. Nothing here calls cudaDeviceSynchronize: with a diffusion
+ * or segmentation model live in the same context that would block on work this
+ * pass has no relationship to.
+ *
+ * The one behavioural difference from the host call is the seed colour, which
+ * is reduced on the device (fixed 256-block tree, double accumulator) instead of
+ * in host float32 row-major order. It is a more accurate sum, not a less
+ * accurate one, and it only seeds the 1x1 top of the pyramid; measured against
+ * the host path the outputs agree to ~1e-7. The host entry point still reduces
+ * on the host, so the byte-identical CPU/GPU claim in matte/README.md continues
+ * to hold for it.
+ */
+int omatte_estimate_fb_cuda_device(const float *d_image, const float *d_alpha, int h, int w,
+                                   int depth, const omatte_params *params, float *d_out_f,
+                                   float *d_out_b, void *stream);
+
+/* Composites d_fg over either a full background image or a solid colour.
+ * d_background is h*w*depth device floats, or NULL to use background_rgb (depth
+ * floats, host memory), or both NULL for black. d_out may alias d_fg. */
+int omatte_composite_cuda_device(const float *d_fg, const float *d_alpha,
+                                 const float *d_background, const float *background_rgb, int h,
+                                 int w, int depth, float *d_out, void *stream);
+
+/* Releases the cached device workspace (buffers and the private stream).
+ * Allocations are reused across calls precisely so a request never pays
+ * cudaMalloc/cudaFree - cudaFree synchronises the whole context, which on a
+ * shared GPU means waiting for someone else's model. Call this only at
+ * shutdown, or when something else needs the VRAM back. */
+void omatte_cuda_release_workspace(void);
+
+/* Bytes of device memory the cached workspace currently holds. */
+size_t omatte_cuda_workspace_bytes(void);
 
 #ifdef __cplusplus
 }

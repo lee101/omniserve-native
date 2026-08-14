@@ -19,6 +19,7 @@ import os
 import statistics
 import sys
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,10 +83,14 @@ def request_image(base: str, payload: dict, secret: str | None, timeout: float) 
         method="POST",
     )
     started = time.perf_counter()
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        body = response.read()
-        content_type = response.headers.get("Content-Type", "")
-        status = response.status
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read()
+            content_type = response.headers.get("Content-Type", "")
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        body = exc.read(4096).decode("utf-8", "replace").strip()
+        raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
     image, meta = decode_image_response(body, content_type, timeout)
     meta.update({
         "http_status": status,
@@ -203,8 +208,13 @@ def write_contact_sheet(rows: list[dict], output: Path) -> None:
     for row_index, row in enumerate(rows):
         y = pad + row_index * (cell_h + label_h + pad)
         reference = Image.open(row["reference_path"]).convert("RGB")
-        candidate = Image.open(row["candidate_path"]).convert("RGB")
-        diff = ImageChops.difference(reference, candidate)
+        candidate_path = row.get("candidate_path")
+        if candidate_path:
+            candidate = Image.open(candidate_path).convert("RGB")
+            diff = ImageChops.difference(reference, candidate)
+        else:
+            candidate = Image.new("RGB", reference.size, (127, 29, 29))
+            diff = candidate.copy()
         for column, (label, image) in enumerate((("reference", reference), ("candidate", candidate), ("difference", diff))):
             x = pad + column * (cell_w + pad)
             image.thumbnail((cell_w, cell_h), Image.Resampling.LANCZOS)
@@ -213,7 +223,9 @@ def write_contact_sheet(rows: list[dict], output: Path) -> None:
             if column == 1:
                 score = row.get("semantic", {}).get("clip_image_cosine")
                 suffix = "" if score is None else f" · CLIP {score:.3f}"
-                draw.text((x, y + cell_h + 25), f"{row['candidate']['wall_ms']/1000:.2f}s{suffix}", fill=(71, 85, 105), font=font)
+                error = row["candidate"].get("error")
+                timing = "error" if error else f"{row['candidate']['wall_ms']/1000:.2f}s"
+                draw.text((x, y + cell_h + 25), f"{timing}{suffix}", fill=(71, 85, 105), font=font)
     sheet.save(output, quality=92)
 
 
@@ -229,6 +241,12 @@ def markdown_report(report: dict) -> str:
         "| Case | Size | Reference s | Candidate s | CLIP image | Prompt Δ | Aesthetic Δ | Result |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
+    latency = report.get("latency") or {}
+    if latency:
+        lines[6:6] = [
+            f"- median latency ratio: `{latency['candidate_to_reference_ratio']:.3f}` "
+            f"(maximum `{latency['maximum_ratio']:.3f}`)",
+        ]
     for row in report["rows"]:
         semantic = row.get("semantic") or {}
         def metric(name: str) -> str:
@@ -316,11 +334,31 @@ def main() -> int:
                 "reference_path": str(ref_path),
             }, sort_keys=True), flush=True)
             continue
-        candidate, candidate_meta = request_image(
-            args.candidate_base, payload, candidate_secret, args.timeout)
         ref_path = run_dir / f"{index:02d}_{case['id']}_reference.png"
         cand_path = run_dir / f"{index:02d}_{case['id']}_candidate.png"
         reference.save(ref_path, format="PNG")
+        try:
+            candidate, candidate_meta = request_image(
+                args.candidate_base, payload, candidate_secret, args.timeout)
+        except Exception as exc:
+            message = f"candidate request failed: {type(exc).__name__}: {exc}"
+            row = {
+                **case,
+                "reference": reference_meta,
+                "candidate": {"wall_ms": 0.0, "error": message},
+                "reference_path": str(ref_path),
+                "candidate_path": None,
+                "candidate_quality": {},
+                "pixel": {},
+                "semantic": {},
+                "failures": [message],
+                "passed": False,
+            }
+            rows.append(row)
+            failures.append(f"{case['id']}: {message}")
+            print(json.dumps({"case": case["id"], "passed": False,
+                              "error": message}, sort_keys=True), flush=True)
+            continue
         candidate.save(cand_path, format="PNG")
         candidate_array = np.asarray(candidate, dtype=np.float32)
         quality = {
@@ -337,6 +375,8 @@ def main() -> int:
             row_failures.append(f"entropy {quality['entropy']:.3f}")
         if quality["stddev"] < gates.get("candidate_stddev_min", 8.0):
             row_failures.append(f"stddev {quality['stddev']:.3f}")
+        if semantic_error:
+            row_failures.append(f"semantic scorer unavailable: {semantic_error}")
         if scorer:
             for name, comparator in (
                 ("clip_image_cosine", "clip_image_cosine_min"),
@@ -381,6 +421,21 @@ def main() -> int:
 
     if semantic_error:
         failures.append(f"semantic scorer unavailable: {semantic_error}")
+    timed_rows = [row for row in rows if not row["candidate"].get("error")]
+    latency = {}
+    if timed_rows:
+        reference_median = statistics.median(row["reference"]["wall_ms"] for row in timed_rows)
+        candidate_median = statistics.median(row["candidate"]["wall_ms"] for row in timed_rows)
+        ratio = candidate_median / reference_median if reference_median > 0 else float("inf")
+        maximum = gates.get("median_latency_ratio_max", 1.5)
+        latency = {
+            "reference_median_ms": reference_median,
+            "candidate_median_ms": candidate_median,
+            "candidate_to_reference_ratio": ratio,
+            "maximum_ratio": maximum,
+        }
+        if ratio > maximum:
+            failures.append(f"median latency ratio {ratio:.3f} > {maximum:.3f}")
     report = {
         "timestamp": now_slug(),
         "reference_base": (str(args.reference_run) if args.reference_run else args.reference_base),
@@ -388,6 +443,7 @@ def main() -> int:
         "corpus": str(args.corpus),
         "semantic_available": scorer is not None,
         "semantic_error": semantic_error,
+        "latency": latency,
         "rows": rows,
         "failures": failures,
         "passed": not failures,

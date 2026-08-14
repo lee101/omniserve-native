@@ -10,6 +10,7 @@ __pycache__/
 .pytest_cache/
 performance/*.callgrind.out
 performance/*.massif.out
+evals/
 
 # Locally built shared object used by matte/ctypes_candidate.py. The .npy
 # fixtures under matte/fixtures/ are golden reference data and ARE committed.

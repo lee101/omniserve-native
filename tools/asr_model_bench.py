@@ -10,6 +10,7 @@ corpus-level aggregation so the numbers are comparable to the gate.
         --backend whisper-base=hf:openai/whisper-base.en \\
         --backend whisper-small=hf:openai/whisper-small.en \\
         --backend gemini=gemini:gemini-2.5-flash \\
+        --backend gpt-transcribe=openai:gpt-transcribe \\
         --out performance/asr-models.json
 
 Backend specs:
@@ -17,6 +18,7 @@ Backend specs:
     http:<url>          an OpenAI-style multipart endpoint (a served worker)
     gemini:<model>      Gemini generateContent with inline audio + a transcribe
                         prompt; needs GEMINI_API_KEY
+    openai:<model>      OpenAI audio transcriptions; needs OPENAI_API_KEY
 
 A corpus is either JSONL ({"audio_filepath":..., "text":...}) or the flat
 {"file.wav": "reference"} map DictatorFlow's e2e corpus uses.
@@ -31,6 +33,7 @@ import os
 import sys
 import time
 import urllib.request
+import uuid
 import wave
 from pathlib import Path
 from typing import Any, Callable
@@ -163,6 +166,38 @@ def gemini_backend(model: str) -> Callable[[Path], str]:
     return run
 
 
+def openai_backend(model: str) -> Callable[[Path], str]:
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise SystemExit("openai backend needs OPENAI_API_KEY")
+    endpoint = os.environ.get(
+        "OPENAI_TRANSCRIBE_URL", "https://api.openai.com/v1/audio/transcriptions"
+    ).strip()
+
+    def run(clip: Path) -> str:
+        boundary = uuid.uuid4().hex
+        fields = (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n{model}\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\njson\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{clip.name}"\r\n'
+            "Content-Type: audio/wav\r\n\r\n"
+        ).encode()
+        body = fields + clip.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(
+            endpoint,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            return extract_text(json.loads(resp.read().decode("utf-8", "replace")))
+
+    return run
+
+
 def audio_lm_backend(model_id: str) -> Callable[[Path], str]:
     """An audio-capable instruction model (Gemma 3n, Qwen2-Audio, Phi-4-mm).
 
@@ -221,7 +256,9 @@ def build_backend(spec: str) -> Callable[[Path], str]:
         return http_backend(rest)
     if kind == "gemini":
         return gemini_backend(rest)
-    raise SystemExit(f"unknown backend spec {spec!r} (hf:, audiolm:, http:, gemini:)")
+    if kind == "openai":
+        return openai_backend(rest)
+    raise SystemExit(f"unknown backend spec {spec!r} (hf:, audiolm:, http:, gemini:, openai:)")
 
 
 # ---- scoring ----------------------------------------------------------------
@@ -341,6 +378,9 @@ def main() -> int:
             continue
         result = score(name, run, corpus, args.verbose)
         result["spec"] = spec
+        if spec == "openai:gpt-transcribe" and result.get("audio_seconds") is not None:
+            result["price_per_audio_minute_usd"] = 0.0045
+            result["estimated_api_cost_usd"] = round(result["audio_seconds"] / 60 * 0.0045, 8)
         results.append(result)
         if result.get("wer") is None:
             print(f"  {result.get('error', 'no result')}")

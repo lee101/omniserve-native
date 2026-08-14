@@ -91,6 +91,53 @@ class DecontaminationTest(unittest.TestCase):
             gpu = omatte.estimate_foreground(self.observed, self.alpha, use_cuda=True)
             self.assertLess(np.abs(gpu - cpu).max(), 1e-5)
 
+    def test_background_is_solved_not_derived(self):
+        """B comes out of the same 2x2 system as F, so it is available for free.
+
+        A naive (I - a*F) / (1 - a) blows up as alpha approaches 1; the solved
+        backdrop stays in range everywhere, which is what makes it usable as a
+        style-transfer input.
+        """
+        estimated, backdrop = omatte.estimate_foreground(self.observed, self.alpha,
+                                                         return_background=True)
+        self.assertEqual(backdrop.shape, self.observed.shape)
+        self.assertTrue(np.isfinite(backdrop).all())
+        self.assertGreaterEqual(backdrop.min(), 0.0)
+        self.assertLessEqual(backdrop.max(), 1.0)
+
+        transparent = self.alpha <= 0.001
+        self.assertLess(np.abs(backdrop[transparent] - BACKDROP).max(), 0.05,
+                        "where nothing occludes it, the backdrop is the backdrop")
+
+    def test_device_pointer_path_matches_the_host_path(self):
+        """The GPU-resident entry point the worker uses must not be a different
+        algorithm - only a different place for the buffers to live."""
+        if not omatte.device_api_available():
+            self.skipTest("libomatte.so has no CUDA device API")
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch is not installed")
+        if not torch.cuda.is_available():
+            self.skipTest("torch has no CUDA device")
+
+        host_fg, host_bg = omatte.estimate_foreground(self.observed, self.alpha,
+                                                      return_background=True)
+        image = torch.from_numpy(self.observed).cuda()
+        alpha = torch.from_numpy(self.alpha).cuda()
+        device_fg, device_bg = omatte.estimate_foreground_torch(image, alpha,
+                                                                return_background=True)
+
+        # The only difference is the seed reduction, which runs on the device
+        # here and in host float32 order there. It seeds a 1x1 level.
+        self.assertLess(np.abs(host_fg - device_fg.cpu().numpy()).max(), 1e-5)
+        self.assertLess(np.abs(host_bg - device_bg.cpu().numpy()).max(), 1e-5)
+
+        white = np.ones(3, dtype=np.float32)
+        composite = omatte.composite_torch(device_fg, alpha, background_rgb=white)
+        expected = self.alpha[..., None] * host_fg + (1 - self.alpha[..., None]) * white
+        self.assertLess(np.abs(composite.cpu().numpy() - expected).max(), 1e-5)
+
     def test_recomposite_over_new_background(self):
         """A cutout placed on a white page should not show a green halo."""
         estimated = omatte.estimate_foreground(self.observed, self.alpha)

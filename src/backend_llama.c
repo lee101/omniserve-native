@@ -39,12 +39,24 @@ static bool g_flash_attn;
 
 static struct llama_model *g_model;
 static const struct llama_vocab *g_vocab;
+enum { OLLM_VERIFY_BATCH_CAP = 17 };
 typedef struct {
     struct llama_context *ctx;
     bool busy;
     llama_token *cached_tokens;
     int cached_count;
     int cached_cap;
+    /* Speculative verification is bounded to sixteen drafts plus the token
+     * that precedes them. Keep that tiny batch in the slot: llama_batch_init
+     * allocates every member separately, and doing that once per decode round
+     * puts allocator traffic on the hottest CPU path. A busy slot has exactly
+     * one owner, so these arrays need no additional lock. */
+    llama_token verify_tokens[OLLM_VERIFY_BATCH_CAP];
+    llama_pos verify_positions[OLLM_VERIFY_BATCH_CAP];
+    int32_t verify_n_seq_ids[OLLM_VERIFY_BATCH_CAP];
+    llama_seq_id verify_seq_ids[OLLM_VERIFY_BATCH_CAP];
+    llama_seq_id *verify_seq_id_ptrs[OLLM_VERIFY_BATCH_CAP];
+    int8_t verify_logits[OLLM_VERIFY_BATCH_CAP];
 } ollm_slot;
 static ollm_slot *g_slots;
 static int g_slot_count;
@@ -394,13 +406,14 @@ static void cache_prompt(ollm_slot *slot, const llama_token *tokens, int count) 
  * tokens this round commits. `previous` is the last token sampled but not yet
  * in the cache.
  */
-static int decode_round(struct llama_context *ctx, struct llama_sampler *smpl,
+static int decode_round(ollm_slot *slot, struct llama_sampler *smpl,
                         const probability_capture *sampled,
                         llama_token previous, int *n_past,
                         const llama_token *context, int context_len,
                         ospec_governor *gov,
                         llama_token *out_tokens, float *out_probs, int out_cap) {
     if (out_cap <= 0) return 0;
+    struct llama_context *ctx = slot->ctx;
 
     /* Straight after the prefill there is nothing to decode: the logits for the
      * next token are already the ones the prompt left behind. */
@@ -435,18 +448,26 @@ static int decode_round(struct llama_context *ctx, struct llama_sampler *smpl,
     /* The verify batch is `previous` followed by the draft, every position
      * asked for logits: a draft is only useful if the token after it can be
      * sampled without running the model again. */
-    struct llama_batch batch = llama_batch_init(draft_len + 1, 0, 1);
-    if (!batch.token) return 0;
-    batch.n_tokens = draft_len + 1;
+    const int verify_count = draft_len + 1;
+    if (verify_count > OLLM_VERIFY_BATCH_CAP) return 0;
     for (int i = 0; i < draft_len + 1; i++) {
-        batch.token[i] = i == 0 ? previous : draft[i - 1];
-        batch.pos[i] = (llama_pos)(*n_past + i);
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = 1;
+        slot->verify_tokens[i] = i == 0 ? previous : draft[i - 1];
+        slot->verify_positions[i] = (llama_pos)(*n_past + i);
+        slot->verify_n_seq_ids[i] = 1;
+        slot->verify_seq_ids[i] = 0;
+        slot->verify_seq_id_ptrs[i] = &slot->verify_seq_ids[i];
+        slot->verify_logits[i] = 1;
     }
+    struct llama_batch batch = {
+        .n_tokens = verify_count,
+        .token = slot->verify_tokens,
+        .embd = NULL,
+        .pos = slot->verify_positions,
+        .n_seq_id = slot->verify_n_seq_ids,
+        .seq_id = slot->verify_seq_id_ptrs,
+        .logits = slot->verify_logits,
+    };
     int rc = llama_decode(ctx, batch);
-    llama_batch_free(batch);
     if (rc != 0) return 0;
 
     int produced = 0;
@@ -843,7 +864,7 @@ bool ollm_chat(const ochat_req *req, otoken_cb on_token, void *user, ochat_resul
     for (int i = 0; i < max_new; i++) {
         if (!ok) break;
         if (round_pos >= round_count) {
-            round_count = decode_round(ctx, smpl, &sampled, previous, &n_past,
+            round_count = decode_round(slot, smpl, &sampled, previous, &n_past,
                                        context, context_len,
                                        g_spec_draft_max > 0 ? &gov : NULL,
                                        round_tokens, round_probs,

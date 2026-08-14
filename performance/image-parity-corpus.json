@@ -13,7 +13,8 @@
     "clip_prompt_delta_min": -0.04,
     "aesthetic_delta_min": -0.75,
     "candidate_entropy_min": 3.0,
-    "candidate_stddev_min": 8.0
+    "candidate_stddev_min": 8.0,
+    "median_latency_ratio_max": 1.5
   },
   "cases": [
     {

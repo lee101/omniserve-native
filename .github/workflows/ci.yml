@@ -84,6 +84,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint scripts
         run: shellcheck -S warning scripts/*.sh
+      - name: Open-source release audit
+        run: sh scripts/release_audit.sh
 
   python:
     runs-on: ubuntu-latest

@@ -325,11 +325,17 @@ int omatte_estimate_fb(const float *image, const float *alpha, int h, int w, int
 
 void omatte_composite(const float *fg, const float *alpha, const float *background_rgb, int h,
                       int w, int depth, float *out) {
+    omatte_composite_image(fg, alpha, NULL, background_rgb, h, w, depth, out);
+}
+
+void omatte_composite_image(const float *fg, const float *alpha, const float *background,
+                            const float *background_rgb, int h, int w, int depth, float *out) {
     if (!fg || !alpha || !out) return;
     for (size_t i = 0, n = (size_t)h * w; i < n; i++) {
         const float a = alpha[i];
         for (int c = 0; c < depth; c++) {
-            const float back = background_rgb ? background_rgb[c] : 0.0f;
+            const float back = background ? background[i * depth + c]
+                                          : (background_rgb ? background_rgb[c] : 0.0f);
             out[i * depth + c] = a * fg[i * depth + c] + (1.0f - a) * back;
         }
     }
@@ -350,4 +356,38 @@ int omatte_estimate_fb_cuda(const float *image, const float *alpha, int h, int w
     (void)out_b;
     return -3;
 }
+
+int omatte_estimate_fb_cuda_device(const float *d_image, const float *d_alpha, int h, int w,
+                                   int depth, const omatte_params *params, float *d_out_f,
+                                   float *d_out_b, void *stream) {
+    (void)d_image;
+    (void)d_alpha;
+    (void)h;
+    (void)w;
+    (void)depth;
+    (void)params;
+    (void)d_out_f;
+    (void)d_out_b;
+    (void)stream;
+    return -3;
+}
+
+int omatte_composite_cuda_device(const float *d_fg, const float *d_alpha, const float *d_background,
+                                 const float *background_rgb, int h, int w, int depth,
+                                 float *d_out, void *stream) {
+    (void)d_fg;
+    (void)d_alpha;
+    (void)d_background;
+    (void)background_rgb;
+    (void)h;
+    (void)w;
+    (void)depth;
+    (void)d_out;
+    (void)stream;
+    return -3;
+}
+
+void omatte_cuda_release_workspace(void) {}
+
+size_t omatte_cuda_workspace_bytes(void) { return 0; }
 #endif

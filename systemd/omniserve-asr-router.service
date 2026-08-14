@@ -1,5 +1,5 @@
 [Unit]
-Description=OmniServe capacity-aware local/remote ASR router
+Description=OmniServe native C capacity-aware local/remote ASR router
 After=network.target omniserve-asr-worker.service
 
 [Service]
@@ -11,7 +11,7 @@ Environment=OMNISERVE_ASR_LOCAL_UPSTREAM=http://127.0.0.1:9097
 # service. Leaving it empty makes local-only failures explicit.
 Environment=OMNISERVE_ASR_FALLBACK_UPSTREAM=http://127.0.0.1:9083
 Environment=OMNISERVE_ASR_GATEWAY_STATUS=http://127.0.0.1:8791/status
-ExecStart=/usr/bin/python3 /nvme0n1-disk/code/omniserve-native/workers/asr_router.py
+ExecStart=/nvme0n1-disk/code/omniserve-native/build-full/omniserve-asr-router
 Restart=always
 RestartSec=3
 

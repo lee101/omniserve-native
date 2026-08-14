@@ -7,7 +7,9 @@ Skips (exit 0) when the worker's base dependencies are unavailable.
 """
 
 import importlib.util
+import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -97,7 +99,9 @@ class CacheParamsTest(unittest.TestCase):
         request = worker.RemoveBackgroundRequest(image_url="https://x.test/a.jpg")
         params = request.cache_params()
         self.assertEqual(
-            set(params), {"format", "threshold", "decontaminate", "model", "input_size", "quality"}
+            set(params),
+            {"format", "threshold", "decontaminate", "model", "input_size", "quality",
+             "return_background", "background", "background_prompt", "background_strength"},
         )
 
     def test_threshold_change_changes_the_key(self):
@@ -130,8 +134,9 @@ class JobLifecycleTest(unittest.TestCase):
 
     def test_miss_queues_a_job_that_completes(self):
         request = worker.RemoveBackgroundRequest(image_url="https://x.test/lamp.jpg")
-        produced = {"cached": False, "key": "cutouts/ab/abc.webp", "url": CUTOUT_URL,
-                    "content": b"webp", "media_type": "image/webp"}
+        produced = {"cached": False, "media_type": "image/webp",
+                    "artifacts": {"cutout": {"key": "cutouts/ab/abc.webp", "url": CUTOUT_URL,
+                                             "content": b"webp"}}}
 
         with (
             mock.patch.object(worker.object_store, "exists", return_value=False),
@@ -151,8 +156,9 @@ class JobLifecycleTest(unittest.TestCase):
 
     def test_job_without_bucket_returns_inline_data_url(self):
         request = worker.RemoveBackgroundRequest(image_url="https://x.test/pot.jpg")
-        produced = {"cached": False, "key": None, "url": None, "content": b"webp-bytes",
-                    "media_type": "image/webp"}
+        produced = {"cached": False, "media_type": "image/webp",
+                    "artifacts": {"cutout": {"key": None, "url": None,
+                                             "content": b"webp-bytes"}}}
 
         with (
             mock.patch.object(worker.object_store, "exists", return_value=False),
@@ -187,6 +193,181 @@ class JobLifecycleTest(unittest.TestCase):
         with self.assertRaises(worker.HTTPException) as caught:
             worker.produce_cutout(request)
         self.assertEqual(caught.exception.status_code, 400)
+
+
+class ForegroundGenerationTest(unittest.TestCase):
+    def test_generation_and_cutout_are_one_job(self):
+        request = worker.ForegroundGenerationRequest(
+            prompt="full body harbour worker on a plain backdrop", width=640, height=960, seed=42,
+        )
+        generated = Image.new("RGB", (640, 960), "white")
+        produced = {"cached": False, "media_type": "image/webp",
+                    "artifacts": {"cutout": {"key": None, "url": None,
+                                                "content": b"cutout-webp"}}}
+        with (
+            mock.patch.object(worker, "generate_backdrop", return_value=generated) as generate,
+            mock.patch.object(worker, "produce_cutout", return_value=produced) as cutout,
+        ):
+            response = worker.enqueue_foreground_generation(request)
+            job = wait_for(response["job_id"])
+
+        generate.assert_called_once_with(request.prompt, 640, 960, None, 0.0, 42)
+        cutout.assert_called_once()
+        source_request = cutout.call_args.args[0]
+        self.assertTrue(source_request.image_url.startswith("data:image/webp;base64,"))
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["seed"], 42)
+        self.assertEqual(job["source_width"], 640)
+        self.assertTrue(job["data_url"].startswith("data:image/webp;base64,"))
+
+    def test_generation_rejects_unknown_format_before_queueing(self):
+        request = worker.ForegroundGenerationRequest(prompt="person", output_format="gif")
+        with self.assertRaises(worker.HTTPException) as caught:
+            worker.enqueue_foreground_generation(request)
+        self.assertEqual(caught.exception.status_code, 400)
+
+
+class VideoBackgroundRemovalTest(unittest.TestCase):
+    def request(self):
+        return worker.VideoBackgroundRequest(
+            video_url="https://cdn.example.test/person.webm",
+            output_upload_url="https://upload.example.test/result",
+            output_public_url="https://cdn.example.test/result.webm",
+        )
+
+    def test_person_route_completes_with_private_video(self):
+        result = {"fallback_required": False, "route": "local-rvm-person",
+                  "video_url": "https://cdn.example.test/result.webm",
+                  "duration_seconds": 2.0, "metrics": {"inference_fps": 40.0}}
+        with mock.patch.object(worker.video_matting, "process", return_value=result):
+            response = worker.enqueue_video_background_removal(self.request())
+            job = wait_for(response["job_id"])
+        self.assertEqual(job["status"], "done")
+        self.assertFalse(job["fallback_required"])
+        self.assertEqual(job["route"], "local-rvm-person")
+
+    def test_non_person_route_requests_standby_without_error(self):
+        result = {"fallback_required": True, "fallback_reason": "no person detected",
+                  "route": "standby-general-matting", "duration_seconds": 2.0,
+                  "metrics": {"person_detection": {"detected": False}}}
+        with mock.patch.object(worker.video_matting, "process", return_value=result):
+            response = worker.enqueue_video_background_removal(self.request())
+            job = wait_for(response["job_id"])
+        self.assertEqual(job["status"], "done")
+        self.assertTrue(job["fallback_required"])
+        self.assertEqual(job["route"], "standby-general-matting")
+
+    def test_full_local_queue_rejects_for_provider_spillover(self):
+        seeded = []
+        now = __import__("time").time()
+        with worker._jobs_lock:
+            for index in range(worker.VIDEO_JOB_MAX_PENDING):
+                job_id = f"capacity-test-{index}"
+                seeded.append(job_id)
+                worker._jobs[job_id] = {"job_id": job_id, "kind": "video", "status": "queued",
+                                        "created": now, "updated": now}
+        try:
+            with self.assertRaises(worker.HTTPException) as caught:
+                worker.enqueue_video_background_removal(self.request())
+            self.assertEqual(caught.exception.status_code, 429)
+            self.assertEqual(caught.exception.headers["Retry-After"], "5")
+        finally:
+            with worker._jobs_lock:
+                for job_id in seeded:
+                    worker._jobs.pop(job_id, None)
+
+    def test_health_exposes_queue_gpu_and_throughput(self):
+        with (
+            mock.patch.object(worker.torch.cuda, "is_available", return_value=True),
+            mock.patch.object(worker.torch.cuda, "mem_get_info", return_value=(2 << 30, 32 << 30)),
+            mock.patch.object(worker.torch.cuda, "memory_allocated", return_value=512 << 20),
+            mock.patch.object(worker.torch.cuda, "memory_reserved", return_value=768 << 20),
+            mock.patch.object(worker.video_matting, "health",
+                              return_value={"person_detector": "ready", "rvm_loaded": False}),
+        ):
+            capacity = worker.health()["video_capacity"]
+        self.assertTrue(capacity["accepting"])
+        self.assertEqual(capacity["max_pending"], worker.VIDEO_JOB_MAX_PENDING)
+        self.assertEqual(capacity["gpu"]["free_mib"], 2048)
+        self.assertIn("average_seconds", capacity["stats"])
+
+    def test_error_event_is_structured_jsonl(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "events.jsonl"
+            with mock.patch.object(worker, "EVENTS_PATH", str(path)):
+                worker._emit_event("error", "video_job_error", job_id="safe-id", error="boom")
+            payload = json.loads(path.read_text().strip())
+        self.assertEqual(payload["event"], "video_job_error")
+        self.assertEqual(payload["job_id"], "safe-id")
+
+
+class BackgroundRequestTest(unittest.TestCase):
+    def test_artifacts_do_not_share_a_cache_key(self):
+        request = worker.RemoveBackgroundRequest(image_url="https://x.test/a.jpg",
+                                                 return_background=True)
+        self.assertNotEqual(worker.artifact_key(request, "cutout"),
+                            worker.artifact_key(request, "background"))
+
+    def test_asking_for_the_backdrop_changes_the_cutout_key(self):
+        """Otherwise a plain cutout would serve from a run that also solved the
+        backdrop, or worse, the reverse."""
+        plain = worker.RemoveBackgroundRequest(image_url="https://x.test/a.jpg")
+        with_bg = worker.RemoveBackgroundRequest(image_url="https://x.test/a.jpg",
+                                                 return_background=True)
+        self.assertNotEqual(worker.artifact_key(plain, "cutout"),
+                            worker.artifact_key(with_bg, "cutout"))
+
+    def test_backdrop_prompt_changes_the_composite_key(self):
+        a = worker.RemoveBackgroundRequest(image_url="https://x.test/a.jpg",
+                                           background_prompt="a beach at dusk")
+        b = worker.RemoveBackgroundRequest(image_url="https://x.test/a.jpg",
+                                           background_prompt="a studio backdrop")
+        self.assertNotEqual(worker.artifact_key(a, "composite"),
+                            worker.artifact_key(b, "composite"))
+
+    def test_generated_backdrop_is_refused_on_the_synchronous_endpoint(self):
+        """Diffusion holds a gateway permit for its whole duration, so it has to
+        go through the job lane or it occupies an interactive slot."""
+        request = worker.RemoveBackgroundRequest(image_url="https://x.test/a.jpg",
+                                                 background_prompt="a beach at dusk")
+        with self.assertRaises(worker.HTTPException) as caught:
+            worker.background_removal(request)
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("/jobs", caught.exception.detail)
+
+    def test_wants_extras_only_when_there_is_more_than_one_image(self):
+        plain = worker.RemoveBackgroundRequest(image_url="https://x.test/a.jpg")
+        transparent = worker.RemoveBackgroundRequest(image_url="https://x.test/a.jpg",
+                                                     background="transparent")
+        self.assertFalse(plain.wants_extras())
+        self.assertTrue(transparent.wants_extras())
+        self.assertTrue(worker.RemoveBackgroundRequest(
+            image_url="https://x.test/a.jpg", return_background=True).wants_extras())
+
+    def test_colour_parsing(self):
+        self.assertEqual(worker.parse_colour("#fff"), (1.0, 1.0, 1.0))
+        self.assertEqual(worker.parse_colour("#000000"), (0.0, 0.0, 0.0))
+        self.assertEqual(worker.parse_colour("white"), (1.0, 1.0, 1.0))
+        red = worker.parse_colour("#FF0000")
+        self.assertEqual(red, (1.0, 0.0, 0.0))
+        self.assertIsNone(worker.parse_colour("https://x.test/bg.jpg"))
+        self.assertIsNone(worker.parse_colour("#12345"))
+
+    def test_multi_artifact_result_is_json(self):
+        request = worker.RemoveBackgroundRequest(image_url="https://x.test/a.jpg",
+                                                 return_background=True)
+        produced = {"cached": False, "media_type": "image/webp", "artifacts": {
+            "cutout": {"key": "k1", "url": CUTOUT_URL, "content": b"a"},
+            "background": {"key": "k2", "url": None, "content": b"b"},
+        }}
+        with mock.patch.object(worker, "produce_cutout", return_value=produced):
+            response = worker.background_removal(request)
+
+        self.assertEqual(response.media_type, "application/json")
+        import json as _json
+        body = _json.loads(response.body)
+        self.assertEqual(body["cutout"]["url"], CUTOUT_URL)
+        self.assertTrue(body["background"]["data_url"].startswith("data:image/webp;base64,"))
 
 
 if __name__ == "__main__":

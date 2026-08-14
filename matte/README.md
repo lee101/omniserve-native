@@ -456,12 +456,43 @@ throughput, and raise the iteration counts if you want a closer solve.
 
 ### Throughput (1024x1024x3, RTX 5090, best of 5)
 
+Measured on a device already saturated by another tenant, which is the condition
+this runs in.
+
 | backend | time |
 | --- | --- |
 | pymatting (numba) | 886 ms |
 | C sequential, 1 thread | 410 ms |
 | C red-black, 16 threads | 192 ms |
-| CUDA | 19 ms |
+| CUDA, host pointers | 9.2 ms |
+| CUDA, device pointers (`omatte_estimate_fb_cuda_device`) | 3.1 ms |
+
+The host-pointer figure was 15.7 ms before the device buffers were made
+persistent and the device-wide sync was replaced with a private stream. What is
+left of it is transfer and the host-side seed reduction: 2.8 ms H2D, 7.2 ms D2H
+of F and B, 1.5 ms reducing the seed colours - about 11 ms of moving data around
+1 ms of solving.
+
+The device entry point removes all of it. Caller-owned device pointers, torch's
+own stream, and a seed reduction on the GPU (fixed 256-block tree, double
+accumulator, so it is deterministic). It agrees with the host path to 6.9e-07
+max abs; the difference is the reduction order, and the device version is the
+more accurate of the two. It seeds the 1x1 top of the pyramid.
+
+Nothing here calls `cudaDeviceSynchronize`, and nothing allocates per request.
+Both matter more than they look on a shared card: a device sync waits on the
+co-resident segmentation or diffusion model's streams, and `cudaFree`
+synchronises the whole context. Eight allocations and eight frees per request was
+most of the original wall clock. The workspace is grow-only and 84 MiB for
+1024x1024; `omatte_cuda_release_workspace()` returns it.
+
+Levels small enough to fit one block (both dimensions <= 32) run in a single
+fused kernel with `__syncthreads()` where the launch boundaries were, cutting 184
+launches to 41. Same loads, same stores, same order - `run_eval.sh` reports
+identical numbers - but it was worth measuring rather than assuming: on this
+contended device one empty kernel plus a stream sync costs 2.26 ms and 184 of
+them cost 2.38 ms, so launch count was not what the fixed cost was made of.
+Waiting for a slot on a busy GPU was.
 
 ### Running it
 
@@ -473,4 +504,22 @@ ctest --test-dir build-cuda -R matte  # green-screen decontamination test
 
 `workers/omatte.py` is the ctypes binding the BiRefNet worker uses; set
 `BIREFNET_DECONTAMINATE=0` to turn the pass off, or pass `"decontaminate": false`
-per request.
+per request. `estimate_foreground` takes numpy arrays,
+`estimate_foreground_torch` takes CUDA tensors and is what the worker calls;
+`composite_torch` does `a*F + (1-a)*B` on the device against either a background
+image or a solid colour.
+
+### The background is an output, not a leftover
+
+`B` is solved jointly with `F` in the same 2x2 system at every pixel, every
+iteration, every level. `return_background=True` costs nothing extra, and the
+result is not `(I - a*F) / (1 - a)`, which blows up as alpha approaches 1. The
+solved backdrop stays in `[0, 1]` everywhere, which is what makes it usable as
+input to something else - the cutout worker feeds it back to the diffusion lane
+as the init image for a style-transferred replacement, so the new backdrop
+inherits the original's lighting.
+
+On a synthetic green-screen fixture the recovered backdrop came back as
+`[0.027, 0.911, 0.080]` against a true `[0.02, 0.92, 0.08]`, and the subject
+composited onto white had 0.048 mean error against the ideal in the fringe band
+where compositing the observed pixels had 0.107.

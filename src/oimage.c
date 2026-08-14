@@ -59,6 +59,123 @@ static bool safe_lora_filename(const char *value) {
            strcmp(value + len - (sizeof suffix - 1), suffix) == 0;
 }
 
+static bool resolve_cached_lora_file(const char *directory, const char *filename,
+                                     char **out_path) {
+    size_t needed = strlen(directory) + strlen(filename) + 2;
+    char *path = malloc(needed);
+    if (!path) return false;
+    snprintf(path, needed, "%s/%s", directory, filename);
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        free(path);
+        return false;
+    }
+    char resolved_directory[PATH_MAX];
+    char resolved_path[PATH_MAX];
+    if (!realpath(directory, resolved_directory) || !realpath(path, resolved_path)) {
+        free(path);
+        return false;
+    }
+    size_t directory_len = strlen(resolved_directory);
+    if (strncmp(resolved_path, resolved_directory, directory_len) != 0 ||
+        resolved_path[directory_len] != '/') {
+        free(path);
+        return false;
+    }
+    free(path);
+    *out_path = strdup(resolved_path);
+    return *out_path != NULL;
+}
+
+static char *default_lora_registry_path(const char *directory) {
+    const char *slash = strrchr(directory, '/');
+    if (!slash || slash == directory) return NULL;
+    size_t parent_len = (size_t)(slash - directory);
+    const char suffix[] = "/lora_registry.json";
+    char *path = malloc(parent_len + sizeof suffix);
+    if (!path) return NULL;
+    memcpy(path, directory, parent_len);
+    memcpy(path + parent_len, suffix, sizeof suffix);
+    return path;
+}
+
+static char *read_small_file(const char *path, size_t *out_len) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return NULL;
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    long size = ftell(file);
+    if (size < 0 || size > 1024 * 1024 || fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    char *data = malloc((size_t)size + 1);
+    if (!data) {
+        fclose(file);
+        return NULL;
+    }
+    size_t read_len = fread(data, 1, (size_t)size, file);
+    fclose(file);
+    if (read_len != (size_t)size) {
+        free(data);
+        return NULL;
+    }
+    data[read_len] = 0;
+    *out_len = read_len;
+    return data;
+}
+
+static char *registry_lora_filename(const char *directory, const char *id) {
+    const char *configured = getenv("OMNISERVE_NATIVE_LORA_REGISTRY");
+    char *fallback = NULL;
+    const char *registry_path = configured && configured[0] ? configured : NULL;
+    if (!registry_path) {
+        fallback = default_lora_registry_path(directory);
+        registry_path = fallback;
+    }
+    if (!registry_path) return NULL;
+
+    size_t json_len = 0;
+    char *json = read_small_file(registry_path, &json_len);
+    free(fallback);
+    if (!json) return NULL;
+
+    int token_cap = 65536;
+    oj_tok *tokens = calloc((size_t)token_cap, sizeof *tokens);
+    if (!tokens) {
+        free(json);
+        return NULL;
+    }
+    int token_count = oj_parse(json, json_len, tokens, token_cap);
+    if (token_count <= 0 || tokens[0].type != OJ_ARRAY) {
+        free(tokens);
+        free(json);
+        return NULL;
+    }
+
+    char *filename = NULL;
+    for (int i = 1; i < token_count; i++) {
+        if (tokens[i].parent != 0 || tokens[i].type != OJ_OBJECT) continue;
+        int id_token = oj_obj_get(json, tokens, token_count, i, "id");
+        if (id_token < 0 || !oj_str_eq(json, &tokens[id_token], id)) continue;
+        int path_token = oj_obj_get(json, tokens, token_count, i, "path");
+        if (path_token < 0 || tokens[path_token].type != OJ_STRING) break;
+        char *path = oj_strdup(json, &tokens[path_token]);
+        if (!path) break;
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        if (safe_lora_filename(base)) filename = strdup(base);
+        free(path);
+        break;
+    }
+
+    free(tokens);
+    free(json);
+    return filename;
+}
+
 static char *cached_lora_path(const char *id, const char *filename,
                               char *error, size_t error_cap) {
     const char *directory = getenv("OMNISERVE_NATIVE_LORA_DIR");
@@ -79,37 +196,18 @@ static char *cached_lora_path(const char *id, const char *filename,
         set_error(error, error_cap, "lora_filename must be a safe .safetensors basename");
         return NULL;
     }
-    size_t needed = strlen(directory) + strlen(filename) + 2;
-    char *path = malloc(needed);
-    if (!path) {
-        set_error(error, error_cap, "allocation failed");
-        return NULL;
+    char *path = NULL;
+    if (resolve_cached_lora_file(directory, filename, &path)) return path;
+    if (filename == fallback) {
+        char *registry_filename = registry_lora_filename(directory, id);
+        if (registry_filename) {
+            bool ok = resolve_cached_lora_file(directory, registry_filename, &path);
+            free(registry_filename);
+            if (ok) return path;
+        }
     }
-    snprintf(path, needed, "%s/%s", directory, filename);
-    struct stat st;
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
-        free(path);
-        set_error(error, error_cap, "lora_id is not installed in the native cache");
-        return NULL;
-    }
-    char resolved_directory[PATH_MAX];
-    char resolved_path[PATH_MAX];
-    if (!realpath(directory, resolved_directory) || !realpath(path, resolved_path)) {
-        free(path);
-        set_error(error, error_cap, "could not resolve native LoRA cache path");
-        return NULL;
-    }
-    size_t directory_len = strlen(resolved_directory);
-    if (strncmp(resolved_path, resolved_directory, directory_len) != 0 ||
-        resolved_path[directory_len] != '/') {
-        free(path);
-        set_error(error, error_cap, "lora_filename resolves outside the native cache");
-        return NULL;
-    }
-    free(path);
-    path = strdup(resolved_path);
-    if (!path) set_error(error, error_cap, "allocation failed");
-    return path;
+    set_error(error, error_cap, "lora_id is not installed in the native cache");
+    return NULL;
 }
 
 void oimage_request_free(oimage_request *request) {

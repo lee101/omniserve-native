@@ -124,6 +124,28 @@ static void test_image_contract(void) {
     CHECK(request.generation.lora_count == 1);
     CHECK(strcmp(request.generation.loras[0].path, named_lora_path) == 0);
     oimage_request_free(&request);
+    char registry_lora_path[512];
+    snprintf(registry_lora_path, sizeof registry_lora_path, "%s/Z-Image_360.safetensors", lora_dir);
+    lora_file = fopen(registry_lora_path, "wb");
+    CHECK(lora_file != NULL);
+    if (lora_file) fclose(lora_file);
+    char registry_path[512];
+    snprintf(registry_path, sizeof registry_path, "%s/lora_registry.json", lora_dir);
+    FILE *registry_file = fopen(registry_path, "wb");
+    CHECK(registry_file != NULL);
+    if (registry_file) {
+        fprintf(registry_file,
+                "[{\"id\":\"zimage_360\",\"path\":\"%s/Z-Image_360.safetensors\"}]",
+                lora_dir);
+        fclose(registry_file);
+    }
+    setenv("OMNISERVE_NATIVE_LORA_REGISTRY", registry_path, 1);
+    const char *registry_lora = "{\"prompt\":\"cat\",\"lora_id\":\"zimage_360\"}";
+    CHECK(oimage_request_parse(registry_lora, strlen(registry_lora),
+                               &request, error, sizeof error));
+    CHECK(request.generation.lora_count == 1);
+    CHECK(strcmp(request.generation.loras[0].path, registry_lora_path) == 0);
+    oimage_request_free(&request);
     const char *unsafe_filename = "{\"prompt\":\"cat\",\"lora_id\":\"z_style\","
                                   "\"lora_filename\":\"../secret.safetensors\"}";
     CHECK(!oimage_request_parse(unsafe_filename, strlen(unsafe_filename),
@@ -138,8 +160,11 @@ static void test_image_contract(void) {
     const char *unsafe_lora_id = "{\"prompt\":\"cat\",\"lora_id\":\"../secret\"}";
     CHECK(!oimage_request_parse(unsafe_lora_id, strlen(unsafe_lora_id),
                                 &request, error, sizeof error));
+    unsetenv("OMNISERVE_NATIVE_LORA_REGISTRY");
     unsetenv("OMNISERVE_NATIVE_LORA_DIR");
     unlink(escaped_lora_path);
+    unlink(registry_path);
+    unlink(registry_lora_path);
     unlink(named_lora_path);
     unlink(lora_path);
     rmdir(lora_dir);
@@ -262,6 +287,7 @@ static void test_openapi(void) {
         "/api/v1/generate-large", "/api/v1/image-caption",
         "/v1/animations/generations", "/v1/3d/generations",
         "/v1/images/backgrounds",
+        "/v1/images/segmentations", "/v1/images/text-layers", "/v1/images/edits",
         "/v1/images/foreground-generations/jobs",
         "/v1/images/foreground-generations/jobs/{job_id}",
         "/v1/images/background-removals/jobs",

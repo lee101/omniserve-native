@@ -8,17 +8,37 @@
 #include <strings.h>
 #include <time.h>
 
+/*
+ * One queued request.
+ *
+ * The condition variable is per waiter, not shared, and that is the whole point.
+ * A single broadcast queue costs O(n) wakeups per release and each woken thread
+ * then walks the list to find out whether it is the head, so a release under n
+ * queued requests is O(n^2) of contended work on one mutex - and n-1 of those
+ * threads go straight back to sleep. Saturation is exactly when the queue is
+ * long, so the scheduler got most expensive precisely when it had least to
+ * spare. Here a releasing thread grants permits directly to the waiters that fit
+ * and signals only those, so a release wakes exactly the threads that are about
+ * to run.
+ *
+ * Allocation is on the waiter's own stack: it is linked in and unlinked again
+ * entirely within one osched_acquire_n call, so its lifetime is that frame.
+ */
 typedef struct waiter {
     otier tier;
     int permits;
     long seq;
     struct timespec queued_at;
+    pthread_cond_t cond;
+    bool granted;
     struct waiter *next;
 } waiter;
 
 struct osched {
     pthread_mutex_t lock;
-    pthread_cond_t cond;
+    /* No shared condition variable: waiters each own one, so a release signals
+     * only the threads it just admitted. */
+    pthread_condattr_t condattr;
     int slots;
     int used_slots;
     int active;
@@ -40,11 +60,11 @@ osched *osched_create(int slots, double admission_timeout_s) {
     osched *s = calloc(1, sizeof *s);
     if (!s) return NULL;
     pthread_mutex_init(&s->lock, NULL);
-    pthread_condattr_t attr;
-    pthread_condattr_init(&attr);
-    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-    pthread_cond_init(&s->cond, &attr);
-    pthread_condattr_destroy(&attr);
+    /* Held for the lifetime of the scheduler because every waiter initialises
+     * its condvar from it. The monotonic clock has to match the deadline, or a
+     * wall-clock step would move every admission timeout. */
+    pthread_condattr_init(&s->condattr);
+    pthread_condattr_setclock(&s->condattr, CLOCK_MONOTONIC);
     s->slots = slots > 0 ? slots : 1;
     s->timeout_s = admission_timeout_s > 0 ? admission_timeout_s : 600;
     return s;
@@ -53,7 +73,7 @@ osched *osched_create(int slots, double admission_timeout_s) {
 void osched_destroy(osched *s) {
     if (!s) return;
     pthread_mutex_destroy(&s->lock);
-    pthread_cond_destroy(&s->cond);
+    pthread_condattr_destroy(&s->condattr);
     free(s);
 }
 
@@ -79,18 +99,51 @@ const char *otier_name(otier t) {
     }
 }
 
-static bool is_head(const osched *s, const waiter *me) {
-    for (const waiter *w = s->waiters; w; w = w->next) {
-        if (w->tier < me->tier) return false;
-        if (w->tier == me->tier && w->seq < me->seq) return false;
-    }
-    return true;
-}
-
 static void unlink_waiter(osched *s, waiter *me) {
     waiter **p = &s->waiters;
     while (*p && *p != me) p = &(*p)->next;
     if (*p) *p = me->next;
+}
+
+/* Insertion sort into a list kept in service order: tier ascending (paid first),
+ * then sequence ascending within a tier. The list is short - it is bounded by
+ * the number of in-flight HTTP requests - and keeping it ordered on insert is
+ * what makes the head O(1) to find on every release. */
+static void link_waiter(osched *s, waiter *me) {
+    waiter **p = &s->waiters;
+    while (*p && ((*p)->tier < me->tier ||
+                  ((*p)->tier == me->tier && (*p)->seq < me->seq))) {
+        p = &(*p)->next;
+    }
+    me->next = *p;
+    *p = me;
+}
+
+static bool fits_locked(const osched *s, otier tier, int permits) {
+    /* Background work reserves the whole device: it is the lane that swaps
+     * embedded models out, so it cannot share with a request that expects them
+     * loaded. */
+    return tier == TIER_BACKGROUND ? (s->active == 0 && s->used_slots == 0)
+                                   : (s->used_slots + permits <= s->slots);
+}
+
+/* Hands slots to the front of the queue and wakes only those waiters.
+ *
+ * The loop stops at the first waiter that does not fit rather than skipping it,
+ * which preserves the previous head-of-line rule exactly: a cheap request never
+ * overtakes an expensive one that is already waiting, so a lane asking for the
+ * whole device cannot be starved by a stream of single-permit callers. */
+static void promote_locked(osched *s) {
+    while (s->waiters) {
+        waiter *head = s->waiters;
+        if (!fits_locked(s, head->tier, head->permits)) break;
+        s->waiters = head->next;
+        s->active++;
+        s->used_slots += head->permits;
+        s->served[head->tier]++;
+        head->granted = true;
+        pthread_cond_signal(&head->cond);
+    }
 }
 
 bool osched_try_acquire_n(osched *s, otier tier, int permits) {
@@ -102,10 +155,7 @@ bool osched_try_acquire_n(osched *s, otier tier, int permits) {
      * is the admission point for callers that have somewhere else to go, and
      * jumping the queue would let them take the slot the waiter has already
      * paid for in latency. */
-    bool available = tier == TIER_BACKGROUND
-        ? s->active == 0 && s->used_slots == 0
-        : s->used_slots + permits <= s->slots;
-    if (s->waiters || !available) {
+    if (s->waiters || !fits_locked(s, tier, permits)) {
         pthread_mutex_unlock(&s->lock);
         return false;
     }
@@ -121,10 +171,7 @@ bool osched_acquire_n(osched *s, otier tier, int permits) {
         return false;
     }
     pthread_mutex_lock(&s->lock);
-    bool immediately_available = tier == TIER_BACKGROUND
-        ? s->active == 0 && s->used_slots == 0
-        : s->used_slots + permits <= s->slots;
-    if (!s->waiters && immediately_available) {
+    if (!s->waiters && fits_locked(s, tier, permits)) {
         s->active++;
         s->used_slots += permits;
         s->served[tier]++;
@@ -143,45 +190,45 @@ bool osched_acquire_n(osched *s, otier tier, int permits) {
         deadline.tv_nsec -= 1000000000L;
     }
 
-    waiter *me = calloc(1, sizeof *me);
-    if (!me) {
+    waiter me = {0};
+    me.tier = tier;
+    me.permits = permits;
+    me.seq = ++s->seq;
+    clock_gettime(CLOCK_MONOTONIC, &me.queued_at);
+    if (pthread_cond_init(&me.cond, &s->condattr) != 0) {
         pthread_mutex_unlock(&s->lock);
         return false;
     }
-    me->tier = tier;
-    me->permits = permits;
-    clock_gettime(CLOCK_MONOTONIC, &me->queued_at);
-    me->seq = ++s->seq;
-    me->next = s->waiters;
-    s->waiters = me;
+    link_waiter(s, &me);
 
-    for (;;) {
-        bool slot_free = tier == TIER_BACKGROUND
-            ? s->active == 0 && s->used_slots == 0
-            : s->used_slots + permits <= s->slots;
-        if (slot_free && is_head(s, me)) break;
-        int rc = pthread_cond_timedwait(&s->cond, &s->lock, &deadline);
-        if (rc != 0) {
-            unlink_waiter(s, me);
-            free(me);
-            s->timed_out[tier]++;
-            if (s->waiters) pthread_cond_broadcast(&s->cond);
-            pthread_mutex_unlock(&s->lock);
-            return false;
+    bool timed_out = false;
+    while (!me.granted) {
+        if (pthread_cond_timedwait(&me.cond, &s->lock, &deadline) != 0 && !me.granted) {
+            timed_out = true;
+            break;
         }
     }
-    unlink_waiter(s, me);
-    s->active++;
-    s->used_slots += permits;
-    s->served[tier]++;
+
+    if (timed_out) {
+        /* Still queued, so nothing was handed to us: drop out and let whoever
+         * is now at the front take the slot this request was holding a place
+         * for. */
+        unlink_waiter(s, &me);
+        s->timed_out[tier]++;
+        promote_locked(s);
+        pthread_mutex_unlock(&s->lock);
+        pthread_cond_destroy(&me.cond);
+        return false;
+    }
+
+    /* promote_locked already unlinked us and charged the permits. */
     struct timespec admitted_at;
     clock_gettime(CLOCK_MONOTONIC, &admitted_at);
-    double queued_ms = elapsed_ms(me->queued_at, admitted_at);
-    free(me);
+    double queued_ms = elapsed_ms(me.queued_at, admitted_at);
     s->queue_ms_total[tier] += queued_ms;
     if (queued_ms > s->queue_ms_max[tier]) s->queue_ms_max[tier] = queued_ms;
-    if (s->waiters) pthread_cond_broadcast(&s->cond);
     pthread_mutex_unlock(&s->lock);
+    pthread_cond_destroy(&me.cond);
     return true;
 }
 
@@ -195,7 +242,7 @@ void osched_release_n(osched *s, otier tier, int permits) {
     pthread_mutex_lock(&s->lock);
     if (s->active > 0) s->active--;
     s->used_slots = s->used_slots >= permits ? s->used_slots - permits : 0;
-    if (s->waiters) pthread_cond_broadcast(&s->cond);
+    promote_locked(s);
     pthread_mutex_unlock(&s->lock);
 }
 

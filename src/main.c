@@ -27,6 +27,8 @@ typedef struct {
     const char *secret;
     oproxy_target *llm_upstream;
     oproxy_target *image_upstream;
+    oproxy_target *image_worker_upstream;
+    oproxy_target *image_editor_upstream;
     oproxy_target *art_upstream;
     oproxy_target *birefnet_upstream;
     oproxy_target *tts_upstream;
@@ -336,10 +338,12 @@ static void handle_readyz(ohttp_request *req) {
 static void handle_status(ohttp_request *req, app_state *app) {
     osched_stats stats;
     osched_snapshot(app->sched, &stats);
-    oproxy_stats llm_proxy, image_proxy, birefnet_proxy, tts_proxy, stt_proxy, forecast_proxy;
+    oproxy_stats llm_proxy, image_proxy, image_worker_proxy, birefnet_proxy, tts_proxy;
+    oproxy_stats stt_proxy, forecast_proxy;
     oproxy_stats embedding_proxy, multimodal_proxy, animation_proxy, threed_proxy, aux_proxy;
     oproxy_target_snapshot(app->llm_upstream, &llm_proxy);
     oproxy_target_snapshot(app->image_upstream, &image_proxy);
+    oproxy_target_snapshot(app->image_worker_upstream, &image_worker_proxy);
     oproxy_target_snapshot(app->birefnet_upstream, &birefnet_proxy);
     oproxy_target_snapshot(app->tts_upstream, &tts_proxy);
     oproxy_target_snapshot(app->stt_upstream, &stt_proxy);
@@ -366,13 +370,14 @@ static void handle_status(ohttp_request *req, app_state *app) {
              "\"diffusion\":{\"ready\":%s,\"model\":\"%s\"},"
              /* Key order must track the argument order below, which matches the
               * permits object: llm, image, birefnet, tts, stt, ... */
-             "\"upstreams\":{\"llm\":%s,\"image\":%s,\"art\":%s,\"birefnet\":%s,\"tts\":%s,\"stt\":%s,\"forecast\":%s,"
+             "\"upstreams\":{\"llm\":%s,\"image\":%s,\"image_worker\":%s,\"art\":%s,\"birefnet\":%s,\"tts\":%s,\"stt\":%s,\"forecast\":%s,"
              "\"embedding\":%s,\"multimodal\":%s,\"animation\":%s,\"threed\":%s,\"aux\":%s},"
              "\"permits\":{\"llm\":%d,\"image\":%d,\"art\":%d,\"birefnet\":%d,\"tts\":%d,\"stt\":%d,\"forecast\":%d,"
              "\"embedding\":%d,\"multimodal\":%d,\"animation\":%d,\"threed\":%d,\"aux\":%d},"
              "\"proxy_pool\":{"
              "\"llm\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"image\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
+             "\"image_worker\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"birefnet\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"tts\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"stt\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
@@ -397,6 +402,7 @@ static void handle_status(ohttp_request *req, app_state *app) {
              oembed_ready() ? "true" : "false", oembed_model_name(),
              osd_ready() ? "true" : "false", osd_model_name(),
              app->llm_upstream ? "true" : "false", app->image_upstream ? "true" : "false",
+             app->image_worker_upstream ? "true" : "false",
              app->art_upstream ? "true" : "false",
              app->birefnet_upstream ? "true" : "false",
              app->tts_upstream ? "true" : "false", app->stt_upstream ? "true" : "false",
@@ -413,6 +419,8 @@ static void handle_status(ohttp_request *req, app_state *app) {
              llm_proxy.connections_reused, llm_proxy.failures,
              image_proxy.idle_connections, image_proxy.connections_opened,
              image_proxy.connections_reused, image_proxy.failures,
+             image_worker_proxy.idle_connections, image_worker_proxy.connections_opened,
+             image_worker_proxy.connections_reused, image_worker_proxy.failures,
              birefnet_proxy.idle_connections, birefnet_proxy.connections_opened,
              birefnet_proxy.connections_reused, birefnet_proxy.failures,
              tts_proxy.idle_connections, tts_proxy.connections_opened,
@@ -698,13 +706,14 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
         return;
     }
     otier tier = tier_override >= 0 ? (otier)tier_override : request_tier(req);
-    int permits = tier == TIER_BACKGROUND ? osched_capacity(app->sched) : modality_permits;
+    int permits = modality_permits;
+    bool admit = permits > 0;
 
     /* With a remote available, queueing locally is the wrong default: the wait
      * buys nothing the remote would not have already delivered. Without one,
      * behaviour is unchanged and the blocking acquire still applies. */
     oproxy_target *local = upstream;
-    oproxy_target *overflow = overflow_for(app, local, tier);
+    oproxy_target *overflow = admit ? overflow_for(app, local, tier) : NULL;
     bool on_overflow = false;
     if (overflow) {
         if (!osched_try_acquire_n(app->sched, tier, permits)) {
@@ -716,7 +725,7 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
             permits = 0;
         }
     }
-    if (!on_overflow && !osched_acquire_n(app->sched, tier, permits)) {
+    if (admit && !on_overflow && !osched_acquire_n(app->sched, tier, permits)) {
         respond_error(req, 503, "admission timeout; retry");
         return;
     }
@@ -1274,7 +1283,7 @@ static void handle_images(ohttp_request *req, app_state *app) {
         return;
     }
     otier tier = request_tier(req);
-    int permits = tier == TIER_BACKGROUND ? osched_capacity(app->sched) : app->image_permits;
+    int permits = app->image_permits;
     if (!osched_acquire_n(app->sched, tier, permits)) {
         oimage_request_free(&image_request);
         respond_error(req, 503, "admission timeout; retry");
@@ -1785,6 +1794,21 @@ static void route(ohttp_request *req, void *user) {
         else handle_images(req, app);
         return;
     }
+    /* Precise masks and masked edits are handled by a scale-to-zero GPU pool.
+     * They have their own target so SAM2 / inpainting cold starts cannot steal
+     * the resident Z-Image or BiRefNet lanes on the shared local GPU. */
+    if (ohttp_path_is(req, "/v1/images/segmentations") ||
+        ohttp_path_is(req, "/v1/images/text-layers") ||
+        ohttp_path_is(req, "/v1/images/edits")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        if (!app->image_editor_upstream) {
+            respond_error(req, 503, "image editor worker is not configured");
+            return;
+        }
+        handle_proxy_as(req, app, app->image_editor_upstream, 1, "application/json", NULL);
+        return;
+    }
     /* OmniServe's vision/video control-plane surface is part of the public
      * native gateway too. Keep one upstream and preserve the exact path so
      * models, LoRAs, validation and capacity decisions stay centralized. */
@@ -1808,7 +1832,7 @@ static void route(ohttp_request *req, void *user) {
     }
     if (ohttp_path_is(req, "/loras")) {
         if (!ohttp_method_is(req, "GET")) { respond_error(req, 405, "GET required"); return; }
-        handle_proxy_as(req, app, app->image_upstream, 1, NULL, NULL);
+        handle_proxy_as(req, app, app->image_upstream, 0, NULL, NULL);
         return;
     }
     /* Style transfer over an existing backdrop, same lane and same tier as the
@@ -1879,6 +1903,24 @@ static void route(ohttp_request *req, void *user) {
                              is_post ? "application/json" : NULL, mapped_path, -1);
         return;
     }
+    if (path_starts_with(req, "/v1/videos/background-removals/jobs")) {
+        const bool is_post = ohttp_method_is(req, "POST");
+        if (!is_post && !ohttp_method_is(req, "GET")) {
+            respond_error(req, 405, "GET or POST required");
+            return;
+        }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        char mapped_path[1024];
+        int mapped_len = snprintf(mapped_path, sizeof mapped_path, "%.*s",
+                                  (int)req->path_len, req->path);
+        if (mapped_len <= 0 || mapped_len >= (int)sizeof mapped_path) {
+            respond_error(req, 414, "path too long");
+            return;
+        }
+        handle_proxy_as_tier(req, app, app->birefnet_upstream, 1,
+                             is_post ? "application/json" : NULL, mapped_path, TIER_BACKGROUND);
+        return;
+    }
     if (ohttp_path_is(req, "/v1/images/background-removals") ||
         ohttp_path_is(req, "/api/v1/birefnet")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
@@ -1937,7 +1979,7 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/api/v1/speech/catalog")) {
         if (!ohttp_method_is(req, "GET")) { respond_error(req, 405, "GET required"); return; }
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
-        handle_proxy(req, app, app->tts_upstream, app->tts_permits, NULL);
+        handle_proxy(req, app, app->tts_upstream, 0, NULL);
         return;
     }
     if (ohttp_path_is(req, "/v1/audio/transcriptions") ||
@@ -1960,7 +2002,7 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/v1/training/status") ||
         ohttp_path_is(req, "/v1/training/jobs")) {
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
-        handle_proxy(req, app, app->training_upstream, 1, "application/json");
+        handle_proxy(req, app, app->training_upstream, 0, "application/json");
         return;
     }
     if (ohttp_path_is(req, "/v1/training/jobs/run")) {
@@ -1995,7 +2037,9 @@ static void route(ohttp_request *req, void *user) {
         ohttp_path_is(req, "/aesthetic_score");
     if (image_worker_path) {
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
-        handle_proxy(req, app, app->image_upstream, app->image_permits, NULL);
+        oproxy_target *target = app->image_worker_upstream
+            ? app->image_worker_upstream : app->image_upstream;
+        handle_proxy(req, app, target, app->image_permits, NULL);
         return;
     }
     if (ohttp_path_is(req, "/synthesize")) {
@@ -2062,6 +2106,7 @@ int main(int argc, char **argv) {
             puts("usage: omniserve-native [--port PORT]\n"
                  "environment: OMNISERVE_NATIVE_LLM_GGUF, _EMBEDDING_GGUF, _SD_MODEL,\n"
                  "             _SECRET, _SLOTS, _LLM_UPSTREAM, _IMAGE_UPSTREAM,\n"
+                 "             _IMAGE_WORKER_UPSTREAM,\n"
                  "             _ART_UPSTREAM, _ART_PATH, _ART_PERMITS,\n"
                  "             _BIREFNET_UPSTREAM, _TTS_UPSTREAM, _STT_UPSTREAM,\n"
                  "             _FORECAST_UPSTREAM, _FORECAST_PERMITS,\n"
@@ -2146,6 +2191,8 @@ int main(int argc, char **argv) {
     const char *unified_upstream = getenv("OMNISERVE_NATIVE_UPSTREAM");
     const char *llm_upstream = getenv("OMNISERVE_NATIVE_LLM_UPSTREAM");
     const char *image_upstream = getenv("OMNISERVE_NATIVE_IMAGE_UPSTREAM");
+    const char *image_worker_upstream = getenv("OMNISERVE_NATIVE_IMAGE_WORKER_UPSTREAM");
+    const char *image_editor_upstream = getenv("OMNISERVE_NATIVE_IMAGE_EDITOR_UPSTREAM");
     const char *art_upstream = getenv("OMNISERVE_NATIVE_ART_UPSTREAM");
     const char *birefnet_upstream = getenv("OMNISERVE_NATIVE_BIREFNET_UPSTREAM");
     const char *tts_upstream = getenv("OMNISERVE_NATIVE_TTS_UPSTREAM");
@@ -2179,6 +2226,8 @@ int main(int argc, char **argv) {
 } while (0)
     CREATE_UPSTREAM(llm_upstream, llm_upstream, "LLM");
     CREATE_UPSTREAM(image_upstream, image_upstream, "image");
+    CREATE_UPSTREAM(image_worker_upstream, image_worker_upstream, "image worker");
+    CREATE_UPSTREAM(image_editor_upstream, image_editor_upstream, "image editor");
     CREATE_UPSTREAM(art_upstream, art_upstream, "background art");
     CREATE_UPSTREAM(birefnet_upstream, birefnet_upstream, "birefnet");
     CREATE_UPSTREAM(tts_upstream, tts_upstream, "TTS");
@@ -2322,6 +2371,8 @@ int main(int argc, char **argv) {
     olog_shutdown();
     oproxy_target_destroy(app.llm_upstream);
     oproxy_target_destroy(app.image_upstream);
+    oproxy_target_destroy(app.image_worker_upstream);
+    oproxy_target_destroy(app.image_editor_upstream);
     oproxy_target_destroy(app.art_upstream);
     oproxy_target_destroy(app.birefnet_upstream);
     oproxy_target_destroy(app.tts_upstream);
