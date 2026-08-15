@@ -67,16 +67,11 @@ budget must include KV cache, compute workspace, and backend overhead for the
 intended context length. Models that do not fit remain visible in the selector
 but cannot be admitted.
 
-The catalogue includes two Anima-2.9B research profiles tied to the sibling
-`anima-omniserve-native` Cog. `anima-2.9b-offload` uses Accelerate CPU offload
-for a quiet 24 GB card; `anima-2.9b-bf16` keeps the compiled pipeline on CUDA
-and targets 32 GB or larger. These are conservative whole-pipeline budgets,
-not the 5.44 GiB expansion checkpoint size alone. OmniServe continues to fail
-closed when another process has consumed the required headroom.
-
-Anima is a Cosmos-derived diffusion pipeline, so the native path invokes the
-Cog's BF16/TF32 PyTorch runtime. It is not routed through the GGUF/llama.cpp
-language-model backend.
+The catalogue includes `anima-gemma-qlora`, the tiny Gemma QLoRA used by
+text-generator.io. It is admitted only when a request needs it; OmniServe does
+not preload it. `qwen2.5-7b-qlora` remains for chat. Large GGUF Q4 profiles and
+the 24 GB Anima diffusion offload/compile rows were removed from this front
+door so a quiet card is not reserved for unused weights.
 
 ## Shared GPU job queue
 
@@ -135,12 +130,13 @@ from the shared base image. New services add a manifest row and a module with
 new GPU server or scheduling implementation.
 
 MiniMax-Music3 is deployed from this repository as a separate scale-to-zero
-endpoint with `scripts/deploy-music3-runpod.sh`. It shares RunPod, storage,
-monitoring, and billing infrastructure while keeping its 10.6 GiB CUDA runtime
-image and roughly 38 GiB checkpoint out of production video cold starts. The
-worker keeps the quality-preserving upstream defaults: backbone and RVQ CUDA
-graphs, compiled DIT blocks, compiled DAV decoder, 30 DIT steps, and the
-measured-fastest `torch_sdpa` acoustic attention path.
+endpoint with `scripts/deploy-music3-runpod.sh`. The RunPod adapter is native C
+in `music3c/`; it lazy-starts `sgl-omni` on the first request and will not
+replace the ~38 GiB checkpoint unless `MUSIC3_FORCE_REDOWNLOAD=1`. Prefer H100
+80GB (H200 remains allowed). The worker keeps the quality-preserving upstream
+defaults: backbone and RVQ CUDA graphs, compiled DIT blocks, compiled DAV
+decoder, 30 DIT steps, and the measured-fastest `torch_sdpa` acoustic attention
+path.
 
 Requests should set an explicit workload:
 

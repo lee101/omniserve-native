@@ -20,25 +20,26 @@ if [[ -z "$runpod_key" ]]; then
   echo "ERROR: RUNPOD_API_KEY is required" >&2
   exit 1
 fi
-for command_name in base64 curl git jq sha256sum; do
+for command_name in base64 curl git jq sha256sum make cc; do
   command -v "$command_name" >/dev/null || { echo "ERROR: missing $command_name" >&2; exit 1; }
 done
 
-tag="$(sha256sum "$root/music3/Dockerfile" "$root/music3/handler.py" "$config" | sha256sum | cut -c1-16)"
+tag="$(sha256sum "$root/music3c/Dockerfile" "$root/music3c/main.c" "$root/music3c/music3.c" "$root/music3/sglang-music3-a100.patch" "$config" | sha256sum | cut -c1-16)"
 image="$base_image"
 if [[ "${MUSIC3_BUILD_DERIVED_IMAGE:-0}" == "1" ]]; then
   command -v docker >/dev/null || { echo "ERROR: missing docker" >&2; exit 1; }
   image="${image_repository}:${tag}"
   echo "Building optional derived image $image"
-  docker buildx build --pull --push --platform linux/amd64 -t "$image" -f "$root/music3/Dockerfile" "$root"
+  docker buildx build --pull --push --platform linux/amd64 -t "$image" -f "$root/music3c/Dockerfile" "$root"
 fi
 
 # Avoid copying the upstream image's 11.42GB layer between registries. RunPod
-# pulls it from its public source; our tiny adapter and pinned source checkout
-# live in the template/shared volume instead.
-handler_b64="$(base64 -w0 "$root/music3/handler.py")"
+# pulls it from its public source; the C adapter is compiled here and the
+# 38GB MiniMax-Music3 checkpoint stays on the regional network volume.
+make -C "$root" build/music3c
+worker_b64="$(base64 -w0 "$root/build/music3c")"
 sgl_patch_b64="$(base64 -w0 "$root/music3/sglang-music3-a100.patch")"
-bootstrap='set -Eeuo pipefail; runtime=/runpod-volume/omniserve/music3/sglang-omni-e0c98529; mkdir -p /runpod-volume/omniserve/music3/pip /opt/omniserve-music3; if [[ ! -f "$runtime/pyproject.toml" ]]; then git clone --filter=blob:none https://github.com/sgl-project/sglang-omni.git "$runtime"; git -C "$runtime" checkout e0c98529e5730f60e19251025877387b9476c8d4; fi; printf "%s" "$MUSIC3_SGL_PATCH_B64" | base64 -d > /tmp/music3-a100.patch; if ! git -C "$runtime" apply --reverse --check /tmp/music3-a100.patch 2>/dev/null; then git -C "$runtime" apply --check /tmp/music3-a100.patch; git -C "$runtime" apply /tmp/music3-a100.patch; fi; python3 -m pip install --no-deps --no-build-isolation -e "$runtime"; python3 -m pip install --cache-dir /runpod-volume/omniserve/music3/pip "runpod==1.8.1"; printf "%s" "$MUSIC3_HANDLER_B64" | base64 -d > /opt/omniserve-music3/handler.py; exec python3 -u /opt/omniserve-music3/handler.py'
+bootstrap='set -Eeuo pipefail; runtime=/runpod-volume/omniserve/music3/sglang-omni-e0c98529; mkdir -p /runpod-volume/omniserve/music3/pip /opt/omniserve-music3; if [[ ! -f "$runtime/pyproject.toml" ]]; then git clone --filter=blob:none https://github.com/sgl-project/sglang-omni.git "$runtime"; git -C "$runtime" checkout e0c98529e5730f60e19251025877387b9476c8d4; fi; printf "%s" "$MUSIC3_SGL_PATCH_B64" | base64 -d > /tmp/music3-a100.patch; if ! git -C "$runtime" apply --reverse --check /tmp/music3-a100.patch 2>/dev/null; then git -C "$runtime" apply --check /tmp/music3-a100.patch; git -C "$runtime" apply /tmp/music3-a100.patch; fi; python3 -m pip install --no-deps --no-build-isolation -e "$runtime"; printf "%s" "$MUSIC3_WORKER_B64" | base64 -d > /opt/omniserve-music3/music3c; chmod +x /opt/omniserve-music3/music3c; exec /opt/omniserve-music3/music3c'
 
 api="https://rest.runpod.io/v1"
 auth=(-H "Authorization: Bearer $runpod_key" -H "Content-Type: application/json")
@@ -50,10 +51,10 @@ if [[ -z "$volume_id" || -z "$datacenter_id" ]]; then
   exit 1
 fi
 
-template_payload="$(jq -n --arg image "$image" --arg registry_auth "$registry_auth_id" --arg bootstrap "$bootstrap" --arg handler "$handler_b64" --arg sgl_patch "$sgl_patch_b64" '{
+template_payload="$(jq -n --arg image "$image" --arg registry_auth "$registry_auth_id" --arg bootstrap "$bootstrap" --arg worker "$worker_b64" --arg sgl_patch "$sgl_patch_b64" '{
   imageName:$image, name:"omniserve-minimax-music3", containerDiskInGb:60,
   dockerEntrypoint:[], dockerStartCmd:["bash","-lc",$bootstrap], env:{
-    MUSIC3_HANDLER_B64:$handler,
+    MUSIC3_WORKER_B64:$worker,
     MUSIC3_SGL_PATCH_B64:$sgl_patch,
     MUSIC3_MODEL_ID:"MiniMaxAI/MiniMax-Music3",
     MUSIC3_MODEL_DIR:"/runpod-volume/models/minimax-music3",
