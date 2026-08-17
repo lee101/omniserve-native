@@ -162,6 +162,10 @@ def main() -> int:
     parser.add_argument("--guidance-scale", type=float, default=0.0)
     parser.add_argument("--teleport", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--teleport-start-step", type=int, default=7)
+    parser.add_argument(
+        "--allow-raw", action="store_true",
+        help="accept a raw image response without native metadata (for Daisy)",
+    )
     parser.add_argument("--output-dir", type=Path, default=ROOT / "evals")
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--server-root", default=str(ROOT))
@@ -223,7 +227,7 @@ def main() -> int:
         body, content_type, headers = request_json(args.base, payload, args.timeout)
         wall_ms = round((time.perf_counter() - started) * 1000, 3)
         image, response_meta = decode_image(body, content_type)
-        if lora is not None and (
+        if lora is not None and not args.allow_raw and (
             response_meta.get("transport") == "raw" or
             response_meta.get("teleport") is None
         ):
