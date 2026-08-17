@@ -146,7 +146,7 @@ def stop_server(process: subprocess.Popen[str]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("running", "local", "auto"), default="running")
+    parser.add_argument("--mode", choices=("running", "local", "ssh", "auto"), default="running")
     parser.add_argument("--base", default="http://127.0.0.1:8791")
     parser.add_argument("--lora", default=str(DEFAULT_LORA),
                         help="LoRA path; pass an empty string for the base model")
@@ -168,6 +168,9 @@ def main() -> int:
     parser.add_argument("--server-binary", default="build-full/omniserve-native")
     parser.add_argument("--env-file")
     parser.add_argument("--port", type=int, default=8792)
+    parser.add_argument("--ssh-host", help="SSH host for --mode ssh")
+    parser.add_argument("--ssh-remote-port", type=int, default=8791)
+    parser.add_argument("--ssh-local-port", type=int, default=18792)
     parser.add_argument("--server-arg", action="append", default=[])
     args = parser.parse_args()
 
@@ -188,7 +191,17 @@ def main() -> int:
             args.mode = "running"
         except RuntimeError:
             args.mode = "local"
-    if args.mode == "local":
+    if args.mode == "ssh":
+        if not args.ssh_host:
+            raise SystemExit("--ssh-host is required with --mode ssh")
+        args.base = f"http://127.0.0.1:{args.ssh_local_port}"
+        process = subprocess.Popen([
+            "ssh", "-N", "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=30", "-o", "StrictHostKeyChecking=no",
+            "-L", f"{args.ssh_local_port}:127.0.0.1:{args.ssh_remote_port}",
+            args.ssh_host,
+        ], start_new_session=True, text=True)
+    elif args.mode == "local":
         process = start_local_server(args)
 
     try:
@@ -210,6 +223,16 @@ def main() -> int:
         body, content_type, headers = request_json(args.base, payload, args.timeout)
         wall_ms = round((time.perf_counter() - started) * 1000, 3)
         image, response_meta = decode_image(body, content_type)
+        if lora is not None and (
+            response_meta.get("transport") == "raw" or
+            response_meta.get("teleport") is None
+        ):
+            raise RuntimeError(
+                "the target server accepted the request but returned no native "
+                "LoRA/teleport metadata; it is likely an older proxy or Z-Image "
+                "build that ignores loras. Use --mode ssh with the native gateway "
+                "or upgrade the local server."
+            )
         after = gpu_memory()
 
         output_dir = args.output_dir.expanduser() / f"zimage_lora_{stamp()}"
