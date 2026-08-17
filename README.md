@@ -41,6 +41,31 @@ The service invokes the installed `curl` binary for outbound HTTPS. This keeps
 the C build dependency-free while supporting HTTPS remote providers. The Docker
 image includes `curl` and CA certificates.
 
+## Local Z-Image LoRA tests
+
+`tools/test_zimage_lora.py` generates a reviewable Z-Image-Turbo image from a
+direct `.safetensors` path and writes `image.webp` plus `report.json` under an
+`evals/zimage_lora_*` directory. The report records the request, response
+teleport metadata, latency, and `nvidia-smi` memory snapshots. It can use the
+already-running loopback gateway or start a binary from the current checkout:
+
+```bash
+python3 tools/test_zimage_lora.py \
+  --mode running \
+  --lora /vfast/data/code/loras/new/nsm_ZIT_000017532.safetensors
+
+python3 tools/test_zimage_lora.py \
+  --mode local --server-root /nvme0n1-disk/code/omniserve-native \
+  --server-binary build-full/omniserve-native \
+  --env-file /etc/omniserve-h3.env
+```
+
+The native latent cache fingerprints every LoRA path and scale, so repeated
+requests cannot reuse a latent captured with a different adapter. The default
+test profile is 768×768, nine Euler steps, zero requested guidance (using the
+server's distilled Z-Image setting), one adapter, and one image. `--mode auto`
+uses the running gateway when healthy and otherwise starts the local binary.
+
 ## Tunnel Deployment
 
 1. Copy `.env.example` to `.env` and set the front-door and Cloudflare Tunnel
