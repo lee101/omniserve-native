@@ -148,7 +148,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("running", "local", "auto"), default="running")
     parser.add_argument("--base", default="http://127.0.0.1:8791")
-    parser.add_argument("--lora", type=Path, default=DEFAULT_LORA)
+    parser.add_argument("--lora", default=str(DEFAULT_LORA),
+                        help="LoRA path; pass an empty string for the base model")
     parser.add_argument("--lora-scale", type=float, default=1.0)
     parser.add_argument("--prompt", default=(
         "a cinematic portrait of an astronaut botanist in a glass greenhouse on Mars, "
@@ -170,9 +171,10 @@ def main() -> int:
     parser.add_argument("--server-arg", action="append", default=[])
     args = parser.parse_args()
 
-    if not args.lora.is_file():
-        raise SystemExit(f"LoRA file not found: {args.lora}")
-    if not -4.0 <= args.lora_scale <= 4.0:
+    lora = Path(args.lora).expanduser() if args.lora else None
+    if lora is not None and not lora.is_file():
+        raise SystemExit(f"LoRA file not found: {lora}")
+    if lora is not None and not -4.0 <= args.lora_scale <= 4.0:
         raise SystemExit("--lora-scale must be between -4 and 4")
     if args.width % 64 or args.height % 64:
         raise SystemExit("--width and --height must be multiples of 64")
@@ -200,8 +202,9 @@ def main() -> int:
             "seed": args.seed,
             "teleport": args.teleport,
             "teleport_start_step": args.teleport_start_step,
-            "loras": [{"path": str(args.lora.resolve()), "scale": args.lora_scale}],
         }
+        if lora is not None:
+            payload["loras"] = [{"path": str(lora.resolve()), "scale": args.lora_scale}]
         before = gpu_memory()
         started = time.perf_counter()
         body, content_type, headers = request_json(args.base, payload, args.timeout)
@@ -217,7 +220,8 @@ def main() -> int:
             "mode": args.mode,
             "base": args.base,
             "request": payload,
-            "lora": {"path": str(args.lora.resolve()), "bytes": args.lora.stat().st_size},
+            "lora": ({"path": str(lora.resolve()), "bytes": lora.stat().st_size}
+                     if lora is not None else None),
             "response": response_meta,
             "content_type": content_type,
             "response_bytes": len(body),
