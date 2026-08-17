@@ -50,7 +50,7 @@ test: $(TESTS) $(JOB_TEST) $(MUSIC3C_TEST)
 	build/test_breaker
 	$(JOB_TEST)
 	$(MUSIC3C_TEST)
-	python3 -m pytest -q tests/test_runtime.py tests/test_person_detection.py tests/test_video_matting.py tests/test_music3_handler.py
+	python3 -m pytest -q tests/test_runtime.py tests/test_person_detection.py tests/test_video_matting.py tests/test_music3_handler.py tests/test_wan_animate_2.py
 
 clean:
 	rm -rf build

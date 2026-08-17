@@ -211,16 +211,92 @@ def _infer(tensor, recurrent, ratio):
         return _model(tensor, *recurrent, ratio)
 
 
-def release() -> None:
-    """Release RVM before OmniServe switches this GPU to another workload."""
+def _release_rvm() -> None:
     global _model, _eager_model, _model_engine, _compile_error
     _model = None
     _eager_model = None
     _model_engine = ""
     _compile_error = ""
+
+
+def release() -> None:
+    """Release RVM before OmniServe switches this GPU to another workload."""
+    _release_rvm()
     _person_detector.release()
+    try:
+        from workloads import matanyone_matting
+        matanyone_matting.release()
+    except Exception:
+        pass
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(value, (int, float)):
+        return value != 0
+    return bool(value)
+
+
+def matte_quality_ok(rgb: np.ndarray, alpha: np.ndarray) -> tuple[bool, str]:
+    if rgb is None or alpha is None or rgb.size == 0 or alpha.size == 0:
+        return False, "empty matte"
+    opaque = alpha > 12
+    coverage = float(opaque.mean())
+    if coverage < 0.02:
+        return False, "alpha coverage too low"
+    if not opaque.any():
+        return False, "no opaque pixels"
+    tone = float(rgb[opaque].mean())
+    if tone < 4:
+        return False, "opaque pixels are black"
+    return True, ""
+
+
+class MatteQualityMonitor:
+    def __init__(self, max_near_black_frames: int = 2):
+        self.max_near_black_frames = max_near_black_frames
+        self.near_black_frames = 0
+
+    def check(self, rgb: np.ndarray, alpha: np.ndarray) -> tuple[bool, str]:
+        if rgb is None or alpha is None or rgb.size == 0 or alpha.size == 0:
+            return False, "empty matte"
+        opaque = alpha > 12
+        coverage = float(opaque.mean())
+        if coverage < 0.02:
+            return False, "alpha coverage too low"
+        tone = float(rgb[opaque].mean())
+        if tone < 4:
+            self.near_black_frames += 1
+            if self.near_black_frames > self.max_near_black_frames:
+                return False, f"opaque pixels are black for {self.near_black_frames} frames"
+        else:
+            self.near_black_frames = 0
+        return True, ""
+
+
+def matting_plan(inputs: dict) -> dict:
+    if _as_bool(inputs.get("max_quality")):
+        return {
+            "engine": "matanyone",
+            "skip_person": True,
+            "allow_standby": False,
+            "identity_engine": "matanyone-v1",
+            "route": "local-matanyone",
+        }
+    return {
+        "engine": "rvm",
+        "skip_person": False,
+        "allow_standby": True,
+        "identity_engine": f"rvm-{MODEL_BACKBONE}-chunked-v3",
+        "route": "local-rvm-person",
+    }
+
+
+def _mask_reference(inputs: dict) -> str:
+    return str(inputs.get("mask_url") or inputs.get("image_url") or "").strip()
 
 
 def _downsample_ratio(width: int, height: int) -> float:
@@ -311,6 +387,9 @@ def _matte(source: Path, transparent: Path, info: dict, job: dict) -> dict:
             rgba = np.concatenate((rgb, alpha_bytes[..., None]), axis=-1)
             encoder.stdin.write(rgba.tobytes())
             frames += count
+            quality_ok, quality_reason = matte_quality_ok(rgb, alpha_bytes)
+            if not quality_ok:
+                raise RuntimeError(f"RVM matte rejected: {quality_reason}")
             if runpod is not None and (frames == count or frames % 30 < count):
                 runpod.serverless.progress_update(job, f"Matted {frames} frames")
     finally:
@@ -399,43 +478,48 @@ def handler(job: dict) -> dict:
         source = work / "source.video"
         _download(video_url, source)
         info = _probe(source)
-        route_mode = os.getenv("VIDEO_MATTING_ROUTE", "auto").strip().lower()
-        if route_mode not in {"auto", "rvm", "standby"}:
-            raise ValueError("VIDEO_MATTING_ROUTE must be auto, rvm, or standby")
-        if route_mode == "rvm":
-            route = {"detected": True, "forced": True, "error": ""}
-        elif route_mode == "standby":
-            route = {"detected": False, "forced": True, "error": ""}
+        plan = matting_plan(inputs)
+        mask_url = _mask_reference(inputs)
+        if plan["engine"] == "matanyone":
+            route = {"detected": True, "forced": True, "engine": "matanyone", "error": ""}
         else:
-            route = _person_detector.detect(source, duration=info["duration"]).public_dict()
-            route["forced"] = False
-        if not route["detected"]:
-            reason = "person detector uncertainty" if route.get("error") else "no person detected"
-            return {
-                "fallback_required": True,
-                "fallback_reason": reason,
-                "route": "standby-general-matting",
-                "duration_seconds": info["duration"],
-                "metrics": {"person_detection": route},
-            }
+            route_mode = os.getenv("VIDEO_MATTING_ROUTE", "auto").strip().lower()
+            if route_mode not in {"auto", "rvm", "standby"}:
+                raise ValueError("VIDEO_MATTING_ROUTE must be auto, rvm, or standby")
+            if route_mode == "rvm":
+                route = {"detected": True, "forced": True, "error": ""}
+            elif route_mode == "standby":
+                route = {"detected": False, "forced": True, "error": ""}
+            else:
+                route = _person_detector.detect(source, duration=info["duration"]).public_dict()
+                route["forced"] = False
+            if not route["detected"]:
+                reason = "person detector uncertainty" if route.get("error") else "no person detected"
+                return {
+                    "fallback_required": True,
+                    "fallback_reason": reason,
+                    "route": "standby-general-matting",
+                    "duration_seconds": info["duration"],
+                    "metrics": {"person_detection": route},
+                }
         content_hash = _sha256(source)
-        identity = json.dumps(
-            {
-                "content": content_hash,
-                "preserve_audio": preserve_audio,
-                "engine": f"rvm-{MODEL_BACKBONE}-chunked-v3",
-                "downsample_ratio": _downsample_ratio(info["width"], info["height"]),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        identity_payload = {
+            "content": content_hash,
+            "preserve_audio": preserve_audio,
+            "engine": plan["identity_engine"],
+        }
+        if plan["engine"] == "rvm":
+            identity_payload["downsample_ratio"] = _downsample_ratio(info["width"], info["height"])
+        else:
+            identity_payload["mask"] = mask_url or "auto"
+        identity = json.dumps(identity_payload, sort_keys=True, separators=(",", ":"))
         key = hashlib.sha256(identity.encode()).hexdigest()
         cache = _cache_root()
         cached = cache / "outputs" / f"{key}.webm"
         lock_path = cache / "locks" / f"{key}.lock"
         cached.parent.mkdir(parents=True, exist_ok=True)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        metrics = {"person_detection": route}
+        metrics = {"person_detection": route, "plan": plan}
         cache_hit = False
         with lock_path.open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -443,7 +527,12 @@ def handler(job: dict) -> dict:
                 cache_hit = True
             else:
                 transparent = work / "transparent-no-audio.webm"
-                metrics.update(_matte(source, transparent, info, job))
+                if plan["engine"] == "matanyone":
+                    _release_rvm()
+                    from workloads.matanyone_matting import matte as matte_anyone
+                    metrics.update(matte_anyone(source, transparent, info, job, mask_url, work))
+                else:
+                    metrics.update(_matte(source, transparent, info, job))
                 produced = work / "foreground-vp9-alpha.webm"
                 _mux_audio(transparent, source, produced, preserve_audio, info["has_audio"])
                 partial = cached.with_suffix(".partial")
@@ -469,7 +558,7 @@ def handler(job: dict) -> dict:
             "sha256": _sha256(cached),
             "cache_hit": cache_hit,
             "metrics": metrics,
-            "route": "local-rvm-person",
+            "route": plan["route"],
             "fallback_required": False,
         }
         if inline is not None:

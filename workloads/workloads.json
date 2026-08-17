@@ -1,12 +1,22 @@
 {
   "video-matting": {
     "module": "workloads.video_matting",
-    "required_mib": 1800,
+    "required_mib": 2800,
     "aliases": ["video_background_removal", "video-background-removal", "matting"]
   },
   "h3-video": {
     "module": "workloads.h3_video",
     "required_mib": 43000,
     "aliases": ["h3", "video-generation", "minimax-h3"]
+  },
+  "wan-animate-2": {
+    "module": "workloads.wan_animate_2",
+    "required_mib": 24576,
+    "aliases": ["wan-animate", "character-animation", "character_animation"],
+    "profiles": [
+      {"name": "small", "required_mib": 20480, "scratch_mib": 6144},
+      {"name": "balanced", "required_mib": 28672, "scratch_mib": 8192},
+      {"name": "throughput", "required_mib": 57344, "scratch_mib": 12288}
+    ]
   }
 }

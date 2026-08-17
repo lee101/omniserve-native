@@ -174,3 +174,33 @@ as compatibility aliases, so the live Manifold endpoint can migrate without a
 new public job contract. RVM remains GPL-3.0 research software and must be
 replaced or approved before commercial launch; that replacement is isolated to
 the workload module.
+
+## Wan-Animate-2 and global GPU admission
+
+`wan-animate-2` accepts a character image plus a driving video and uses the
+official distilled Wan-Animate-2 Diffusers checkpoint by default. Its ordered
+execution frontier is `small` (20 GiB, NF4 + sequential offload), `balanced`
+(28 GiB, NF4 + model offload), and `throughput` (56 GiB, resident BF16 plus
+`torch.compile`). `execution_profile=auto` selects the fastest lane that fits
+after reclaiming idle workloads. A CUDA OOM unloads every engine, clears the
+allocator, and retries once on the next smaller lane.
+
+On a shared production GPU, set `OMNISERVE_VRAM_BROKER_URL` to the native front
+door, such as `http://127.0.0.1:8791`. The Python runtime then composes its live
+NVIDIA memory checks with the front door's cross-process `/v1/gpu/lease` API.
+Set `OMNISERVE_VRAM_BROKER_REQUIRED=1` to fail closed if that broker is down.
+
+```json
+{
+  "input": {
+    "workload": "wan-animate-2",
+    "character_image_url": "https://cdn.example/character.png",
+    "driving_video_url": "https://cdn.example/dance.mp4",
+    "prompt": "Person appearance: ... Background: ...",
+    "duration": 5,
+    "execution_profile": "auto",
+    "output_upload_url": "https://presigned-upload.example/...",
+    "output_public_url": "https://cdn.example/result.mp4"
+  }
+}
+```

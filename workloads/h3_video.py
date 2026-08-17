@@ -37,8 +37,10 @@ def release() -> None:
         return
     runtime = getattr(module, "_runtime", None)
     if runtime is not None:
-        runtime.close()
-        module._runtime = None
+        try:
+            runtime.close()
+        finally:
+            module._runtime = None
     try:
         import torch
 

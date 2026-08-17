@@ -1,4 +1,7 @@
-FROM ubuntu:22.04 AS native-builder
+# Reuse the pinned runtime base for the tiny native build stage. This avoids a
+# second registry dependency during releases; BuildKit discards the compiler
+# layer, so it does not increase the final worker image size.
+FROM ghcr.io/lee101/h3-cog@sha256:632903993661f8e63c79d67dadbe28e300081d88c9c1dc22376f4cb95ad0c353 AS native-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -17,6 +20,18 @@ RUN /usr/bin/ffmpeg -hide_banner -encoders 2>&1 | grep -q 'libvpx-vp9' \
 # The video person-routing workload imports both packages at runtime.
 RUN python -m pip install --no-cache-dir ultralytics opencv-python-headless
 
+# Wan-Animate-2 landed after the latest stable Diffusers release. Pin the
+# reviewed integration commit so an image rebuild cannot silently change its
+# pipeline contract. NF4 is used only by the 20/28 GiB execution profiles.
+RUN python -m pip install --no-cache-dir \
+    "git+https://github.com/huggingface/diffusers.git@14f482c30c91021cc0e363a0a17a115b44972aee" \
+    "huggingface-hub==1.27.0" "transformers==5.15.0" \
+    "bitsandbytes==0.50.1" "decord==0.6.0"
+
+# Catch dependency drift here rather than on the first expensive cold start.
+RUN python -c 'import diffusers, transformers; from diffusers import WanAnimatePipeline' \
+    && python -c 'import decord'
+
 ARG RVM_URL=https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_resnet50_fp32.torchscript
 ARG RVM_SHA256=072adec3c75a1af773ec35d8b595612f8e3472b7a4b8a210684432b493376852
 ARG RVM_SOURCE_COMMIT=53d74c6826735f01f4406b5ca9075eee27bec094
@@ -24,6 +39,7 @@ ARG RVM_STATE_URL=https://github.com/PeterL1n/RobustVideoMatting/releases/downlo
 ARG RVM_STATE_SHA256=c191a807251164c073dce5fa408e7a816070d539b882b2a3150330a9fec112ce
 ARG PERSON_DETECTOR_URL=https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt
 ARG PERSON_DETECTOR_SHA256=0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1
+ARG MATANYONE_COMMIT=e5ddc534c1fff9bb9e54cf476095d29071b7cb4f
 
 RUN mkdir -p /opt/models /opt/omniserve/bin \
     && curl -fL --retry 3 "$RVM_URL" -o /opt/models/rvm_resnet50_fp32.torchscript \
@@ -34,7 +50,12 @@ RUN mkdir -p /opt/models /opt/omniserve/bin \
     && echo "$PERSON_DETECTOR_SHA256  /opt/models/yolo11n.pt" | sha256sum -c - \
     && mkdir -p /opt/robust-video-matting \
     && curl -fL --retry 3 "https://github.com/PeterL1n/RobustVideoMatting/archive/$RVM_SOURCE_COMMIT.tar.gz" \
-       | tar -xz --strip-components=1 -C /opt/robust-video-matting
+       | tar -xz --strip-components=1 -C /opt/robust-video-matting \
+    && mkdir -p /opt/matanyone \
+    && curl -fL --retry 3 "https://github.com/pq-yang/MatAnyone/archive/$MATANYONE_COMMIT.tar.gz" \
+       | tar -xz --strip-components=1 -C /opt/matanyone
+
+RUN python -m pip install --no-cache-dir hydra-core einops omegaconf imageio tqdm
 
 COPY --from=native-builder /out-omni-job /opt/omniserve/bin/omni-job
 COPY runtime /opt/omniserve/runtime
@@ -46,12 +67,19 @@ ENV PYTHONUNBUFFERED=1 \
     RVM_MODEL_PATH=/opt/models/rvm_resnet50_fp32.torchscript \
     RVM_STATE_PATH=/opt/models/rvm_resnet50.pth \
     RVM_SOURCE_PATH=/opt/robust-video-matting \
+    MATANYONE_SOURCE_PATH=/opt/matanyone \
     RVM_TORCH_COMPILE=0 \
     RVM_CHUNK_FRAMES=8 \
     PERSON_DETECTOR_PATH=/opt/models/yolo11n.pt \
     TORCHINDUCTOR_CACHE_DIR=/runpod-volume/omniserve/torchinductor \
     VIDEO_BACKGROUND_CACHE=/runpod-volume/omniserve/video-matting \
     OMNISERVE_WORKLOAD_MANIFEST=/opt/omniserve/workloads/workloads.json \
-    OMNISERVE_DEFAULT_WORKLOAD=video-matting
+    OMNISERVE_DEFAULT_WORKLOAD=video-matting \
+    OMNISERVE_VRAM_BROKER_REQUIRED=0
+
+ENV HF_HOME=/runpod-volume/omniserve/huggingface \
+    TORCH_HOME=/runpod-volume/omniserve/torch \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    WAN_ANIMATE_TORCH_COMPILE=1
 
 ENTRYPOINT ["python", "-u", "/opt/omniserve/runtime/handler.py"]

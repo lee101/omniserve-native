@@ -1,7 +1,7 @@
 {
   "name": "omniserve-native",
   "workersMin": 0,
-  "workersMax": 3,
+  "workersMax": 0,
   "idleTimeout": 5,
   "flashboot": true,
   "scalerType": "REQUEST_COUNT",
@@ -11,10 +11,15 @@
   "minCudaVersion": "13.0",
   "gpuTypeIds": [
     "NVIDIA A40",
+    "NVIDIA GeForce RTX 3090",
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA L4",
+    "NVIDIA RTX A5000",
     "NVIDIA RTX A6000",
+    "NVIDIA RTX 5000 Ada Generation",
     "NVIDIA RTX 6000 Ada Generation",
     "NVIDIA L40",
     "NVIDIA L40S"
   ],
-  "notes": "Multi-region OmniServe pool with one worker per active request and a 15-minute runaway bound. Workload plugins declare VRAM requirements and release hooks; set OMNISERVE_RUNPOD_USE_NETWORK_VOLUME=1 for regional shared caches."
+  "notes": "Multi-region OmniServe pool is paused at rest and activated by ManifoldGen up to its workload-specific maximum. Workload plugins declare VRAM requirements and release hooks; set OMNISERVE_RUNPOD_USE_NETWORK_VOLUME=1 for regional shared caches."
 }
