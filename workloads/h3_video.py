@@ -1,10 +1,10 @@
-"""Adapter for the H3 runtime already present in the shared base image."""
+"""Adapter for the H3 runtime."""
 
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import sys
+from pathlib import Path
 
 _module = None
 

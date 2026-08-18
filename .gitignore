@@ -8,3 +8,5 @@ __pycache__/
 .runpod.env
 .runpod-music3.env
 compile_commands.json
+tools/test_zimage_lora.py
+evals
