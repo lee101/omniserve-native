@@ -1,18 +1,25 @@
 {
   "name": "omniserve-minimax-music3",
   "workersMin": 0,
-  "workersMax": 2,
-  "idleTimeout": 180,
+  "workersMax": 3,
+  "idleTimeout": 20,
   "flashboot": true,
   "scalerType": "REQUEST_COUNT",
   "scalerValue": 1,
   "executionTimeoutMs": 2400000,
-  "allowedCudaVersions": ["13.0"],
+  "allowedCudaVersions": [
+    "13.0"
+  ],
   "minCudaVersion": "13.0",
   "gpuTypeIds": [
-    "NVIDIA H100 PCIe",
+    "NVIDIA H200",
+    "NVIDIA H200 NVL",
     "NVIDIA H100 80GB HBM3",
     "NVIDIA H100 NVL",
-    "NVIDIA H200"
-  ]
+    "NVIDIA H100 PCIe",
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "NVIDIA A100 80GB PCIe",
+    "NVIDIA A100-SXM4-80GB"
+  ],
+  "notes": "H200 first: the AR decode is memory-bandwidth bound, so the fastest card is also the cheapest per finished track. Workers scale to zero after 20 idle seconds; the site raises workersMin when sustained demand makes a warm worker cheaper than the cold starts it avoids."
 }

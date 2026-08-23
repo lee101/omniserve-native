@@ -43,15 +43,25 @@ typedef struct {
     double stereo_correlation;
 } Music3WavStats;
 
+typedef struct {
+    double model_download_seconds;
+    double server_start_seconds;
+    double generation_seconds;
+    double upload_seconds;
+    double total_seconds;
+    double server_started_at;
+    double prefetch_seconds;
+    double prefetch_gib;
+    int server_ready_before_job;
+    const char *gpu_name;
+} Music3Timings;
+
 int music3_normalize_request(const char *json, Music3Request *request);
 int music3_wav_statistics(const unsigned char *audio, size_t length, Music3WavStats *stats);
 void music3_sha256_hex(const unsigned char *data, size_t length, char out[MUSIC3_SHA_SIZE]);
 int music3_sha256_file(const char *path, char out[MUSIC3_SHA_SIZE]);
 int music3_write_result_json(char *out, size_t size, const Music3Request *request,
                              const Music3WavStats *stats, const char *audio_url,
-                             const char *inline_b64, double model_download_seconds,
-                             double server_start_seconds, double generation_seconds,
-                             double upload_seconds, double total_seconds,
-                             double server_started_at);
+                             const char *inline_b64, const Music3Timings *timings);
 
 #endif

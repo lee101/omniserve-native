@@ -375,10 +375,15 @@ static int json_escape_into(char *out, size_t size, size_t *used, const char *te
 
 int music3_write_result_json(char *out, size_t size, const Music3Request *request,
                              const Music3WavStats *stats, const char *audio_url,
-                             const char *inline_b64, double model_download_seconds,
-                             double server_start_seconds, double generation_seconds,
-                             double upload_seconds, double total_seconds,
-                             double server_started_at) {
+                             const char *inline_b64, const Music3Timings *timings) {
+    double model_download_seconds = timings->model_download_seconds;
+    double server_start_seconds = timings->server_start_seconds;
+    double generation_seconds = timings->generation_seconds;
+    double upload_seconds = timings->upload_seconds;
+    double total_seconds = timings->total_seconds;
+    double server_started_at = timings->server_started_at;
+    /* GPU names are plain ASCII from the driver; keep the JSON simple. */
+    const char *gpu_name = timings->gpu_name != NULL ? timings->gpu_name : "";
     size_t used = 0;
     double duration = stats->duration_seconds > 0.001 ? stats->duration_seconds : 0.001;
     int n = snprintf(out, size,
@@ -406,11 +411,14 @@ int music3_write_result_json(char *out, size_t size, const Music3Request *reques
     n = snprintf(out + used, size - used,
         ",\"model_download_seconds\":%.3f,\"server_start_seconds\":%.3f,\"generation_seconds\":%.3f,"
         "\"realtime_factor\":%.3f,\"audio_seconds_per_compute_second\":%.3f,\"server_started_at\":%.3f,"
-        "\"upload_seconds\":%.3f,\"total_seconds\":%.3f,\"optimizations\":[\"backbone-cuda-graph\","
-        "\"rvq-depth-cuda-graph\",\"compiled-dit-blocks\",\"compiled-dav-decoder\",\"batched-seeded-sampling\"]}",
+        "\"upload_seconds\":%.3f,\"total_seconds\":%.3f,\"prefetch_seconds\":%.3f,\"prefetch_gib\":%.3f,"
+        "\"server_ready_before_job\":%s,\"gpu\":\"%s\",\"optimizations\":[\"backbone-cuda-graph\","
+        "\"rvq-depth-cuda-graph\",\"compiled-dit-blocks\",\"compiled-dav-decoder\",\"batched-seeded-sampling\","
+        "\"warm-start-thread\",\"parallel-weight-prefetch\"]}",
         model_download_seconds, server_start_seconds, generation_seconds,
         generation_seconds / duration, duration / (generation_seconds > 0.001 ? generation_seconds : 0.001),
-        server_started_at, upload_seconds, total_seconds);
+        server_started_at, upload_seconds, total_seconds, timings->prefetch_seconds, timings->prefetch_gib,
+        timings->server_ready_before_job ? "true" : "false", gpu_name);
     if (n < 0 || used + (size_t)n >= size) return -1;
     used += (size_t)n;
     if (audio_url && audio_url[0]) {

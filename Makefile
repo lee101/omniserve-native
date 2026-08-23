@@ -7,7 +7,9 @@ TESTS := build/test_admission build/test_breaker
 JOBCTL := build/omni-job
 JOB_TEST := build/test_jobs
 MUSIC3C := build/music3c
+MUSIC3C_DEPLOY := build/music3c-deploy
 MUSIC3C_TEST := build/test_music3c
+DEPLOY_CC ?= $(firstword $(wildcard /usr/bin/gcc /usr/bin/cc) cc)
 SQLITE_LIB := $(shell pkg-config --variable=libdir sqlite3)/libsqlite3.so
 ifneq ($(wildcard $(CONDA_PREFIX)/lib/libsqlite3.so),)
 SQLITE_LIB := $(CONDA_PREFIX)/lib/libsqlite3.so
@@ -37,7 +39,15 @@ build/test_breaker: build tests/test_breaker.c src/breaker.c src/breaker.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_breaker.c src/breaker.c -o $@
 
 $(MUSIC3C): build music3c/main.c music3c/music3.c music3c/music3.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) music3c/main.c music3c/music3.c -lm -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) music3c/main.c music3c/music3.c -lm -lpthread -o $@
+
+# The deployed worker runs inside the SGLang-Omni image, so it is linked
+# statically with the system toolchain: a build against another libc segfaults
+# on the container's loader and the worker then never polls for jobs.
+$(MUSIC3C_DEPLOY): build music3c/main.c music3c/music3.c music3c/music3.h
+	$(DEPLOY_CC) -std=c17 -O2 -Wall -Wextra -D_POSIX_C_SOURCE=200809L -static -s \
+		music3c/main.c music3c/music3.c -lm -o $@
+	$@ --selftest
 
 $(MUSIC3C_TEST): build tests/test_music3c.c music3c/music3.c music3c/music3.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Imusic3c -UNDEBUG tests/test_music3c.c music3c/music3.c -lm -o $@

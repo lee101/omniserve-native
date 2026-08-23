@@ -1,7 +1,9 @@
 #include "music3.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,13 +13,24 @@
 #include <time.h>
 #include <unistd.h>
 
-enum { MUSIC3_INLINE_LIMIT = 8 << 20, MUSIC3_RESULT_SIZE = 16 << 20 };
+enum {
+    MUSIC3_INLINE_LIMIT = 8 << 20,
+    MUSIC3_RESULT_SIZE = 16 << 20,
+    MUSIC3_MAX_SERVE_ARGS = 64,
+    MUSIC3_MAX_PREFETCH_FILES = 512,
+    MUSIC3_PREFETCH_CHUNK = 8 << 20
+};
 
 static pid_t g_server_pid = -1;
 static double g_server_started_at;
 static const char *g_model_id;
 static const char *g_model_dir;
 static const char *g_port;
+static pthread_mutex_t g_server_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char g_gpu_name[128];
+static double g_prefetch_seconds;
+static double g_prefetch_gib;
+static int g_server_ready_before_job;
 
 static const char *env_str(const char *name, const char *fallback) {
     const char *value = getenv(name);
@@ -135,9 +148,15 @@ static int ensure_model(double *download_seconds) {
             return -1;
         }
     }
+    /* sgl-omni serves from qwen_7B/, flowmatching_vae.pth and dav.pth; the
+     * diffusers-layout copies of the same weights are another 26 GiB that the
+     * runtime never opens, so the slim snapshot halves the cold download. */
     char *snapshot[] = {
-        "huggingface-cli", "download", (char *)g_model_id, "--local-dir", (char *)g_model_dir, NULL
+        "huggingface-cli", "download", (char *)g_model_id, "--local-dir", (char *)g_model_dir,
+        "--max-workers", (char *)env_str("MUSIC3_DOWNLOAD_WORKERS", "16"),
+        "--include", "qwen_7B/*", "dav.pth", "*.json", "*.txt", NULL, NULL
     };
+    if (env_int("MUSIC3_FULL_SNAPSHOT", 0) == 1) snapshot[7] = NULL;
     if (run_logged(snapshot, env_str("MUSIC3_SERVER_LOG", "/runpod-volume/omniserve/music3/server.log")) != 0)
         return -1;
     char payload[256];
@@ -147,26 +166,178 @@ static int ensure_model(double *download_seconds) {
     return 0;
 }
 
-static int start_server(double *download_seconds, double *start_seconds) {
+/* Network-volume reads are latency bound, so a single reader leaves most of the
+ * link idle. Warming the page cache from several threads makes the serial torch
+ * load that follows hit memory instead of the volume. */
+typedef struct {
+    char paths[MUSIC3_MAX_PREFETCH_FILES][1024];
+    off_t sizes[MUSIC3_MAX_PREFETCH_FILES];
+    int count;
+    int next;
+    off_t budget;
+    off_t consumed;
+    pthread_mutex_t mutex;
+} Music3Prefetch;
+
+static void prefetch_collect(Music3Prefetch *plan, const char *directory, int depth) {
+    if (depth > 3 || plan->count >= MUSIC3_MAX_PREFETCH_FILES) return;
+    DIR *handle = opendir(directory);
+    if (handle == NULL) return;
+    const char *include = env_str("MUSIC3_PREFETCH_INCLUDE", "qwen_7B,flowmatching_vae.pth,dav.pth");
+    struct dirent *entry;
+    while ((entry = readdir(handle)) != NULL && plan->count < MUSIC3_MAX_PREFETCH_FILES) {
+        if (entry->d_name[0] == '.') continue;
+        /* Only the weights the runtime actually opens are worth page cache. */
+        if (depth == 0 && strstr(include, entry->d_name) == NULL) continue;
+        char path[1024];
+        if (snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name) >= (int)sizeof(path)) continue;
+        struct stat info;
+        if (stat(path, &info) != 0) continue;
+        if (S_ISDIR(info.st_mode)) { prefetch_collect(plan, path, depth + 1); continue; }
+        if (!S_ISREG(info.st_mode) || info.st_size < (64 << 20)) continue;
+        snprintf(plan->paths[plan->count], sizeof(plan->paths[0]), "%s", path);
+        plan->sizes[plan->count] = info.st_size;
+        plan->count++;
+    }
+    closedir(handle);
+}
+
+static void *prefetch_worker(void *argument) {
+    Music3Prefetch *plan = argument;
+    unsigned char *buffer = malloc(MUSIC3_PREFETCH_CHUNK);
+    if (buffer == NULL) return NULL;
+    for (;;) {
+        pthread_mutex_lock(&plan->mutex);
+        int index = plan->next;
+        if (index >= plan->count || plan->consumed >= plan->budget) {
+            pthread_mutex_unlock(&plan->mutex);
+            break;
+        }
+        plan->next++;
+        plan->consumed += plan->sizes[index];
+        pthread_mutex_unlock(&plan->mutex);
+        int fd = open(plan->paths[index], O_RDONLY);
+        if (fd < 0) continue;
+        posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+        while (read(fd, buffer, MUSIC3_PREFETCH_CHUNK) > 0) continue;
+        close(fd);
+    }
+    free(buffer);
+    return NULL;
+}
+
+static off_t prefetch_budget_bytes(void) {
+    off_t configured = (off_t)env_int("MUSIC3_PREFETCH_MAX_GIB", 0) << 30;
+    off_t available = 0;
+    FILE *meminfo = fopen("/proc/meminfo", "r");
+    if (meminfo != NULL) {
+        char line[256];
+        while (fgets(line, sizeof(line), meminfo) != NULL) {
+            long kilobytes = 0;
+            if (sscanf(line, "MemAvailable: %ld kB", &kilobytes) == 1) {
+                available = (off_t)kilobytes * 1024;
+                break;
+            }
+        }
+        fclose(meminfo);
+    }
+    /* Leave headroom: the loader itself needs host memory for the weights. */
+    off_t safe = available > 0 ? available / 2 : (off_t)32 << 30;
+    if (configured > 0 && configured < safe) return configured;
+    return safe;
+}
+
+static void prefetch_model(void) {
+    int threads = env_int("MUSIC3_PREFETCH_THREADS", 8);
+    if (threads < 1) return;
+    if (threads > 32) threads = 32;
+    Music3Prefetch *plan = calloc(1, sizeof(*plan));
+    if (plan == NULL) return;
+    pthread_mutex_init(&plan->mutex, NULL);
+    plan->budget = prefetch_budget_bytes();
+    prefetch_collect(plan, g_model_dir, 0);
+    if (plan->count == 0 || plan->budget <= 0) { free(plan); return; }
+    double started = monotonic_seconds();
+    pthread_t workers[32];
+    int spawned = 0;
+    for (int i = 0; i < threads && i < plan->count; ++i)
+        if (pthread_create(&workers[spawned], NULL, prefetch_worker, plan) == 0) spawned++;
+    for (int i = 0; i < spawned; ++i) pthread_join(workers[i], NULL);
+    g_prefetch_seconds = monotonic_seconds() - started;
+    g_prefetch_gib = (double)plan->consumed / (double)(1 << 30);
+    fprintf(stderr, "Music3 prefetched %.2f GiB in %.1fs with %d threads\n",
+            g_prefetch_gib, g_prefetch_seconds, spawned);
+    pthread_mutex_destroy(&plan->mutex);
+    free(plan);
+}
+
+/* Space-separated extra `sgl-omni serve` flags, so acoustic dtype, attention
+ * backend and solver steps are tunable per endpoint without a rebuild. */
+static int append_extra_serve_args(char **args, int used, char *scratch, size_t scratch_size) {
+    const char *extra = getenv("MUSIC3_SERVE_EXTRA_ARGS");
+    if (extra == NULL || extra[0] == '\0') return used;
+    snprintf(scratch, scratch_size, "%s", extra);
+    char *save = NULL;
+    for (char *token = strtok_r(scratch, " \t", &save);
+         token != NULL && used < MUSIC3_MAX_SERVE_ARGS - 1;
+         token = strtok_r(NULL, " \t", &save))
+        args[used++] = token;
+    return used;
+}
+
+/* Cost per track depends on which card the worker landed on, so the result
+ * carries the GPU the platform actually gave us. */
+static void detect_gpu(void) {
+    if (g_gpu_name[0] != '\0') return;
+    FILE *pipe = popen("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null", "r");
+    if (pipe == NULL) return;
+    if (fgets(g_gpu_name, sizeof(g_gpu_name), pipe) != NULL) {
+        size_t length = strlen(g_gpu_name);
+        while (length > 0 && (g_gpu_name[length - 1] == '\n' || g_gpu_name[length - 1] == '\r'))
+            g_gpu_name[--length] = '\0';
+    }
+    pclose(pipe);
+}
+
+static int start_server_locked(double *download_seconds, double *start_seconds) {
     *start_seconds = 0;
     if (g_server_pid > 0 && kill(g_server_pid, 0) == 0 && health()) {
         *download_seconds = 0;
         return 0;
     }
     if (ensure_model(download_seconds) != 0) return -1;
+    detect_gpu();
     mkdir(env_str("TORCHINDUCTOR_CACHE_DIR", "/tmp/music3-torchinductor"), 0755);
+    prefetch_model();
     double started = monotonic_seconds();
     pid_t child = fork();
     if (child == 0) {
         const char *log_path = env_str("MUSIC3_SERVER_LOG", "/runpod-volume/omniserve/music3/server.log");
         int fd = open(log_path, O_CREAT | O_WRONLY | O_APPEND, 0644);
         if (fd >= 0) { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); }
-        char *args[] = {
-            "sgl-omni", "serve", "--model-path", (char *)g_model_dir, "--host", "127.0.0.1",
-            "--port", (char *)g_port, "--max-running-requests", (char *)env_str("MUSIC3_MAX_RUNNING_REQUESTS", "1"),
-            "--stages.dit_dav.factory-args.dtype", (char *)env_str("MUSIC3_ACOUSTIC_DTYPE", "bfloat16"),
-            NULL
-        };
+        char scratch[1024];
+        char *args[MUSIC3_MAX_SERVE_ARGS] = {0};
+        int used = 0;
+        /* Running the module directly lets a worker serve straight from the
+         * runtime on the volume, with no per-boot editable install. */
+        if (env_int("MUSIC3_SERVE_PYTHON_MODULE", 0) == 1) {
+            args[used++] = "python3";
+            args[used++] = "-m";
+            args[used++] = "sglang_omni.cli";
+        } else args[used++] = "sgl-omni";
+        args[used++] = "serve";
+        args[used++] = "--model-path";
+        args[used++] = (char *)g_model_dir;
+        args[used++] = "--host";
+        args[used++] = "127.0.0.1";
+        args[used++] = "--port";
+        args[used++] = (char *)g_port;
+        args[used++] = "--max-running-requests";
+        args[used++] = (char *)env_str("MUSIC3_MAX_RUNNING_REQUESTS", "1");
+        args[used++] = "--stages.dit_dav.factory-args.dtype";
+        args[used++] = (char *)env_str("MUSIC3_ACOUSTIC_DTYPE", "bfloat16");
+        used = append_extra_serve_args(args, used, scratch, sizeof(scratch));
+        args[used] = NULL;
         execvp(args[0], args);
         _exit(127);
     }
@@ -188,6 +359,31 @@ static int start_server(double *download_seconds, double *start_seconds) {
     waitpid(child, NULL, 0);
     g_server_pid = -1;
     return -1;
+}
+
+static int start_server(double *download_seconds, double *start_seconds) {
+    pthread_mutex_lock(&g_server_mutex);
+    int status = start_server_locked(download_seconds, start_seconds);
+    pthread_mutex_unlock(&g_server_mutex);
+    return status;
+}
+
+/* Load the checkpoint while the worker is still idle rather than inside the
+ * first request, so a warm-started worker answers at generation speed. */
+static void *warm_start_worker(void *unused) {
+    (void)unused;
+    double download = 0, start = 0;
+    if (start_server(&download, &start) == 0)
+        fprintf(stderr, "Music3 warm start ready in %.1fs (download %.1fs)\n", start, download);
+    else
+        fprintf(stderr, "Music3 warm start failed; the first request will retry\n");
+    return NULL;
+}
+
+static void start_warm_thread(void) {
+    if (env_int("MUSIC3_WARM_START", 1) != 1) return;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, warm_start_worker, NULL) == 0) pthread_detach(thread);
 }
 
 static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -290,6 +486,7 @@ static int handle_job_json(const char *json, char **result_json) {
         return 400;
     }
     double total_started = monotonic_seconds(), download = 0, start = 0, generation = 0, upload = 0;
+    g_server_ready_before_job = g_server_pid > 0 && kill(g_server_pid, 0) == 0 && health();
     if (start_server(&download, &start) != 0) {
         *result_json = strdup("{\"error\":\"MiniMax-Music3 server failed to start\"}");
         return 503;
@@ -326,9 +523,15 @@ static int handle_job_json(const char *json, char **result_json) {
     }
     char *out = malloc(MUSIC3_RESULT_SIZE);
     if (out == NULL) { free(audio); free(inline_b64); return -1; }
+    Music3Timings timings = {
+        .model_download_seconds = download, .server_start_seconds = start,
+        .generation_seconds = generation, .upload_seconds = upload,
+        .total_seconds = monotonic_seconds() - total_started, .server_started_at = g_server_started_at,
+        .prefetch_seconds = g_prefetch_seconds, .prefetch_gib = g_prefetch_gib,
+        .server_ready_before_job = g_server_ready_before_job, .gpu_name = g_gpu_name,
+    };
     if (music3_write_result_json(out, MUSIC3_RESULT_SIZE, &request, &stats, audio_url, inline_b64,
-                                 download, start, generation, upload, monotonic_seconds() - total_started,
-                                 g_server_started_at) != 0) {
+                                 &timings) != 0) {
         free(out); free(audio); free(inline_b64);
         *result_json = strdup("{\"error\":\"result encoding failed\"}");
         return 500;
@@ -350,12 +553,29 @@ static int replace_id(const char *template, const char *id, char *out, size_t si
     return 0;
 }
 
+/* RunPod's worker queue rejects an unauthenticated job-take with a 401 body
+ * that otherwise looks like a job, so every control-plane call carries the
+ * worker key the platform injects into the container. */
+static const char *worker_auth_header(char *buffer, size_t size) {
+    const char *key = getenv("RUNPOD_AI_API_KEY");
+    if (key == NULL || key[0] == '\0') key = getenv("RUNPOD_API_KEY");
+    if (key == NULL || key[0] == '\0') return NULL;
+    snprintf(buffer, size, "Authorization: %s", key);
+    return buffer;
+}
+
 static char *curl_get(const char *url) {
     char path[] = "/tmp/music3-http-XXXXXX";
     int fd = mkstemp(path);
     if (fd < 0) return NULL;
     close(fd);
-    char *args[] = {"curl", "--silent", "--show-error", "--max-time", "30", (char *)url, "-o", path, NULL};
+    char auth[1024];
+    const char *auth_header = worker_auth_header(auth, sizeof(auth));
+    char *args[] = {
+        "curl", "--silent", "--show-error", "--max-time", "30", (char *)url, "-o", path,
+        NULL, NULL, NULL
+    };
+    if (auth_header != NULL) { args[8] = "--header"; args[9] = (char *)auth_header; }
     if (curl_to_file(args) != 0) { unlink(path); return NULL; }
     unsigned char *data = NULL;
     size_t length = 0;
@@ -372,10 +592,14 @@ static int curl_post_json(const char *url, const char *json) {
     close(fd);
     char at_path[64];
     snprintf(at_path, sizeof(at_path), "@%s", path);
+    char auth[1024];
+    const char *auth_header = worker_auth_header(auth, sizeof(auth));
     char *args[] = {
         "curl", "--silent", "--show-error", "--fail", "--max-time", "30", "--request", "POST",
-        "--header", "Content-Type: application/json", "--data-binary", at_path, (char *)url, "-o", "/dev/null", NULL
+        "--header", "Content-Type: application/json", "--data-binary", at_path, (char *)url, "-o", "/dev/null",
+        NULL, NULL, NULL
     };
+    if (auth_header != NULL) { args[15] = "--header"; args[16] = (char *)auth_header; }
     int ok = curl_to_file(args);
     unlink(path);
     return ok;
@@ -404,20 +628,46 @@ static void append_query(char *out, size_t size, const char *base, const char *q
     snprintf(out, size, "%s%s%s", base, sep, query);
 }
 
-static void start_heartbeat(void) {
-    const char *ping = getenv("RUNPOD_WEBHOOK_PING");
-    if (ping == NULL || ping[0] == '\0') return;
-    int interval = env_int("RUNPOD_PING_INTERVAL", 10);
-    if (interval < 1) interval = 10;
-    pid_t child = fork();
-    if (child != 0) return;
+/* RunPod expires a job whose worker stops naming it in the ping, and a music
+ * render runs for minutes, so the heartbeat has to carry the id of the job
+ * currently being generated rather than an empty one. */
+static pthread_mutex_t g_active_job_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char g_active_job_id[256];
+
+static void set_active_job(const char *id) {
+    pthread_mutex_lock(&g_active_job_mutex);
+    if (id == NULL) g_active_job_id[0] = '\0';
+    else snprintf(g_active_job_id, sizeof(g_active_job_id), "%s", id);
+    pthread_mutex_unlock(&g_active_job_mutex);
+}
+
+static void *heartbeat_worker(void *argument) {
+    const char *ping = argument;
+    /* RunPod publishes this interval in milliseconds (10000 by default); read
+     * as seconds it becomes a three-hour sleep and the platform reclaims the
+     * job mid-render as a dead worker. */
+    int interval = env_int("RUNPOD_PING_INTERVAL", 10000) / 1000;
+    if (interval < 1) interval = 1;
+    if (interval > 30) interval = 30;
     for (;;) {
-        char url[2048];
-        append_query(url, sizeof(url), ping, "job_id=&retry_ping=0");
+        char job_id[256], query[320], url[2400];
+        pthread_mutex_lock(&g_active_job_mutex);
+        snprintf(job_id, sizeof(job_id), "%s", g_active_job_id);
+        pthread_mutex_unlock(&g_active_job_mutex);
+        snprintf(query, sizeof(query), "job_id=%s&retry_ping=0", job_id);
+        append_query(url, sizeof(url), ping, query);
         char *ignored = curl_get(url);
         free(ignored);
         sleep((unsigned)interval);
     }
+    return NULL;
+}
+
+static void start_heartbeat(void) {
+    const char *ping = getenv("RUNPOD_WEBHOOK_PING");
+    if (ping == NULL || ping[0] == '\0') return;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, heartbeat_worker, (void *)ping) == 0) pthread_detach(thread);
 }
 
 static int runpod_loop(void) {
@@ -425,25 +675,59 @@ static int runpod_loop(void) {
     const char *post_url = getenv("RUNPOD_WEBHOOK_POST_OUTPUT");
     if (get_url == NULL || get_url[0] == '\0' || post_url == NULL || post_url[0] == '\0') return 2;
     start_heartbeat();
+    start_warm_thread();
+    fprintf(stderr, "music3c polling for jobs\n");
+    fflush(stderr);
+    long empty_polls = 0;
     for (;;) {
         char take[2048];
         append_query(take, sizeof(take), get_url, "job_in_progress=0");
         char *job = curl_get(take);
         if (job == NULL || job[0] == '\0' || strcmp(job, "[]") == 0 || strcmp(job, "null") == 0) {
+            /* A silent worker with a queued job is otherwise impossible to
+             * tell apart from a crashed one, so idle polling stays visible. */
+            if (++empty_polls % 60 == 0) {
+                fprintf(stderr, "music3c idle: %ld empty polls, last fetch %s\n",
+                        empty_polls, job == NULL ? "failed" : "empty");
+                fflush(stderr);
+            }
             free(job);
             sleep(1);
             continue;
         }
         char *id = extract_job_id(job);
+        if (id == NULL) {
+            /* Error envelopes (auth, throttling) also come back 200; treat
+             * anything without a job id as idle instead of spinning on it. */
+            if (++empty_polls % 60 == 0) {
+                fprintf(stderr, "music3c cannot read a job id from: %.400s\n", job);
+                fflush(stderr);
+            }
+            free(job);
+            sleep(1);
+            continue;
+        }
+        empty_polls = 0;
+        fprintf(stderr, "music3c took job %s (%zu bytes)\n", id, strlen(job));
+        fflush(stderr);
+        set_active_job(id);
         char *result = NULL;
         int status = handle_job_json(job, &result);
         free(job);
+        set_active_job(NULL);
         if (id != NULL && result != NULL) {
-            char url[4096], envelope[MUSIC3_RESULT_SIZE + 64];
+            char url[4096];
+            /* A result envelope carries inline base64 audio, so it is far past
+             * what the thread stack can hold and has to live on the heap. */
+            size_t envelope_size = MUSIC3_RESULT_SIZE + 64;
+            char *envelope = malloc(envelope_size);
             replace_id(post_url, id, url, sizeof(url));
-            if (status >= 400) snprintf(envelope, sizeof(envelope), "%s", result);
-            else snprintf(envelope, sizeof(envelope), "{\"output\":%s}", result);
-            (void)curl_post_json(url, envelope);
+            if (envelope != NULL) {
+                if (status >= 400) snprintf(envelope, envelope_size, "%s", result);
+                else snprintf(envelope, envelope_size, "{\"output\":%s}", result);
+                (void)curl_post_json(url, envelope);
+                free(envelope);
+            }
         }
         free(id);
         free(result);
@@ -465,6 +749,9 @@ int main(int argc, char **argv) {
         if (result) { fputs(result, stdout); fputc('\n', stdout); free(result); }
         return status >= 400 ? 1 : 0;
     }
+    /* Boot checks the binary loads in this image before handing it the job
+     * loop, which the plain no-argument form would enter and never leave. */
+    if (argc == 2 && strcmp(argv[1], "--selftest") == 0) return 0;
     if (argc == 1 && getenv("RUNPOD_WEBHOOK_GET_JOB") != NULL) return runpod_loop();
     fprintf(stderr, "usage: music3c --job-file PATH\n");
     return 2;
