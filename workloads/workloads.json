@@ -9,6 +9,11 @@
     "required_mib": 43000,
     "aliases": ["h3", "video-generation", "minimax-h3"]
   },
+  "anima-2.9b": {
+    "module": "workloads.anima_image",
+    "required_mib": 12800,
+    "aliases": ["anima", "anima-image", "anime-illustration"]
+  },
   "wan-animate-2": {
     "module": "workloads.wan_animate_2",
     "required_mib": 24576,

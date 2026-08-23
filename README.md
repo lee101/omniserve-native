@@ -200,6 +200,45 @@ new public job contract. RVM remains GPL-3.0 research software and must be
 replaced or approved before commercial launch; that replacement is isolated to
 the workload module.
 
+## Anima 2.9B text-to-image
+
+`anima-2.9b` serves the Cosmos-derived Anima 2.9B illustration model through the
+same manifest runtime. It loads the pinned reference weights on the `meta`
+device and adopts the bf16 checkpoint with `assign=True`, so no 2.9B fp32 CPU
+initialisation and no read of the 3.9 GB base transformer the expansion
+checkpoint fully replaces. Each denoise step is one batched
+classifier-free-guidance forward, and `ANIMA_COMPILE_ARTIFACT_DIR` (default
+`/runpod-volume/anima-compile-cache`) is replayed into inductor before
+`torch.compile`, so a scale-to-zero worker does not compile on a request.
+Artifacts are named `anima-sm<arch>-torch<version>.bin` and are produced by
+`precompile.py` in the `anima-omniserve-native` repository.
+
+On an RTX 3090 Ti at 832x1216 with 28 steps the compiled path runs 18.9 s per
+image against 24.9 s for the reference loop; admission reserves 12800 MiB, which
+covers the 7.6 GiB of resident weights plus the measured 10.9 GiB peak. Repeat
+prompts reuse cached text-encoder embeddings, so gallery-style traffic skips the
+text encode on warm workers.
+
+The weights are non-commercial. The handler fails closed unless
+`APPNZ_ANIMA_COMMERCIAL_LICENSE_ACCEPTED=1` is set after a CircleStone
+commercial license is in force.
+
+```json
+{
+  "input": {
+    "workload": "anima-2.9b",
+    "prompt": "masterpiece, 1girl, wind-swept cape, luminous city at dusk",
+    "negative_prompt": "low quality, blurry, malformed hands",
+    "width": 832,
+    "height": 1216,
+    "num_inference_steps": 28,
+    "guidance_scale": 4.0,
+    "seed": 42,
+    "output_format": "webp"
+  }
+}
+```
+
 ## Wan-Animate-2 and global GPU admission
 
 `wan-animate-2` accepts a character image plus a driving video and uses the
