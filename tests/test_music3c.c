@@ -66,6 +66,11 @@ int main(void) {
     assert(stats.clipped_samples == 0);
     assert(stats.has_stereo_correlation);
     assert(stats.stereo_correlation > 0.999);
+    assert(music3_name_included("dav.pth", "qwen_7B,flowmatching_vae.pth,dav.pth") == 1);
+    assert(music3_name_included("dav.pth.tmp", "qwen_7B,flowmatching_vae.pth,dav.pth") == 0);
+    assert(music3_name_included("q", "qwen_7B") == 0);
+    assert(music3_name_included("", "qwen_7B") == 0);
+    assert(music3_name_included("flowmatching_vae.pth", "flowmatching_vae.pth") == 1);
     puts("music3c tests passed");
     return 0;
 }

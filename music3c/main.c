@@ -188,7 +188,7 @@ static void prefetch_collect(Music3Prefetch *plan, const char *directory, int de
     while ((entry = readdir(handle)) != NULL && plan->count < MUSIC3_MAX_PREFETCH_FILES) {
         if (entry->d_name[0] == '.') continue;
         /* Only the weights the runtime actually opens are worth page cache. */
-        if (depth == 0 && strstr(include, entry->d_name) == NULL) continue;
+        if (depth == 0 && !music3_name_included(entry->d_name, include)) continue;
         char path[1024];
         if (snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name) >= (int)sizeof(path)) continue;
         struct stat info;

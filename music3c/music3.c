@@ -274,6 +274,19 @@ int music3_normalize_request(const char *json, Music3Request *request) {
     return 0;
 }
 
+int music3_name_included(const char *name, const char *list) {
+    if (name == NULL || name[0] == '\0' || list == NULL) return 0;
+    size_t name_length = strlen(name);
+    while (*list != '\0') {
+        const char *end = strchr(list, ',');
+        size_t token_length = end != NULL ? (size_t)(end - list) : strlen(list);
+        if (token_length == name_length && strncmp(list, name, name_length) == 0) return 1;
+        if (end == NULL) break;
+        list = end + 1;
+    }
+    return 0;
+}
+
 static uint32_t le32(const unsigned char *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }

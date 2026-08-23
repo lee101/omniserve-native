@@ -46,7 +46,7 @@ $(MUSIC3C): build music3c/main.c music3c/music3.c music3c/music3.h
 # on the container's loader and the worker then never polls for jobs.
 $(MUSIC3C_DEPLOY): build music3c/main.c music3c/music3.c music3c/music3.h
 	$(DEPLOY_CC) -std=c17 -O2 -Wall -Wextra -D_POSIX_C_SOURCE=200809L -static -s \
-		music3c/main.c music3c/music3.c -lm -o $@
+		music3c/main.c music3c/music3.c -lm -lpthread -o $@
 	$@ --selftest
 
 $(MUSIC3C_TEST): build tests/test_music3c.c music3c/music3.c music3c/music3.h
@@ -61,6 +61,19 @@ test: $(TESTS) $(JOB_TEST) $(MUSIC3C_TEST)
 	$(JOB_TEST)
 	$(MUSIC3C_TEST)
 	python3 -m pytest -q tests/test_runtime.py tests/test_person_detection.py tests/test_video_matting.py tests/test_music3_handler.py tests/test_wan_animate_2.py
+
+ASAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer
+ASAN_CC := $(firstword $(wildcard /usr/bin/gcc /usr/bin/cc) gcc)
+.PHONY: test-asan
+test-asan: build
+	$(ASAN_CC) $(CPPFLAGS) $(CFLAGS) $(ASAN_FLAGS) -UNDEBUG tests/test_admission.c src/admission.c -o build/test_admission_asan
+	$(ASAN_CC) $(CPPFLAGS) $(CFLAGS) $(ASAN_FLAGS) tests/test_breaker.c src/breaker.c -o build/test_breaker_asan
+	$(ASAN_CC) $(CPPFLAGS) $(CFLAGS) $(ASAN_FLAGS) -UNDEBUG tests/test_jobs.c src/jobs.c $(LDFLAGS) $(SQLITE_LIB) -o build/test_jobs_asan
+	$(ASAN_CC) $(CPPFLAGS) $(CFLAGS) $(ASAN_FLAGS) -Imusic3c -UNDEBUG tests/test_music3c.c music3c/music3.c -lm -o build/test_music3c_asan
+	build/test_admission_asan
+	build/test_breaker_asan
+	build/test_jobs_asan
+	build/test_music3c_asan
 
 clean:
 	rm -rf build

@@ -57,6 +57,7 @@ typedef struct {
 } Music3Timings;
 
 int music3_normalize_request(const char *json, Music3Request *request);
+int music3_name_included(const char *name, const char *list);
 int music3_wav_statistics(const unsigned char *audio, size_t length, Music3WavStats *stats);
 void music3_sha256_hex(const unsigned char *data, size_t length, char out[MUSIC3_SHA_SIZE]);
 int music3_sha256_file(const char *path, char out[MUSIC3_SHA_SIZE]);
