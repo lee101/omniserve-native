@@ -1,0 +1,22 @@
+services:
+  omniserve:
+    build: .
+    env_file: .env
+    gpus: all
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    restart: unless-stopped
+    # The port stays private to this compose network; cloudflared is the only ingress.
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      omniserve:
+        condition: service_healthy
+    restart: unless-stopped

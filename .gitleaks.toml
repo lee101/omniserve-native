@@ -1,0 +1,16 @@
+[extend]
+useDefault = true
+
+[[rules]]
+id = "runpod-api-key"
+description = "RunPod API key"
+regex = '''rpa_[A-Za-z0-9]{20,}'''
+secretGroup = 0
+entropy = 3.0
+
+[[rules]]
+id = "huggingface-token"
+description = "HuggingFace access token"
+regex = '''hf_[A-Za-z0-9]{30,}'''
+secretGroup = 0
+entropy = 3.0

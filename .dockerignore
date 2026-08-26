@@ -1,0 +1,12 @@
+.git
+.gitignore
+build
+*.o
+__pycache__
+*.pyc
+.pytest_cache
+.runpod.env
+.runpod-music3.env
+.env
+benchmarks
+tests
