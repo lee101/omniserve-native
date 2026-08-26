@@ -143,6 +143,29 @@ uploaded unless that separate WebM alpha plane is decodable. Plain `ffprobe`
 may still report the visible VP9 stream as `yuv420p`; use a forced libvpx decode
 when inspecting these files.
 
+## PCM16 -> WAV wrapping (`wavwrap`)
+
+`src/wavwrap.c` wraps raw mono PCM16LE TTS output in a RIFF header with one
+allocation and one copy. `build/wavwrap` is a stdin/stdout CLI around it.
+
+- Measured on the 16-core workstation: ~20 GiB/s for 2 MiB payloads
+  (typical TTS reply) and ~0.8 GiB/s at 64 MiB where allocator page faults
+  dominate. The op is memcpy-bound by construction.
+- A GPU cannot win: the CUDA comparison (`tests/bench_wavwrap_cuda.cu`) pays
+  PCIe upload plus download for bytes the CPU copies in-cache, so the GPU
+  pipeline loses before its first kernel launches at these payload sizes.
+  The binary exists to prove that with numbers on any host with a working
+  CUDA runtime.
+- ringnz backend-go keeps an equivalent single-allocation Go implementation
+  in-process: a network or cgo hop to this repo's binary costs more than the
+  copy itself. Both implementations are kept byte-identical and compared by
+  `tests/bench_wavwrap.sh`.
+
+```bash
+make build/wavwrap build/bench_wavwrap
+bash tests/bench_wavwrap.sh
+```
+
 ## Multi-workload GPU runtime
 
 OmniServe owns the deployable GPU image in `Dockerfile.runpod`; `Dockerfile`

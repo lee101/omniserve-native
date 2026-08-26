@@ -3,12 +3,13 @@ override CFLAGS += -std=c17 -Wall -Wextra -Wpedantic -Werror -O2
 override CPPFLAGS += -D_POSIX_C_SOURCE=200809L -Isrc
 
 BIN := build/omniserve
-TESTS := build/test_admission build/test_breaker
+TESTS := build/test_admission build/test_breaker build/test_wavwrap
 JOBCTL := build/omni-job
 JOB_TEST := build/test_jobs
 MUSIC3C := build/music3c
 MUSIC3C_DEPLOY := build/music3c-deploy
 MUSIC3C_TEST := build/test_music3c
+WAVWRAP := build/wavwrap
 DEPLOY_CC ?= $(firstword $(wildcard /usr/bin/gcc /usr/bin/cc) cc)
 SQLITE_LIB := $(shell pkg-config --variable=libdir sqlite3)/libsqlite3.so
 ifneq ($(wildcard $(CONDA_PREFIX)/lib/libsqlite3.so),)
@@ -18,7 +19,7 @@ endif
 
 .PHONY: all run test clean
 
-all: $(BIN) $(JOBCTL) $(MUSIC3C)
+all: $(BIN) $(JOBCTL) $(MUSIC3C) $(WAVWRAP)
 
 build:
 	mkdir -p $@
@@ -37,6 +38,21 @@ $(JOB_TEST): build tests/test_jobs.c src/jobs.c src/jobs.h
 
 build/test_breaker: build tests/test_breaker.c src/breaker.c src/breaker.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_breaker.c src/breaker.c -o $@
+
+$(WAVWRAP): build src/wavwrap_main.c src/wavwrap.c src/wavwrap.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) src/wavwrap_main.c src/wavwrap.c -o $@
+
+build/test_wavwrap: build tests/test_wavwrap.c src/wavwrap.c src/wavwrap.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG tests/test_wavwrap.c src/wavwrap.c -o $@
+
+build/bench_wavwrap: build tests/bench_wavwrap.c src/wavwrap.c src/wavwrap.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/bench_wavwrap.c src/wavwrap.c -o $@
+
+NVCC ?= $(firstword $(wildcard /usr/local/cuda-12/bin/nvcc /usr/local/cuda/bin/nvcc) nvcc)
+ifneq ($(shell command -v $(NVCC) 2>/dev/null),)
+build/bench_wavwrap_cuda: build tests/bench_wavwrap_cuda.cu
+	$(NVCC) -O2 -std=c++17 tests/bench_wavwrap_cuda.cu -o $@
+endif
 
 $(MUSIC3C): build music3c/main.c music3c/music3.c music3c/music3.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) music3c/main.c music3c/music3.c -lm -lpthread -o $@
@@ -57,7 +73,7 @@ run: $(BIN)
 
 test: $(TESTS) $(JOB_TEST) $(MUSIC3C_TEST)
 	build/test_admission
-	build/test_breaker
+	build/test_wavwrap
 	$(JOB_TEST)
 	$(MUSIC3C_TEST)
 	python3 -m pytest -q tests/test_runtime.py tests/test_person_detection.py tests/test_video_matting.py tests/test_music3_handler.py tests/test_wan_animate_2.py
