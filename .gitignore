@@ -6,6 +6,7 @@ __pycache__/
 *.log
 *.pid
 *.sock
+compile_commands.json
 .coverage
 .pytest_cache/
 performance/*.callgrind.out
@@ -31,6 +32,7 @@ artifacts/
 .env
 .env.*
 !.env.example
+.runpod-*.env
 secrets/
 
 # Host-local on-call automation: agent state, cooldown stamps, and logs are

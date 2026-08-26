@@ -1384,6 +1384,23 @@ static int log_files_present(const char *dir) {
     return present;
 }
 
+static int unused_loopback_port(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    socklen_t len = sizeof addr;
+    int port = 0;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) == 0 &&
+        getsockname(fd, (struct sockaddr *)&addr, &len) == 0) {
+        port = ntohs(addr.sin_port);
+    }
+    close(fd);
+    return port;
+}
+
 /* The access log is the one place a credential could leak to disk by accident,
  * so the redaction is pinned here rather than left to review. */
 static void test_access_log(void) {
@@ -1400,13 +1417,15 @@ static void test_access_log(void) {
     CHECK(olog_enabled());
 
     echo_context context = { .target = NULL };
-    ohttp_config cfg = { .port = 18793, .reactor_threads = 1, .worker_threads = 2,
+    int port = unused_loopback_port();
+    CHECK(port > 0);
+    ohttp_config cfg = { .port = port, .reactor_threads = 1, .worker_threads = 2,
                          .handler = echo_handler, .user = &context };
     ohttp_server *srv = ohttp_start(&cfg);
     CHECK(srv != NULL);
     usleep(100000);
 
-    char *r = http_roundtrip(18793,
+    char *r = http_roundtrip(port,
         "POST /echo?token=querysecret789 HTTP/1.1\r\nHost: x\r\n"
         "Authorization: Bearer supersecret123\r\nX-API-Key: topsecretkey456\r\n"
         "X-Forwarded-For: 8.8.8.8\r\nX-Omniserve-Tier: paid\r\n"
@@ -1416,7 +1435,7 @@ static void test_access_log(void) {
 
     /* A bare CR, a quote and a control byte in the path: one request must stay
      * one line no matter what the client puts in the request target. */
-    r = http_roundtrip(18793,
+    r = http_roundtrip(port,
         "GET /inject\"\rmarker\x01x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
     free(r);
 
@@ -1450,7 +1469,7 @@ static void test_access_log(void) {
         char raw[256];
         snprintf(raw, sizeof raw,
                  "GET /rotate/%d HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", i);
-        free(http_roundtrip(18793, raw, NULL));
+        free(http_roundtrip(port, raw, NULL));
     }
     olog_flush();
     usleep(50000);

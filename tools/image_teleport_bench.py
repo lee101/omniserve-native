@@ -34,7 +34,15 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--teleport-start-step", type=int, default=7)
+    parser.add_argument(
+        "--replays",
+        type=int,
+        default=1,
+        help="exact cache-hit replays per primed request (use >1 for an OOM/leak soak)",
+    )
     args = parser.parse_args()
+    if args.replays < 1:
+        parser.error("--replays must be at least 1")
 
     corpus = json.loads(args.corpus.read_text())
     cases = corpus["cases"][: args.limit or None]
@@ -55,33 +63,53 @@ def main() -> int:
             args.base, {**common, "teleport": False}, secret, args.timeout)
         prime, prime_meta = request_image(
             args.base, {**common, "teleport": True}, secret, args.timeout)
-        replay, replay_meta = request_image(
-            args.base, {**common, "teleport": True}, secret, args.timeout)
+        replay_results = [
+            request_image(
+                args.base, {**common, "teleport": True}, secret, args.timeout,
+            )
+            for _ in range(args.replays)
+        ]
         baseline_sha = pixels_sha256(baseline)
         prime_sha = pixels_sha256(prime)
-        replay_sha = pixels_sha256(replay)
-        teleport = replay_meta.get("teleport") or {}
+        replay_shas = [pixels_sha256(image) for image, _ in replay_results]
         row_failures = []
         if baseline_sha != prime_sha:
             row_failures.append("split prime differs from unsplit baseline")
-        if prime_sha != replay_sha:
-            row_failures.append("replayed pixels differ from prime")
-        if not teleport.get("cache_hit"):
-            row_failures.append("replay did not report an exact cache hit")
-        if teleport.get("method") != "exact_prompt_latent_replay":
-            row_failures.append(f"unexpected method {teleport.get('method')!r}")
-        for name, image in (("baseline", baseline), ("prime", prime), ("replay", replay)):
+        for replay_index, ((_, replay_meta), replay_sha) in enumerate(
+            zip(replay_results, replay_shas, strict=True)
+        ):
+            teleport = replay_meta.get("teleport") or {}
+            if prime_sha != replay_sha:
+                row_failures.append(f"replay {replay_index} pixels differ from prime")
+            if not teleport.get("cache_hit"):
+                row_failures.append(f"replay {replay_index} did not report an exact cache hit")
+            if teleport.get("method") != "exact_prompt_latent_replay":
+                row_failures.append(
+                    f"replay {replay_index} reported unexpected method "
+                    f"{teleport.get('method')!r}"
+                )
+        for name, image in (("baseline", baseline), ("prime", prime)):
             image.save(run_dir / f"{index:02d}_{case['id']}_{name}.png", format="PNG")
-        speedup = prime_meta["wall_ms"] / replay_meta["wall_ms"]
+        for replay_index, (replay, _) in enumerate(replay_results):
+            replay.save(
+                run_dir / f"{index:02d}_{case['id']}_replay_{replay_index:02d}.png",
+                format="PNG",
+            )
+        replay_wall_ms = [meta["wall_ms"] for _, meta in replay_results]
+        median_replay_wall_ms = statistics.median(replay_wall_ms)
+        speedup = prime_meta["wall_ms"] / median_replay_wall_ms
         row = {
             "id": case["id"],
             "size": case["size"],
             "baseline": baseline_meta,
             "prime": prime_meta,
-            "replay": replay_meta,
+            "replay": replay_results[0][1],
+            "replays": [meta for _, meta in replay_results],
+            "median_replay_wall_ms": median_replay_wall_ms,
             "baseline_sha256": baseline_sha,
             "prime_sha256": prime_sha,
-            "replay_sha256": replay_sha,
+            "replay_sha256": replay_shas[0],
+            "replay_sha256s": replay_shas,
             "speedup": speedup,
             "failures": row_failures,
             "passed": not row_failures,
@@ -89,12 +117,17 @@ def main() -> int:
         rows.append(row)
         failures.extend(f"{case['id']}: {failure}" for failure in row_failures)
         print(json.dumps({"case": case["id"], "passed": row["passed"],
-                          "cache_hit": teleport.get("cache_hit"),
+                          "cache_hits": sum(
+                              bool((meta.get("teleport") or {}).get("cache_hit"))
+                              for _, meta in replay_results
+                          ),
+                          "replays": args.replays,
                           "speedup": round(speedup, 3)}, sort_keys=True), flush=True)
 
     report = {
         "timestamp": slug(),
         "base": args.base,
+        "replays_per_case": args.replays,
         "rows": rows,
         "median_speedup": statistics.median(row["speedup"] for row in rows),
         "failures": failures,
@@ -105,7 +138,8 @@ def main() -> int:
         "# OmniServe Exact Latent Teleport",
         "",
         f"- passed: `{report['passed']}`",
-        f"- median prime/replay speedup: `{report['median_speedup']:.3f}x`",
+        f"- replays per case: `{args.replays}`",
+        f"- median prime/median-replay speedup: `{report['median_speedup']:.3f}x`",
         "",
         "| Case | Baseline s | Prime s | Replay s | Speedup | Exact |",
         "| --- | ---: | ---: | ---: | ---: | --- |",
@@ -113,7 +147,7 @@ def main() -> int:
     for row in rows:
         lines.append(
             f"| `{row['id']}` | {row['baseline']['wall_ms']/1000:.2f} | "
-            f"{row['prime']['wall_ms']/1000:.2f} | {row['replay']['wall_ms']/1000:.2f} | "
+            f"{row['prime']['wall_ms']/1000:.2f} | {row['median_replay_wall_ms']/1000:.2f} | "
             f"{row['speedup']:.3f}x | {'PASS' if row['passed'] else 'FAIL'} |"
         )
     if failures:
