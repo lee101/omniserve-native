@@ -798,7 +798,11 @@ python tools/image_teleport_bench.py --base http://127.0.0.1:8792 --limit 3
 
 The teleport gate is stricter than perceptual parity: unsplit baseline,
 split-prime, and replay must have identical decoded RGB bytes, and replay must
-report an exact cache hit. Latency is reported but exactness is the hard gate.
+report an exact cache hit. The prime must be a miss; use `--seed-offset` when
+rerunning against a persistent cache. Unless explicitly overridden, exact
+replay resumes at the last scheduled step (`steps-1`), the fastest exact point
+in the RTX 5090 resume-step sweep. Latency is reported but exactness is the hard
+gate.
 
 Measured findings, including the embedding-artifact comparison and the KV
 quantization result, are in `performance/quality.md`. Two of them matter for

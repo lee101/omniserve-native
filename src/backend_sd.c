@@ -339,7 +339,8 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     bool ok = false;
     if (req->teleport && params.batch_count == 1 && req->lora_count == 0 &&
         req->steps > 1 && latent_api_ready()) {
-        int default_resume = sd_env_int("OMNISERVE_NATIVE_SD_TELEPORT_START_STEP", 7, 1, 99);
+        int default_resume = sd_env_int(
+            "OMNISERVE_NATIVE_SD_TELEPORT_START_STEP", req->steps - 1, 1, 99);
         int resume_step = req->teleport_start_step > 0
             ? req->teleport_start_step : default_resume;
         if (resume_step >= req->steps) resume_step = req->steps - 1;

@@ -66,7 +66,18 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=ROOT / "evals")
     parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=900.0)
-    parser.add_argument("--teleport-start-step", type=int, default=7)
+    parser.add_argument(
+        "--teleport-start-step",
+        type=int,
+        default=None,
+        help="resume step (default: final scheduled step, steps-1)",
+    )
+    parser.add_argument(
+        "--seed-offset",
+        type=int,
+        default=0,
+        help="offset corpus seeds to guarantee a fresh prime cache key",
+    )
     parser.add_argument(
         "--replays",
         type=int,
@@ -92,9 +103,15 @@ def main() -> int:
     for index, case in enumerate(cases):
         common = {
             **defaults,
-            **{key: case[key] for key in ("prompt", "size", "seed")},
+            **{key: case[key] for key in ("prompt", "size")},
+            "seed": int(case["seed"]) + args.seed_offset,
             "n": 1,
-            "teleport_start_step": min(args.teleport_start_step, defaults.get("steps", 9) - 1),
+            "teleport_start_step": min(
+                args.teleport_start_step
+                if args.teleport_start_step is not None
+                else defaults.get("steps", 9) - 1,
+                defaults.get("steps", 9) - 1,
+            ),
         }
         baseline, baseline_meta = request_with_retries(
             args.base, {**common, "teleport": False}, secret, args.timeout,
@@ -117,6 +134,11 @@ def main() -> int:
         row_failures = []
         if baseline_sha != prime_sha:
             row_failures.append("split prime differs from unsplit baseline")
+        prime_teleport = prime_meta.get("teleport") or {}
+        if prime_teleport.get("cache_hit"):
+            row_failures.append(
+                "prime unexpectedly reported a cache hit; rerun with a fresh --seed-offset"
+            )
         for replay_index, ((_, replay_meta), replay_sha) in enumerate(
             zip(replay_results, replay_shas, strict=True)
         ):
@@ -143,6 +165,8 @@ def main() -> int:
         row = {
             "id": case["id"],
             "size": case["size"],
+            "seed": common["seed"],
+            "teleport_start_step": common["teleport_start_step"],
             "baseline": baseline_meta,
             "prime": prime_meta,
             "replay": replay_results[0][1],
@@ -169,6 +193,7 @@ def main() -> int:
     report = {
         "timestamp": slug(),
         "base": args.base,
+        "seed_offset": args.seed_offset,
         "replays_per_case": args.replays,
         "rows": rows,
         "median_speedup": statistics.median(row["speedup"] for row in rows),
