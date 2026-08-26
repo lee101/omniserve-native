@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import statistics
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +26,38 @@ def pixels_sha256(image) -> str:
     return hashlib.sha256(image.tobytes()).hexdigest()
 
 
+def request_with_retries(
+    base: str,
+    payload: dict,
+    secret: str | None,
+    timeout: float,
+    *,
+    retries: int,
+    retry_delay: float,
+):
+    """Retry transient admission/backpressure responses, not semantic errors."""
+    for attempt in range(retries + 1):
+        try:
+            return request_image(base, payload, secret, timeout)
+        except RuntimeError as exc:
+            retryable = "HTTP 503" in str(exc) or "HTTP 429" in str(exc)
+            if not retryable or attempt >= retries:
+                raise
+            delay = retry_delay * (attempt + 1)
+            print(
+                json.dumps(
+                    {
+                        "retry": attempt + 1,
+                        "delay_seconds": delay,
+                        "reason": str(exc),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            time.sleep(delay)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="http://127.0.0.1:8792")
@@ -40,9 +73,13 @@ def main() -> int:
         default=1,
         help="exact cache-hit replays per primed request (use >1 for an OOM/leak soak)",
     )
+    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--retry-delay", type=float, default=2.0)
     args = parser.parse_args()
     if args.replays < 1:
         parser.error("--replays must be at least 1")
+    if args.retries < 0 or args.retry_delay < 0:
+        parser.error("--retries and --retry-delay must be non-negative")
 
     corpus = json.loads(args.corpus.read_text())
     cases = corpus["cases"][: args.limit or None]
@@ -59,13 +96,18 @@ def main() -> int:
             "n": 1,
             "teleport_start_step": min(args.teleport_start_step, defaults.get("steps", 9) - 1),
         }
-        baseline, baseline_meta = request_image(
-            args.base, {**common, "teleport": False}, secret, args.timeout)
-        prime, prime_meta = request_image(
-            args.base, {**common, "teleport": True}, secret, args.timeout)
+        baseline, baseline_meta = request_with_retries(
+            args.base, {**common, "teleport": False}, secret, args.timeout,
+            retries=args.retries, retry_delay=args.retry_delay,
+        )
+        prime, prime_meta = request_with_retries(
+            args.base, {**common, "teleport": True}, secret, args.timeout,
+            retries=args.retries, retry_delay=args.retry_delay,
+        )
         replay_results = [
-            request_image(
+            request_with_retries(
                 args.base, {**common, "teleport": True}, secret, args.timeout,
+                retries=args.retries, retry_delay=args.retry_delay,
             )
             for _ in range(args.replays)
         ]
