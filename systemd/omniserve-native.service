@@ -78,6 +78,10 @@ Environment=OMNISERVE_NATIVE_SD_VAE_TILING=1
 Environment=OMNISERVE_NATIVE_SD_VAE_TILE_X=64
 Environment=OMNISERVE_NATIVE_SD_VAE_TILE_Y=64
 Environment=OMNISERVE_NATIVE_SD_TELEPORT_CACHE_SIZE=32
+# Resume exact repeats at the final scheduled step. The RTX 5090 sweep kept
+# pixels identical and improved the three-case median prime/replay ratio from
+# 1.217x at step 4 to 1.491x at step 8 on the nine-step profile.
+Environment=OMNISERVE_NATIVE_SD_TELEPORT_START_STEP=8
 Environment=OMNISERVE_NATIVE_IMAGE_PREFER_EMBEDDED=1
 # RA1 fal_zimage LoRAs resolve by basename under this cache-only directory.
 Environment=OMNISERVE_NATIVE_LORA_DIR=/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache
