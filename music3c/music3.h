@@ -41,6 +41,11 @@ typedef struct {
     double digital_silence_percent;
     int has_stereo_correlation;
     double stereo_correlation;
+    double continuity_score;
+    double worst_local_drop_db;
+    double largest_adjacent_jump_db;
+    double severe_drop_seconds;
+    double longest_severe_drop_seconds;
 } Music3WavStats;
 
 typedef struct {
@@ -54,6 +59,8 @@ typedef struct {
     double prefetch_gib;
     int server_ready_before_job;
     const char *gpu_name;
+    int quality_attempts;
+    long long original_seed;
 } Music3Timings;
 
 int music3_normalize_request(const char *json, Music3Request *request);

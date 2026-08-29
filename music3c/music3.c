@@ -292,6 +292,68 @@ static uint32_t le32(const unsigned char *p) {
 }
 static uint16_t le16(const unsigned char *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 
+static int compare_double(const void *left, const void *right) {
+    double a = *(const double *)left, b = *(const double *)right;
+    return (a > b) - (a < b);
+}
+
+static void continuity_statistics(const unsigned char *data, size_t data_bytes, unsigned channels,
+                                  unsigned sample_rate, Music3WavStats *stats) {
+    size_t total_frames = data_bytes / (2 * channels);
+    size_t window_frames = sample_rate / 4; /* 250 ms catches perceptual holes cheaply. */
+    if (window_frames == 0 || total_frames < window_frames * 3) { stats->continuity_score = 100; return; }
+    size_t windows = (total_frames + window_frames - 1) / window_frames;
+    double *db = calloc(windows, sizeof(*db));
+    if (db == NULL) { stats->continuity_score = 100; return; }
+    for (size_t window = 0; window < windows; ++window) {
+        size_t first = window * window_frames, last = first + window_frames;
+        if (last > total_frames) last = total_frames;
+        double sum_sq = 0;
+        for (size_t frame = first; frame < last; ++frame) {
+            double mono = 0;
+            for (unsigned channel = 0; channel < channels; ++channel) {
+                size_t index = (frame * channels + channel) * 2;
+                int16_t raw = (int16_t)(data[index] | (data[index + 1] << 8));
+                mono += raw / 32768.0;
+            }
+            mono /= channels;
+            sum_sq += mono * mono;
+        }
+        double rms = sqrt(sum_sq / (double)(last - first));
+        db[window] = 20.0 * log10(rms > 1e-9 ? rms : 1e-9);
+    }
+    size_t radius = 8, edge = 6;
+    double worst_drop = 0, adjacent_jump = 0;
+    unsigned severe = 0, run = 0, longest = 0;
+    for (size_t i = 1; i < windows; ++i) {
+        double jump = fabs(db[i] - db[i - 1]);
+        if (jump > adjacent_jump) adjacent_jump = jump;
+    }
+    for (size_t i = edge; i + edge < windows; ++i) {
+        size_t begin = i > radius ? i - radius : 0;
+        size_t end = i + radius + 1 < windows ? i + radius + 1 : windows;
+        double nearby[17];
+        size_t count = end - begin;
+        for (size_t j = 0; j < count; ++j) nearby[j] = db[begin + j];
+        qsort(nearby, count, sizeof(*nearby), compare_double);
+        double local_75 = nearby[(3 * (count - 1)) / 4];
+        double drop = local_75 - db[i];
+        if (drop > worst_drop) worst_drop = drop;
+        int flagged = drop >= 12.0 && db[i] <= -34.0;
+        if (flagged) { severe++; run++; if (run > longest) longest = run; }
+        else run = 0;
+    }
+    double severe_seconds = severe * 0.25;
+    double score = 100.0 - fmax(0.0, worst_drop - 8.0) * 2.0 - severe_seconds * 8.0
+                   - fmax(0.0, adjacent_jump - 14.0);
+    stats->continuity_score = fmax(0.0, score);
+    stats->worst_local_drop_db = worst_drop;
+    stats->largest_adjacent_jump_db = adjacent_jump;
+    stats->severe_drop_seconds = severe_seconds;
+    stats->longest_severe_drop_seconds = longest * 0.25;
+    free(db);
+}
+
 int music3_wav_statistics(const unsigned char *audio, size_t length, Music3WavStats *stats) {
     memset(stats, 0, sizeof(*stats));
     if (audio == NULL || length < 44 || memcmp(audio, "RIFF", 4) != 0 || memcmp(audio + 8, "WAVE", 4) != 0)
@@ -367,6 +429,7 @@ int music3_wav_statistics(const unsigned char *audio, size_t length, Music3WavSt
             stats->stereo_correlation = cov / sqrt(left_var * right_var);
         }
     }
+    continuity_statistics(data, data_bytes, channels, sample_rate, stats);
     return 0;
 }
 
@@ -411,9 +474,12 @@ int music3_write_result_json(char *out, size_t size, const Music3Request *reques
     n = snprintf(out + used, size - used,
         ",\"peak_dbfs\":%.3f,\"rms_dbfs\":%.3f,\"crest_factor_db\":%.3f,\"dc_offset\":%.7f,"
         "\"clipped_samples\":%u,\"clipped_percent\":%.6f,\"digital_silence_percent\":%.4f,"
-        "\"stereo_correlation\":",
+        "\"continuity_score\":%.2f,\"worst_local_drop_db\":%.2f,\"largest_adjacent_jump_db\":%.2f,"
+        "\"severe_drop_seconds\":%.3f,\"longest_severe_drop_seconds\":%.3f,\"stereo_correlation\":",
         stats->peak_dbfs, stats->rms_dbfs, stats->crest_factor_db, stats->dc_offset,
-        stats->clipped_samples, stats->clipped_percent, stats->digital_silence_percent);
+        stats->clipped_samples, stats->clipped_percent, stats->digital_silence_percent,
+        stats->continuity_score, stats->worst_local_drop_db, stats->largest_adjacent_jump_db,
+        stats->severe_drop_seconds, stats->longest_severe_drop_seconds);
     if (n < 0 || used + (size_t)n >= size) return -1;
     used += (size_t)n;
     if (stats->has_stereo_correlation)
@@ -425,13 +491,15 @@ int music3_write_result_json(char *out, size_t size, const Music3Request *reques
         ",\"model_download_seconds\":%.3f,\"server_start_seconds\":%.3f,\"generation_seconds\":%.3f,"
         "\"realtime_factor\":%.3f,\"audio_seconds_per_compute_second\":%.3f,\"server_started_at\":%.3f,"
         "\"upload_seconds\":%.3f,\"total_seconds\":%.3f,\"prefetch_seconds\":%.3f,\"prefetch_gib\":%.3f,"
-        "\"server_ready_before_job\":%s,\"gpu\":\"%s\",\"optimizations\":[\"backbone-cuda-graph\","
+        "\"server_ready_before_job\":%s,\"gpu\":\"%s\",\"quality_attempts\":%d,\"quality_original_seed\":%lld,"
+        "\"optimizations\":[\"backbone-cuda-graph\","
         "\"rvq-depth-cuda-graph\",\"compiled-dit-blocks\",\"compiled-dav-decoder\",\"batched-seeded-sampling\","
         "\"warm-start-thread\",\"parallel-weight-prefetch\"]}",
         model_download_seconds, server_start_seconds, generation_seconds,
         generation_seconds / duration, duration / (generation_seconds > 0.001 ? generation_seconds : 0.001),
         server_started_at, upload_seconds, total_seconds, timings->prefetch_seconds, timings->prefetch_gib,
-        timings->server_ready_before_job ? "true" : "false", gpu_name);
+        timings->server_ready_before_job ? "true" : "false", gpu_name,
+        timings->quality_attempts, timings->original_seed);
     if (n < 0 || used + (size_t)n >= size) return -1;
     used += (size_t)n;
     if (audio_url && audio_url[0]) {

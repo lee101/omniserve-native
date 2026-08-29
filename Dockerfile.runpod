@@ -71,7 +71,6 @@ ENV PYTHONUNBUFFERED=1 \
     RVM_TORCH_COMPILE=0 \
     RVM_CHUNK_FRAMES=8 \
     PERSON_DETECTOR_PATH=/opt/models/yolo11n.pt \
-    TORCHINDUCTOR_CACHE_DIR=/runpod-volume/omniserve/torchinductor \
     VIDEO_BACKGROUND_CACHE=/runpod-volume/omniserve/video-matting \
     OMNISERVE_WORKLOAD_MANIFEST=/opt/omniserve/workloads/workloads.json \
     OMNISERVE_DEFAULT_WORKLOAD=video-matting \
@@ -79,6 +78,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 ENV HF_HOME=/runpod-volume/omniserve/huggingface \
     TORCH_HOME=/runpod-volume/omniserve/torch \
+    TORCHINDUCTOR_CACHE_DIR=/runpod-volume/omniserve/torchinductor \
+    TRITON_CACHE_DIR=/runpod-volume/omniserve/triton \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     WAN_ANIMATE_TORCH_COMPILE=1
 

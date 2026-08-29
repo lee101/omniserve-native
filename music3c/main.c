@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -312,6 +313,13 @@ static int start_server_locked(double *download_seconds, double *start_seconds) 
     double started = monotonic_seconds();
     pid_t child = fork();
     if (child == 0) {
+        /* The image WORKDIR ships its own sglang_omni checkout; CWD would
+         * shadow the pinned runtime on the volume via sys.path[0]. */
+        if (chdir("/") != 0) _exit(126);
+        /* Checkpoint is fully local at this point; skip hub probes on boot
+         * unless the operator explicitly overrides. */
+        setenv("HF_HUB_OFFLINE", "1", 0);
+        setenv("TRANSFORMERS_OFFLINE", "1", 0);
         const char *log_path = env_str("MUSIC3_SERVER_LOG", "/runpod-volume/omniserve/music3/server.log");
         int fd = open(log_path, O_CREAT | O_WRONLY | O_APPEND, 0644);
         if (fd >= 0) { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); }
@@ -338,6 +346,22 @@ static int start_server_locked(double *download_seconds, double *start_seconds) 
         args[used++] = (char *)env_str("MUSIC3_ACOUSTIC_DTYPE", "bfloat16");
         used = append_extra_serve_args(args, used, scratch, sizeof(scratch));
         args[used] = NULL;
+        if (getenv("MUSIC3_SERVE_DIAG")) {
+            FILE *dbg = fopen("/runpod-volume/omniserve/music3/worker-diag.txt", "a");
+            if (dbg) {
+                fprintf(dbg, "--- serve boot ---\n");
+                int saved_out = dup(STDOUT_FILENO);
+                int saved_err = dup(STDERR_FILENO);
+                dup2(fileno(dbg), STDOUT_FILENO);
+                dup2(fileno(dbg), STDERR_FILENO);
+                (void)!system("hostname; pwd; env | sort | grep -E 'PYTHONPATH|HOSTNAME'; ls /runpod-volume/ 2>&1 | head -5; git -C /runpod-volume/omniserve/music3/sglang-omni-e0c98529 rev-parse HEAD 2>&1; python3 -c 'import sglang_omni; print(sglang_omni.__file__)' 2>&1");
+                for (int i = 0; args[i]; ++i) fprintf(dbg, "ARG[%d]=%s\n", i, args[i]);
+                fflush(dbg);
+                dup2(saved_out, STDOUT_FILENO);
+                dup2(saved_err, STDERR_FILENO);
+                fclose(dbg);
+            }
+        }
         execvp(args[0], args);
         _exit(127);
     }
@@ -486,6 +510,8 @@ static int handle_job_json(const char *json, char **result_json) {
         return 400;
     }
     double total_started = monotonic_seconds(), download = 0, start = 0, generation = 0, upload = 0;
+    long long original_seed = request.seed;
+    int quality_attempts = 1;
     g_server_ready_before_job = g_server_pid > 0 && kill(g_server_pid, 0) == 0 && health();
     if (start_server(&download, &start) != 0) {
         *result_json = strdup("{\"error\":\"MiniMax-Music3 server failed to start\"}");
@@ -502,6 +528,28 @@ static int handle_job_json(const char *json, char **result_json) {
         free(audio);
         *result_json = strdup("{\"error\":\"generated WAV is invalid\"}");
         return 502;
+    }
+    int retries = env_int("MUSIC3_QUALITY_RETRIES", 1);
+    double threshold = atof(env_str("MUSIC3_CONTINUITY_THRESHOLD", "75"));
+    for (int retry = 0; retry < retries && stats.continuity_score < threshold; ++retry) {
+        Music3Request candidate_request = request;
+        candidate_request.seed = original_seed <= LLONG_MAX - retry - 1 ? original_seed + retry + 1 : retry;
+        unsigned char *candidate_audio = NULL;
+        size_t candidate_length = 0;
+        double candidate_seconds = 0;
+        if (generate_audio(&candidate_request, &candidate_audio, &candidate_length, &candidate_seconds) != 0)
+            break;
+        generation += candidate_seconds;
+        quality_attempts++;
+        Music3WavStats candidate_stats = {0};
+        if (music3_wav_statistics(candidate_audio, candidate_length, &candidate_stats) == 0 &&
+            candidate_stats.continuity_score > stats.continuity_score) {
+            free(audio);
+            audio = candidate_audio;
+            audio_length = candidate_length;
+            stats = candidate_stats;
+            request = candidate_request;
+        } else free(candidate_audio);
     }
     char *inline_b64 = NULL;
     const char *audio_url = NULL;
@@ -529,6 +577,7 @@ static int handle_job_json(const char *json, char **result_json) {
         .total_seconds = monotonic_seconds() - total_started, .server_started_at = g_server_started_at,
         .prefetch_seconds = g_prefetch_seconds, .prefetch_gib = g_prefetch_gib,
         .server_ready_before_job = g_server_ready_before_job, .gpu_name = g_gpu_name,
+        .quality_attempts = quality_attempts, .original_seed = original_seed,
     };
     if (music3_write_result_json(out, MUSIC3_RESULT_SIZE, &request, &stats, audio_url, inline_b64,
                                  &timings) != 0) {

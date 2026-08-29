@@ -66,6 +66,20 @@ int main(void) {
     assert(stats.clipped_samples == 0);
     assert(stats.has_stereo_correlation);
     assert(stats.stereo_correlation > 0.999);
+    assert(stats.continuity_score > 99.0);
+
+    /* A one-second internal collapse between healthy tone must trip the retry gate. */
+    int16_t dropout[32000 * 6 * 2];
+    for (unsigned i = 0; i < 32000 * 6; ++i) {
+        double level = (i >= 32000 * 2 && i < 32000 * 3) ? 0.00001 : 0.25;
+        int16_t sample = (int16_t)(level * sin(2.0 * 3.141592653589793 * 440.0 * i / 32000) * 32767.0);
+        dropout[i * 2] = sample; dropout[i * 2 + 1] = sample;
+    }
+    unsigned char dropout_wav[44 + sizeof(dropout)];
+    write_wav(dropout_wav, &used, dropout, 32000 * 6, 2, 32000);
+    assert(music3_wav_statistics(dropout_wav, used, &stats) == 0);
+    assert(stats.continuity_score < 80.0);
+    assert(stats.longest_severe_drop_seconds >= 0.75);
     assert(music3_name_included("dav.pth", "qwen_7B,flowmatching_vae.pth,dav.pth") == 1);
     assert(music3_name_included("dav.pth.tmp", "qwen_7B,flowmatching_vae.pth,dav.pth") == 0);
     assert(music3_name_included("q", "qwen_7B") == 0);

@@ -1,7 +1,7 @@
 {
-  "name": "omniserve-minimax-music3",
+  "name": "omniserve-minimax-music3-standard",
   "workersMin": 0,
-  "workersMax": 3,
+  "workersMax": 1,
   "idleTimeout": 20,
   "flashboot": true,
   "scalerType": "REQUEST_COUNT",

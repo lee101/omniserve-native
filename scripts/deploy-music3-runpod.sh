@@ -109,6 +109,7 @@ template_payload="$(jq -n --arg image "$image" --arg registry_auth "$registry_au
     MUSIC3_MODEL_DIR:"/runpod-volume/models/minimax-music3",
     HF_HOME:"/runpod-volume/huggingface",
     TORCHINDUCTOR_CACHE_DIR:"/runpod-volume/omniserve/music3/torchinductor",
+    TRITON_CACHE_DIR:"/runpod-volume/omniserve/music3/triton",
     FLASHINFER_WORKSPACE_BASE:"/runpod-volume/omniserve/music3/flashinfer",
     MUSIC3_PORT:"8000", MUSIC3_MAX_RUNNING_REQUESTS:"1", MUSIC3_ACOUSTIC_DTYPE:"bfloat16",
     MUSIC3_STARTUP_TIMEOUT_SECONDS:"1800", MUSIC3_REQUEST_TIMEOUT_SECONDS:"1800",

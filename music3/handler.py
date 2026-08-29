@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import threading
 import time
@@ -177,13 +178,20 @@ def _start_server() -> dict[str, float]:
             return {"model_download_seconds": 0.0, "server_start_seconds": 0.0}
         model_download = _download_model()
         started = time.monotonic()
-        Path(os.environ.get("TORCHINDUCTOR_CACHE_DIR", "/tmp/music3-torchinductor")).mkdir(parents=True, exist_ok=True)
         command = [
             "sgl-omni", "serve", "--model-path", str(MODEL_DIR),
             "--host", "127.0.0.1", "--port", str(PORT),
             "--max-running-requests", os.getenv("MUSIC3_MAX_RUNNING_REQUESTS", "1"),
             "--stages.dit_dav.factory-args.dtype", os.getenv("MUSIC3_ACOUSTIC_DTYPE", "bfloat16"),
         ]
+        # Parity with music3c: per-endpoint tuning (cuda-graph sizes, attention
+        # backend, quantization) without a rebuild.
+        command.extend(shlex.split(os.getenv("MUSIC3_SERVE_EXTRA_ARGS", "")))
+
+        # Weights are fully local at this point; stop sgl-omni from paying hub
+        # reachability/version probes on every scale-from-zero boot.
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         _server_log_path.parent.mkdir(parents=True, exist_ok=True)
         server_log = _server_log_path.open("ab", buffering=0)
         server_log.write(f"\n--- Music3 server start {time.time()} ---\n".encode())
