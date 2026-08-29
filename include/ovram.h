@@ -76,6 +76,7 @@ int ovram_lease(ovram *v, const char *owner, int mb, int min_mb, otier tier,
                 double ttl_s, char *id_out, size_t id_cap);
 
 bool ovram_release(ovram *v, const char *id);
+bool ovram_renew(ovram *v, const char *id, double ttl_s);
 
 /* The TTL a lease gets when the caller does not name one. Callers need this to
  * report the expiry back, and a lease whose expiry the holder cannot see is one
@@ -92,6 +93,7 @@ int ovram_lease_at(ovram *v, const char *owner, int mb, int min_mb, otier tier,
                    double ttl_s, double now_s, int device_free_mb,
                    char *id_out, size_t id_cap);
 int ovram_expire_at(ovram *v, double now_s);
+bool ovram_renew_at(ovram *v, const char *id, double ttl_s, double now_s);
 int ovram_headroom_at(ovram *v, otier tier, double now_s, int device_free_mb);
 
 #endif

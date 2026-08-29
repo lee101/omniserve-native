@@ -3,12 +3,12 @@
   "model": {
     "llm": "gemma-roleplay-v2-q8_0",
     "embedding": "gte-modernbert-base-q8_0",
-    "diffusion": "none"
+    "diffusion": "z_image_turbo-Q4_K"
   },
   "gpu": {
     "device_present": true,
-    "requested": true,
-    "placement": "gpu",
+    "requested": false,
+    "placement": "cpu",
     "device": "NVIDIA GeForce RTX 5090",
     "kv_type": "q8_0",
     "flash_attn": true,
@@ -18,7 +18,7 @@
     {
       "check": "llm.reachable",
       "ok": true,
-      "detail": "http=200 52ms"
+      "detail": "http=200 13865ms"
     },
     {
       "check": "llm.cold_determinism",
@@ -39,13 +39,13 @@
     {
       "check": "llm.prefix_cache_active",
       "ok": true,
-      "detail": "cached_prompt_tokens=35 cold=88ms warm=74ms (cold reported 19)"
+      "detail": "cached_prompt_tokens=35 cold=24410ms warm=15971ms (cold reported 19)"
     },
     {
       "check": "llm.prefix_cache_speedup",
       "ok": true,
-      "detail": "88ms -> 74ms",
-      "score": 1.1918919787954605
+      "detail": "24410ms -> 15971ms",
+      "score": 1.528406645897607
     },
     {
       "check": "llm.max_tokens_honored",
@@ -60,7 +60,7 @@
     {
       "check": "llm.legacy_generate",
       "ok": true,
-      "detail": "http=200 56ms text='Hi I am bored so looking for something'"
+      "detail": "http=200 11890ms text='Hi I am bored so looking for something'"
     },
     {
       "check": "llm.max_sentences_honored",
@@ -81,7 +81,7 @@
   ],
   "metrics": {
     "llm.prefix_cache_agreement": 1.0,
-    "llm.prefix_cache_speedup": 1.191892,
+    "llm.prefix_cache_speedup": 1.528407,
     "llm.task_accuracy": 0.875
   },
   "failures": [],

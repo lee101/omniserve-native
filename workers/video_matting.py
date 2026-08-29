@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import queue
 from pathlib import Path
 import shutil
 import socket
@@ -21,6 +22,8 @@ import numpy as np
 import requests
 import torch
 
+from gpu_admission import AdaptiveCudaGuard
+
 
 MODEL_SOURCE = Path(os.getenv("RVM_SOURCE_PATH", "/nvme0n1-disk/models/robust-video-matting"))
 MODEL_BACKBONE = os.getenv("RVM_BACKBONE", "resnet50").strip().lower()
@@ -34,6 +37,18 @@ TORCH_HOME = Path(os.getenv("TORCH_HOME", "/nvme0n1-disk/models/torch"))
 MAX_INPUT_BYTES = int(os.getenv("VIDEO_MATTING_MAX_INPUT_BYTES", str(2 << 30)))
 MAX_DURATION = float(os.getenv("VIDEO_MATTING_MAX_DURATION", "30.25"))
 RVM_MIN_FREE_MIB = max(256, int(os.getenv("RVM_MIN_FREE_MIB", "1536")))
+RVM_OOM_MARGIN_MIB = max(64, int(os.getenv("RVM_OOM_MARGIN_MIB", "512")))
+RVM_OOM_BACKOFF_SECONDS = max(0.1, float(os.getenv("RVM_OOM_BACKOFF_SECONDS", "5")))
+RVM_OOM_BACKOFF_MAX_SECONDS = max(
+    RVM_OOM_BACKOFF_SECONDS,
+    float(os.getenv("RVM_OOM_BACKOFF_MAX_SECONDS", "300")),
+)
+RVM_OOM_RECOVERY_SUCCESSES = max(1, int(os.getenv("RVM_OOM_RECOVERY_SUCCESSES", "8")))
+RVM_VRAM_BROKER_URL = os.getenv("RVM_VRAM_BROKER_URL", "http://127.0.0.1:8791").strip().rstrip("/")
+RVM_VRAM_BROKER_REQUIRED = os.getenv("RVM_VRAM_BROKER_REQUIRED", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+RVM_VRAM_LEASE_TTL_SECONDS = max(30, int(os.getenv("RVM_VRAM_LEASE_TTL_SECONDS", "1800")))
 REQUEST_TIMEOUT = (15, 300)
 FFMPEG = os.getenv("VIDEO_MATTING_FFMPEG", "/usr/bin/ffmpeg")
 FFPROBE = os.getenv("VIDEO_MATTING_FFPROBE", "/usr/bin/ffprobe")
@@ -46,6 +61,56 @@ _rvm_model = None
 _rvm_eager = None
 _rvm_engine = ""
 _compile_error = ""
+
+
+_rvm_guard = AdaptiveCudaGuard(
+    RVM_MIN_FREE_MIB,
+    oom_margin_mib=RVM_OOM_MARGIN_MIB,
+    backoff_seconds=RVM_OOM_BACKOFF_SECONDS,
+    backoff_max_seconds=RVM_OOM_BACKOFF_MAX_SECONDS,
+    recovery_successes=RVM_OOM_RECOVERY_SUCCESSES,
+)
+
+
+def _acquire_vram_lease(required_mib: int) -> dict:
+    """Reserve cross-process headroom from the native broker when configured."""
+    if not RVM_VRAM_BROKER_URL:
+        return {"brokered": False, "granted": True, "mb": 0, "lease_id": ""}
+    try:
+        response = requests.post(
+            f"{RVM_VRAM_BROKER_URL}/v1/gpu/lease",
+            json={"owner": "rvm", "mb": required_mib, "min_mb": required_mib,
+                  "tier": "background", "ttl_s": RVM_VRAM_LEASE_TTL_SECONDS},
+            timeout=(2, 5),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("granted") and payload.get("lease_id"):
+            return {"brokered": True, "granted": True, "mb": int(payload.get("mb") or 0),
+                    "lease_id": str(payload["lease_id"])}
+        return {"brokered": True, "granted": False, "mb": 0, "lease_id": "",
+                "reason": str(payload.get("reason") or "no_headroom")}
+    except (requests.RequestException, ValueError, TypeError) as error:
+        if RVM_VRAM_BROKER_REQUIRED:
+            return {"brokered": True, "granted": False, "mb": 0, "lease_id": "",
+                    "reason": f"broker_unavailable: {str(error)[:300]}"}
+        return {"brokered": False, "granted": True, "mb": 0, "lease_id": "",
+                "warning": f"broker_unavailable: {str(error)[:300]}"}
+
+
+def _release_vram_lease(lease: dict) -> None:
+    lease_id = str(lease.get("lease_id") or "")
+    if not lease_id or not RVM_VRAM_BROKER_URL:
+        return
+    try:
+        requests.post(
+            f"{RVM_VRAM_BROKER_URL}/v1/gpu/release",
+            json={"lease_id": lease_id},
+            timeout=(2, 5),
+        ).raise_for_status()
+    except requests.RequestException:
+        # The broker TTL is the crash-safe release path.
+        pass
 
 
 def _validate_public_url(url: str) -> None:
@@ -254,15 +319,22 @@ def rvm_capacity() -> dict:
     try:
         free_bytes, total_bytes = torch.cuda.mem_get_info()
         free_mib = round(free_bytes / (1 << 20))
+        total_mib = round(total_bytes / (1 << 20))
+        adaptive = _rvm_guard.capacity(free_mib, total_mib)
         capacity = {
-            "ready": _rvm_model is not None or free_mib >= RVM_MIN_FREE_MIB,
+            "ready": adaptive["ready"],
             "free_mib": free_mib,
-            "total_mib": round(total_bytes / (1 << 20)),
+            "total_mib": total_mib,
             "minimum_free_mib": RVM_MIN_FREE_MIB,
             "rvm_loaded": _rvm_model is not None,
+            "adaptive": adaptive,
         }
         if not capacity["ready"]:
-            capacity["reason"] = "insufficient GPU headroom to load RVM"
+            capacity["reason"] = (
+                "RVM is cooling down after a CUDA OOM"
+                if adaptive["cooldown_seconds"] > 0
+                else "insufficient adaptive GPU headroom for RVM"
+            )
         return capacity
     except Exception as error:  # pragma: no cover - driver failure
         return {"ready": False, "reason": str(error)[:500], "minimum_free_mib": RVM_MIN_FREE_MIB}
@@ -295,6 +367,47 @@ def _read_exact(pipe, size: int) -> bytes:
     return bytes(chunks)
 
 
+def _encoder_writer(encoder, payloads: queue.Queue, errors: list[str]) -> None:
+    """Drain RGBA chunks so CUDA inference can overlap VP9 encoding."""
+    try:
+        while True:
+            payload = payloads.get()
+            if payload is None:
+                return
+            if encoder.stdin is None:
+                raise RuntimeError("video encoder stdin is unavailable")
+            encoder.stdin.write(payload)
+    except (BrokenPipeError, OSError, RuntimeError, ValueError) as error:
+        errors.append(str(error)[:1000])
+    finally:
+        if encoder.stdin is not None:
+            try:
+                encoder.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+
+
+def _queue_encoder_payload(payloads: queue.Queue, payload: bytes, errors: list[str]) -> None:
+    """Put a bounded chunk without hanging forever after an encoder failure."""
+    while True:
+        if errors:
+            raise RuntimeError(f"video encoder pipe failed: {errors[0]}")
+        try:
+            payloads.put(payload, timeout=0.25)
+            return
+        except queue.Full:
+            continue
+
+
+def _black_transparent_rgb(rgb: np.ndarray, alpha_bytes: np.ndarray) -> int:
+    """Black invisible video RGB and return the number of changed pixels."""
+    invisible = alpha_bytes == 0
+    if not invisible.any():
+        return 0
+    rgb[invisible] = 0
+    return int(invisible.sum())
+
+
 def _downsample_ratio(width: int, height: int) -> float:
     configured = os.getenv("RVM_DOWNSAMPLE_RATIO", "").strip()
     if configured:
@@ -318,24 +431,38 @@ def _matte(source: Path, transparent: Path, info: dict, progress) -> dict:
     vp9_deadline = os.getenv("VIDEO_ALPHA_VP9_DEADLINE", "realtime").strip().lower()
     if vp9_deadline not in {"realtime", "good", "best"}:
         raise ValueError("VIDEO_ALPHA_VP9_DEADLINE must be realtime, good, or best")
-    vp9_cpu_used = max(0, min(8, int(os.getenv("VIDEO_ALPHA_VP9_CPU_USED", "6"))))
-    vp9_threads = max(1, min(32, int(os.getenv("VIDEO_ALPHA_VP9_THREADS", "16"))))
+    vp9_cpu_used = max(0, min(8, int(os.getenv("VIDEO_ALPHA_VP9_CPU_USED", "8"))))
+    vp9_threads = max(1, min(32, int(os.getenv("VIDEO_ALPHA_VP9_THREADS", "8"))))
+    vp9_tile_columns = max(0, min(3, int(os.getenv("VIDEO_ALPHA_VP9_TILE_COLUMNS", "1"))))
     encoder = subprocess.Popen(
         [FFMPEG, "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba",
          "-s:v", f"{width}x{height}", "-r", f"{fps:.8f}", "-i", "pipe:0", "-an",
          "-c:v", "libvpx-vp9", "-deadline", vp9_deadline, "-cpu-used", str(vp9_cpu_used),
-         "-threads", str(vp9_threads), "-row-mt", "1", "-tile-columns", "2", "-frame-parallel", "1",
+         "-threads", str(vp9_threads), "-row-mt", "1", "-tile-columns", str(vp9_tile_columns),
+         "-frame-parallel", "1",
          "-pix_fmt", "yuva420p", "-auto-alt-ref", "0", "-crf", "18", "-b:v", "0",
          "-metadata:s:v:0", "alpha_mode=1", "-y", str(transparent)],
         stdin=subprocess.PIPE,
     )
     if decoder.stdout is None or encoder.stdin is None:
         raise RuntimeError("could not open video pipes")
+    encoder_queue_chunks = max(1, min(4, int(os.getenv("VIDEO_ENCODER_QUEUE_CHUNKS", "2"))))
+    encoder_payloads: queue.Queue = queue.Queue(maxsize=encoder_queue_chunks)
+    encoder_errors: list[str] = []
+    encoder_thread = threading.Thread(
+        target=_encoder_writer,
+        args=(encoder, encoder_payloads, encoder_errors),
+        name="video-alpha-encoder",
+        daemon=True,
+    )
+    encoder_thread.start()
     _load_rvm()
     recurrent = [None, None, None, None]
     frame_bytes = width * height * 3
     frames = 0
+    transparent_pixels = 0
     model_seconds = 0.0
+    synchronization = "cuda-events+d2h"
     started = time.perf_counter()
     try:
         while True:
@@ -350,25 +477,51 @@ def _matte(source: Path, transparent: Path, info: dict, progress) -> dict:
             if count < chunk_frames:
                 infer_rgb = np.concatenate((rgb, np.repeat(rgb[-1:], chunk_frames - count, axis=0)))
             tensor = torch.from_numpy(infer_rgb).permute(0, 3, 1, 2)[None].cuda().half().div_(255)
-            torch.cuda.synchronize()
-            model_started = time.perf_counter()
+            model_started = torch.cuda.Event(enable_timing=True)
+            model_finished = torch.cuda.Event(enable_timing=True)
+            model_started.record()
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
                 _, alpha, *recurrent = _infer(tensor, recurrent, ratio)
-            torch.cuda.synchronize()
-            model_seconds += time.perf_counter() - model_started
+            model_finished.record()
             if alpha.ndim == 4:
                 alpha = alpha[:, None]
+            # This copy is the real completion boundary: the encoder cannot use
+            # alpha before it reaches the host.  Once it returns, both events on
+            # the same stream are complete, so elapsed_time is valid without a
+            # device-wide synchronize that stalls unrelated model streams.
             alpha_bytes = (alpha[0, :count, 0].clamp(0, 1) * 255).round().byte().cpu().numpy()
-            encoder.stdin.write(np.concatenate((rgb, alpha_bytes[..., None]), axis=-1).tobytes())
+            model_seconds += model_started.elapsed_time(model_finished) / 1000.0
+            # RGB under alpha=0 cannot be displayed. Making it uniform reduces
+            # entropy in both the VP9 colour plane and its tiles.
+            transparent_pixels += _black_transparent_rgb(rgb, alpha_bytes)
+            _queue_encoder_payload(
+                encoder_payloads,
+                np.concatenate((rgb, alpha_bytes[..., None]), axis=-1).tobytes(),
+                encoder_errors,
+            )
             frames += count
             progress(frames)
     finally:
         decoder.stdout.close()
-        encoder.stdin.close()
+        if not encoder_errors:
+            while True:
+                try:
+                    encoder_payloads.put(None, timeout=0.25)
+                    break
+                except queue.Full:
+                    if encoder_errors:
+                        break
+        encoder_thread.join(timeout=30)
+        if encoder_thread.is_alive() and encoder.stdin is not None:
+            try:
+                encoder.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            encoder_thread.join(timeout=5)
     decode_status, encode_status = decoder.wait(), encoder.wait()
-    if decode_status or encode_status or not transparent.is_file():
-        raise RuntimeError(f"video pipeline failed (decode={decode_status}, encode={encode_status})")
-    torch.cuda.synchronize()
+    if decode_status or encode_status or encoder_errors or not transparent.is_file():
+        detail = f", encoder_pipe={encoder_errors[0]}" if encoder_errors else ""
+        raise RuntimeError(f"video pipeline failed (decode={decode_status}, encode={encode_status}{detail})")
     pipeline_seconds = time.perf_counter() - started
     return {"frames": frames, "inference_seconds": model_seconds,
             "inference_fps": frames / model_seconds if model_seconds else 0.0,
@@ -376,6 +529,10 @@ def _matte(source: Path, transparent: Path, info: dict, progress) -> dict:
             "pipeline_fps": frames / pipeline_seconds if pipeline_seconds else 0.0,
             "encode_and_io_seconds": max(0.0, pipeline_seconds - model_seconds),
             "vp9_deadline": vp9_deadline, "vp9_cpu_used": vp9_cpu_used,
+            "vp9_threads": vp9_threads, "vp9_tile_columns": vp9_tile_columns,
+            "encoder_queue_chunks": encoder_queue_chunks,
+            "transparent_pixels": transparent_pixels,
+            "synchronization": synchronization,
             "downsample_ratio": ratio, "chunk_frames": chunk_frames,
             "source_width": width, "source_height": height, "engine": _rvm_engine,
             "torch_compile_error": _compile_error}
@@ -448,16 +605,29 @@ def process(request: dict, progress=lambda _frames: None) -> dict:
                     "fallback_reason": capacity.get("reason", "local GPU is at capacity"),
                     "route": "standby-gpu-pressure", "duration_seconds": info["duration"],
                     "metrics": {"person_detection": decision, "rvm_capacity": capacity}}
-        transparent = work / "transparent-no-audio.webm"
-        metrics = {"person_detection": decision, "rvm_capacity": capacity}
-        try:
-            metrics.update(_matte(source, transparent, info, progress))
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
+        lease = _acquire_vram_lease(capacity["adaptive"]["required_free_mib"])
+        if not lease["granted"]:
             return {"fallback_required": True,
-                    "fallback_reason": "local GPU ran out of memory while loading RVM",
+                    "fallback_reason": f"VRAM broker denied RVM: {lease.get('reason', 'no headroom')}",
                     "route": "standby-gpu-pressure", "duration_seconds": info["duration"],
-                    "metrics": metrics}
+                    "metrics": {"person_detection": decision, "rvm_capacity": capacity,
+                                "vram_lease": lease}}
+        transparent = work / "transparent-no-audio.webm"
+        metrics = {"person_detection": decision, "rvm_capacity": capacity, "vram_lease": lease}
+        try:
+            try:
+                metrics.update(_matte(source, transparent, info, progress))
+            except torch.cuda.OutOfMemoryError:
+                _rvm_guard.note_oom(capacity["free_mib"], capacity["total_mib"])
+                _release_rvm()
+                metrics["rvm_capacity_after_oom"] = rvm_capacity()
+                return {"fallback_required": True,
+                        "fallback_reason": "local GPU ran out of memory; adaptive RVM backoff engaged",
+                        "route": "standby-gpu-pressure", "duration_seconds": info["duration"],
+                        "metrics": metrics}
+        finally:
+            _release_vram_lease(lease)
+        _rvm_guard.note_success()
         output = work / "foreground-vp9-alpha.webm"
         _mux_audio(transparent, source, output, bool(request.get("preserve_audio", True)), info["has_audio"])
         metrics.update(_validate_vp9_alpha(output))
@@ -479,14 +649,20 @@ def health() -> dict:
             "rvm_capacity": rvm_capacity()}
 
 
-def release() -> None:
-    global _person_model, _person_error, _person_thread, _rvm_model, _rvm_eager, _rvm_engine
+def _release_rvm() -> None:
+    global _rvm_model, _rvm_eager, _rvm_engine
     with _load_lock:
-        _person_model = None
-        _person_error = ""
-        _person_thread = None
         _rvm_model = None
         _rvm_eager = None
         _rvm_engine = ""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def release() -> None:
+    global _person_model, _person_error, _person_thread
+    _release_rvm()
+    with _load_lock:
+        _person_model = None
+        _person_error = ""
+        _person_thread = None

@@ -6,15 +6,26 @@ After=network-online.target
 Type=simple
 User=administrator
 WorkingDirectory=/nvme0n1-disk/code/omniserve-native
+EnvironmentFile=-/etc/omniserve-r2.env
 Environment=HF_HOME=/nvme0n1-disk/models/huggingface
 Environment=BIREFNET_MODEL=ZhengPeng7/BiRefNet
 Environment=BIREFNET_INPUT_SIZE=1024
 Environment=BIREFNET_PORT=9094
 Environment=BIREFNET_JOB_WORKERS=2
-# Background removal must coexist with the resident LLM/search/image lanes.
-# The cached model is fast enough for this batch endpoint on CPU and never
-# competes for the card's last few GiB of scratch space.
-Environment=BIREFNET_DEVICE=cpu
+# A persistent broker lease accounts for the compiled model's weights and
+# workspace. If the shared card cannot safely grant it, the worker remains
+# available by loading the CPU model instead.
+Environment=BIREFNET_DEVICE=cuda
+Environment=BIREFNET_VRAM_BROKER_URL=http://127.0.0.1:8791
+Environment=BIREFNET_VRAM_BROKER_REQUIRED=0
+Environment=BIREFNET_VRAM_LEASE_MIB=3584
+Environment=BIREFNET_VRAM_LEASE_TTL_SECONDS=1800
+Environment=BIREFNET_TORCH_COMPILE=1
+Environment=BIREFNET_TORCH_COMPILE_MODE=default
+Environment=BIREFNET_TORCH_COMPILE_VALIDATE=1
+Environment=BIREFNET_CUDNN_BENCHMARK=0
+Environment=BIREFNET_WEBP_QUALITY=85
+Environment=BIREFNET_WEBP_METHOD=4
 Environment=TORCH_HOME=/nvme0n1-disk/models/torch
 Environment=RVM_SOURCE_PATH=/nvme0n1-disk/models/robust-video-matting
 Environment=RVM_BACKBONE=resnet50
@@ -27,13 +38,28 @@ Environment=RVM_TORCH_COMPILE=0
 Environment=RVM_TORCH_COMPILE_MODE=default
 Environment=RVM_CHUNK_FRAMES=8
 Environment=RVM_MIN_FREE_MIB=1536
+Environment=RVM_VRAM_BROKER_URL=http://127.0.0.1:8791
+Environment=RVM_VRAM_BROKER_REQUIRED=1
+Environment=RVM_VRAM_LEASE_TTL_SECONDS=1800
+Environment=RVM_OOM_MARGIN_MIB=512
+Environment=RVM_OOM_BACKOFF_SECONDS=5
+Environment=RVM_OOM_BACKOFF_MAX_SECONDS=300
+Environment=RVM_OOM_RECOVERY_SUCCESSES=8
 Environment=PERSON_DETECTOR_SAMPLES=8
 Environment=PERSON_DETECTOR_CONFIDENCE=0.35
 Environment=VIDEO_MATTING_MAX_PENDING=2
 Environment=VIDEO_MATTING_IDLE_RELEASE_SECONDS=300
+Environment=VIDEO_MATTING_FFMPEG=/nvme0n1-disk/code/omniserve-native/.local/ffmpeg/8.1.2/bin/ffmpeg
+Environment=VIDEO_MATTING_FFPROBE=/nvme0n1-disk/code/omniserve-native/.local/ffmpeg/8.1.2/bin/ffprobe
+Environment=VIDEO_ALPHA_VP9_DEADLINE=realtime
+Environment=VIDEO_ALPHA_VP9_CPU_USED=8
+Environment=VIDEO_ALPHA_VP9_THREADS=8
+Environment=VIDEO_ALPHA_VP9_TILE_COLUMNS=1
+Environment=VIDEO_ENCODER_QUEUE_CHUNKS=2
 Environment=OMNISERVE_EVENTS_PATH=/nvme0n1-disk/data/omniserve-monitor/events.jsonl
 Environment=OMNISERVE_EVENTS_MAX_BYTES=8388608
-Environment=TORCHINDUCTOR_CACHE_DIR=/nvme0n1-disk/models/torch/inductor-rvm
+Environment=TORCHINDUCTOR_CACHE_DIR=/nvme0n1-disk/models/torch/inductor-matting
+Environment=TORCHINDUCTOR_COMPILE_THREADS=8
 ExecStart=/nvme0n1-disk/code/omniserve-native/.venv/bin/python workers/birefnet_worker.py
 Restart=on-failure
 RestartSec=3

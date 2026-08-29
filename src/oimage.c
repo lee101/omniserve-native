@@ -2,6 +2,7 @@
 
 #include "ojson.h"
 
+#include "onsfw.h"
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -11,6 +12,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 static void set_error(char *error, size_t cap, const char *message) {
     if (error && cap) snprintf(error, cap, "%s", message);
@@ -37,6 +39,23 @@ static int image_env_int(const char *name, int fallback, int minimum, int maximu
     long parsed = strtol(value, &end, 10);
     if (errno || end == value || *end || parsed < minimum || parsed > maximum) return fallback;
     return (int)parsed;
+}
+
+int oimage_gpu_headroom_mb(void) {
+    return image_env_int("OMNISERVE_NATIVE_SD_MIN_FREE_MB", 4096, 0, 65536);
+}
+
+bool oimage_gpu_headroom_ok(double free_gib, char *error, size_t error_cap) {
+    int minimum_mb = oimage_gpu_headroom_mb();
+    if (minimum_mb == 0 || free_gib < 0.0 || free_gib * 1024.0 >= (double)minimum_mb) {
+        return true;
+    }
+    if (error && error_cap) {
+        snprintf(error, error_cap,
+                 "image generation needs at least %d MB free GPU memory; only %.0f MB is free",
+                 minimum_mb, free_gib * 1024.0);
+    }
+    return false;
 }
 
 static bool safe_lora_id(const char *value) {
@@ -221,6 +240,44 @@ void oimage_request_free(oimage_request *request) {
     memset(request, 0, sizeof *request);
 }
 
+static bool add_automatic_nsfw_lora(oimage_request *request) {
+    if (!request || request->generation.lora_count ||
+        !onsfw_prompt_has_word(request->prompt)) {
+        return true;
+    }
+    const char *path = getenv("OMNISERVE_NATIVE_NSFW_LORA_PATH");
+    if (!path || path[0] != '/' || access(path, R_OK) != 0) {
+        if (path && path[0]) {
+            fprintf(stderr, "[safety] prompt word match but NSFW LoRA is unavailable: %s\n",
+                    path);
+        }
+        return true;
+    }
+    char *owned_path = strdup(path);
+    if (!owned_path) return false;
+    size_t count = request->generation.lora_count;
+    oimg_lora *grown = realloc(request->loras, (count + 1) * sizeof *grown);
+    if (!grown) {
+        free(owned_path);
+        return false;
+    }
+    double scale = 0.6;
+    const char *scale_text = getenv("OMNISERVE_NATIVE_NSFW_LORA_SCALE");
+    if (scale_text && scale_text[0]) {
+        char *end = NULL;
+        double parsed = strtod(scale_text, &end);
+        if (end != scale_text && isfinite(parsed) && parsed >= -4.0 && parsed <= 4.0) {
+            scale = parsed;
+        }
+    }
+    grown[count].path = owned_path;
+    grown[count].scale = (float)scale;
+    request->loras = grown;
+    request->generation.loras = grown;
+    request->generation.lora_count = count + 1;
+    fprintf(stderr, "[safety] prompt word match: enabling NSFW LoRA scale=%.2f\n", scale);
+    return true;
+}
 static bool parse_size(const char *json, const oj_tok *token, int *width, int *height) {
     if (token->type != OJ_STRING || token->end <= token->start) return false;
     size_t len = (size_t)(token->end - token->start);
@@ -548,6 +605,11 @@ bool oimage_request_parse(const char *json, size_t json_len, oimage_request *req
         }
     } else if (lora_filename_token >= 0) {
         set_error(error, error_cap, "lora_filename requires lora_id");
+        oimage_request_free(request);
+        return false;
+    }
+    if (!add_automatic_nsfw_lora(request)) {
+        set_error(error, error_cap, "could not prepare automatic NSFW LoRA");
         oimage_request_free(request);
         return false;
     }

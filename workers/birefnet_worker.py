@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import os
@@ -47,15 +48,26 @@ except ImportError:  # pragma: no cover - image cutouts remain available
 MODEL_ID = os.getenv("BIREFNET_MODEL", "ZhengPeng7/BiRefNet")
 DEVICE = os.getenv("BIREFNET_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 INPUT_SIZE = int(os.getenv("BIREFNET_INPUT_SIZE", "1024"))
+TORCH_COMPILE = os.getenv("BIREFNET_TORCH_COMPILE", "0") == "1"
+TORCH_COMPILE_MODE = os.getenv("BIREFNET_TORCH_COMPILE_MODE", "default").strip()
+TORCH_COMPILE_VALIDATE = os.getenv("BIREFNET_TORCH_COMPILE_VALIDATE", "1") == "1"
+CUDNN_BENCHMARK = os.getenv("BIREFNET_CUDNN_BENCHMARK", "0") == "1"
+VRAM_BROKER_URL = os.getenv(
+    "BIREFNET_VRAM_BROKER_URL", os.getenv("RVM_VRAM_BROKER_URL", "http://127.0.0.1:8791"),
+).strip().rstrip("/")
+VRAM_BROKER_REQUIRED = os.getenv("BIREFNET_VRAM_BROKER_REQUIRED", "0") == "1"
+VRAM_LEASE_MIB = max(512, int(os.getenv("BIREFNET_VRAM_LEASE_MIB", "3584")))
+VRAM_LEASE_TTL_SECONDS = max(60, int(os.getenv("BIREFNET_VRAM_LEASE_TTL_SECONDS", "1800")))
 MAX_DOWNLOAD_BYTES = int(os.getenv("BIREFNET_MAX_DOWNLOAD_BYTES", str(64 << 20)))
 # Colour decontamination: recover the true foreground colour so the backdrop
 # (green screens especially) stops bleeding into semi-transparent edges.
 DECONTAMINATE = os.getenv("BIREFNET_DECONTAMINATE", "1") == "1"
 DECONTAMINATE_MAX_PIXELS = int(os.getenv("BIREFNET_DECONTAMINATE_MAX_PIXELS", str(16 << 20)))
 # WebP keeps the alpha channel at a fraction of PNG's size; 85 is the quality
-# used across the stack. exact=True keeps the RGB under transparent pixels, so a
-# client-side brush can paint parts of the background back in.
-WEBP_QUALITY = int(os.getenv("BIREFNET_WEBP_QUALITY", "85"))
+# used across the stack. Hidden RGB is deliberately blacked before encoding:
+# it is not visible, and random source colours under alpha=0 defeat compression.
+WEBP_QUALITY = max(0, min(100, int(os.getenv("BIREFNET_WEBP_QUALITY", "85"))))
+WEBP_METHOD = max(0, min(6, int(os.getenv("BIREFNET_WEBP_METHOD", "4"))))
 DEFAULT_FORMAT = os.getenv("BIREFNET_OUTPUT_FORMAT", "webp").lower()
 CACHE_ENABLED = os.getenv("BIREFNET_CACHE", "1") == "1"
 JOB_TTL_SECONDS = int(os.getenv("BIREFNET_JOB_TTL", "3600"))
@@ -115,6 +127,9 @@ class RemoveBackgroundRequest(BaseModel):
             "model": MODEL_ID,
             "input_size": INPUT_SIZE,
             "quality": WEBP_QUALITY if self.output_format.lower() == "webp" else 0,
+            "webp_method": WEBP_METHOD if self.output_format.lower() == "webp" else 0,
+            "transparent_rgb": "black" if self.output_format.lower() == "webp" else "n/a",
+            "dtype": str(runtime.dtype),
             "return_background": self.return_background,
             "background": self.background or "",
             "background_prompt": self.background_prompt or "",
@@ -147,8 +162,16 @@ class VideoBackgroundRequest(BaseModel):
 
 class Runtime:
     model: Any = None
+    eager_model: Any = None
     transform: Any = None
     dtype: torch.dtype = torch.float16
+    engine: str = "unloaded"
+    compile_error: str = ""
+    compile_seconds: float = 0.0
+    compile_validation: dict[str, Any] = {}
+    vram_lease: dict[str, Any] = {}
+    normalize_mean: Any = None
+    normalize_std: Any = None
 
 
 runtime = Runtime()
@@ -161,6 +184,8 @@ _job_pool = ThreadPoolExecutor(max_workers=JOB_WORKERS, thread_name_prefix="bire
 _video_job_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-matting-job")
 _event_lock = threading.Lock()
 _idle_stop = threading.Event()
+_lease_stop = threading.Event()
+_model_lock = threading.Lock()
 _video_stats: dict[str, Any] = {
     "submitted": 0,
     "completed": 0,
@@ -271,6 +296,67 @@ def _video_capacity() -> dict[str, Any]:
     }
 
 
+def _acquire_model_vram_lease() -> dict[str, Any]:
+    if not VRAM_BROKER_URL:
+        return {"brokered": False, "granted": True, "mb": 0, "lease_id": ""}
+    try:
+        response = requests.post(
+            f"{VRAM_BROKER_URL}/v1/gpu/lease",
+            json={"owner": "birefnet", "mb": VRAM_LEASE_MIB, "min_mb": VRAM_LEASE_MIB,
+                  "tier": "background", "ttl_s": VRAM_LEASE_TTL_SECONDS},
+            timeout=(2, 5),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("granted") and payload.get("lease_id"):
+            return {"brokered": True, "granted": True, "mb": int(payload.get("mb") or 0),
+                    "lease_id": str(payload["lease_id"])}
+        return {"brokered": True, "granted": False, "mb": 0, "lease_id": "",
+                "reason": str(payload.get("reason") or "no_headroom")}
+    except (requests.RequestException, ValueError, TypeError) as error:
+        return {"brokered": True, "granted": False, "mb": 0, "lease_id": "",
+                "reason": f"broker_unavailable: {_safe_error(error)}"}
+
+
+def _release_model_vram_lease() -> None:
+    lease_id = str(runtime.vram_lease.get("lease_id") or "")
+    if lease_id and VRAM_BROKER_URL:
+        try:
+            requests.post(
+                f"{VRAM_BROKER_URL}/v1/gpu/release",
+                json={"lease_id": lease_id}, timeout=(2, 5),
+            ).raise_for_status()
+        except requests.RequestException:
+            pass  # Lease expiry is the crash-safe release path.
+    runtime.vram_lease = {}
+
+
+def _lease_renewal_loop() -> None:
+    interval = min(300.0, max(30.0, VRAM_LEASE_TTL_SECONDS / 3.0))
+    while not _lease_stop.wait(interval):
+        lease_id = str(runtime.vram_lease.get("lease_id") or "")
+        if not lease_id or not VRAM_BROKER_URL:
+            continue
+        try:
+            response = requests.post(
+                f"{VRAM_BROKER_URL}/v1/gpu/renew",
+                json={"lease_id": lease_id, "ttl_s": VRAM_LEASE_TTL_SECONDS}, timeout=(2, 5),
+            )
+            if response.status_code == 404:
+                # The gateway may have restarted and forgotten its in-memory
+                # leases. Re-register the still-resident model immediately.
+                replacement = _acquire_model_vram_lease()
+                if replacement.get("granted"):
+                    runtime.vram_lease = replacement
+                else:
+                    runtime.vram_lease["renewal_error"] = replacement.get("reason", "no_headroom")
+                continue
+            response.raise_for_status()
+            runtime.vram_lease.pop("renewal_error", None)
+        except requests.RequestException as error:
+            runtime.vram_lease["renewal_error"] = _safe_error(error)
+
+
 def _idle_release_loop() -> None:
     if VIDEO_IDLE_RELEASE_SECONDS <= 0:
         return
@@ -291,28 +377,133 @@ def _idle_release_loop() -> None:
         _emit_event("info", "video_models_released", idle_seconds=round(idle_for, 1))
 
 
-def load_model() -> None:
+def _unwrap_prediction(prediction):
+    while isinstance(prediction, (tuple, list)):
+        prediction = prediction[-1]
+    return prediction
+
+
+def _prepare_input(image: Image.Image):
+    if not DEVICE.startswith("cuda"):
+        return runtime.transform(image).unsqueeze(0).to(DEVICE, dtype=runtime.dtype)
+    resized = image.convert("RGB").resize((INPUT_SIZE, INPUT_SIZE), Image.Resampling.BILINEAR)
+    # Upload three uint8 bytes per pixel, then cast/normalize on the device;
+    # torchvision's ToTensor would send four float32 bytes per channel.
+    array = np.array(resized, dtype=np.uint8, order="C", copy=True)
+    tensor = torch.from_numpy(array).to(DEVICE, non_blocking=True)
+    tensor = tensor.permute(2, 0, 1)[None].to(dtype=runtime.dtype)
+    tensor.div_(255.0).sub_(runtime.normalize_mean).div_(runtime.normalize_std)
+    return tensor.contiguous(memory_format=torch.channels_last)
+
+
+def _validate_compiled_model(eager, compiled) -> dict[str, float]:
+    """Warm the production input graph and reject silently incorrect compilation."""
+    axis = np.linspace(0, 255, INPUT_SIZE, dtype=np.uint8)
+    xx = np.broadcast_to(axis[None, :], (INPUT_SIZE, INPUT_SIZE))
+    yy = np.broadcast_to(axis[:, None], (INPUT_SIZE, INPUT_SIZE))
+    pattern = np.stack((xx, yy, np.bitwise_xor(xx, yy)), axis=-1)
+    with torch.inference_mode(), torch.autocast("cuda", dtype=runtime.dtype):
+        # Input creation belongs inside inference_mode too: inference tensors
+        # and ordinary tensors produce different Dynamo guards/cache keys.
+        sample = _prepare_input(Image.fromarray(pattern, mode="RGB"))
+        eager_mask = torch.sigmoid(_unwrap_prediction(eager(sample))).float()
+        compiled_mask = torch.sigmoid(_unwrap_prediction(compiled(sample))).float()
+    mean_delta = float((eager_mask - compiled_mask).abs().mean().item())
+    agreement = float(((eager_mask >= 0.5) == (compiled_mask >= 0.5)).float().mean().item())
+    validation = {"mean_abs_delta": mean_delta, "binary_agreement": agreement}
+    if mean_delta > 0.005 or agreement < 0.99:
+        raise RuntimeError(
+            f"compiled model failed validation (mean_abs_delta={mean_delta:.6f}, "
+            f"binary_agreement={agreement:.6f})"
+        )
+    return validation
+
+
+def _load_model_on(device: str) -> None:
+    global DEVICE
+    DEVICE = device
     if DEVICE.startswith("cuda"):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
+        # Benchmarking searched convolution plans that peaked at 6.45 GiB on
+        # the 5090. Heuristics peak near 3.3 GiB with equal steady throughput.
+        torch.backends.cudnn.benchmark = CUDNN_BENCHMARK
     runtime.dtype = torch.float16 if DEVICE.startswith("cuda") else torch.float32
     model = AutoModelForImageSegmentation.from_pretrained(
         MODEL_ID,
         trust_remote_code=True,
-        torch_dtype=runtime.dtype,
+        dtype=runtime.dtype,
     ).to(DEVICE)
     model.eval()
     if DEVICE.startswith("cuda"):
         model = model.to(memory_format=torch.channels_last)
-    if os.getenv("BIREFNET_TORCH_COMPILE", "0") == "1":
-        model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+    runtime.eager_model = model
     runtime.model = model
+    runtime.engine = f"birefnet-{runtime.dtype}-eager"
+    runtime.compile_error = ""
+    runtime.compile_seconds = 0.0
+    runtime.compile_validation = {}
     runtime.transform = transforms.Compose([
         transforms.Resize((INPUT_SIZE, INPUT_SIZE), interpolation=transforms.InterpolationMode.BILINEAR),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
+    if DEVICE.startswith("cuda"):
+        runtime.normalize_mean = torch.tensor(
+            [0.485, 0.456, 0.406], device=DEVICE, dtype=runtime.dtype,
+        )[None, :, None, None]
+        runtime.normalize_std = torch.tensor(
+            [0.229, 0.224, 0.225], device=DEVICE, dtype=runtime.dtype,
+        )[None, :, None, None]
+    if TORCH_COMPILE and DEVICE.startswith("cuda"):
+        started = time.perf_counter()
+        try:
+            compiled = torch.compile(model, mode=TORCH_COMPILE_MODE, fullgraph=False)
+            if TORCH_COMPILE_VALIDATE:
+                runtime.compile_validation = _validate_compiled_model(model, compiled)
+            runtime.model = compiled
+            runtime.engine = f"birefnet-{runtime.dtype}-compile-{TORCH_COMPILE_MODE}"
+        except Exception as error:
+            runtime.model = model
+            runtime.compile_error = _safe_error(error)
+            runtime.engine = f"birefnet-{runtime.dtype}-eager-compile-fallback"
+        finally:
+            runtime.compile_seconds = time.perf_counter() - started
+            # Keep weights and generated kernels, but return one-time compiler
+            # and warm-up workspaces to the shared card.
+            torch.cuda.empty_cache()
+            try:
+                # Inductor otherwise keeps its native compiler subprocess pool
+                # alive for the lifetime of this long-running API worker. New
+                # input shapes can recreate it lazily if compilation is needed.
+                from torch._inductor.async_compile import shutdown_compile_workers
+                shutdown_compile_workers()
+            except (ImportError, RuntimeError):
+                pass
+
+
+def load_model() -> None:
+    requested = DEVICE
+    if requested.startswith("cuda"):
+        runtime.vram_lease = _acquire_model_vram_lease()
+        if not runtime.vram_lease.get("granted"):
+            if VRAM_BROKER_REQUIRED:
+                raise RuntimeError(f"BiRefNet VRAM lease denied: {runtime.vram_lease.get('reason')}")
+            print(f"BiRefNet CUDA unavailable; falling back to CPU: {runtime.vram_lease.get('reason')}")
+            _load_model_on("cpu")
+            return
+    try:
+        _load_model_on(requested)
+    except torch.cuda.OutOfMemoryError:
+        _release_model_vram_lease()
+        torch.cuda.empty_cache()
+        if VRAM_BROKER_REQUIRED:
+            raise
+        print("BiRefNet CUDA load ran out of memory; falling back to CPU")
+        _load_model_on("cpu")
+    except Exception:
+        _release_model_vram_lease()
+        raise
 
 
 def read_image(value: str) -> Image.Image:
@@ -382,8 +573,11 @@ def image_to_device(image: Image.Image, device: str):
     Converting on the device means 3 bytes per pixel cross the bus instead of
     12, which on a 1024x1024 cutout is 3 MB rather than 12 MB.
     """
-    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
-    tensor = torch.from_numpy(np.ascontiguousarray(array)).to(device, non_blocking=True)
+    # PIL may expose a read-only buffer.  ascontiguousarray can return that same
+    # buffer, which makes torch warn that later writes would be undefined.  The
+    # explicit copy is the staging buffer we want for an asynchronous upload.
+    array = np.array(image.convert("RGB"), dtype=np.uint8, order="C", copy=True)
+    tensor = torch.from_numpy(array).to(device, non_blocking=True)
     return tensor.float().div_(255.0)
 
 
@@ -417,7 +611,9 @@ def estimate_foreground_background(image: Image.Image, alpha_device, alpha_array
         return foreground, background, True
 
     rgb = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
-    result = omatte.estimate_foreground(rgb, alpha_array.astype(np.float32),
+    alpha_float = (alpha_array.astype(np.float32) / 255.0
+                   if alpha_array.dtype == np.uint8 else alpha_array.astype(np.float32))
+    result = omatte.estimate_foreground(rgb, alpha_float,
                                         return_background=want_background)
     foreground, background = result if want_background else (result, None)
     return foreground, background, False
@@ -441,6 +637,8 @@ def composite_over(foreground, alpha_device, alpha_array, on_device, backdrop=No
         return device_to_image(out)
 
     alpha = alpha_array.astype(np.float32)[..., None]
+    if alpha_array.dtype == np.uint8:
+        alpha /= 255.0
     if backdrop is not None:
         back = np.asarray(backdrop.convert("RGB"), dtype=np.float32) / 255.0
     else:
@@ -449,12 +647,28 @@ def composite_over(foreground, alpha_device, alpha_array, on_device, backdrop=No
     return Image.fromarray(np.clip(blended * 255.0 + 0.5, 0, 255).astype("uint8"), mode="RGB")
 
 
+def _black_fully_transparent(rgba: Image.Image) -> Image.Image:
+    """Remove invisible RGB entropy without changing the alpha plane."""
+    if "A" not in rgba.getbands():
+        return rgba
+    rgba = rgba.convert("RGBA")
+    alpha = np.asarray(rgba.getchannel("A"))
+    transparent = alpha == 0
+    if not transparent.any():
+        return rgba
+    pixels = np.array(rgba, dtype=np.uint8, copy=True)
+    pixels[transparent, :3] = 0
+    return Image.fromarray(pixels, mode="RGBA")
+
+
 def encode_image(rgba: Image.Image, output_format: str) -> tuple[bytes, str]:
     buffer = io.BytesIO()
     if output_format == "webp":
-        # exact=True: do not discard RGB under transparent pixels, so a brush
-        # can paint the background back in without smearing.
-        rgba.save(buffer, format="WEBP", quality=WEBP_QUALITY, method=6, exact=True)
+        # The cutout's alpha is the contract. Invisible RGB is blacked above,
+        # and exact=False lets libwebp use that fact for a smaller/faster encode.
+        _black_fully_transparent(rgba).save(
+            buffer, format="WEBP", quality=WEBP_QUALITY, method=WEBP_METHOD, exact=False,
+        )
         return buffer.getvalue(), "image/webp"
     rgba.save(buffer, format="PNG", optimize=True)
     return buffer.getvalue(), "image/png"
@@ -475,7 +689,8 @@ def artifact_key(request: RemoveBackgroundRequest, name: str) -> str | None:
                                   suffix=request.output_format.lower())
 
 
-def produce_cutout(request: RemoveBackgroundRequest) -> dict[str, Any]:
+def produce_cutout(request: RemoveBackgroundRequest,
+                   source_image: Image.Image | None = None) -> dict[str, Any]:
     """Cutout (and any extra artifacts) with a content-addressed cache in front.
 
     The cache key is the (normalised) source URL plus every parameter that
@@ -503,7 +718,9 @@ def produce_cutout(request: RemoveBackgroundRequest) -> dict[str, Any]:
                                "content": None if url else object_store.get(key)}
         return {"cached": True, "media_type": media_type, "artifacts": artifacts}
 
-    image = read_image(request.image_url)
+    # A generated foreground is already a PIL image. Keep it in memory through
+    # stage 1 instead of WebP-encoding, base64-wrapping, and decoding it again.
+    image = source_image if source_image is not None else read_image(request.image_url)
     produced = remove_background(image, request)
 
     artifacts: dict[str, Any] = {}
@@ -524,6 +741,19 @@ def produce_cutout(request: RemoveBackgroundRequest) -> dict[str, Any]:
         "width": image.width,
         "height": image.height,
     }
+
+
+def _generated_source_key(request: ForegroundGenerationRequest, image: Image.Image) -> str:
+    """Stable cache source for a generated image without an intermediate encode."""
+    rgb = image.convert("RGB")
+    descriptor = json.dumps({
+        "prompt": request.prompt,
+        "width": request.width,
+        "height": request.height,
+        "seed": request.seed,
+        "pixels": hashlib.sha256(rgb.tobytes()).hexdigest(),
+    }, sort_keys=True, separators=(",", ":")).encode()
+    return "generated:" + hashlib.sha256(descriptor).hexdigest()
 
 
 def _gateway_url(path: str) -> str:
@@ -636,15 +866,22 @@ def segment(image: Image.Image, threshold: float):
     """
     if runtime.model is None:
         raise HTTPException(503, "BiRefNet is not loaded")
-    tensor = runtime.transform(image).unsqueeze(0).to(DEVICE, dtype=runtime.dtype)
-    if DEVICE.startswith("cuda"):
-        tensor = tensor.contiguous(memory_format=torch.channels_last)
-    with torch.autocast(device_type="cuda", dtype=runtime.dtype, enabled=DEVICE.startswith("cuda")):
-        prediction = runtime.model(tensor)
-    if isinstance(prediction, (tuple, list)):
-        prediction = prediction[-1]
-    if isinstance(prediction, (tuple, list)):
-        prediction = prediction[-1]
+    tensor = _prepare_input(image)
+    with _model_lock:
+        try:
+            with torch.autocast(device_type="cuda", dtype=runtime.dtype,
+                                enabled=DEVICE.startswith("cuda")):
+                prediction = runtime.model(tensor)
+        except Exception as error:
+            if runtime.model is runtime.eager_model or runtime.eager_model is None:
+                raise
+            runtime.compile_error = _safe_error(error)
+            runtime.model = runtime.eager_model
+            runtime.engine = f"birefnet-{runtime.dtype}-eager-compile-fallback"
+            with torch.autocast(device_type="cuda", dtype=runtime.dtype,
+                                enabled=DEVICE.startswith("cuda")):
+                prediction = runtime.model(tensor)
+    prediction = _unwrap_prediction(prediction)
     mask = torch.sigmoid(prediction)
     mask = functional.interpolate(mask, size=(image.height, image.width), mode="bilinear",
                                   align_corners=False)
@@ -652,7 +889,12 @@ def segment(image: Image.Image, threshold: float):
     if threshold > 0:
         mask = torch.where(mask >= threshold, mask, torch.zeros_like(mask))
     mask = mask.contiguous()
-    return (mask, mask.cpu().numpy()) if mask.is_cuda else (None, mask.numpy())
+    if mask.is_cuda:
+        # The CUDA matte pass keeps the float alpha above. Pillow only needs a
+        # byte plane, so avoid downloading a 4-byte float for every pixel.
+        alpha_bytes = mask.mul(255.0).round().to(torch.uint8).cpu().numpy()
+        return mask, alpha_bytes
+    return None, mask.numpy()
 
 
 @torch.inference_mode()
@@ -665,7 +907,9 @@ def remove_background(image: Image.Image, request: RemoveBackgroundRequest) -> d
     """
     output_format = request.output_format.lower()
     mask_device, mask_array = segment(image, request.foreground_threshold)
-    alpha = Image.fromarray((mask_array * 255).astype("uint8"), mode="L")
+    alpha_bytes = (mask_array if mask_array.dtype == np.uint8
+                   else (mask_array * 255).round().astype("uint8"))
+    alpha = Image.fromarray(alpha_bytes, mode="L")
 
     want_decontaminate = DECONTAMINATE if request.decontaminate is None else request.decontaminate
     needs_backdrop = bool(request.return_background or
@@ -723,19 +967,26 @@ def remove_background(image: Image.Image, request: RemoveBackgroundRequest) -> d
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     _idle_stop.clear()
+    _lease_stop.clear()
     load_model()
     if video_matting is not None:
         video_matting.preload_person_detector_async()
     idle_thread = threading.Thread(target=_idle_release_loop, name="video-model-reaper", daemon=True)
+    lease_thread = threading.Thread(target=_lease_renewal_loop, name="vram-lease-renewer", daemon=True)
     idle_thread.start()
+    lease_thread.start()
     yield
     _idle_stop.set()
+    _lease_stop.set()
     idle_thread.join(timeout=2)
+    lease_thread.join(timeout=2)
     runtime.model = None
+    runtime.eager_model = None
     if video_matting is not None:
         video_matting.release()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    _release_model_vram_lease()
 
 
 app = FastAPI(title="BiRefNet worker", version="1.0", lifespan=lifespan)
@@ -748,11 +999,19 @@ def health() -> dict[str, Any]:
         "model": MODEL_ID,
         "device": DEVICE,
         "input_size": INPUT_SIZE,
+        "engine": runtime.engine,
+        "torch_compile_error": runtime.compile_error,
+        "torch_compile_seconds": round(runtime.compile_seconds, 3),
+        "torch_compile_validation": runtime.compile_validation,
+        "vram_lease": runtime.vram_lease,
+        "cudnn_benchmark": CUDNN_BENCHMARK,
         "decontaminate": DECONTAMINATE and omatte is not None,
         "matte_library": omatte.library_path() if omatte else None,
         "matte_cuda": bool(omatte and omatte.cuda_available()),
         "output_format": DEFAULT_FORMAT,
         "webp_quality": WEBP_QUALITY,
+        "webp_method": WEBP_METHOD,
+        "webp_transparent_rgb": "black",
         "cache": object_store.describe() if (CACHE_ENABLED and object_store) else {"backend": "off"},
         "video_matting": video_matting.health() if video_matting is not None else {"status": "unavailable"},
         "video_capacity": _video_capacity(),
@@ -862,17 +1121,14 @@ def _run_foreground_generation(job_id: str, request: ForegroundGenerationRequest
     try:
         generated = generate_backdrop(request.prompt, request.width, request.height,
                                       None, 0.0, request.seed)
-        source = io.BytesIO()
-        generated.save(source, format="WEBP", quality=95, method=4)
-        image_url = "data:image/webp;base64," + base64.b64encode(source.getvalue()).decode()
         _set_job(job_id, status="matting")
         result = produce_cutout(RemoveBackgroundRequest(
-            image_url=image_url,
+            image_url=_generated_source_key(request, generated),
             output_format=request.output_format,
             foreground_threshold=request.foreground_threshold,
             decontaminate=request.decontaminate,
             cache=request.cache,
-        ))
+        ), source_image=generated)
     except HTTPException as error:
         _set_job(job_id, status="error", error=str(error.detail), http_status=error.status_code)
         return

@@ -13,10 +13,13 @@
 #include "ovram.h"
 
 #include <math.h>
+#include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #define MAX_TOKS 4096
@@ -27,6 +30,7 @@ typedef struct {
     const char *secret;
     oproxy_target *llm_upstream;
     oproxy_target *image_upstream;
+    oproxy_target *h3_upstream;
     oproxy_target *image_worker_upstream;
     oproxy_target *image_editor_upstream;
     oproxy_target *art_upstream;
@@ -41,8 +45,10 @@ typedef struct {
     oproxy_target *threed_upstream;
     oproxy_target *aux_upstream;
     int upstream_timeout_ms;
+    int h3_timeout_ms;
     int llm_permits;
     int image_permits;
+    int h3_permits;
     int art_permits;
     int birefnet_permits;
     int tts_permits;
@@ -55,6 +61,8 @@ typedef struct {
     int threed_permits;
     int aux_permits;
     bool prefer_embedded_image;
+    const char *h3_api_key;
+    unsigned h3_tier_mask;
     oscale *scale;
     ocapacity *capacity;
     ovram *vram;
@@ -74,6 +82,72 @@ extern const char *DOCS_HTML;
 extern const char *OPENAPI_JSON;
 
 static bool env_flag(const char *name, int fallback);
+
+/* The native LLM is an embedded backend, so the Python scheduler cannot evict
+ * it unless the gateway exposes the same lifecycle it exposes for a proxy
+ * worker. Keep the active configuration here so a failed replacement can
+ * restore the previous model. The swap root is an explicit allow-list; an
+ * internal HTTP caller must not turn this control endpoint into an arbitrary
+ * file loader. */
+static pthread_mutex_t g_llm_swap_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_llm_active_path[PATH_MAX];
+static char g_llm_active_ngl[32];
+static int g_llm_active_ctx;
+static int g_llm_active_contexts;
+
+static bool path_is_under(const char *path, const char *root) {
+    size_t n = strlen(root);
+    return strncmp(path, root, n) == 0 && (path[n] == '\0' || path[n] == '/');
+}
+
+static bool llm_swap_path(const char *requested, char *resolved, size_t resolved_cap) {
+    if (!requested || !requested[0] || !resolved || resolved_cap == 0) return false;
+    char path[PATH_MAX];
+    char root[PATH_MAX];
+    if (!realpath(requested, path)) return false;
+    const char *root_env = getenv("OMNISERVE_NATIVE_LLM_SWAP_DIR");
+    if (!root_env || !root_env[0] || !realpath(root_env, root)) return false;
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || !path_is_under(path, root)) return false;
+    snprintf(resolved, resolved_cap, "%s", path);
+    return true;
+}
+
+/* A large GGUF can be perfectly valid while still being too large for the
+ * currently available slice of a shared GPU. `auto` is intentionally
+ * conservative: it only requests full offload when the file itself plus a
+ * configurable runtime margin fits in the driver's current free memory. A
+ * caller that wants a partial split can continue to pass an explicit layer
+ * count. */
+static int resolve_llm_ngl(const char *model_path, const char *value, int fallback) {
+    if (!value || !value[0] || strcasecmp(value, "auto") != 0) {
+        return value && value[0] ? atoi(value) : fallback;
+    }
+
+    struct stat st;
+    double free_gib = -1.0;
+    bool have_vram = ogpu_memory_gib(&free_gib, NULL);
+    long long keep_mb = 2048;
+    const char *keep_env = getenv("OMNISERVE_NATIVE_NGL_AUTO_KEEP_FREE_MB");
+    if (keep_env && keep_env[0]) keep_mb = atoll(keep_env);
+    if (keep_mb < 0) keep_mb = 0;
+
+    unsigned long long model_bytes = 0;
+    if (stat(model_path, &st) == 0 && st.st_size > 0) {
+        model_bytes = (unsigned long long)st.st_size;
+    }
+    unsigned long long margin_bytes = (unsigned long long)keep_mb * 1024ULL * 1024ULL;
+    unsigned long long required_bytes = model_bytes + margin_bytes;
+    unsigned long long free_bytes = have_vram && free_gib > 0.0
+        ? (unsigned long long)(free_gib * 1024.0 * 1024.0 * 1024.0) : 0;
+    bool fits = have_vram && model_bytes > 0 && free_bytes >= required_bytes;
+
+    fprintf(stderr,
+            "llm NGL=auto: model=%llu MiB free=%llu MiB keep_free=%lld MiB -> %s\n",
+            model_bytes / (1024ULL * 1024ULL), free_bytes / (1024ULL * 1024ULL),
+            keep_mb, fits ? "full GPU offload" : "CPU placement");
+    return fits ? 999 : 0;
+}
 
 static bool query_secret_matches(const ohttp_request *req, const char *secret, size_t secret_len) {
     const char *p = req->query;
@@ -338,12 +412,13 @@ static void handle_readyz(ohttp_request *req) {
 static void handle_status(ohttp_request *req, app_state *app) {
     osched_stats stats;
     osched_snapshot(app->sched, &stats);
-    oproxy_stats llm_proxy, image_proxy, image_worker_proxy, birefnet_proxy, tts_proxy;
+    oproxy_stats llm_proxy, image_proxy, image_worker_proxy, h3_proxy, birefnet_proxy, tts_proxy;
     oproxy_stats stt_proxy, forecast_proxy;
     oproxy_stats embedding_proxy, multimodal_proxy, animation_proxy, threed_proxy, aux_proxy;
     oproxy_target_snapshot(app->llm_upstream, &llm_proxy);
     oproxy_target_snapshot(app->image_upstream, &image_proxy);
     oproxy_target_snapshot(app->image_worker_upstream, &image_worker_proxy);
+    oproxy_target_snapshot(app->h3_upstream, &h3_proxy);
     oproxy_target_snapshot(app->birefnet_upstream, &birefnet_proxy);
     oproxy_target_snapshot(app->tts_upstream, &tts_proxy);
     oproxy_target_snapshot(app->stt_upstream, &stt_proxy);
@@ -370,14 +445,15 @@ static void handle_status(ohttp_request *req, app_state *app) {
              "\"diffusion\":{\"ready\":%s,\"model\":\"%s\"},"
              /* Key order must track the argument order below, which matches the
               * permits object: llm, image, birefnet, tts, stt, ... */
-             "\"upstreams\":{\"llm\":%s,\"image\":%s,\"image_worker\":%s,\"art\":%s,\"birefnet\":%s,\"tts\":%s,\"stt\":%s,\"forecast\":%s,"
+             "\"upstreams\":{\"llm\":%s,\"image\":%s,\"image_worker\":%s,\"h3\":%s,\"art\":%s,\"birefnet\":%s,\"tts\":%s,\"stt\":%s,\"forecast\":%s,"
              "\"embedding\":%s,\"multimodal\":%s,\"animation\":%s,\"threed\":%s,\"aux\":%s},"
-             "\"permits\":{\"llm\":%d,\"image\":%d,\"art\":%d,\"birefnet\":%d,\"tts\":%d,\"stt\":%d,\"forecast\":%d,"
+             "\"permits\":{\"llm\":%d,\"image\":%d,\"h3\":%d,\"art\":%d,\"birefnet\":%d,\"tts\":%d,\"stt\":%d,\"forecast\":%d,"
              "\"embedding\":%d,\"multimodal\":%d,\"animation\":%d,\"threed\":%d,\"aux\":%d},"
              "\"proxy_pool\":{"
              "\"llm\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"image\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"image_worker\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
+             "\"h3\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"birefnet\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"tts\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"stt\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
@@ -403,6 +479,7 @@ static void handle_status(ohttp_request *req, app_state *app) {
              osd_ready() ? "true" : "false", osd_model_name(),
              app->llm_upstream ? "true" : "false", app->image_upstream ? "true" : "false",
              app->image_worker_upstream ? "true" : "false",
+             app->h3_upstream ? "true" : "false",
              app->art_upstream ? "true" : "false",
              app->birefnet_upstream ? "true" : "false",
              app->tts_upstream ? "true" : "false", app->stt_upstream ? "true" : "false",
@@ -411,7 +488,7 @@ static void handle_status(ohttp_request *req, app_state *app) {
              app->multimodal_upstream ? "true" : "false",
              app->animation_upstream ? "true" : "false",
              app->threed_upstream ? "true" : "false", app->aux_upstream ? "true" : "false",
-             app->llm_permits, app->image_permits, app->art_permits, app->birefnet_permits,
+             app->llm_permits, app->image_permits, app->h3_permits, app->art_permits, app->birefnet_permits,
              app->tts_permits, app->stt_permits, app->forecast_permits,
              app->embedding_permits, app->multimodal_permits, app->animation_permits,
              app->threed_permits, app->aux_permits,
@@ -421,6 +498,8 @@ static void handle_status(ohttp_request *req, app_state *app) {
              image_proxy.connections_reused, image_proxy.failures,
              image_worker_proxy.idle_connections, image_worker_proxy.connections_opened,
              image_worker_proxy.connections_reused, image_worker_proxy.failures,
+             h3_proxy.idle_connections, h3_proxy.connections_opened,
+             h3_proxy.connections_reused, h3_proxy.failures,
              birefnet_proxy.idle_connections, birefnet_proxy.connections_opened,
              birefnet_proxy.connections_reused, birefnet_proxy.failures,
              tts_proxy.idle_connections, tts_proxy.connections_opened,
@@ -487,6 +566,8 @@ static void handle_models(ohttp_request *req, const app_state *app) {
                                     "upstream-llm", "llm", "proxy");
     if (app->image_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_IMAGE_MODEL") ?:
                                       "upstream-image", "diffusion", "proxy");
+    if (app->h3_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_H3_MODEL") ?:
+                                   "h3", "video", "proxy-cost-aware");
     if (app->art_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_ART_MODEL") ?:
                                     "Tongyi-MAI/Z-Image-Turbo", "background-art", "proxy-background");
     if (app->birefnet_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_BIREFNET_MODEL") ?:
@@ -661,7 +742,7 @@ static void reload_embedded_models_after_background(void) {
         if (parallel_contexts < 1) parallel_contexts = 1;
         if (parallel_contexts > slots) parallel_contexts = slots;
         fprintf(stderr, "exclusive background window: reloading LLM %s\n", gguf);
-        if (!ollm_init(gguf, ngl ? atoi(ngl) : 999, ctx ? atoi(ctx) : 8192,
+        if (!ollm_init(gguf, resolve_llm_ngl(gguf, ngl, 999), ctx ? atoi(ctx) : 8192,
                        parallel_contexts)) {
             fprintf(stderr, "exclusive background window: LLM reload failed\n");
         }
@@ -740,16 +821,36 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
           env_flag("OMNISERVE_NATIVE_TRAINING_SWAP_EMBEDDED_MODELS", 1)));
     if (swap_embedded_models) unload_embedded_models_for_background();
 
-    oproxy_header forwarded[16];
+    oproxy_header forwarded[17];
     int forwarded_n = 0;
-    int forwarded_limit = tier_override >= 0 ? 13 : 16;
+    bool h3_service_auth = local == app->h3_upstream && app->h3_api_key && app->h3_api_key[0];
+    int forwarded_limit = tier_override >= 0 ? 13 : (h3_service_auth ? 15 : 16);
     for (int i = 0; i < req->header_count && forwarded_n < forwarded_limit; i++) {
         if (!proxy_header_allowed(&req->headers[i])) continue;
+        if (h3_service_auth &&
+            ((req->headers[i].name_len == sizeof "Authorization" - 1 &&
+              strncasecmp(req->headers[i].name, "Authorization", sizeof "Authorization" - 1) == 0) ||
+             (req->headers[i].name_len == sizeof "X-API-Key" - 1 &&
+              strncasecmp(req->headers[i].name, "X-API-Key", sizeof "X-API-Key" - 1) == 0)))
+            continue;
         forwarded[forwarded_n++] = (oproxy_header){
             .name = req->headers[i].name,
             .name_len = req->headers[i].name_len,
             .value = req->headers[i].value,
             .value_len = req->headers[i].value_len,
+        };
+    }
+    char h3_authorization[1024];
+    if (h3_service_auth) {
+        int n = snprintf(h3_authorization, sizeof h3_authorization, "Bearer %s", app->h3_api_key);
+        if (n <= 7 || (size_t)n >= sizeof h3_authorization) {
+            osched_release_n(app->sched, tier, permits);
+            respond_error(req, 500, "H3 service credential is invalid");
+            return;
+        }
+        forwarded[forwarded_n++] = (oproxy_header){
+            .name = "Authorization", .name_len = sizeof "Authorization" - 1,
+            .value = h3_authorization, .value_len = (size_t)n,
         };
     }
     if (tier_override >= 0) {
@@ -777,6 +878,8 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
     oproxy_result result;
     const char *upstream_path = path_override ? path_override : req->path;
     size_t upstream_path_len = path_override ? strlen(path_override) : req->path_len;
+    int upstream_timeout_ms = local == app->h3_upstream
+        ? app->h3_timeout_ms : app->upstream_timeout_ms;
     bool ok = oproxy_target_relay(
         upstream,
         req->method, req->method_len,
@@ -785,7 +888,7 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
         req->body, req->body_len,
         content_type, content_type_len,
         forwarded, forwarded_n,
-        app->upstream_timeout_ms,
+        upstream_timeout_ms,
         proxy_sink_raw, req,
         &result, error, sizeof error);
     if (swap_embedded_models) reload_embedded_models_after_background();
@@ -808,7 +911,7 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
             req->body, req->body_len,
             content_type, content_type_len,
             forwarded, forwarded_n,
-            app->upstream_timeout_ms,
+            upstream_timeout_ms,
             proxy_sink_raw, req,
             &result, error, sizeof error);
     }
@@ -1289,8 +1392,40 @@ static void handle_images(ohttp_request *req, app_state *app) {
         respond_error(req, 503, "admission timeout; retry");
         return;
     }
+    /* Keep the scratch budget visible to every broker-aware GPU tenant until
+     * generation finishes.  A point-in-time cudaMemGetInfo check alone still
+     * lets another tenant claim the same bytes between admission and a late
+     * denoising cache allocation. */
+    char image_lease_id[40] = {0};
+    int required_headroom_mb = oimage_gpu_headroom_mb();
+    if (app->vram && required_headroom_mb > 0 &&
+        ovram_lease(app->vram, "embedded-zimage", required_headroom_mb,
+                    required_headroom_mb, tier, 0.0,
+                    image_lease_id, sizeof image_lease_id) != required_headroom_mb) {
+        char lease_error[160];
+        snprintf(lease_error, sizeof lease_error,
+                 "image generation needs at least %d MB free GPU memory; "
+                 "managed GPU capacity is busy",
+                 required_headroom_mb);
+        osched_release_n(app->sched, tier, permits);
+        oimage_request_free(&image_request);
+        respond_error(req, 503, lease_error);
+        return;
+    }
+    double free_gib = -1.0;
+    double total_gib = -1.0;
+    char headroom_error[160];
+    if (ogpu_memory_gib(&free_gib, &total_gib) &&
+        !oimage_gpu_headroom_ok(free_gib, headroom_error, sizeof headroom_error)) {
+        if (image_lease_id[0]) ovram_release(app->vram, image_lease_id);
+        osched_release_n(app->sched, tier, permits);
+        oimage_request_free(&image_request);
+        respond_error(req, 503, headroom_error);
+        return;
+    }
     oimg_result result;
     bool ok = osd_generate(&image_request.generation, &result);
+    if (image_lease_id[0]) ovram_release(app->vram, image_lease_id);
     osched_release_n(app->sched, tier, permits);
     if (!ok) {
         oimage_request_free(&image_request);
@@ -1587,6 +1722,142 @@ static void handle_host_memory(ohttp_request *req) {
     ohttp_respond_str(req, 200, "application/json", body);
 }
 
+typedef struct {
+    char path[PATH_MAX];
+    char ngl[32];
+    int ctx;
+    int contexts;
+} llm_admin_config;
+
+static bool parse_llm_admin_config(const ohttp_request *req, llm_admin_config *out) {
+    memset(out, 0, sizeof *out);
+    const char *default_path = g_llm_active_path[0]
+        ? g_llm_active_path : getenv("OMNISERVE_NATIVE_LLM_GGUF");
+    if (default_path) snprintf(out->path, sizeof out->path, "%s", default_path);
+    const char *default_ngl = g_llm_active_ngl[0]
+        ? g_llm_active_ngl : getenv("OMNISERVE_NATIVE_NGL");
+    if (default_ngl) snprintf(out->ngl, sizeof out->ngl, "%s", default_ngl);
+    out->ctx = g_llm_active_ctx > 0 ? g_llm_active_ctx : 8192;
+    out->contexts = g_llm_active_contexts > 0 ? g_llm_active_contexts : 1;
+
+    if (req->body_len == 0) return out->path[0] != 0;
+    oj_tok *toks = malloc(sizeof *toks * 64);
+    if (!toks) return false;
+    int n = oj_parse(req->body, req->body_len, toks, 64);
+    if (n <= 0 || toks[0].type != OJ_OBJECT) {
+        free(toks);
+        return false;
+    }
+    int path_tok = oj_obj_get(req->body, toks, n, 0, "path");
+    if (path_tok < 0) path_tok = oj_obj_get(req->body, toks, n, 0, "model_path");
+    if (path_tok >= 0) {
+        if (toks[path_tok].type != OJ_STRING ||
+            !oj_unescape(req->body, &toks[path_tok], out->path, sizeof out->path)) {
+            free(toks);
+            return false;
+        }
+    }
+    int ngl_tok = oj_obj_get(req->body, toks, n, 0, "ngl");
+    if (ngl_tok >= 0) {
+        if (toks[ngl_tok].type != OJ_STRING ||
+            !oj_unescape(req->body, &toks[ngl_tok], out->ngl, sizeof out->ngl)) {
+            free(toks);
+            return false;
+        }
+    }
+    int ctx_tok = oj_obj_get(req->body, toks, n, 0, "ctx");
+    if (ctx_tok >= 0) out->ctx = (int)oj_number(req->body, &toks[ctx_tok], out->ctx);
+    int contexts_tok = oj_obj_get(req->body, toks, n, 0, "contexts");
+    if (contexts_tok >= 0) {
+        out->contexts = (int)oj_number(req->body, &toks[contexts_tok], out->contexts);
+    }
+    free(toks);
+    return out->path[0] != 0;
+}
+
+static void llm_admin_response(ohttp_request *req, bool ok, int status, const char *action) {
+    ollm_placement placement;
+    ollm_placement_snapshot(&placement);
+    double free_gib = -1.0;
+    (void)ogpu_memory_gib(&free_gib, NULL);
+    char body[768];
+    snprintf(body, sizeof body,
+             "{\"ok\":%s,\"action\":\"%s\",\"loaded\":%s,"
+             "\"model\":\"%.240s\",\"placement\":\"%s\","
+             "\"gpu_free_gib\":%.2f}",
+             ok ? "true" : "false", action, ollm_ready() ? "true" : "false",
+             ollm_model_name(), placement.on_gpu ? "gpu" : "cpu",
+             free_gib);
+    ohttp_respond_str(req, status, "application/json", body);
+}
+
+static bool llm_admin_load(const llm_admin_config *config) {
+    char resolved[PATH_MAX];
+    if (!llm_swap_path(config->path, resolved, sizeof resolved)) return false;
+    int contexts = config->contexts > 0 ? config->contexts : 1;
+    const char *slots_env = getenv("OMNISERVE_NATIVE_SLOTS");
+    int slots = slots_env ? atoi(slots_env) : contexts;
+    if (slots < 1) slots = 1;
+    if (contexts > slots) contexts = slots;
+    const char *ngl = config->ngl[0] ? config->ngl : "auto";
+    int layers = resolve_llm_ngl(resolved, ngl, 999);
+    fprintf(stderr, "admin LLM load: path=%s ngl=%s ctx=%d contexts=%d\n",
+            resolved, ngl, config->ctx, contexts);
+    if (!ollm_init(resolved, layers, config->ctx > 0 ? config->ctx : 8192, contexts)) return false;
+    snprintf(g_llm_active_path, sizeof g_llm_active_path, "%s", resolved);
+    snprintf(g_llm_active_ngl, sizeof g_llm_active_ngl, "%s", ngl);
+    g_llm_active_ctx = config->ctx > 0 ? config->ctx : 8192;
+    g_llm_active_contexts = contexts;
+    return true;
+}
+
+static void handle_llm_unload(ohttp_request *req) {
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+    pthread_mutex_lock(&g_llm_swap_lock);
+    ollm_shutdown();
+    pthread_mutex_unlock(&g_llm_swap_lock);
+    llm_admin_response(req, true, 200, "unload");
+}
+
+static void handle_llm_load(ohttp_request *req) {
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+    llm_admin_config config;
+    if (!parse_llm_admin_config(req, &config)) {
+        respond_error(req, 400, "path must name a model under OMNISERVE_NATIVE_LLM_SWAP_DIR");
+        return;
+    }
+    pthread_mutex_lock(&g_llm_swap_lock);
+    bool ok = !ollm_ready() && llm_admin_load(&config);
+    pthread_mutex_unlock(&g_llm_swap_lock);
+    llm_admin_response(req, ok, ok ? 200 : 503, "load");
+}
+
+static void handle_llm_swap(ohttp_request *req) {
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+    llm_admin_config next;
+    if (!parse_llm_admin_config(req, &next)) {
+        respond_error(req, 400, "path must name a model under OMNISERVE_NATIVE_LLM_SWAP_DIR");
+        return;
+    }
+    pthread_mutex_lock(&g_llm_swap_lock);
+    llm_admin_config previous = {0};
+    snprintf(previous.path, sizeof previous.path, "%s", g_llm_active_path);
+    snprintf(previous.ngl, sizeof previous.ngl, "%s", g_llm_active_ngl);
+    previous.ctx = g_llm_active_ctx;
+    previous.contexts = g_llm_active_contexts;
+    ollm_shutdown();
+    bool ok = llm_admin_load(&next);
+    if (!ok && previous.path[0]) {
+        fprintf(stderr, "admin LLM swap failed; restoring %s\n", previous.path);
+        (void)llm_admin_load(&previous);
+    }
+    pthread_mutex_unlock(&g_llm_swap_lock);
+    llm_admin_response(req, ok, ok ? 200 : 503, "swap");
+}
+
 static void handle_vram_status(ohttp_request *req, app_state *app) {
     if (!app->vram) { respond_error(req, 503, "vram broker is not enabled"); return; }
     char body[512];
@@ -1681,6 +1952,28 @@ static void handle_vram_release(ohttp_request *req, app_state *app) {
     ohttp_respond_str(req, 200, "application/json", "{\"released\":true}");
 }
 
+static void handle_vram_renew(ohttp_request *req, app_state *app) {
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    if (!app->vram) { respond_error(req, 503, "vram broker is not enabled"); return; }
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+
+    oj_tok *toks = malloc(sizeof(oj_tok) * 32);
+    if (!toks) { respond_error(req, 500, "out of memory"); return; }
+    int n = oj_parse(req->body, req->body_len, toks, 32);
+    char id[40] = {0};
+    double ttl_s = 0.0;
+    if (n > 0 && toks[0].type == OJ_OBJECT) {
+        int id_tok = oj_obj_get(req->body, toks, n, 0, "lease_id");
+        if (id_tok >= 0) oj_unescape(req->body, &toks[id_tok], id, sizeof id);
+        int ttl_tok = oj_obj_get(req->body, toks, n, 0, "ttl_s");
+        if (ttl_tok >= 0) ttl_s = oj_number(req->body, &toks[ttl_tok], 0);
+    }
+    free(toks);
+    bool renewed = ovram_renew(app->vram, id, ttl_s);
+    ohttp_respond_str(req, renewed ? 200 : 404, "application/json",
+                      renewed ? "{\"renewed\":true}" : "{\"renewed\":false}");
+}
+
 static void route(ohttp_request *req, void *user) {
     app_state *app = user;
     if (ohttp_method_is(req, "OPTIONS")) {
@@ -1698,7 +1991,17 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/v1/gpu/vram")) { handle_vram_status(req, app); return; }
     if (ohttp_path_is(req, "/v1/host/memory")) { handle_host_memory(req); return; }
     if (ohttp_path_is(req, "/v1/gpu/lease")) { handle_vram_lease(req, app); return; }
+    if (ohttp_path_is(req, "/v1/gpu/renew")) { handle_vram_renew(req, app); return; }
     if (ohttp_path_is(req, "/v1/gpu/release")) { handle_vram_release(req, app); return; }
+    if (ohttp_path_is(req, "/admin/llm/unload") || ohttp_path_is(req, "/admin/unload")) {
+        handle_llm_unload(req); return;
+    }
+    if (ohttp_path_is(req, "/admin/llm/load") || ohttp_path_is(req, "/admin/load")) {
+        handle_llm_load(req); return;
+    }
+    if (ohttp_path_is(req, "/admin/llm/swap") || ohttp_path_is(req, "/admin/swap")) {
+        handle_llm_swap(req); return;
+    }
     if (ohttp_path_is(req, "/v1/models")) {
         if (!ohttp_method_is(req, "GET")) { respond_error(req, 405, "GET required"); return; }
         if (app->aux_upstream && env_flag("OMNISERVE_NATIVE_MODELS_COMPAT_PROXY", 0))
@@ -1824,10 +2127,20 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/v1/video/generations")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
-        /* Video is a batch-sized model. It may use idle capacity but must not
-         * occupy interactive slots while image, speech or text work waits. */
-        handle_proxy_as_tier(req, app, app->image_upstream, app->image_permits,
-                             "application/json", NULL, TIER_BACKGROUND);
+        if (app->h3_upstream) {
+            otier tier = request_tier(req);
+            if (!(app->h3_tier_mask & OSCALE_TIER_BIT(tier))) {
+                respond_error(req, 402, "video generation requires a billable tier");
+                return;
+            }
+            handle_proxy_as(req, app, app->h3_upstream, app->h3_permits,
+                            "application/json",
+                            configured_path("OMNISERVE_NATIVE_H3_PATH", "/predict-sync"));
+        } else {
+            /* Legacy image backends retain the idle-only batch policy. */
+            handle_proxy_as_tier(req, app, app->image_upstream, app->image_permits,
+                                 "application/json", NULL, TIER_BACKGROUND);
+        }
         return;
     }
     if (ohttp_path_is(req, "/loras")) {
@@ -2106,6 +2419,7 @@ int main(int argc, char **argv) {
             puts("usage: omniserve-native [--port PORT]\n"
                  "environment: OMNISERVE_NATIVE_LLM_GGUF, _EMBEDDING_GGUF, _SD_MODEL,\n"
                  "             _SECRET, _SLOTS, _LLM_UPSTREAM, _IMAGE_UPSTREAM,\n"
+                 "             _H3_UPSTREAM, _H3_PATH, _H3_API_KEY, _H3_TIERS, _H3_TIMEOUT_MS,\n"
                  "             _IMAGE_WORKER_UPSTREAM,\n"
                  "             _ART_UPSTREAM, _ART_PATH, _ART_PERMITS,\n"
                  "             _BIREFNET_UPSTREAM, _TTS_UPSTREAM, _STT_UPSTREAM,\n"
@@ -2124,6 +2438,11 @@ int main(int argc, char **argv) {
     if (slots > 64) slots = 64;
     app.llm_permits = configured_permits("OMNISERVE_NATIVE_LLM_PERMITS", 1, slots);
     app.image_permits = configured_permits("OMNISERVE_NATIVE_IMAGE_PERMITS", slots, slots);
+    /* app.nz owns H3's local/remote admission. Zero means this long-lived
+     * relay must not pin an OmniServe GPU slot while RunPod is executing. */
+    app.h3_permits = env_int("OMNISERVE_NATIVE_H3_PERMITS", 0);
+    if (app.h3_permits < 0) app.h3_permits = 0;
+    if (app.h3_permits > slots) app.h3_permits = slots;
     app.art_permits = configured_permits("OMNISERVE_NATIVE_ART_PERMITS", slots, slots);
     app.birefnet_permits = configured_permits("OMNISERVE_NATIVE_BIREFNET_PERMITS", 1, slots);
     app.tts_permits = configured_permits("OMNISERVE_NATIVE_TTS_PERMITS", 1, slots);
@@ -2179,6 +2498,8 @@ int main(int argc, char **argv) {
         if (paths[0]) ohost_prefetch_start(paths, keep_pct);
     }
     app.secret = getenv("OMNISERVE_NATIVE_SECRET");
+    app.h3_api_key = getenv("OMNISERVE_NATIVE_H3_API_KEY");
+    app.h3_tier_mask = parse_tier_mask(getenv("OMNISERVE_NATIVE_H3_TIERS"));
     app.prefer_embedded_image = env_flag("OMNISERVE_NATIVE_IMAGE_PREFER_EMBEDDED", 0);
     const char *workers_env = getenv("OMNISERVE_NATIVE_WORKERS");
     int workers = workers_env ? atoi(workers_env) : 32;
@@ -2191,6 +2512,7 @@ int main(int argc, char **argv) {
     const char *unified_upstream = getenv("OMNISERVE_NATIVE_UPSTREAM");
     const char *llm_upstream = getenv("OMNISERVE_NATIVE_LLM_UPSTREAM");
     const char *image_upstream = getenv("OMNISERVE_NATIVE_IMAGE_UPSTREAM");
+    const char *h3_upstream = getenv("OMNISERVE_NATIVE_H3_UPSTREAM");
     const char *image_worker_upstream = getenv("OMNISERVE_NATIVE_IMAGE_WORKER_UPSTREAM");
     const char *image_editor_upstream = getenv("OMNISERVE_NATIVE_IMAGE_EDITOR_UPSTREAM");
     const char *art_upstream = getenv("OMNISERVE_NATIVE_ART_UPSTREAM");
@@ -2226,6 +2548,7 @@ int main(int argc, char **argv) {
 } while (0)
     CREATE_UPSTREAM(llm_upstream, llm_upstream, "LLM");
     CREATE_UPSTREAM(image_upstream, image_upstream, "image");
+    CREATE_UPSTREAM(h3_upstream, h3_upstream, "H3");
     CREATE_UPSTREAM(image_worker_upstream, image_worker_upstream, "image worker");
     CREATE_UPSTREAM(image_editor_upstream, image_editor_upstream, "image editor");
     CREATE_UPSTREAM(art_upstream, art_upstream, "background art");
@@ -2267,6 +2590,8 @@ int main(int argc, char **argv) {
     }
     const char *upstream_timeout = getenv("OMNISERVE_NATIVE_UPSTREAM_TIMEOUT_MS");
     app.upstream_timeout_ms = upstream_timeout ? atoi(upstream_timeout) : 600000;
+    const char *h3_timeout = getenv("OMNISERVE_NATIVE_H3_TIMEOUT_MS");
+    app.h3_timeout_ms = h3_timeout ? atoi(h3_timeout) : 1800000;
 
     const char *gguf = getenv("OMNISERVE_NATIVE_LLM_GGUF");
     if (gguf && gguf[0]) {
@@ -2277,7 +2602,17 @@ int main(int argc, char **argv) {
         int parallel_contexts = contexts ? atoi(contexts) : slots;
         if (parallel_contexts < 1) parallel_contexts = 1;
         if (parallel_contexts > slots) parallel_contexts = slots;
-        if (!ollm_init(gguf, ngl ? atoi(ngl) : 999, ctx ? atoi(ctx) : 8192,
+        char resolved_gguf[PATH_MAX];
+        if (realpath(gguf, resolved_gguf)) {
+            snprintf(g_llm_active_path, sizeof g_llm_active_path, "%s", resolved_gguf);
+        } else {
+            snprintf(g_llm_active_path, sizeof g_llm_active_path, "%s", gguf);
+        }
+        snprintf(g_llm_active_ngl, sizeof g_llm_active_ngl, "%s", ngl ? ngl : "auto");
+        g_llm_active_ctx = ctx ? atoi(ctx) : 8192;
+        if (g_llm_active_ctx < 1) g_llm_active_ctx = 8192;
+        g_llm_active_contexts = parallel_contexts;
+        if (!ollm_init(gguf, resolve_llm_ngl(gguf, ngl, 999), ctx ? atoi(ctx) : 8192,
                        parallel_contexts)) {
             fprintf(stderr, "llm load failed\n");
         }
@@ -2371,6 +2706,7 @@ int main(int argc, char **argv) {
     olog_shutdown();
     oproxy_target_destroy(app.llm_upstream);
     oproxy_target_destroy(app.image_upstream);
+    oproxy_target_destroy(app.h3_upstream);
     oproxy_target_destroy(app.image_worker_upstream);
     oproxy_target_destroy(app.image_editor_upstream);
     oproxy_target_destroy(app.art_upstream);

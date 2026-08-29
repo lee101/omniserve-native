@@ -104,7 +104,10 @@ int omatte_estimate_fb_cuda_device(const float *d_image, const float *d_alpha, i
 
 /* Composites d_fg over either a full background image or a solid colour.
  * d_background is h*w*depth device floats, or NULL to use background_rgb (depth
- * floats, host memory), or both NULL for black. d_out may alias d_fg. */
+ * floats, host memory), or both NULL for black. d_out may alias d_fg. A
+ * caller-provided stream makes the operation asynchronous and orders d_out for
+ * the next consumer on that stream; the private fallback stream is completed
+ * before return because the caller otherwise has no completion handle. */
 int omatte_composite_cuda_device(const float *d_fg, const float *d_alpha,
                                  const float *d_background, const float *background_rgb, int h,
                                  int w, int depth, float *d_out, void *stream);

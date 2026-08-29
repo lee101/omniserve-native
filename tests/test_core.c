@@ -71,6 +71,21 @@ static void test_json(void) {
 }
 
 static void test_image_contract(void) {
+    char headroom_error[160] = {0};
+    unsetenv("OMNISERVE_NATIVE_SD_MIN_FREE_MB");
+    CHECK(oimage_gpu_headroom_mb() == 4096);
+    CHECK(oimage_gpu_headroom_ok(4.0, headroom_error, sizeof headroom_error));
+    CHECK(!oimage_gpu_headroom_ok(2.0, headroom_error, sizeof headroom_error));
+    CHECK(strstr(headroom_error, "4096 MB") != NULL);
+    CHECK(strstr(headroom_error, "2048 MB") != NULL);
+    setenv("OMNISERVE_NATIVE_SD_MIN_FREE_MB", "0", 1);
+    CHECK(oimage_gpu_headroom_mb() == 0);
+    CHECK(oimage_gpu_headroom_ok(0.1, headroom_error, sizeof headroom_error));
+    setenv("OMNISERVE_NATIVE_SD_MIN_FREE_MB", "8192", 1);
+    CHECK(oimage_gpu_headroom_mb() == 8192);
+    CHECK(!oimage_gpu_headroom_ok(7.99, headroom_error, sizeof headroom_error));
+    unsetenv("OMNISERVE_NATIVE_SD_MIN_FREE_MB");
+
     const char *body = "{\"prompt\":\"red cube\",\"negative_prompt\":\"blur\","
                        "\"size\":\"768x512\",\"width\":1024,\"steps\":8,"
                        "\"guidance_scale\":1.5,\"seed\":42,\"n\":1}";
@@ -1661,12 +1676,27 @@ static void test_vram_arbitration(void) {
     /* 8192 free, 1024 floor for background: 7168 grantable. */
     CHECK(ovram_headroom_at(v, TIER_BACKGROUND, 100.0, 8192) == 7168);
 
+    /* The embedded image lane leases its whole scratch floor, not a partial
+     * best effort.  While it is active no second background tenant can size
+     * itself against those same physical bytes. */
+    char image_id[40], competing_id[40];
+    CHECK(ovram_lease_at(v, "embedded-zimage", 4096, 4096,
+                         TIER_BACKGROUND, 60.0, 90.0, 8192,
+                         image_id, sizeof image_id) == 4096);
+    CHECK(ovram_lease_at(v, "competing-gpu-tenant", 4096, 4096,
+                         TIER_BACKGROUND, 60.0, 90.0, 8192,
+                         competing_id, sizeof competing_id) == 0);
+    CHECK(competing_id[0] == '\0');
+    CHECK(ovram_release(v, image_id));
+
     /* The whole point: a granted lease is subtracted from what the next caller
      * sees, so two tenants cannot size against the same free bytes. */
     int a = ovram_lease_at(v, "zimage", 4096, 1024, TIER_BACKGROUND, 60.0, 100.0, 8192,
                            id_a, sizeof id_a);
     CHECK(a == 4096);
     CHECK(ovram_headroom_at(v, TIER_BACKGROUND, 100.0, 8192) == 3072);
+    CHECK(ovram_renew_at(v, id_a, 120.0, 110.0));
+    CHECK(!ovram_renew_at(v, "missing", 120.0, 110.0));
 
     /* Asking beyond headroom yields a partial grant when min_mb still fits. */
     int b = ovram_lease_at(v, "other", 8192, 1024, TIER_BACKGROUND, 60.0, 100.0, 8192,
@@ -1680,9 +1710,11 @@ static void test_vram_arbitration(void) {
                          id_c, sizeof id_c) == 0);
     CHECK(id_c[0] == '\0');
 
-    /* Paid dips further into the floor than background may, so interactive
-     * traffic is not starved by batch work holding every lease. */
-    CHECK(ovram_headroom_at(v, TIER_PAID, 100.0, 8192) > 0);
+    /* Higher-priority traffic is not starved by background leases. Those
+     * leases still protect background tenants from each other, but normal
+     * interactive work sizes from the real device headroom and its own floor. */
+    CHECK(ovram_headroom_at(v, TIER_FREE, 100.0, 8192) == 7424);
+    CHECK(ovram_headroom_at(v, TIER_PAID, 100.0, 8192) == 7936);
 
     CHECK(ovram_release(v, id_a));
     CHECK(!ovram_release(v, id_a));
@@ -1708,8 +1740,8 @@ static void test_vram_arbitration(void) {
      * lease still held here would be reaped by it and skew the counters. */
     ovram_stats st;
     ovram_snapshot(v, &st);
-    CHECK(st.grants == 2 && st.partial_grants == 1 && st.denials == 2);
-    CHECK(st.releases == 1 && st.expirations == 1);
+    CHECK(st.grants == 3 && st.partial_grants == 1 && st.denials == 3);
+    CHECK(st.releases == 2 && st.expirations == 1);
     CHECK(st.lease_count == 0);
 
     ovram_destroy(v);

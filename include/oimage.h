@@ -17,6 +17,8 @@ typedef struct {
 
 void oimage_request_init(oimage_request *request);
 void oimage_request_free(oimage_request *request);
+int oimage_gpu_headroom_mb(void);
+bool oimage_gpu_headroom_ok(double free_gib, char *error, size_t error_cap);
 bool oimage_request_parse(const char *json, size_t json_len, oimage_request *request,
                           char *error, size_t error_cap);
 bool oimage_openai_response(const oimg_result *result, const char *model, long long seed,

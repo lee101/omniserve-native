@@ -18,6 +18,8 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "workers"))
 
+from gpu_admission import AdaptiveCudaGuard
+
 try:
     import torch  # noqa: F401
     import fastapi  # noqa: F401
@@ -73,6 +75,13 @@ def wait_for(job_id, statuses={"done", "error"}, timeout=5.0):
 
 
 class EncodingTest(unittest.TestCase):
+    def test_webp_is_the_default_output_format(self):
+        self.assertEqual(worker.DEFAULT_FORMAT, "webp")
+        self.assertEqual(worker.RemoveBackgroundRequest(image_url="https://x.test/a.jpg").output_format,
+                         "webp")
+        self.assertEqual(worker.ForegroundGenerationRequest(prompt="person").output_format,
+                         "webp")
+
     def test_webp_keeps_alpha_and_is_smaller_than_png(self):
         rgba = Image.new("RGBA", (256, 256), (200, 40, 40, 255))
         for x in range(256):
@@ -93,6 +102,16 @@ class EncodingTest(unittest.TestCase):
         self.assertEqual(decoded.mode, "RGBA")
         self.assertEqual(decoded.size, (256, 256))
 
+    def test_webp_blackens_rgb_under_fully_transparent_pixels(self):
+        rgba = Image.new("RGBA", (3, 1), (240, 30, 10, 0))
+        rgba.putpixel((1, 0), (12, 34, 56, 255))
+
+        normalized = worker._black_fully_transparent(rgba)
+
+        self.assertEqual(normalized.getpixel((0, 0)), (0, 0, 0, 0))
+        self.assertEqual(normalized.getpixel((1, 0)), (12, 34, 56, 255))
+        self.assertEqual(normalized.getpixel((2, 0)), (0, 0, 0, 0))
+
 
 class CacheParamsTest(unittest.TestCase):
     def test_params_cover_everything_that_changes_pixels(self):
@@ -101,8 +120,10 @@ class CacheParamsTest(unittest.TestCase):
         self.assertEqual(
             set(params),
             {"format", "threshold", "decontaminate", "model", "input_size", "quality",
-             "return_background", "background", "background_prompt", "background_strength"},
+             "webp_method", "dtype", "return_background", "background",
+             "background_prompt", "background_strength", "transparent_rgb"},
         )
+        self.assertEqual(params["transparent_rgb"], "black")
 
     def test_threshold_change_changes_the_key(self):
         import object_store
@@ -196,6 +217,21 @@ class JobLifecycleTest(unittest.TestCase):
 
 
 class ForegroundGenerationTest(unittest.TestCase):
+    def test_cutout_can_use_an_in_memory_stage_one_image(self):
+        image = Image.new("RGB", (8, 8), "white")
+        request = worker.RemoveBackgroundRequest(image_url="generated:test")
+        produced = {"cutout": b"cutout-webp"}
+        with (
+            mock.patch.object(worker, "object_store", None),
+            mock.patch.object(worker, "read_image", side_effect=AssertionError("decoded again")),
+            mock.patch.object(worker, "remove_background", return_value=produced) as remove,
+        ):
+            result = worker.produce_cutout(request, source_image=image)
+
+        remove.assert_called_once_with(image, request)
+        self.assertFalse(result["cached"])
+        self.assertEqual(result["artifacts"]["cutout"]["content"], b"cutout-webp")
+
     def test_generation_and_cutout_are_one_job(self):
         request = worker.ForegroundGenerationRequest(
             prompt="full body harbour worker on a plain backdrop", width=640, height=960, seed=42,
@@ -214,7 +250,8 @@ class ForegroundGenerationTest(unittest.TestCase):
         generate.assert_called_once_with(request.prompt, 640, 960, None, 0.0, 42)
         cutout.assert_called_once()
         source_request = cutout.call_args.args[0]
-        self.assertTrue(source_request.image_url.startswith("data:image/webp;base64,"))
+        self.assertTrue(source_request.image_url.startswith("generated:"))
+        self.assertIs(cutout.call_args.kwargs["source_image"], generated)
         self.assertEqual(job["status"], "done")
         self.assertEqual(job["seed"], 42)
         self.assertEqual(job["source_width"], 640)
@@ -227,7 +264,93 @@ class ForegroundGenerationTest(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 400)
 
 
+class ModelOptimizationTest(unittest.TestCase):
+    def test_compiled_runtime_failure_falls_back_to_eager(self):
+        class Broken:
+            def __call__(self, _tensor):
+                raise RuntimeError("compiled graph failed")
+
+        class Eager:
+            def __call__(self, tensor):
+                return [torch.zeros((1, 1, tensor.shape[-2], tensor.shape[-1]))]
+
+        previous = (worker.runtime.model, worker.runtime.eager_model, worker.runtime.transform,
+                    worker.runtime.dtype, worker.runtime.engine, worker.runtime.compile_error)
+        try:
+            worker.runtime.model = Broken()
+            worker.runtime.eager_model = Eager()
+            worker.runtime.transform = lambda _image: torch.zeros((3, 8, 8))
+            worker.runtime.dtype = torch.float32
+            with mock.patch.object(worker, "DEVICE", "cpu"):
+                device_mask, host_mask = worker.segment(Image.new("RGB", (8, 8)), 0.0)
+            self.assertIsNone(device_mask)
+            self.assertEqual(host_mask.shape, (8, 8))
+            self.assertIs(worker.runtime.model, worker.runtime.eager_model)
+            self.assertIn("compiled graph failed", worker.runtime.compile_error)
+            self.assertIn("compile-fallback", worker.runtime.engine)
+        finally:
+            (worker.runtime.model, worker.runtime.eager_model, worker.runtime.transform,
+             worker.runtime.dtype, worker.runtime.engine,
+             worker.runtime.compile_error) = previous
+
+    def test_model_lease_uses_shared_broker(self):
+        granted = mock.Mock(status_code=200)
+        granted.json.return_value = {"granted": True, "lease_id": "lv-biref", "mb": 3584}
+        granted.raise_for_status.return_value = None
+        released = mock.Mock()
+        released.raise_for_status.return_value = None
+        with (
+            mock.patch.object(worker, "VRAM_BROKER_URL", "http://127.0.0.1:8791"),
+            mock.patch.object(worker.requests, "post", side_effect=[granted, released]) as post,
+        ):
+            worker.runtime.vram_lease = worker._acquire_model_vram_lease()
+            worker._release_model_vram_lease()
+        self.assertEqual(post.call_count, 2)
+        self.assertTrue(post.call_args_list[0].args[0].endswith("/v1/gpu/lease"))
+        self.assertTrue(post.call_args_list[1].args[0].endswith("/v1/gpu/release"))
+
+
+class AdaptiveCudaGuardTest(unittest.TestCase):
+    def test_oom_raises_floor_and_cools_down(self):
+        guard = AdaptiveCudaGuard(
+            1536, oom_margin_mib=512, backoff_seconds=5.0, backoff_max_seconds=60.0,
+        )
+        guard.note_oom(free_mib=2000, total_mib=32000, now=100.0)
+        cooling = guard.capacity(free_mib=10000, total_mib=32000, now=102.0)
+        recovered = guard.capacity(free_mib=2600, total_mib=32000, now=106.0)
+
+        self.assertFalse(cooling["ready"])
+        self.assertEqual(cooling["cooldown_seconds"], 3.0)
+        self.assertEqual(cooling["required_free_mib"], 2512)
+        self.assertTrue(recovered["ready"])
+        self.assertEqual(recovered["total_ooms"], 1)
+
+    def test_guard_recovers_after_sustained_success(self):
+        guard = AdaptiveCudaGuard(1536, oom_margin_mib=512, recovery_successes=2)
+        guard.note_oom(free_mib=2000, total_mib=32000, now=100.0)
+        guard.note_success()
+        guard.note_success()
+        state = guard.capacity(free_mib=2100, total_mib=32000, now=1000.0)
+
+        self.assertTrue(state["ready"])
+        self.assertEqual(state["required_free_mib"], 2000)
+        self.assertEqual(state["backoff_level"], 0)
+
+
+@unittest.skipIf(worker.video_matting is None, "video matting dependencies unavailable")
 class VideoBackgroundRemovalTest(unittest.TestCase):
+    def test_video_encoder_blacks_transparent_rgb(self):
+        import numpy as np
+
+        rgb = np.array([[[240, 30, 10], [12, 34, 56]]], dtype=np.uint8)
+        alpha = np.array([[0, 255]], dtype=np.uint8)
+
+        changed = worker.video_matting._black_transparent_rgb(rgb, alpha)
+
+        self.assertEqual(changed, 1)
+        np.testing.assert_array_equal(rgb[0, 0], [0, 0, 0])
+        np.testing.assert_array_equal(rgb[0, 1], [12, 34, 56])
+
     def request(self):
         return worker.VideoBackgroundRequest(
             video_url="https://cdn.example.test/person.webm",
@@ -290,6 +413,26 @@ class VideoBackgroundRemovalTest(unittest.TestCase):
         self.assertEqual(capacity["max_pending"], worker.VIDEO_JOB_MAX_PENDING)
         self.assertEqual(capacity["gpu"]["free_mib"], 2048)
         self.assertIn("average_seconds", capacity["stats"])
+
+    def test_rvm_lease_uses_the_shared_native_broker(self):
+        granted = mock.Mock()
+        granted.json.return_value = {"granted": True, "lease_id": "lv-test", "mb": 1536}
+        granted.raise_for_status.return_value = None
+        released = mock.Mock()
+        released.raise_for_status.return_value = None
+        with (
+            mock.patch.object(worker.video_matting, "RVM_VRAM_BROKER_URL", "http://127.0.0.1:8791"),
+            mock.patch.object(worker.video_matting.requests, "post",
+                              side_effect=[granted, released]) as post,
+        ):
+            lease = worker.video_matting._acquire_vram_lease(1536)
+            worker.video_matting._release_vram_lease(lease)
+
+        self.assertTrue(lease["granted"])
+        self.assertEqual(lease["lease_id"], "lv-test")
+        self.assertEqual(post.call_count, 2)
+        self.assertTrue(post.call_args_list[0].args[0].endswith("/v1/gpu/lease"))
+        self.assertTrue(post.call_args_list[1].args[0].endswith("/v1/gpu/release"))
 
     def test_error_event_is_structured_jsonl(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -68,7 +68,7 @@ endif()
 set(LLAMA_DIR "${CMAKE_SOURCE_DIR}/../llama.cpp" CACHE PATH "llama.cpp checkout")
 set(SD_DIR "${CMAKE_SOURCE_DIR}/../stable-diffusion.cpp" CACHE PATH "stable-diffusion.cpp checkout")
 
-set(CORE_SRC src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c src/omatte.c src/oproxy.c src/osched.c
+set(CORE_SRC src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c src/omatte.c src/onsfw.c src/oproxy.c src/osched.c
              src/ohost.c src/ovram.c src/ospec.c
              src/oscale.c src/otext.c src/otune.c)
 
@@ -160,6 +160,12 @@ if(Python3_Interpreter_FOUND)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_image_worker_routing.py"
     )
     set_tests_properties(image_worker_routing PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    add_test(
+        NAME h3_routing
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_h3_routing.py"
+    )
+    set_tests_properties(h3_routing PROPERTIES
         ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
     # Skips itself when numpy or libomatte.so is missing (CPU-only CI).
     add_test(

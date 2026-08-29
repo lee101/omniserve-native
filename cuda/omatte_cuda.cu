@@ -672,6 +672,7 @@ extern "C" int omatte_composite_cuda_device(const float *d_fg, const float *d_al
         for (int c = 0; c < depth; c++) solid[c] = background_rgb[c];
     }
 
+    const bool caller_owns_stream = stream_arg != nullptr;
     cudaStream_t stream = (cudaStream_t)stream_arg;
     if (!stream) {
         pthread_mutex_lock(&g_lock);
@@ -688,6 +689,10 @@ extern "C" int omatte_composite_cuda_device(const float *d_fg, const float *d_al
                                                      solid[1], solid[2], solid[3], pixels, depth,
                                                      d_out);
     cudaError_t status = cudaGetLastError();
-    if (status == cudaSuccess) status = cudaStreamSynchronize(stream);
+    // A caller-provided stream is the completion contract: PyTorch queues its
+    // next consumer on the same stream, so a host wait here only destroys that
+    // overlap.  The private fallback stream has no such external ordering and
+    // therefore remains synchronous before returning its output pointer.
+    if (status == cudaSuccess && !caller_owns_stream) status = cudaStreamSynchronize(stream);
     return status == cudaSuccess ? 0 : -2;
 }

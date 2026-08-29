@@ -95,6 +95,7 @@ typedef struct {
     float guidance_scale;
     int64_t seed;
     int resume_step;
+    char *lora_key;
     sd_latent_t *latent;
     unsigned long long tick;
 } latent_cache_entry;
@@ -139,23 +140,51 @@ static bool latent_api_ready(void) {
            g_latent_cache && g_latent_cache_size > 0;
 }
 
+static char *lora_cache_key(const oimg_req *req) {
+    size_t needed = 1;
+    for (size_t i = 0; i < req->lora_count; i++) {
+        const char *path = req->loras[i].path ? req->loras[i].path : "";
+        needed += strlen(path) + 64;
+    }
+    char *key = malloc(needed);
+    if (!key) return NULL;
+    key[0] = '\0';
+    size_t offset = 0;
+    for (size_t i = 0; i < req->lora_count; i++) {
+        const char *path = req->loras[i].path ? req->loras[i].path : "";
+        int written = snprintf(key + offset, needed - offset, "%s|%.9g;",
+                               path, (double)req->loras[i].scale);
+        if (written < 0 || (size_t)written >= needed - offset) {
+            free(key);
+            return NULL;
+        }
+        offset += (size_t)written;
+    }
+    return key;
+}
+
 static bool cache_key_equal(const latent_cache_entry *entry, const oimg_req *req,
-                            int resume_step) {
+                            int resume_step, const char *lora_key) {
     const char *negative = req->negative_prompt ? req->negative_prompt : "";
     return entry->latent && entry->width == req->width && entry->height == req->height &&
            entry->steps == req->steps && entry->guidance_scale == req->guidance_scale &&
            entry->seed == req->seed && entry->resume_step == resume_step &&
+           strcmp(entry->lora_key ? entry->lora_key : "", lora_key) == 0 &&
            strcmp(entry->prompt, req->prompt) == 0 &&
            strcmp(entry->negative_prompt, negative) == 0;
 }
 
 static latent_cache_entry *cache_find(const oimg_req *req, int resume_step) {
+    char *lora_key = lora_cache_key(req);
+    if (!lora_key) return NULL;
     for (int i = 0; i < g_latent_cache_size; i++) {
-        if (cache_key_equal(&g_latent_cache[i], req, resume_step)) {
+        if (cache_key_equal(&g_latent_cache[i], req, resume_step, lora_key)) {
             g_latent_cache[i].tick = ++g_latent_cache_tick;
+            free(lora_key);
             return &g_latent_cache[i];
         }
     }
+    free(lora_key);
     return NULL;
 }
 
@@ -163,6 +192,7 @@ static void cache_entry_clear(latent_cache_entry *entry) {
     if (entry->latent && p_free_latent) p_free_latent(entry->latent);
     free(entry->prompt);
     free(entry->negative_prompt);
+    free(entry->lora_key);
     memset(entry, 0, sizeof *entry);
 }
 
@@ -178,9 +208,11 @@ static bool cache_insert(const oimg_req *req, int resume_step, sd_latent_t *late
     if (!slot) return false;
     char *prompt = strdup(req->prompt);
     char *negative = strdup(req->negative_prompt ? req->negative_prompt : "");
-    if (!prompt || !negative) {
+    char *lora_key = lora_cache_key(req);
+    if (!prompt || !negative || !lora_key) {
         free(prompt);
         free(negative);
+        free(lora_key);
         return false;
     }
     cache_entry_clear(slot);
@@ -192,6 +224,7 @@ static bool cache_insert(const oimg_req *req, int resume_step, sd_latent_t *late
     slot->guidance_scale = req->guidance_scale;
     slot->seed = req->seed;
     slot->resume_step = resume_step;
+    slot->lora_key = lora_key;
     slot->latent = latent;
     slot->tick = ++g_latent_cache_tick;
     return true;
@@ -337,7 +370,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     sd_image_t *images = NULL;
     int image_count = 0;
     bool ok = false;
-    if (req->teleport && params.batch_count == 1 && req->lora_count == 0 &&
+    if (req->teleport && params.batch_count == 1 &&
         req->steps > 1 && latent_api_ready()) {
         int default_resume = sd_env_int(
             "OMNISERVE_NATIVE_SD_TELEPORT_START_STEP", req->steps - 1, 1, 99);
@@ -360,7 +393,14 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
             out->teleport_cache_hit = replay.cache_hit;
             out->teleport_capture_step = resume_step - 1;
             out->teleport_resume_step = replay.resume_step;
-            if (captured && !cache_insert(req, resume_step, captured)) p_free_latent(captured);
+            if (captured) {
+                if (!cache_insert(req, resume_step, captured)) {
+                    fprintf(stderr, "diffusion teleport latent cache insert failed\n");
+                    p_free_latent(captured);
+                }
+            } else if (!cached) {
+                fprintf(stderr, "diffusion teleport completed without returning a captured latent\n");
+            }
         } else {
             if (captured) p_free_latent(captured);
             if (cached) cache_entry_clear(cached);

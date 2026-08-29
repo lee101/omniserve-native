@@ -118,7 +118,7 @@ moving the VAE to CPU. Latent tile width and height default to 32 and are contro
 `OMNISERVE_NATIVE_SD_VAE_TILE_X`, `_Y`, and `_OVERLAP` (default 0.5). Keep this
 behind the image parity gate because tiling changes the decode graph.
 
-Other tuning: `OMNISERVE_NATIVE_PORT`, `BIND`, `SLOTS`, `SECRET`, `LLM_GGUF`, `LLM_CONTEXTS`, `NGL`, `CTX`, `BATCH`, `UBATCH`, `KV_TYPE` (`f16` default, `q8_0` halves the KV cache at no measured quality cost — see `performance/quality.md`), `FLASH_ATTN` (auto; forced on for a quantized cache because llama.cpp requires it for a quantized V), `EMBEDDING_GGUF`, `EMBEDDING_NGL` (defaults to CPU), `EMBEDDING_CTX`, `EMBEDDING_POOLING` (`mean` default, `cls` for retrieval finetunes like gte-modernbert), `EMBEDDING_THREADS`, `SD_MODEL`, `ADMISSION_TIMEOUT_S`, `UPSTREAM_TIMEOUT_MS`, `REACTORS`, `WORKERS`, and per-modality `LLM_PERMITS`, `IMAGE_PERMITS`, `TTS_PERMITS`, `STT_PERMITS`, `EMBEDDING_PERMITS`, `MULTIMODAL_PERMITS`, `ANIMATION_PERMITS`, `3D_PERMITS`, and `AUX_PERMITS`.
+Other tuning: `OMNISERVE_NATIVE_PORT`, `BIND`, `SLOTS`, `SECRET`, `LLM_GGUF`, `LLM_SWAP_DIR`, `LLM_CONTEXTS`, `NGL`, `NGL_AUTO_KEEP_FREE_MB`, `CTX`, `BATCH`, `UBATCH` (both accept `auto`), `KV_TYPE` (`f16` default, `q8_0` halves the KV cache at no measured quality cost — see `performance/quality.md`), `FLASH_ATTN` (auto; forced on for a quantized cache because llama.cpp requires it for a quantized V), `EMBEDDING_GGUF`, `EMBEDDING_NGL` (defaults to CPU), `EMBEDDING_CTX`, `EMBEDDING_POOLING` (`mean` default, `cls` for retrieval finetunes like gte-modernbert), `EMBEDDING_THREADS`, `SD_MODEL`, `ADMISSION_TIMEOUT_S`, `UPSTREAM_TIMEOUT_MS`, `REACTORS`, `WORKERS`, and per-modality `LLM_PERMITS`, `IMAGE_PERMITS`, `TTS_PERMITS`, `STT_PERMITS`, `EMBEDDING_PERMITS`, `MULTIMODAL_PERMITS`, `ANIMATION_PERMITS`, `3D_PERMITS`, and `AUX_PERMITS`.
 
 ## Local-first ASR and background fine-tuning
 
@@ -380,14 +380,34 @@ spend rate, cumulative spend and instance-seconds, scale-up/down counts, TTL
 kills, and the reason behind the last decision — so a bill can always be traced
 back to the decision that caused it.
 
-Not yet wired: the request path does not route overflow traffic to a warmed
-instance. `ocapacity_overflow_endpoint()` exists and is tier-gated, but app.nz
-exposes remote cogs only as async predictions or a websocket session proxy,
-neither of which the C relay can use for a normal request. Routing needs a
-synchronous loopback passthrough (`/api/cogs/{id}/http/*`) on the app.nz side
-first; until then, arming a lane warms capacity without sending it traffic, so
-lanes ship disabled. Standing remote endpoints, below, are a separate mechanism
-and are routed today — they need no provisioning, so none of this applies.
+The generic `ocapacity_overflow_endpoint()` path remains warm-only, so those
+lanes still ship disabled. H3 is the first end-to-end cost-aware lane: app.nz
+now exposes an authenticated synchronous Cog prediction seam, and OmniServe
+relays `/v1/video/generations` to it. app.nz first uses local GPU headroom when
+the model fits, selects RunPod serverless for sparse traffic, and promotes to a
+pod only when a five-minute request window and the model's learned runtime show
+that continuous billing is cheaper. The break-even is
+`1 / (1.20 × seconds_per_request)`, with at least three observations before a
+pod is rented and a 50% demotion threshold to prevent flapping. Pods retain the
+existing idle reap and orphan reconciliation.
+
+```bash
+OMNISERVE_NATIVE_H3_UPSTREAM=http://127.0.0.1:8787/api/cogs/$H3_COG_ID \
+OMNISERVE_NATIVE_H3_API_KEY=... \
+OMNISERVE_NATIVE_H3_PATH=/predict-sync \
+OMNISERVE_NATIVE_H3_TIERS=paid \
+OMNISERVE_NATIVE_H3_PERMITS=0 \
+OMNISERVE_NATIVE_H3_TIMEOUT_MS=1800000 \
+./build/omniserve-native --port 8791
+```
+
+`H3_API_KEY` is an app.nz API key belonging to the Cog owner. OmniServe removes
+the caller's `Authorization`/`X-API-Key` before adding this credential. H3
+defaults to the paid tier only; a free or background call gets HTTP 402 before
+app.nz is contacted. `H3_PERMITS=0` is intentional because app.nz owns local
+VRAM admission and remote capacity for this lane. `/status.upstreams.h3`,
+`/status.proxy_pool.h3`, and the app.nz `X-AppNZ-Execution-Tier` response header
+make each placement observable.
 
 ## Standing remote endpoints
 
@@ -444,9 +464,11 @@ inference server should hold.
 
 Higher tiers may dip further into the keep-free floor, so interactive paid
 traffic is not starved by background batch work already holding leases. Leasing
-costs every other tenant headroom, so `/v1/gpu/lease` and `/v1/gpu/release` sit
-on the same trust boundary as the paid tier: loopback callers only, never
-forwarded. A denial is a normal `200` with `"granted": false` — the caller's
+costs every other tenant headroom, so `/v1/gpu/lease`, `/v1/gpu/renew`, and
+`/v1/gpu/release` sit on the same trust boundary as the paid tier: loopback
+callers only, never forwarded. Long-running resident models renew the same lease
+ID, avoiding a release/reacquire race and bounding stale reservations after a
+crash. A denial is a normal `200` with `"granted": false` — the caller's
 fallback path is exactly what "no headroom" should trigger, and a 5xx would make
 a healthy broker look broken to every monitor watching it.
 
@@ -486,9 +508,13 @@ while headroom stays high means leases are being held, not that VRAM ran out.
 - TTS: `POST /v1/audio/speech` and `/api/v1/generate_speech`
 - STT: `POST /v1/audio/transcriptions`, `/api/v1/audio/transcribe`, `/api/v1/audio-file-extraction`, and `/api/v1/audio-extraction`
 - Multimodal: `POST /api/v1/image-caption`, `/api/v1/video-question`, `/api/v1/multimodal-generate`, and `/api/v1/voice-chat`
-- Device memory: `GET /v1/gpu/vram` (broker state), `GET /v1/host/memory` (page-cache warming state), and `POST /v1/gpu/lease` / `POST /v1/gpu/release` (loopback callers only)
+- Device memory: `GET /v1/gpu/vram` (broker state), `GET /v1/host/memory` (page-cache warming state), and `POST /v1/gpu/lease` / `POST /v1/gpu/renew` / `POST /v1/gpu/release` (loopback callers only)
 - Animation: `POST /v1/animations/generations` proxies a configured NVIDIA ACE/Animation Graph adapter and is forcibly admitted as `background`, regardless of the caller's requested tier.
 - 3D: `POST /v1/3d/generations` proxies a configured TRELLIS.2/Pixal3D adapter and is forcibly admitted as `background`, regardless of the caller's requested tier.
+
+Foreground generation keeps the generated PIL image in memory through the
+stage-1 BiRefNet pass; it does not WebP-encode and decode the image between
+generation and matting. The final artifact still defaults to WebP.
 
 Configure the 3D worker with `OMNISERVE_NATIVE_3D_UPSTREAM`, optionally rewrite its path with `OMNISERVE_NATIVE_3D_PATH`, and label it with `OMNISERVE_NATIVE_3D_MODEL`. The route consumes every scheduler permit and therefore starts only when the OmniServe GPU is otherwise idle. With `OMNISERVE_NATIVE_3D_SWAP_EMBEDDED_MODELS=1` (the default), the gateway unloads its embedded LLM and embedding model only after that exclusive background admission, runs the one-shot 3D worker, reloads both models, and then reopens interactive admission. The supplied worker performs a second NVML free-VRAM check before loading the 4B checkpoint, defaults to TRELLIS.2 at 512³ on a 32 GB RTX 5090, and can publish GLB/WebP outputs into R2 plus a searchable JSONL manifest.
 
@@ -509,6 +535,13 @@ Set `OMNISERVE_3D_PUBLIC_BASE` to the externally reachable gateway prefix used
 for non-R2 assets (the packaged service uses
 `http://127.0.0.1:8791/v1/3d` for same-host development). Do not derive public
 asset URLs from the HTTP `Host` header.
+
+The packaged 3D and BiRefNet units optionally load `/etc/omniserve-r2.env`.
+Set the S3-compatible credentials/bucket variables used by `workers/object_store.py`
+for image artifacts, and set `OMNISERVE_3D_R2_REMOTE` plus
+`OMNISERVE_3D_R2_PUBLIC_BASE` for GLB publication. Successful 3D jobs append an
+atomic JSONL entry to `OMNISERVE_3D_MANIFEST`; no entry is created for a failed
+or dependency-blocked generation.
 
 On a shared GPU, set `OMNISERVE_3D_GPU_COORDINATORS` to a comma-separated list
 of peer service bases that implement `POST /admin/hold?seconds=N` and
@@ -562,20 +595,44 @@ image re-encoding in the gateway.
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install torch torchvision transformers accelerate pillow fastapi uvicorn requests
+.venv/bin/pip install -r workers/requirements-birefnet.txt
 HF_HOME=/nvme0n1-disk/models/huggingface \
 BIREFNET_MODEL=ZhengPeng7/BiRefNet \
 .venv/bin/python workers/birefnet_worker.py --port 9094
 
 OMNISERVE_NATIVE_BIREFNET_UPSTREAM=http://127.0.0.1:9094 \
-OMNISERVE_NATIVE_BIREFNET_PERMITS=1 \
+OMNISERVE_NATIVE_BIREFNET_PERMITS=2 \
 ./build/omniserve-native --port 8791
 ```
 
-The worker uses FP16, channels-last CUDA tensors, cuDNN benchmarking, TF32
-where applicable, inference mode, a persistent loaded model, and optional
-`BIREFNET_TORCH_COMPILE=1`. The default 1024-pixel inference size can be tuned
-with `BIREFNET_INPUT_SIZE`.
+The worker uses FP16, channels-last CUDA tensors, TF32 where applicable,
+inference mode, and a persistent loaded model. `BIREFNET_TORCH_COMPILE=1` uses
+the correctness-safe `default` Inductor mode, warms the production input graph
+before readiness, compares it with eager output, and falls back to eager if
+compilation or validation fails. Keep `BIREFNET_CUDNN_BENCHMARK=0`: plan search
+roughly doubled the measured 1024px startup peak without improving steady
+throughput. The persistent model holds a renewable broker lease and falls back
+to CPU at startup when the shared card cannot safely grant it.
+
+Keep the gateway at two BiRefNet permits on the shared RTX 5090 profile. The
+worker serializes the model invocation, but preprocessing, CUDA matte work, and
+WebP encoding can overlap around it. A 12-request production canary measured
+2.98 images/s at one permit, 4.95 at two, and 7.29 at four; four also increased
+mean latency from 335 ms to 509 ms. Two is the measured throughput/latency knee
+and matches the worker's default two job threads without increasing model
+residency.
+
+`BIREFNET_WEBP_QUALITY=85` and `BIREFNET_WEBP_METHOD=4` are the balanced output
+defaults. Fully transparent pixels always have their RGB set to black before
+encoding, and libwebp is allowed to discard invisible RGB data; alpha remains
+unchanged. Existing cached/old images remain valid; this applies to new
+encodes.
+On the tested human cutout method 4 encoded about 26x faster than method 6 with
+identical alpha and about 4% more bytes. The video path similarly streams
+bounded RGBA chunks through a small encoder queue while inference continues,
+and blackens RGB wherever the RVM alpha is zero. The default 1024-pixel
+inference size can be tuned with `BIREFNET_INPUT_SIZE`, though reducing it
+changes fine-edge masks rather than being a free memory optimisation.
 
 ### Colour decontamination stays on the device
 
@@ -720,9 +777,85 @@ The checked-in conversion workflow creates serving artifacts without mutating or
 
 Outputs default to `/nvme0n1-disk/models/omniserve-native`. Override source/output paths with `ONATIVE_MODERNBERT_SOURCE`, `ONATIVE_GEMMA_SOURCE`, `ONATIVE_QWEN_SOURCE`, and `ONATIVE_MODEL_DIR`.
 
+To prepare the Gemma 4 31B MeroMero checkpoint from Hugging Face, use the
+capacity-checked workflow below. It resumes interrupted downloads and refuses
+to start when the source, temporary BF16 GGUF, quantized GGUF, and safety
+margin cannot coexist on the target filesystem:
+
+```bash
+./scripts/prepare_gemma4_model.sh
+# Optional: ONATIVE_GEMMA4_QUANT=IQ4_NL ./scripts/prepare_gemma4_model.sh
+```
+
+`IQ4_XS` is the default native llama.cpp target because it is the smallest of
+the listed 4-bit choices. `NVFP4` is a ModelOpt/TensorRT-LLM checkpoint format,
+not a normal `llama-quantize` target in this checkout; the script rejects it
+instead of producing a mislabeled file. Set `OMNISERVE_NATIVE_NGL=auto` for
+conservative full-offload detection: the gateway compares the GGUF size with
+current free VRAM plus `OMNISERVE_NATIVE_NGL_AUTO_KEEP_FREE_MB` (2 GiB by
+default). Explicit numeric NGL values remain the way to request partial
+offload when the shared card cannot fit all weights.
+
+For a shared 32 GiB RTX 5090 with roughly 13--14 GiB free, the tested
+`G4-MEROMERO-V2-31B-IQ4_XS.gguf` profile is `NGL=20`: llama.cpp offloads 20 of
+61 layers, uses about 5.8 GiB of VRAM, and leaves enough headroom for the
+other tenants. The isolated chat canary was coherent and cut decode time by
+about half versus CPU-only placement. Keep `NGL=auto` for the conservative
+full-fit decision, or pass the measured numeric value when selecting this
+partial profile.
+
+The checked-in `systemd/omniserve-native-gemma4-iq4.conf` is an optional
+machine-specific drop-in for that profile. It sets one context, `q8_0` KV,
+adaptive batch geometry, and the tested partial offload without changing the
+defaults used by older Gemma, CPU-only, or Z-Image hosts. Apply it only on the
+target machine:
+
+```bash
+sudo install -D -m 0644 systemd/omniserve-native-gemma4-iq4.conf \
+  /etc/systemd/system/omniserve-native.service.d/gemma4-iq4.conf
+sudo systemctl daemon-reload
+sudo systemctl restart omniserve-native
+```
+
+To return to the normal shared-image profile, remove that one drop-in, run
+`sudo systemctl daemon-reload`, and restart the service. The LLM scheduler can
+also evict and reload this model through the existing loopback admin hooks, so
+other model configurations do not need to inherit the 31B settings.
+
+The embedded LLM also supports lifecycle-safe, loopback-only replacement when
+`OMNISERVE_NATIVE_LLM_SWAP_DIR` is configured. The swap operation waits for
+active chats to finish, unloads the old model, loads the new allow-listed GGUF,
+and restores the previous model if loading fails:
+
+```bash
+curl -X POST http://127.0.0.1:8791/admin/llm/swap \
+  -H 'content-type: application/json' \
+  -d '{"path":"/nvme0n1-disk/models/omniserve-native/G4-MEROMERO-V2-31B-IQ4_XS.gguf","ngl":"20","ctx":4096,"contexts":1}'
+```
+
+`/admin/llm/unload` and `/admin/llm/load` are available for the scheduler's
+evict/reload cycle. The Python scheduler's proxy catalog can call those hooks
+with `OMNISERVE_PROXY_PROXY_LLM_EVICT_URL` and
+`OMNISERVE_PROXY_PROXY_LLM_LOAD_URL`.
+
+The experimental Blackwell/NVFP4 route is capacity-checked separately:
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse \
+  https://github.com/NVIDIA/Model-Optimizer.git ../Model-Optimizer
+git -C ../Model-Optimizer sparse-checkout set examples/hf_ptq modelopt_recipes
+./scripts/prepare_gemma4_nvfp4.sh
+```
+
+That wrapper refuses an incomplete download and uses ModelOpt's low-memory,
+sequential device-map PTQ settings. The current released TensorRT-LLM wheel
+still needs a Gemma4-capable model registry; do not point production at the
+export until its `trtllm-serve` load-and-generate probe passes.
+
 | Capability | Artifact | Runtime |
 |---|---|---|
 | Gemma 4 roleplay text | `gemma-roleplay-v2-q8_0.gguf` (8,005,436,224 bytes) | embedded libllama |
+| Gemma 4 MeroMero 31B text | `G4-MEROMERO-V2-31B-IQ4_XS.gguf` (16,862,233,024 bytes) | embedded libllama, partial NGL |
 | Qwen 3.5 text | `qwen3.5-4b-text-q8_0.gguf` (4,482,403,104 bytes) | embedded libllama or llama.cpp worker |
 | Qwen 3.5 vision | `mmproj-qwen3.5-4b-f16.gguf` (672,423,488 bytes) | llama.cpp `mtmd` worker behind `OMNISERVE_NATIVE_MULTIMODAL_UPSTREAM` |
 | ModernBERT features (legacy contract) | `modernbert-base-q8_0.gguf` (160,208,000 bytes) | embedded libllama encoder, mean pooling |

@@ -10,6 +10,7 @@ Wants=nvidia-persistenced.service omniserve.service
 Type=simple
 User=administrator
 WorkingDirectory=/nvme0n1-disk/code/omniserve-native
+EnvironmentFile=-/etc/omniserve-h3.env
 # Belt and braces: persistenced being up does not guarantee the device is
 # enumerable yet. The gateway also refuses to start on CPU when GPU layers
 # were requested, so Restart=always retries until the GPU appears.
@@ -17,6 +18,7 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do nvidia-smi -L | grep -q GPU &&
 Environment=OMNISERVE_NATIVE_BIND=127.0.0.1
 Environment=OMNISERVE_NATIVE_PORT=8791
 Environment=OMNISERVE_NATIVE_LLM_GGUF=/nvme0n1-disk/models/omniserve-native/gemma-roleplay-v2-q8_0.gguf
+Environment=OMNISERVE_NATIVE_LLM_SWAP_DIR=/nvme0n1-disk/models/omniserve-native
 # Keep Gemma on CPU in the shared image profile. Full GPU offload leaves less
 # than the VAE decoder's scratch requirement once Z-Image and the search
 # tenants are resident, causing generation to finish denoising and then return
@@ -31,11 +33,11 @@ Environment=OMNISERVE_NATIVE_LLM_CONTEXTS=1
 # performance/quality.md. Forces flash attention, which llama.cpp requires for
 # a quantized V cache.
 Environment=OMNISERVE_NATIVE_KV_TYPE=q8_0
-# The blackwell profile's 4096/1024 geometry reserves a 1119 MiB compute
-# buffer. Roleplay prompts are short, so the prefill width is not the
-# bottleneck; the VRAM it holds is.
-Environment=OMNISERVE_NATIVE_BATCH=1024
-Environment=OMNISERVE_NATIVE_UBATCH=256
+# Let the gateway size prefill scratch from actual current free VRAM. This is
+# 512/128 for the CPU/shared profile and narrows further when a GPU swap lands
+# on a busy card, instead of reserving the Blackwell 4096/1024 buffer blindly.
+Environment=OMNISERVE_NATIVE_BATCH=auto
+Environment=OMNISERVE_NATIVE_UBATCH=auto
 # VRAM broker. Co-tenants ask for headroom instead of each racing to read
 # cudaMemGetInfo; the floor is what unbrokered scratch allocations (notably the
 # search server's per-query score buffer) rely on always being there.
@@ -70,6 +72,10 @@ Environment=OMNISERVE_NATIVE_SD_EAGER_LOAD=0
 # this backend assignment the previous stream flag was silently ignored.
 Environment=OMNISERVE_NATIVE_SD_PARAMS_BACKEND=cpu
 Environment=OMNISERVE_NATIVE_SD_MAX_VRAM=2
+# The conditioner aborts when CUDA pressure prevents it from producing hidden
+# states. Reject before entering the library so pressure remains a retryable
+# request failure instead of restarting every route in this shared gateway.
+Environment=OMNISERVE_NATIVE_SD_MIN_FREE_MB=4096
 Environment=OMNISERVE_NATIVE_SD_ZERO_GUIDANCE=1.0
 # A full-frame 1024px VAE decode exceeds the remaining CUDA headroom on this
 # shared profile after denoising has completed. Use the decoder's overlapped
@@ -86,16 +92,25 @@ Environment=OMNISERVE_NATIVE_IMAGE_PREFER_EMBEDDED=1
 # RA1 fal_zimage LoRAs resolve by basename under this cache-only directory.
 Environment=OMNISERVE_NATIVE_LORA_DIR=/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache
 Environment=OMNISERVE_NATIVE_LORA_REGISTRY=/nvme0n1-disk/code/cutedsl-site/inference/lora_registry.json
+Environment=OMNISERVE_NATIVE_NSFW_LORA_PATH=/vfast/data/code/loras/new/nsm_ZIT_000017532.safetensors
+Environment=OMNISERVE_NATIVE_NSFW_LORA_SCALE=0.6
 Environment=OMNISERVE_NATIVE_SD_IMAGE_FORMAT=webp
 Environment=OMNISERVE_NATIVE_SD_MAX_BATCH=1
 Environment=OMNISERVE_NATIVE_IMAGE_UPSTREAM=http://127.0.0.1:8790
 Environment=OMNISERVE_NATIVE_IMAGE_WORKER_UPSTREAM=http://127.0.0.1:8100
+# Cost-aware H3 front door. Optional credentials and Cog routing are loaded
+# from /etc/omniserve-h3.env; leaving that file absent preserves legacy video.
 # A RunPod adapter for SAM2 object selection and SDXL inpainting. Keep unset
 # until the scale-to-zero image-editor pool is deployed.
 # Environment=OMNISERVE_NATIVE_IMAGE_EDITOR_UPSTREAM=https://image-editor-adapter.example/v1
 Environment=OMNISERVE_NATIVE_IMAGE_GENERATE_PATH=/v1/images/generations
 Environment=OMNISERVE_NATIVE_BIREFNET_UPSTREAM=http://127.0.0.1:9094
-Environment=OMNISERVE_NATIVE_BIREFNET_PERMITS=1
+# BiRefNet serializes the CUDA model call internally, while download,
+# preprocessing, CUDA matte postprocessing, and WebP encoding overlap. A 5090
+# production canary measured 2.98 img/s at one permit and 4.95 img/s at two;
+# four permits reached 7.29 img/s but raised mean latency from 335 to 509 ms.
+# Two is the throughput/latency knee and matches BIREFNET_JOB_WORKERS.
+Environment=OMNISERVE_NATIVE_BIREFNET_PERMITS=2
 Environment=OMNISERVE_NATIVE_TTS_UPSTREAM=http://127.0.0.1:9083
 Environment=OMNISERVE_NATIVE_STT_UPSTREAM=http://127.0.0.1:9096
 Environment=OMNISERVE_NATIVE_FORECAST_UPSTREAM=http://127.0.0.1:8101

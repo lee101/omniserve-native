@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "obackend.h"
+#include "osched.h"
 #include "ospec.h"
 #include "otext.h"
 #include "otune.h"
@@ -99,6 +100,10 @@ static int g_embed_ctx_len;
 
 static pthread_mutex_t g_runtime_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_runtime_refs;
+/* Model replacement is an exclusive operation. Readers cover the complete
+ * chat request, including prompt formatting and decode, so an admin unload
+ * cannot free a llama model while a request still holds its vocab/context. */
+static pthread_rwlock_t g_model_lifecycle_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 static void llama_runtime_acquire(void) {
     pthread_mutex_lock(&g_runtime_lock);
@@ -204,6 +209,43 @@ static enum llama_flash_attn_type flash_attn_resolved(const otune_profile *profi
     return profile->flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
 }
 
+static bool tune_value_auto(const char *value) {
+    return value && strcasecmp(value, "auto") == 0;
+}
+
+static void auto_batch_geometry(bool on_gpu, int *batch, int *ubatch) {
+    if (!on_gpu) {
+        *batch = 512;
+        *ubatch = 128;
+        return;
+    }
+    double free_gib = -1.0;
+    if (!ogpu_memory_gib(&free_gib, NULL) || free_gib < 0.0) {
+        *batch = 512;
+        *ubatch = 128;
+        return;
+    }
+    /* A full Blackwell profile is excellent when the device is dedicated, but
+     * it reserves more scratch than a shared card can afford. Narrow the
+     * prefill in steps so a swap can keep the model resident without making
+     * decode pay for an oversized prompt buffer. */
+    if (free_gib < 8.0) {
+        *batch = 256;
+        *ubatch = 64;
+    } else if (free_gib < 16.0) {
+        *batch = 512;
+        *ubatch = 128;
+    } else if (free_gib < 24.0) {
+        *batch = 1024;
+        *ubatch = 256;
+    } else {
+        *batch = 4096;
+        *ubatch = 1024;
+    }
+    fprintf(stderr, "llm batch=auto: free=%.2f GiB -> batch=%d ubatch=%d\n",
+            free_gib, *batch, *ubatch);
+}
+
 int ollm_suggested_contexts(void) {
     otune_profile profile;
     if (!g_device_desc[0]) probe_gpu_device();
@@ -211,7 +253,8 @@ int ollm_suggested_contexts(void) {
     return profile.parallel_contexts;
 }
 
-bool ollm_init(const char *model_path, int n_gpu_layers, int ctx_len, int parallel_contexts) {
+static bool ollm_init_locked(const char *model_path, int n_gpu_layers, int ctx_len,
+                             int parallel_contexts) {
     llama_runtime_acquire();
     probe_gpu_device();
     g_gpu_requested = n_gpu_layers > 0;
@@ -233,8 +276,12 @@ bool ollm_init(const char *model_path, int n_gpu_layers, int ctx_len, int parall
     snprintf(g_tune_class, sizeof g_tune_class, "%s", profile.class_name);
     const char *batch_env = getenv("OMNISERVE_NATIVE_BATCH");
     const char *ubatch_env = getenv("OMNISERVE_NATIVE_UBATCH");
-    g_batch_size = batch_env ? atoi(batch_env) : profile.n_batch;
-    g_ubatch_size = ubatch_env ? atoi(ubatch_env) : profile.n_ubatch;
+    if (tune_value_auto(batch_env) || tune_value_auto(ubatch_env)) {
+        auto_batch_geometry(g_on_gpu, &g_batch_size, &g_ubatch_size);
+    } else {
+        g_batch_size = batch_env ? atoi(batch_env) : profile.n_batch;
+        g_ubatch_size = ubatch_env ? atoi(ubatch_env) : profile.n_ubatch;
+    }
     if (g_batch_size < 1) g_batch_size = 1;
     if (g_batch_size > g_ctx_len) g_batch_size = g_ctx_len;
     if (g_ubatch_size < 1) g_ubatch_size = 1;
@@ -635,7 +682,8 @@ fail:
     return NULL;
 }
 
-bool ollm_chat(const ochat_req *req, otoken_cb on_token, void *user, ochat_result *out) {
+static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *user,
+                             ochat_result *out) {
     if (!ollm_ready()) return false;
     memset(out, 0, sizeof *out);
     out->finish_reason = "stop";
@@ -909,6 +957,22 @@ bool ollm_chat(const ochat_req *req, otoken_cb on_token, void *user, ochat_resul
             text_len += (size_t)n;
             text[text_len] = 0;
 
+            /* Gemma 4's native Jinja template emits an empty thought-channel
+             * opener when thinking is disabled. It is a prompt control marker,
+             * not user-visible assistant content. Hold a possible partial
+             * marker during streaming, then remove it once complete. */
+            static const char no_think_marker[] =
+                "<|channel>thought\n<channel|>";
+            const size_t no_think_marker_len = sizeof no_think_marker - 1;
+            if (!req->enable_thinking && text_len >= no_think_marker_len &&
+                memcmp(text, no_think_marker, no_think_marker_len) == 0) {
+                memmove(text, text + no_think_marker_len,
+                        text_len - no_think_marker_len + 1);
+                text_len -= no_think_marker_len;
+                piece_start = piece_start >= no_think_marker_len
+                    ? piece_start - no_think_marker_len : 0;
+            }
+
             size_t stop_len = matched_stop_suffix(req, text, text_len);
             bool should_stop = stop_len > 0;
             if (should_stop) {
@@ -934,9 +998,12 @@ bool ollm_chat(const ochat_req *req, otoken_cb on_token, void *user, ochat_resul
                 }
             }
             if (on_token) {
+                bool hold_no_think_marker = !req->enable_thinking &&
+                    text_len > 0 && text_len < no_think_marker_len &&
+                    memcmp(text, no_think_marker, text_len) == 0;
                 size_t held = should_stop ? 0 : possible_stop_prefix(req, text, text_len);
                 size_t safe_len = text_len - held;
-                if (safe_len > streamed_len &&
+                if (!hold_no_think_marker && safe_len > streamed_len &&
                     !on_token(text + streamed_len, safe_len - streamed_len, user)) {
                     out->finish_reason = "cancelled";
                     cancelled = true;
@@ -981,7 +1048,7 @@ void ollm_result_free(ochat_result *r) {
     r->text = NULL;
 }
 
-void ollm_shutdown(void) {
+static void ollm_shutdown_locked(void) {
     bool had_model = g_model != NULL;
     for (int i = 0; i < g_slot_count; i++) {
         if (g_slots[i].ctx) llama_free(g_slots[i].ctx);
@@ -992,7 +1059,36 @@ void ollm_shutdown(void) {
     g_slot_count = 0;
     if (g_model) llama_model_free(g_model);
     g_model = NULL;
+    g_vocab = NULL;
+    g_model_name[0] = 0;
+    g_gpu_requested = false;
+    g_on_gpu = false;
+    g_batch_size = 0;
+    g_ubatch_size = 0;
+    g_kv_type_name[0] = 0;
+    g_tune_class[0] = 0;
+    g_flash_attn = false;
     if (had_model) llama_runtime_release();
+}
+
+bool ollm_init(const char *model_path, int n_gpu_layers, int ctx_len, int parallel_contexts) {
+    pthread_rwlock_wrlock(&g_model_lifecycle_lock);
+    bool ok = ollm_init_locked(model_path, n_gpu_layers, ctx_len, parallel_contexts);
+    pthread_rwlock_unlock(&g_model_lifecycle_lock);
+    return ok;
+}
+
+bool ollm_chat(const ochat_req *req, otoken_cb on_token, void *user, ochat_result *out) {
+    pthread_rwlock_rdlock(&g_model_lifecycle_lock);
+    bool ok = ollm_chat_locked(req, on_token, user, out);
+    pthread_rwlock_unlock(&g_model_lifecycle_lock);
+    return ok;
+}
+
+void ollm_shutdown(void) {
+    pthread_rwlock_wrlock(&g_model_lifecycle_lock);
+    ollm_shutdown_locked();
+    pthread_rwlock_unlock(&g_model_lifecycle_lock);
 }
 
 bool oembed_init(const char *model_path, int n_gpu_layers, int ctx_len, int threads) {
