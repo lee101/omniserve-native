@@ -97,6 +97,9 @@ typedef struct {
     int resume_step;
     char *lora_key;
     sd_latent_t *latent;
+    unsigned char *encoded_image;
+    size_t encoded_image_len;
+    bool encoded_image_is_webp;
     unsigned long long tick;
 } latent_cache_entry;
 
@@ -193,6 +196,7 @@ static void cache_entry_clear(latent_cache_entry *entry) {
     free(entry->prompt);
     free(entry->negative_prompt);
     free(entry->lora_key);
+    free(entry->encoded_image);
     memset(entry, 0, sizeof *entry);
 }
 
@@ -228,6 +232,42 @@ static bool cache_insert(const oimg_req *req, int resume_step, sd_latent_t *late
     slot->latent = latent;
     slot->tick = ++g_latent_cache_tick;
     return true;
+}
+
+static bool cache_copy_encoded_result(const latent_cache_entry *entry, oimg_result *out) {
+    if (!entry->encoded_image || !entry->encoded_image_len) return false;
+    unsigned char **images = calloc(1, sizeof *images);
+    size_t *lengths = calloc(1, sizeof *lengths);
+    unsigned char *image = malloc(entry->encoded_image_len);
+    if (!images || !lengths || !image) {
+        free(images);
+        free(lengths);
+        free(image);
+        return false;
+    }
+    memcpy(image, entry->encoded_image, entry->encoded_image_len);
+    images[0] = image;
+    lengths[0] = entry->encoded_image_len;
+    out->images = images;
+    out->image_lens = lengths;
+    out->image_count = 1;
+    out->png = image;
+    out->png_len = entry->encoded_image_len;
+    out->format = entry->encoded_image_is_webp ? "webp" : "png";
+    out->images_malloc_owned = true;
+    return true;
+}
+
+static void cache_store_encoded_result(latent_cache_entry *entry, const oimg_result *out) {
+    if (!entry || out->image_count != 1 || !out->images || !out->image_lens ||
+        !out->images[0] || !out->image_lens[0] || out->image_lens[0] > (64u << 20)) return;
+    unsigned char *copy = malloc(out->image_lens[0]);
+    if (!copy) return;
+    memcpy(copy, out->images[0], out->image_lens[0]);
+    free(entry->encoded_image);
+    entry->encoded_image = copy;
+    entry->encoded_image_len = out->image_lens[0];
+    entry->encoded_image_is_webp = out->format && strcmp(out->format, "webp") == 0;
 }
 
 bool osd_init(const char *model_path) {
@@ -369,6 +409,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     double started = now_ms();
     sd_image_t *images = NULL;
     int image_count = 0;
+    int cache_resume_step = 0;
     bool ok = false;
     if (req->teleport && params.batch_count == 1 &&
         req->steps > 1 && latent_api_ready()) {
@@ -377,7 +418,19 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         int resume_step = req->teleport_start_step > 0
             ? req->teleport_start_step : default_resume;
         if (resume_step >= req->steps) resume_step = req->steps - 1;
+        cache_resume_step = resume_step;
         latent_cache_entry *cached = cache_find(req, resume_step);
+        if (cached && cache_copy_encoded_result(cached, out)) {
+            out->teleport_used = true;
+            out->teleport_cache_hit = true;
+            out->teleport_result_cache_hit = true;
+            out->teleport_capture_step = resume_step - 1;
+            out->teleport_resume_step = resume_step;
+            out->elapsed_ms = now_ms() - started;
+            pthread_mutex_unlock(&g_sd_lock);
+            free(loras);
+            return true;
+        }
         sd_latent_replay_params_t replay;
         p_latent_params_init(&replay);
         sd_latent_t *captured = NULL;
@@ -471,13 +524,20 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     out->png = out->images[0];
     out->png_len = out->image_lens[0];
     out->format = use_webp ? "webp" : "png";
+    if (out->teleport_used && cache_resume_step > 0 && out->image_count == 1) {
+        pthread_mutex_lock(&g_sd_lock);
+        latent_cache_entry *entry = cache_find(req, cache_resume_step);
+        if (entry) cache_store_encoded_result(entry, out);
+        pthread_mutex_unlock(&g_sd_lock);
+    }
     return true;
 }
 
 void osd_result_free(oimg_result *result) {
     if (result->images) {
         for (size_t i = 0; i < result->image_count; ++i) {
-            if (result->format && strcmp(result->format, "webp") == 0 && p_webp_free) {
+            if (!result->images_malloc_owned && result->format &&
+                strcmp(result->format, "webp") == 0 && p_webp_free) {
                 p_webp_free(result->images[i]);
             } else {
                 free(result->images[i]);

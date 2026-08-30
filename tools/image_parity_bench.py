@@ -52,6 +52,8 @@ def decode_image_response(body: bytes, content_type: str, timeout: float) -> tup
             "transport": "b64_json",
             "model": doc.get("model") if isinstance(doc, dict) else None,
             "seed": row.get("seed"),
+            "inference_time_ms": row.get("inference_time_ms"),
+            "format": row.get("format"),
             "teleport": row.get("teleport"),
         }
     url = row.get("url") or row.get("path") or doc.get("url") or doc.get("path")
@@ -99,6 +101,23 @@ def request_image(base: str, payload: dict, secret: str | None, timeout: float) 
         "encoded_bytes": len(body),
     })
     return image, meta
+
+
+def request_economics(meta: dict, size: str, monthly_gpu_cost: float) -> dict[str, float | str]:
+    width_text, height_text = size.lower().split("x", 1)
+    megapixels = int(width_text) * int(height_text) / 1_000_000
+    inference_ms = meta.get("inference_time_ms")
+    timing_source = "inference_time_ms" if isinstance(inference_ms, (int, float)) else "wall_ms"
+    billed_ms = float(inference_ms if timing_source == "inference_time_ms" else meta["wall_ms"])
+    cost = billed_ms / 1000 * monthly_gpu_cost / (730 * 3600)
+    return {
+        "monthly_gpu_cost_usd": monthly_gpu_cost,
+        "megapixels": megapixels,
+        "timing_source": timing_source,
+        "billed_ms": billed_ms,
+        "cost_per_image_usd": cost,
+        "cost_per_megapixel_usd": cost / megapixels,
+    }
 
 
 def entropy(image: Image.Image) -> float:
@@ -238,23 +257,29 @@ def markdown_report(report: dict) -> str:
         f"- passed: `{report['passed']}`",
         f"- semantic scorer: `{report['semantic_available']}`",
         "",
-        "| Case | Size | Reference s | Candidate s | CLIP image | Prompt Δ | Aesthetic Δ | Result |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| Case | Size | Reference s | Candidate s | Candidate $/MP | CLIP image | Prompt Δ | Aesthetic Δ | Result |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     latency = report.get("latency") or {}
     if latency:
         lines[6:6] = [
-            f"- median latency ratio: `{latency['candidate_to_reference_ratio']:.3f}` "
+            f"- median latency ratio ({latency['timing_source']}): "
+            f"`{latency['candidate_to_reference_ratio']:.3f}` "
             f"(maximum `{latency['maximum_ratio']:.3f}`)",
         ]
     for row in report["rows"]:
         semantic = row.get("semantic") or {}
+        candidate_economics = (row.get("economics") or {}).get("candidate") or {}
+        cost_per_mp = candidate_economics.get("cost_per_megapixel_usd")
+        cost_text = "—" if cost_per_mp is None else f"{cost_per_mp:.6f}"
         def metric(name: str) -> str:
             value = semantic.get(name)
             return "—" if value is None else f"{value:.3f}"
         lines.append(
             f"| `{row['id']}` | {row['size']} | {row['reference']['wall_ms']/1000:.2f} | "
-            f"{row['candidate']['wall_ms']/1000:.2f} | {metric('clip_image_cosine')} | "
+            f"{row['candidate']['wall_ms']/1000:.2f} | "
+            f"{cost_text} | "
+            f"{metric('clip_image_cosine')} | "
             f"{metric('clip_prompt_delta')} | {metric('aesthetic_delta')} | "
             f"{'PASS' if row['passed'] else 'FAIL'} |"
         )
@@ -276,6 +301,12 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=ROOT / "evals")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=900.0)
+    parser.add_argument("--reference-steps", type=int,
+                        help="override the corpus step count for the reference")
+    parser.add_argument("--candidate-steps", type=int,
+                        help="override the corpus step count for the candidate")
+    parser.add_argument("--monthly-gpu-cost", type=float, default=1000.0,
+                        help="amortized GPU host cost used for per-megapixel economics")
     parser.add_argument("--semantic-module-dir", type=Path,
                         default=ROOT.parent / "cutedsl-site" / "inference")
     parser.add_argument("--no-semantic", action="store_true")
@@ -284,6 +315,12 @@ def main() -> int:
         parser.error("--capture-reference and --reference-run are mutually exclusive")
     if not args.capture_reference and not args.candidate_base:
         parser.error("--candidate-base is required unless --capture-reference is used")
+    if args.reference_steps is not None and args.reference_steps < 1:
+        parser.error("--reference-steps must be positive")
+    if args.candidate_steps is not None and args.candidate_steps < 1:
+        parser.error("--candidate-steps must be positive")
+    if args.monthly_gpu_cost <= 0:
+        parser.error("--monthly-gpu-cost must be positive")
 
     corpus = json.loads(args.corpus.read_text())
     cases = corpus["cases"][: args.limit or None]
@@ -310,21 +347,27 @@ def main() -> int:
         captured_rows = {row["id"]: row for row in manifest["rows"]}
     for index, case in enumerate(cases):
         payload = {**defaults, **{key: case[key] for key in ("prompt", "size", "seed")}, "n": 1}
+        reference_payload = {**payload}
+        candidate_payload = {**payload}
+        if args.reference_steps is not None:
+            reference_payload["steps"] = args.reference_steps
+        if args.candidate_steps is not None:
+            candidate_payload["steps"] = args.candidate_steps
         if captured_rows is not None:
             captured = captured_rows.get(case["id"])
-            if not captured or captured.get("payload") != payload:
+            if not captured or captured.get("payload") != reference_payload:
                 raise ValueError(f"captured reference does not match case {case['id']}")
             reference = Image.open(captured["reference_path"]).convert("RGB")
             reference_meta = captured["reference"]
         else:
             reference, reference_meta = request_image(
-                args.reference_base, payload, reference_secret, args.timeout)
+                args.reference_base, reference_payload, reference_secret, args.timeout)
         if args.capture_reference:
             ref_path = run_dir / f"{index:02d}_{case['id']}_reference.png"
             reference.save(ref_path, format="PNG")
             rows.append({
                 **case,
-                "payload": payload,
+                "payload": reference_payload,
                 "reference": reference_meta,
                 "reference_path": str(ref_path.resolve()),
                 "sha256": hashlib.sha256(reference.tobytes()).hexdigest(),
@@ -339,7 +382,7 @@ def main() -> int:
         reference.save(ref_path, format="PNG")
         try:
             candidate, candidate_meta = request_image(
-                args.candidate_base, payload, candidate_secret, args.timeout)
+                args.candidate_base, candidate_payload, candidate_secret, args.timeout)
         except Exception as exc:
             message = f"candidate request failed: {type(exc).__name__}: {exc}"
             row = {
@@ -368,6 +411,12 @@ def main() -> int:
         }
         metrics = pixel_metrics(reference, candidate)
         semantic = scorer.score(case["prompt"], reference, candidate) if scorer else {}
+        economics = {
+            "reference": request_economics(
+                reference_meta, case["size"], args.monthly_gpu_cost),
+            "candidate": request_economics(
+                candidate_meta, case["size"], args.monthly_gpu_cost),
+        }
         row_failures = []
         if not metrics.get("same_dimensions"):
             row_failures.append("dimensions differ")
@@ -389,6 +438,9 @@ def main() -> int:
             **case,
             "reference": reference_meta,
             "candidate": candidate_meta,
+            "reference_payload": reference_payload,
+            "candidate_payload": candidate_payload,
+            "economics": economics,
             "reference_path": str(ref_path),
             "candidate_path": str(cand_path),
             "candidate_quality": quality,
@@ -424,13 +476,25 @@ def main() -> int:
     timed_rows = [row for row in rows if not row["candidate"].get("error")]
     latency = {}
     if timed_rows:
-        reference_median = statistics.median(row["reference"]["wall_ms"] for row in timed_rows)
-        candidate_median = statistics.median(row["candidate"]["wall_ms"] for row in timed_rows)
+        has_inference_timing = all(
+            isinstance(row[side].get("inference_time_ms"), (int, float))
+            for row in timed_rows for side in ("reference", "candidate")
+        )
+        timing_source = "inference_time_ms" if has_inference_timing else "wall_ms"
+        reference_median = statistics.median(
+            row["reference"][timing_source] for row in timed_rows)
+        candidate_median = statistics.median(
+            row["candidate"][timing_source] for row in timed_rows)
         ratio = candidate_median / reference_median if reference_median > 0 else float("inf")
         maximum = gates.get("median_latency_ratio_max", 1.5)
         latency = {
+            "timing_source": timing_source,
             "reference_median_ms": reference_median,
             "candidate_median_ms": candidate_median,
+            "reference_wall_median_ms": statistics.median(
+                row["reference"]["wall_ms"] for row in timed_rows),
+            "candidate_wall_median_ms": statistics.median(
+                row["candidate"]["wall_ms"] for row in timed_rows),
             "candidate_to_reference_ratio": ratio,
             "maximum_ratio": maximum,
         }

@@ -703,7 +703,11 @@ Euler sigma schedule and global step numbering; its baseline, split-prime, and
 replay images must be pixel-identical in `image_teleport_bench.py`. Approximate
 prompt matching is intentionally not implemented. Measured through the gateway,
 a repeat backdrop prompt came back `exact_prompt_latent_replay`, resuming at
-step 7 of 9.
+step 7 of 9. The native cache also retains that request's encoded single image;
+the next identical request reports `exact_prompt_result_cache` and skips the
+remaining denoise step, VAE decode, and image encode. The result cache uses the
+same exact prompt, negative prompt, dimensions, seed, step count, guidance,
+LoRA, and resume-step key as latent replay and is evicted with its latent.
 
 ### Generate a cutout in one stage
 
@@ -915,7 +919,9 @@ CPU CLIP image/prompt similarity, aesthetic-score drift, entropy, and latency:
 ```bash
 python tools/image_parity_bench.py \
   --reference-base http://127.0.0.1:8791 \
-  --candidate-base http://127.0.0.1:8792
+  --candidate-base http://127.0.0.1:8792 \
+  --reference-steps 9 --candidate-steps 4 \
+  --monthly-gpu-cost 1000
 ```
 
 When both checkpoints cannot coexist, capture the immutable reference first,
@@ -936,6 +942,11 @@ rerunning against a persistent cache. Unless explicitly overridden, exact
 replay resumes at the last scheduled step (`steps-1`), the fastest exact point
 in the RTX 5090 resume-step sweep. Latency is reported but exactness is the hard
 gate.
+
+The parity report prefers server-side `inference_time_ms` for accelerator cost
+and latency ratios when both endpoints provide it, while retaining wall time to
+show queue and transport overhead. The measured RTX 5090 step-count/cost
+ablation is in `performance/zimage-cost-ablation-2026-08-30.md`.
 
 Measured findings, including the embedding-artifact comparison and the KV
 quantization result, are in `performance/quality.md`. Two of them matter for

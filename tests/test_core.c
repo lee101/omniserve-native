@@ -233,6 +233,7 @@ static void test_image_contract(void) {
         .teleport_requested = true,
         .teleport_used = true,
         .teleport_cache_hit = true,
+        .teleport_result_cache_hit = true,
         .teleport_capture_step = 6,
         .teleport_resume_step = 7,
     };
@@ -245,6 +246,7 @@ static void test_image_contract(void) {
     CHECK(strstr(json, "\"seed\":42") != NULL);
     CHECK(strstr(json, "\"inference_time_ms\":13") != NULL);
     CHECK(strstr(json, "\"cache_hit\":true") != NULL);
+    CHECK(strstr(json, "\"method\":\"exact_prompt_result_cache\"") != NULL);
     CHECK(strstr(json, "\"resume_step\":7") != NULL);
     oj_tok response_tokens[32];
     CHECK(oj_parse(json, json_len, response_tokens, 32) > 0);

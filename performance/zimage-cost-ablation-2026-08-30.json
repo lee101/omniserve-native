@@ -1,0 +1,106 @@
+{
+  "timestamp": "2026-08-30T11:50:00+12:00",
+  "host": "leaf-gpu-dedicated-server",
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "monthly_host_cost_usd": 1000.0,
+  "amortization_hours_per_month": 730,
+  "cost_per_gpu_second_usd": 0.000380517504,
+  "competitor_price_per_megapixel_usd": 0.005,
+  "break_even_seconds_per_megapixel": 13.14,
+  "service_profile": {
+    "model": "z_image_turbo-Q4_K",
+    "shared_gpu": true,
+    "parameter_backend": "cpu",
+    "stream_layers": true,
+    "max_vram_gib": 2,
+    "vae_tiling": true,
+    "vae_tile": "64x64",
+    "priority": "background"
+  },
+  "measurements": [
+    {
+      "variant": "new_prompt_4_steps",
+      "size": "1024x1024",
+      "megapixels": 1.048576,
+      "inference_time_ms": 7841,
+      "wall_time_ms": 22686.379,
+      "cost_per_image_usd": 0.002983638,
+      "cost_per_megapixel_usd": 0.002845419,
+      "beats_target": true
+    },
+    {
+      "variant": "new_prompt_9_steps",
+      "size": "1024x1024",
+      "megapixels": 1.048576,
+      "inference_time_ms": 15594,
+      "wall_time_ms": 29536.062,
+      "cost_per_image_usd": 0.005933790,
+      "cost_per_megapixel_usd": 0.005658903,
+      "beats_target": false
+    },
+    {
+      "variant": "exact_final_step_replay",
+      "size": "1024x1024",
+      "megapixels": 1.048576,
+      "inference_time_ms": 3013,
+      "wall_time_ms": 16290.348,
+      "cost_per_image_usd": 0.001146499,
+      "cost_per_megapixel_usd": 0.001093387,
+      "beats_target": true,
+      "quality": "byte-identical WebP to full 9-step generation"
+    },
+    {
+      "variant": "new_prompt_4_steps",
+      "size": "512x512",
+      "megapixels": 0.262144,
+      "inference_time_ms": 4406,
+      "wall_time_ms": 15990.441,
+      "cost_per_image_usd": 0.001676560,
+      "cost_per_megapixel_usd": 0.006395569,
+      "beats_target": false
+    }
+  ],
+  "quality_ablations": {
+    "1024_4_steps_vs_9_steps": {
+      "psnr_db": 21.434519,
+      "ssim_global": 0.952488,
+      "edge_cosine": 0.531595,
+      "histogram_intersection": 0.876379,
+      "four_step_corruption_detector": false,
+      "nine_step_corruption_detector": false
+    },
+    "512_corpus_4_steps_vs_9_steps": [
+      {
+        "id": "product_glass_robot",
+        "reference_inference_ms": 9197,
+        "candidate_inference_ms": 4430,
+        "psnr_db": 20.712835,
+        "ssim_global": 0.714840,
+        "edge_cosine": 0.522960,
+        "histogram_intersection": 0.894451
+      },
+      {
+        "id": "pixel_game_asset",
+        "reference_inference_ms": 9185,
+        "candidate_inference_ms": 4525,
+        "psnr_db": 26.968239,
+        "ssim_global": 0.990568,
+        "edge_cosine": 0.714877,
+        "histogram_intersection": 0.665660
+      }
+    ],
+    "semantic_or_human_preference": "not measured; the contact sheets must be reviewed before making a no-quality-loss claim for four steps"
+  },
+  "resolution_model": {
+    "fit": "seconds = 3.261 + 4.367828 * megapixels",
+    "estimated_break_even_megapixels": 0.371744,
+    "estimated_break_even_square_side_px": 610,
+    "warning": "two-point estimate from a busy shared production host"
+  },
+  "artifacts": {
+    "cost_runs": "evals/prod-step-timed",
+    "resolution_runs": "evals/prod-resolution-ablation",
+    "four_vs_nine_report": "evals/prod-4-vs-9/image_parity_20260829T234738Z/report.json",
+    "four_vs_nine_contact_sheet": "evals/prod-4-vs-9/image_parity_20260829T234738Z/contact_sheet.jpg"
+  }
+}

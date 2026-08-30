@@ -704,8 +704,10 @@ bool oimage_openai_response(const oimg_result *result, const char *model, long l
         if (wrote < 0 || (size_t)wrote >= capacity - used) { free(json); return false; }
         used += (size_t)wrote;
         if (result->teleport_requested && count == 1) {
-            const char *method = result->teleport_used
-                ? "exact_prompt_latent_replay" : "full_generation_fallback";
+            const char *method = result->teleport_result_cache_hit
+                ? "exact_prompt_result_cache"
+                : (result->teleport_used
+                    ? "exact_prompt_latent_replay" : "full_generation_fallback");
             wrote = snprintf(json + used, capacity - used,
                 ",\"teleport\":{\"method\":\"%s\",\"cache_hit\":%s,"
                 "\"capture_step\":%d,\"resume_step\":%d}", method,

@@ -133,10 +133,12 @@ typedef struct {
     size_t *image_lens;
     size_t image_count;
     const char *format;
+    bool images_malloc_owned;
     double elapsed_ms;
     bool teleport_requested;
     bool teleport_used;
     bool teleport_cache_hit;
+    bool teleport_result_cache_hit;
     int teleport_capture_step;
     int teleport_resume_step;
 } oimg_result;

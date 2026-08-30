@@ -100,6 +100,8 @@ def decode_image(body: bytes, content_type: str) -> tuple[bytes, dict[str, Any]]
         "transport": "b64_json",
         "model": document.get("model") if isinstance(document, dict) else None,
         "seed": row.get("seed"),
+        "inference_time_ms": row.get("inference_time_ms"),
+        "format": row.get("format"),
         "teleport": row.get("teleport"),
     }
 
@@ -185,7 +187,7 @@ def main() -> int:
         raise SystemExit("--lora-scale must be between -4 and 4")
     if args.width % 64 or args.height % 64:
         raise SystemExit("--width and --height must be multiples of 64")
-    if not 1 <= args.teleport_start_step < args.steps:
+    if args.teleport and not 1 <= args.teleport_start_step < args.steps:
         raise SystemExit("--teleport-start-step must be between 1 and steps-1")
 
     process: subprocess.Popen[str] | None = None
@@ -218,8 +220,9 @@ def main() -> int:
             "guidance_scale": args.guidance_scale,
             "seed": args.seed,
             "teleport": args.teleport,
-            "teleport_start_step": args.teleport_start_step,
         }
+        if args.teleport:
+            payload["teleport_start_step"] = args.teleport_start_step
         if lora is not None:
             payload["loras"] = [{"path": str(lora.resolve()), "scale": args.lora_scale}]
         before = gpu_memory()
