@@ -26,6 +26,8 @@
       "wall_time_ms": 22686.379,
       "cost_per_image_usd": 0.002983638,
       "cost_per_megapixel_usd": 0.002845419,
+      "minimum_productive_occupancy_fraction": 0.569084,
+      "theoretical_megapixels_per_hour": 481.427573,
       "beats_target": true
     },
     {
@@ -36,6 +38,8 @@
       "wall_time_ms": 29536.062,
       "cost_per_image_usd": 0.005933790,
       "cost_per_megapixel_usd": 0.005658903,
+      "minimum_productive_occupancy_fraction": 1.131781,
+      "theoretical_megapixels_per_hour": 242.072182,
       "beats_target": false
     },
     {
@@ -46,6 +50,8 @@
       "wall_time_ms": 16290.348,
       "cost_per_image_usd": 0.001146499,
       "cost_per_megapixel_usd": 0.001093387,
+      "minimum_productive_occupancy_fraction": 0.218677,
+      "theoretical_megapixels_per_hour": 1252.862131,
       "beats_target": true,
       "quality": "byte-identical WebP to full 9-step generation"
     },
@@ -57,6 +63,8 @@
       "wall_time_ms": 15990.441,
       "cost_per_image_usd": 0.001676560,
       "cost_per_megapixel_usd": 0.006395569,
+      "minimum_productive_occupancy_fraction": 1.279114,
+      "theoretical_megapixels_per_hour": 214.189378,
       "beats_target": false
     }
   ],
@@ -96,6 +104,11 @@
     "estimated_break_even_megapixels": 0.371744,
     "estimated_break_even_square_side_px": 610,
     "warning": "two-point estimate from a busy shared production host"
+  },
+  "staged_unmeasured": {
+    "variant": "exact_prompt_result_cache",
+    "expected_quality": "byte-identical encoded response",
+    "warning": "built and tested but not loaded into the traffic-serving process"
   },
   "artifacts": {
     "cost_runs": "evals/prod-step-timed",
