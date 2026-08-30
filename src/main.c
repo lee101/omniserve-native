@@ -549,6 +549,11 @@ static void handle_status(ohttp_request *req, app_state *app) {
     ohttp_respond_str(req, 200, "application/json", body);
 }
 
+static const char *env_or(const char *name, const char *fallback) {
+    const char *value = getenv(name);
+    return value && value[0] ? value : fallback;
+}
+
 static void handle_models(ohttp_request *req, const app_state *app) {
     char body[2048];
     size_t len = (size_t)snprintf(body, sizeof body, "{\"object\":\"list\",\"data\":[");
@@ -562,30 +567,30 @@ static void handle_models(ohttp_request *req, const app_state *app) {
     if (ollm_ready()) ADD_MODEL(ollm_model_name(), "llm", "llama.cpp");
     if (oembed_ready()) ADD_MODEL(oembed_model_name(), "embedding", "llama.cpp");
     if (osd_ready()) ADD_MODEL(osd_model_name(), "diffusion", "stable-diffusion.cpp");
-    if (app->llm_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_LLM_MODEL") ?:
-                                    "upstream-llm", "llm", "proxy");
-    if (app->image_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_IMAGE_MODEL") ?:
-                                      "upstream-image", "diffusion", "proxy");
-    if (app->h3_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_H3_MODEL") ?:
-                                   "h3", "video", "proxy-cost-aware");
-    if (app->art_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_ART_MODEL") ?:
-                                    "Tongyi-MAI/Z-Image-Turbo", "background-art", "proxy-background");
-    if (app->birefnet_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_BIREFNET_MODEL") ?:
-                                         "ZhengPeng7/BiRefNet", "background-removal", "proxy-c-hot-path");
-    if (app->tts_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_TTS_MODEL") ?:
-                                    "upstream-tts", "tts", "proxy");
-    if (app->stt_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_STT_MODEL") ?:
-                                    "upstream-stt", "stt", "proxy");
-    if (app->forecast_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_FORECAST_MODEL") ?:
-                                         "amazon/chronos-2", "forecast", "proxy");
-    if (app->embedding_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_EMBEDDING_MODEL") ?:
-                                          "upstream-embedding", "embedding", "proxy");
-    if (app->multimodal_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_MULTIMODAL_MODEL") ?:
-                                           "upstream-multimodal", "multimodal", "proxy");
-    if (app->animation_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_ANIMATION_MODEL") ?:
-                                          "nvidia-ace-animation", "animation", "proxy-background");
-    if (app->threed_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_3D_MODEL") ?:
-                                       "microsoft/TRELLIS.2-4B", "image-to-3d", "proxy-background");
+    if (app->llm_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_LLM_MODEL", "upstream-llm"),
+                                    "llm", "proxy");
+    if (app->image_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_IMAGE_MODEL", "upstream-image"),
+                                      "diffusion", "proxy");
+    if (app->h3_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_H3_MODEL", "h3"),
+                                   "video", "proxy-cost-aware");
+    if (app->art_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_ART_MODEL", "Tongyi-MAI/Z-Image-Turbo"),
+                                    "background-art", "proxy-background");
+    if (app->birefnet_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_BIREFNET_MODEL", "ZhengPeng7/BiRefNet"),
+                                         "background-removal", "proxy-c-hot-path");
+    if (app->tts_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_TTS_MODEL", "upstream-tts"),
+                                    "tts", "proxy");
+    if (app->stt_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_STT_MODEL", "upstream-stt"),
+                                    "stt", "proxy");
+    if (app->forecast_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_FORECAST_MODEL", "amazon/chronos-2"),
+                                         "forecast", "proxy");
+    if (app->embedding_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_EMBEDDING_MODEL", "upstream-embedding"),
+                                          "embedding", "proxy");
+    if (app->multimodal_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_MULTIMODAL_MODEL", "upstream-multimodal"),
+                                           "multimodal", "proxy");
+    if (app->animation_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_ANIMATION_MODEL", "nvidia-ace-animation"),
+                                          "animation", "proxy-background");
+    if (app->threed_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_3D_MODEL", "microsoft/TRELLIS.2-4B"),
+                                       "image-to-3d", "proxy-background");
 #undef ADD_MODEL
     snprintf(body + len, sizeof body - len, "]}");
     ohttp_respond_str(req, 200, "application/json", body);

@@ -1,8 +1,12 @@
 CC ?= cc
 override CFLAGS += -std=c17 -Wall -Wextra -Wpedantic -Werror -O2
-override CPPFLAGS += -D_POSIX_C_SOURCE=200809L -Isrc
+override CPPFLAGS += -D_POSIX_C_SOURCE=200809L -Isrc -Iinclude
 
 BIN := build/omniserve
+CORE_SRC := src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c \
+	src/omatte.c src/onsfw.c src/oproxy.c src/osched.c src/ohost.c src/ovram.c \
+	src/ospec.c src/oscale.c src/otext.c src/otune.c
+BIN_SRC := src/main.c src/docs.c src/backend_llama.c src/backend_sd.c $(CORE_SRC)
 TESTS := build/test_admission build/test_breaker build/test_wavwrap
 JOBCTL := build/omni-job
 JOB_TEST := build/test_jobs
@@ -24,8 +28,8 @@ all: $(BIN) $(JOBCTL) $(MUSIC3C) $(WAVWRAP)
 build:
 	mkdir -p $@
 
-$(BIN): build src/main.c src/admission.c src/admission.h src/breaker.c src/breaker.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c src/admission.c src/breaker.c -o $@
+$(BIN): build $(BIN_SRC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wno-overlength-strings $(BIN_SRC) -pthread -ldl -lm -o $@
 
 build/test_admission: build tests/test_admission.c src/admission.c src/admission.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG tests/test_admission.c src/admission.c -o $@
