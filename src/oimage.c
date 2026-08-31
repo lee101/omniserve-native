@@ -126,7 +126,7 @@ static char *read_small_file(const char *path, size_t *out_len) {
         return NULL;
     }
     long size = ftell(file);
-    if (size < 0 || size > 1024 * 1024 || fseek(file, 0, SEEK_SET) != 0) {
+    if (size < 0 || size > 1024L * 1024L || fseek(file, 0, SEEK_SET) != 0) {
         fclose(file);
         return NULL;
     }
@@ -233,8 +233,10 @@ void oimage_request_free(oimage_request *request) {
     if (!request) return;
     free(request->prompt);
     free(request->negative_prompt);
-    for (size_t i = 0; i < request->generation.lora_count; ++i) {
-        free((char *)request->loras[i].path);
+    if (request->loras) {
+        for (size_t i = 0; i < request->generation.lora_count; ++i) {
+            free((char *)request->loras[i].path);
+        }
     }
     free(request->loras);
     memset(request, 0, sizeof *request);

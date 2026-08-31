@@ -33,7 +33,8 @@ Admission admit_model(const GpuSnapshot *gpu, const Model *model,
 int read_gpu_snapshot(GpuSnapshot *result) {
     char line[128] = {0};
     unsigned total = 0, used = 0;
-    FILE *pipe = popen("nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits 2>/dev/null", "r");
+    /* Constant command: no request or environment text reaches the shell. */
+    FILE *pipe = popen("nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits 2>/dev/null", "r"); /* NOLINT(cert-env33-c) */
     if (pipe == NULL) return -1;
     int scanned = fgets(line, sizeof(line), pipe) != NULL &&
                   sscanf(line, " %u , %u", &total, &used) == 2;
