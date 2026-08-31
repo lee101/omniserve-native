@@ -99,6 +99,7 @@ jobs:
       - name: Compile and run worker/tool tests
         run: |
           python -m compileall -q tools workers
+          make build/music3c
           python -m pytest -q \
             tests/test_runtime.py \
             tests/test_person_detection.py \
