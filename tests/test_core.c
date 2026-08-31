@@ -241,7 +241,11 @@ static void test_image_contract(void) {
     size_t json_len = 0;
     CHECK(oimage_openai_response(&image_result, "z-image", 42,
                                  &json, &json_len));
-    CHECK(json && json_len == strlen(json));
+    if (json == NULL) {
+        CHECK(json != NULL);
+        return;
+    }
+    CHECK(json_len == strlen(json));
     CHECK(strstr(json, "\"b64_json\":\"YWJj\"") != NULL);
     CHECK(strstr(json, "\"seed\":42") != NULL);
     CHECK(strstr(json, "\"inference_time_ms\":13") != NULL);
