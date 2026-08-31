@@ -48,6 +48,20 @@ int main(void) {
     music3_sha256_hex((const unsigned char *)"abc", 3, digest);
     assert(strcmp(digest, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") == 0);
 
+    char cache_key[MUSIC3_SHA_SIZE], same_key[MUSIC3_SHA_SIZE], changed_key[MUSIC3_SHA_SIZE];
+    music3_result_cache_key(&request, "MiniMaxAI/MiniMax-Music3", "release-a", cache_key);
+    music3_result_cache_key(&request, "MiniMaxAI/MiniMax-Music3", "release-a", same_key);
+    assert(strcmp(cache_key, same_key) == 0);
+    snprintf(request.output_upload_url, sizeof(request.output_upload_url), "https://uploads.example/a");
+    music3_result_cache_key(&request, "MiniMaxAI/MiniMax-Music3", "release-a", same_key);
+    assert(strcmp(cache_key, same_key) == 0);
+    request.output_upload_url[0] = '\0';
+    music3_result_cache_key(&request, "MiniMaxAI/MiniMax-Music3", "release-b", changed_key);
+    assert(strcmp(cache_key, changed_key) != 0);
+    request.seed++;
+    music3_result_cache_key(&request, "MiniMaxAI/MiniMax-Music3", "release-a", changed_key);
+    assert(strcmp(cache_key, changed_key) != 0);
+
     unsigned rate = 32000;
     int16_t stereo[64000];
     for (unsigned i = 0; i < rate; ++i) {
@@ -67,6 +81,13 @@ int main(void) {
     assert(stats.has_stereo_correlation);
     assert(stats.stereo_correlation > 0.999);
     assert(stats.continuity_score > 99.0);
+
+    char result[4096];
+    Music3Timings timings = {.generation_seconds = 0, .gpu_name = "test", .quality_attempts = 1,
+                             .original_seed = request.seed, .exact_result_cache_hit = 1};
+    assert(music3_write_result_json(result, sizeof(result), &request, &stats, NULL, NULL, &timings) == 0);
+    assert(strstr(result, "\"exact_result_cache_hit\":true") != NULL);
+    assert(strstr(result, "\"realtime_factor\":0.000") != NULL);
 
     /* A one-second internal collapse between healthy tone must trip the retry gate. */
     int16_t dropout[32000 * 6 * 2];

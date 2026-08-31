@@ -75,12 +75,12 @@ $(MUSIC3C_TEST): build tests/test_music3c.c music3c/music3.c music3c/music3.h
 run: $(BIN)
 	$(BIN) --models models/models.csv
 
-test: $(TESTS) $(JOB_TEST) $(MUSIC3C_TEST)
+test: $(TESTS) $(JOB_TEST) $(MUSIC3C_TEST) $(MUSIC3C)
 	build/test_admission
 	build/test_wavwrap
 	$(JOB_TEST)
 	$(MUSIC3C_TEST)
-	python3 -m pytest -q tests/test_runtime.py tests/test_person_detection.py tests/test_video_matting.py tests/test_music3_handler.py tests/test_wan_animate_2.py
+	python3 -m pytest -q tests/test_runtime.py tests/test_person_detection.py tests/test_video_matting.py tests/test_music3_handler.py tests/test_music3_result_cache.py tests/test_wan_animate_2.py
 
 ASAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer
 ASAN_CC := $(firstword $(wildcard /usr/bin/gcc /usr/bin/cc) gcc)

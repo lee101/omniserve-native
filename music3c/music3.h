@@ -61,6 +61,7 @@ typedef struct {
     const char *gpu_name;
     int quality_attempts;
     long long original_seed;
+    int exact_result_cache_hit;
 } Music3Timings;
 
 int music3_normalize_request(const char *json, Music3Request *request);
@@ -68,6 +69,8 @@ int music3_name_included(const char *name, const char *list);
 int music3_wav_statistics(const unsigned char *audio, size_t length, Music3WavStats *stats);
 void music3_sha256_hex(const unsigned char *data, size_t length, char out[MUSIC3_SHA_SIZE]);
 int music3_sha256_file(const char *path, char out[MUSIC3_SHA_SIZE]);
+void music3_result_cache_key(const Music3Request *request, const char *model,
+                             const char *scope, char out[MUSIC3_SHA_SIZE]);
 int music3_write_result_json(char *out, size_t size, const Music3Request *request,
                              const Music3WavStats *stats, const char *audio_url,
                              const char *inline_b64, const Music3Timings *timings);

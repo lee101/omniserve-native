@@ -92,6 +92,34 @@ void music3_sha256_hex(const unsigned char *data, size_t length, char out[MUSIC3
     sha256_final(&ctx, out);
 }
 
+static void sha256_field(Sha256Ctx *ctx, const void *data, size_t length) {
+    unsigned char encoded_length[8];
+    uint64_t value = (uint64_t)length;
+    for (int i = 0; i < 8; ++i) encoded_length[7 - i] = (unsigned char)(value >> (8 * i));
+    sha256_update(ctx, encoded_length, sizeof(encoded_length));
+    sha256_update(ctx, data, length);
+}
+
+void music3_result_cache_key(const Music3Request *request, const char *model,
+                             const char *scope, char out[MUSIC3_SHA_SIZE]) {
+    static const char schema[] = "omniserve-music3-result-v1";
+    unsigned char number[8];
+    uint64_t seed = (uint64_t)request->seed;
+    uint64_t frames = (uint64_t)request->max_new_tokens;
+    Sha256Ctx ctx;
+    sha256_init(&ctx);
+    sha256_field(&ctx, schema, sizeof(schema) - 1);
+    sha256_field(&ctx, scope, strlen(scope));
+    sha256_field(&ctx, model, strlen(model));
+    sha256_field(&ctx, request->instructions, strlen(request->instructions));
+    sha256_field(&ctx, request->lyrics, strlen(request->lyrics));
+    for (int i = 0; i < 8; ++i) number[7 - i] = (unsigned char)(frames >> (8 * i));
+    sha256_field(&ctx, number, sizeof(number));
+    for (int i = 0; i < 8; ++i) number[7 - i] = (unsigned char)(seed >> (8 * i));
+    sha256_field(&ctx, number, sizeof(number));
+    sha256_final(&ctx, out);
+}
+
 int music3_sha256_file(const char *path, char out[MUSIC3_SHA_SIZE]) {
     FILE *file = fopen(path, "rb");
     unsigned char chunk[1 << 20];
@@ -471,6 +499,9 @@ int music3_write_result_json(char *out, size_t size, const Music3Request *reques
     if (n < 0 || (size_t)n >= size) return -1;
     used = (size_t)n;
     if (json_escape_into(out, size, &used, stats->sha256) != 0) return -1;
+    double realtime_factor = timings->exact_result_cache_hit ? 0.0 : generation_seconds / duration;
+    double audio_per_compute = timings->exact_result_cache_hit ? 0.0 :
+        duration / (generation_seconds > 0.001 ? generation_seconds : 0.001);
     n = snprintf(out + used, size - used,
         ",\"peak_dbfs\":%.3f,\"rms_dbfs\":%.3f,\"crest_factor_db\":%.3f,\"dc_offset\":%.7f,"
         "\"clipped_samples\":%u,\"clipped_percent\":%.6f,\"digital_silence_percent\":%.4f,"
@@ -492,14 +523,16 @@ int music3_write_result_json(char *out, size_t size, const Music3Request *reques
         "\"realtime_factor\":%.3f,\"audio_seconds_per_compute_second\":%.3f,\"server_started_at\":%.3f,"
         "\"upload_seconds\":%.3f,\"total_seconds\":%.3f,\"prefetch_seconds\":%.3f,\"prefetch_gib\":%.3f,"
         "\"server_ready_before_job\":%s,\"gpu\":\"%s\",\"quality_attempts\":%d,\"quality_original_seed\":%lld,"
+        "\"exact_result_cache_hit\":%s,"
         "\"optimizations\":[\"backbone-cuda-graph\","
         "\"rvq-depth-cuda-graph\",\"compiled-dit-blocks\",\"compiled-dav-decoder\",\"batched-seeded-sampling\","
-        "\"warm-start-thread\",\"parallel-weight-prefetch\"]}",
+        "\"warm-start-thread\",\"parallel-weight-prefetch\",\"exact-result-cache\"]}",
         model_download_seconds, server_start_seconds, generation_seconds,
-        generation_seconds / duration, duration / (generation_seconds > 0.001 ? generation_seconds : 0.001),
+        realtime_factor, audio_per_compute,
         server_started_at, upload_seconds, total_seconds, timings->prefetch_seconds, timings->prefetch_gib,
         timings->server_ready_before_job ? "true" : "false", gpu_name,
-        timings->quality_attempts, timings->original_seed);
+        timings->quality_attempts, timings->original_seed,
+        timings->exact_result_cache_hit ? "true" : "false");
     if (n < 0 || used + (size_t)n >= size) return -1;
     used += (size_t)n;
     if (audio_url && audio_url[0]) {

@@ -24,7 +24,9 @@ for command_name in base64 curl git jq sha256sum make cc; do
   command -v "$command_name" >/dev/null || { echo "ERROR: missing $command_name" >&2; exit 1; }
 done
 
-tag="$(sha256sum "$root/music3c/Dockerfile" "$root/music3c/main.c" "$root/music3c/music3.c" "$root/music3/sglang-music3-a100.patch" "$config" | sha256sum | cut -c1-16)"
+tag="$(sha256sum "$root/music3c/Dockerfile" "$root/music3c/main.c" "$root/music3c/music3.c" \
+  "$root/music3c/music3.h" "$root/music3/sglang-music3-a100.patch" "$config" "${BASH_SOURCE[0]}" \
+  | sha256sum | cut -c1-16)"
 image="$base_image"
 if [[ "${MUSIC3_BUILD_DERIVED_IMAGE:-0}" == "1" ]]; then
   command -v docker >/dev/null || { echo "ERROR: missing docker" >&2; exit 1; }
@@ -100,7 +102,7 @@ if [[ -z "$volume_id" || -z "$datacenter_id" ]]; then
   exit 1
 fi
 
-template_payload="$(jq -n --arg image "$image" --arg registry_auth "$registry_auth_id" --arg bootstrap "$bootstrap" --rawfile worker "$worker_b64_file" --rawfile sgl_patch "$sgl_patch_b64_file" --arg extra_serve_args "${MUSIC3_SERVE_EXTRA_ARGS-$default_serve_args}" '{
+template_payload="$(jq -n --arg image "$image" --arg registry_auth "$registry_auth_id" --arg bootstrap "$bootstrap" --rawfile worker "$worker_b64_file" --rawfile sgl_patch "$sgl_patch_b64_file" --arg extra_serve_args "${MUSIC3_SERVE_EXTRA_ARGS-$default_serve_args}" --arg result_cache_namespace "$tag" '{
   imageName:$image, name:"omniserve-minimax-music3", containerDiskInGb:60,
   dockerEntrypoint:[], dockerStartCmd:["bash","-lc",$bootstrap], env:{
     MUSIC3_WORKER_B64:($worker|rtrimstr("\n")),
@@ -115,6 +117,9 @@ template_payload="$(jq -n --arg image "$image" --arg registry_auth "$registry_au
     MUSIC3_STARTUP_TIMEOUT_SECONDS:"1800", MUSIC3_REQUEST_TIMEOUT_SECONDS:"1800",
     PYTHONPATH:"/runpod-volume/omniserve/music3/sglang-omni-e0c98529",
     MUSIC3_SERVE_PYTHON_MODULE:"1", MUSIC3_WARM_START:"1", MUSIC3_PREFETCH_THREADS:"8",
+    MUSIC3_RESULT_CACHE:"1", MUSIC3_RESULT_CACHE_NAMESPACE:$result_cache_namespace,
+    MUSIC3_RESULT_CACHE_DIR:"/runpod-volume/omniserve/music3/result-cache",
+    MUSIC3_RESULT_CACHE_ENTRIES:"16", MUSIC3_RESULT_CACHE_MIB:"4096",
     MUSIC3_SERVE_EXTRA_ARGS:($extra_serve_args)
   }, category:"NVIDIA",
   isPublic:false, isServerless:true,

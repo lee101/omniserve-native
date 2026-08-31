@@ -433,6 +433,162 @@ static char *base64_encode(const unsigned char *data, size_t length) {
     return out;
 }
 
+typedef struct {
+    char path[PATH_MAX];
+    off_t bytes;
+    struct timespec modified;
+} ResultCacheFile;
+
+static int result_cache_file_compare(const void *left, const void *right) {
+    const ResultCacheFile *a = left, *b = right;
+    if (a->modified.tv_sec != b->modified.tv_sec)
+        return a->modified.tv_sec < b->modified.tv_sec ? -1 : 1;
+    if (a->modified.tv_nsec != b->modified.tv_nsec)
+        return a->modified.tv_nsec < b->modified.tv_nsec ? -1 : 1;
+    return strcmp(a->path, b->path);
+}
+
+static int result_cache_scope(char *out, size_t size) {
+    const char *release = getenv("MUSIC3_RESULT_CACHE_NAMESPACE");
+    if (env_int("MUSIC3_RESULT_CACHE", 0) != 1 || release == NULL || release[0] == '\0') return -1;
+    int n = snprintf(out, size, "%s|dtype=%s|serve=%s|threshold=%s|retries=%d",
+        release, env_str("MUSIC3_ACOUSTIC_DTYPE", "bfloat16"),
+        env_str("MUSIC3_SERVE_EXTRA_ARGS", ""), env_str("MUSIC3_CONTINUITY_THRESHOLD", "75"),
+        env_int("MUSIC3_QUALITY_RETRIES", 1));
+    return n >= 0 && (size_t)n < size ? 0 : -1;
+}
+
+static int result_cache_paths(const char key[MUSIC3_SHA_SIZE], char *wav, size_t wav_size,
+                              char *meta, size_t meta_size) {
+    const char *root = env_str("MUSIC3_RESULT_CACHE_DIR", "/runpod-volume/omniserve/music3/result-cache");
+    if (mkdir(root, 0755) != 0 && errno != EEXIST) return -1;
+    int wn = snprintf(wav, wav_size, "%s/%s.wav", root, key);
+    int mn = snprintf(meta, meta_size, "%s/%s.meta", root, key);
+    return wn >= 0 && mn >= 0 && (size_t)wn < wav_size && (size_t)mn < meta_size ? 0 : -1;
+}
+
+static int write_all(int fd, const void *data, size_t length) {
+    const unsigned char *bytes = data;
+    while (length > 0) {
+        ssize_t written = write(fd, bytes, length);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return -1;
+        bytes += written;
+        length -= (size_t)written;
+    }
+    return 0;
+}
+
+static void result_cache_prune(void) {
+    const char *root = env_str("MUSIC3_RESULT_CACHE_DIR", "/runpod-volume/omniserve/music3/result-cache");
+    int max_entries = env_int("MUSIC3_RESULT_CACHE_ENTRIES", 16);
+    int max_mib = env_int("MUSIC3_RESULT_CACHE_MIB", 4096);
+    if (max_entries < 0) max_entries = 0;
+    if (max_mib < 0) max_mib = 0;
+    long long max_bytes = (long long)max_mib * (1 << 20);
+    DIR *directory = opendir(root);
+    if (directory == NULL) return;
+    ResultCacheFile *files = NULL;
+    size_t count = 0, capacity = 0;
+    long long bytes = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        size_t length = strlen(entry->d_name);
+        if (length != MUSIC3_SHA_SIZE - 1 + 4 || strcmp(entry->d_name + length - 4, ".wav") != 0) continue;
+        if (count == capacity) {
+            size_t next = capacity ? capacity * 2 : 32;
+            ResultCacheFile *grown = realloc(files, next * sizeof(*grown));
+            if (grown == NULL) break;
+            files = grown;
+            capacity = next;
+        }
+        ResultCacheFile *file = &files[count];
+        int n = snprintf(file->path, sizeof(file->path), "%s/%s", root, entry->d_name);
+        struct stat info;
+        if (n < 0 || (size_t)n >= sizeof(file->path) || stat(file->path, &info) != 0 ||
+            !S_ISREG(info.st_mode)) continue;
+        file->bytes = info.st_size;
+#if defined(__APPLE__)
+        file->modified = info.st_mtimespec;
+#else
+        file->modified = info.st_mtim;
+#endif
+        bytes += info.st_size;
+        count++;
+    }
+    closedir(directory);
+    qsort(files, count, sizeof(*files), result_cache_file_compare);
+    for (size_t i = 0; i < count && ((int)(count - i) > max_entries || bytes > max_bytes); ++i) {
+        char meta[PATH_MAX];
+        size_t path_length = strlen(files[i].path);
+        if (path_length + 2 > sizeof(meta)) continue;
+        memcpy(meta, files[i].path, path_length - 4);
+        memcpy(meta + path_length - 4, ".meta", 6);
+        if (unlink(files[i].path) == 0) bytes -= files[i].bytes;
+        unlink(meta);
+    }
+    free(files);
+}
+
+static int result_cache_load(const Music3Request *request, unsigned char **audio, size_t *length,
+                             long long *selected_seed, int *quality_attempts, Music3WavStats *stats) {
+    char scope[8192], key[MUSIC3_SHA_SIZE], wav[PATH_MAX], meta[PATH_MAX];
+    if (result_cache_scope(scope, sizeof(scope)) != 0) return 0;
+    music3_result_cache_key(request, g_model_id, scope, key);
+    if (result_cache_paths(key, wav, sizeof(wav), meta, sizeof(meta)) != 0) return 0;
+    unsigned char *metadata = NULL;
+    size_t metadata_length = 0;
+    if (read_file(meta, &metadata, &metadata_length) != 0) return 0;
+    long long seed = 0;
+    int attempts = 0;
+    int valid_metadata = sscanf((char *)metadata, "%lld %d", &seed, &attempts) == 2 && seed >= 0 && attempts > 0;
+    free(metadata);
+    if (!valid_metadata || read_file(wav, audio, length) != 0) return 0;
+    if (music3_wav_statistics(*audio, *length, stats) != 0) {
+        free(*audio);
+        *audio = NULL;
+        *length = 0;
+        unlink(wav);
+        unlink(meta);
+        return 0;
+    }
+    *selected_seed = seed;
+    *quality_attempts = attempts;
+    utimensat(AT_FDCWD, wav, NULL, 0);
+    utimensat(AT_FDCWD, meta, NULL, 0);
+    return 1;
+}
+
+static void result_cache_store(const Music3Request *original_request, const unsigned char *audio,
+                               size_t length, long long selected_seed, int quality_attempts) {
+    char scope[8192], key[MUSIC3_SHA_SIZE], wav[PATH_MAX], meta[PATH_MAX];
+    if (result_cache_scope(scope, sizeof(scope)) != 0) return;
+    music3_result_cache_key(original_request, g_model_id, scope, key);
+    if (result_cache_paths(key, wav, sizeof(wav), meta, sizeof(meta)) != 0) return;
+    char wav_temp[PATH_MAX], meta_temp[PATH_MAX], metadata[64];
+    int wn = snprintf(wav_temp, sizeof(wav_temp), "%s.tmp-XXXXXX", wav);
+    int mn = snprintf(meta_temp, sizeof(meta_temp), "%s.tmp-XXXXXX", meta);
+    int metadata_length = snprintf(metadata, sizeof(metadata), "%lld %d\n", selected_seed, quality_attempts);
+    if (wn < 0 || mn < 0 || metadata_length < 0 || (size_t)wn >= sizeof(wav_temp) ||
+        (size_t)mn >= sizeof(meta_temp) || (size_t)metadata_length >= sizeof(metadata)) return;
+    int wav_fd = mkstemp(wav_temp), meta_fd = mkstemp(meta_temp);
+    if (wav_fd < 0 || meta_fd < 0) {
+        if (wav_fd >= 0) close(wav_fd);
+        if (meta_fd >= 0) close(meta_fd);
+        unlink(wav_temp); unlink(meta_temp);
+        return;
+    }
+    int wav_written = write_all(wav_fd, audio, length);
+    int meta_written = write_all(meta_fd, metadata, (size_t)metadata_length);
+    close(wav_fd); close(meta_fd);
+    if (wav_written != 0 || meta_written != 0 ||
+        rename(wav_temp, wav) != 0 || rename(meta_temp, meta) != 0) {
+        unlink(wav_temp); unlink(meta_temp);
+        return;
+    }
+    result_cache_prune();
+}
+
 static int json_escape_file(FILE *file, const char *text) {
     fputc('"', file);
     for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
@@ -509,29 +665,38 @@ static int handle_job_json(const char *json, char **result_json) {
         *result_json = error;
         return 400;
     }
+    Music3Request original_request = request;
     double total_started = monotonic_seconds(), download = 0, start = 0, generation = 0, upload = 0;
     long long original_seed = request.seed;
     int quality_attempts = 1;
-    g_server_ready_before_job = g_server_pid > 0 && kill(g_server_pid, 0) == 0 && health();
-    if (start_server(&download, &start) != 0) {
-        *result_json = strdup("{\"error\":\"MiniMax-Music3 server failed to start\"}");
-        return 503;
-    }
     unsigned char *audio = NULL;
     size_t audio_length = 0;
-    if (generate_audio(&request, &audio, &audio_length, &generation) != 0) {
-        *result_json = strdup("{\"error\":\"MiniMax-Music3 returned empty audio\"}");
-        return 502;
-    }
+    long long selected_seed = request.seed;
     Music3WavStats stats = {0};
-    if (music3_wav_statistics(audio, audio_length, &stats) != 0) {
+    int exact_result_cache_hit = result_cache_load(&original_request, &audio, &audio_length,
+                                                    &selected_seed, &quality_attempts, &stats);
+    if (exact_result_cache_hit) {
+        request.seed = selected_seed;
+        g_server_ready_before_job = g_server_pid > 0 && kill(g_server_pid, 0) == 0;
+    } else {
+        g_server_ready_before_job = g_server_pid > 0 && kill(g_server_pid, 0) == 0 && health();
+        if (start_server(&download, &start) != 0) {
+            *result_json = strdup("{\"error\":\"MiniMax-Music3 server failed to start\"}");
+            return 503;
+        }
+        if (generate_audio(&request, &audio, &audio_length, &generation) != 0) {
+            *result_json = strdup("{\"error\":\"MiniMax-Music3 returned empty audio\"}");
+            return 502;
+        }
+    }
+    if (!exact_result_cache_hit && music3_wav_statistics(audio, audio_length, &stats) != 0) {
         free(audio);
         *result_json = strdup("{\"error\":\"generated WAV is invalid\"}");
         return 502;
     }
     int retries = env_int("MUSIC3_QUALITY_RETRIES", 1);
     double threshold = atof(env_str("MUSIC3_CONTINUITY_THRESHOLD", "75"));
-    for (int retry = 0; retry < retries && stats.continuity_score < threshold; ++retry) {
+    for (int retry = 0; !exact_result_cache_hit && retry < retries && stats.continuity_score < threshold; ++retry) {
         Music3Request candidate_request = request;
         candidate_request.seed = original_seed <= LLONG_MAX - retry - 1 ? original_seed + retry + 1 : retry;
         unsigned char *candidate_audio = NULL;
@@ -551,6 +716,8 @@ static int handle_job_json(const char *json, char **result_json) {
             request = candidate_request;
         } else free(candidate_audio);
     }
+    if (!exact_result_cache_hit)
+        result_cache_store(&original_request, audio, audio_length, request.seed, quality_attempts);
     char *inline_b64 = NULL;
     const char *audio_url = NULL;
     if (request.output_upload_url[0]) {
@@ -578,6 +745,7 @@ static int handle_job_json(const char *json, char **result_json) {
         .prefetch_seconds = g_prefetch_seconds, .prefetch_gib = g_prefetch_gib,
         .server_ready_before_job = g_server_ready_before_job, .gpu_name = g_gpu_name,
         .quality_attempts = quality_attempts, .original_seed = original_seed,
+        .exact_result_cache_hit = exact_result_cache_hit,
     };
     if (music3_write_result_json(out, MUSIC3_RESULT_SIZE, &request, &stats, audio_url, inline_b64,
                                  &timings) != 0) {

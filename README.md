@@ -584,6 +584,24 @@ Configure the animation adapter with `OMNISERVE_NATIVE_ANIMATION_UPSTREAM`, opti
 
 The public text-generator.io OpenAPI surface—feature extraction, summarization, speech generation, file/URL transcription, text generation, large generation, image captioning, and legacy engine completion—is explicitly routed. Native worker endpoints for image creation, inpainting, style transfer, captioning, TTS, and STT are also admitted through the same scheduler.
 
+### Exact Music3 repeats
+
+The RunPod Music3 adapter keeps a bounded cache of completed, quality-checked
+WAV masters on its network volume. An identical normalized prompt, lyrics,
+duration and seed returns the same WAV bytes without loading or invoking the
+model; upload URLs are deliberately excluded, so the same master can be sent to
+a new destination. The cache key includes the model, precision/serve settings,
+continuity policy and a release namespace. Quality retries retain the selected
+seed and attempt count in cache metadata, and responses expose
+`exact_result_cache_hit`.
+
+The deployment enables 16 entries / 4 GiB by default. Set
+`MUSIC3_RESULT_CACHE=0` to disable it, adjust `MUSIC3_RESULT_CACHE_ENTRIES` and
+`MUSIC3_RESULT_CACHE_MIB` to bound it, or change
+`MUSIC3_RESULT_CACHE_NAMESPACE` whenever generation behavior changes outside
+the versioned deployment. Fresh requests still use the full quality-gated
+generation path.
+
 Proxied responses are relayed byte-for-byte after incremental framing validation, so `stream:true` stays streaming and WAV/PNG/multipart payloads are not JSON-reencoded. Content-Length and chunked responses retain downstream keep-alive; close-delimited responses close safely. Request bodies grow lazily up to the public edge's 80 MiB limit. Embedded image generation returns PNG bytes.
 
 ## BiRefNet cutout worker
