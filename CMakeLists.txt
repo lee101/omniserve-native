@@ -130,6 +130,27 @@ if(Python3_Interpreter_FOUND)
     )
     set_tests_properties(internal_trust PROPERTIES
         ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    add_test(
+        NAME liveportrait_route
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_liveportrait_route.py"
+    )
+    set_tests_properties(liveportrait_route PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    add_test(
+        NAME liveportrait_worker
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_liveportrait_worker.py"
+    )
+    add_test(
+        NAME depth_worker
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_depth_worker.py"
+    )
+    add_test(
+        NAME depth_route
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_depth_route.py"
+    )
+    set_tests_properties(depth_route PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>"
+    )
     # Skips itself when numpy or libomatte.so is missing (CPU-only CI).
     add_test(
         NAME matte_decontamination

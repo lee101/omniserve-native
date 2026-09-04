@@ -35,6 +35,11 @@ try:
 except ImportError:  # pragma: no cover
     object_store = None
 
+try:
+    import hair_layers
+except ImportError:  # pragma: no cover
+    hair_layers = None
+
 
 MODEL_ID = os.getenv("BIREFNET_MODEL", "ZhengPeng7/BiRefNet")
 DEVICE = os.getenv("BIREFNET_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
@@ -68,6 +73,20 @@ class RemoveBackgroundRequest(BaseModel):
             "decontaminate": DECONTAMINATE if self.decontaminate is None else self.decontaminate,
             "model": MODEL_ID,
             "input_size": INPUT_SIZE,
+            "quality": WEBP_QUALITY if self.output_format.lower() == "webp" else 0,
+        }
+
+
+class HairLayersRequest(BaseModel):
+    image_url: str = Field(min_length=1)
+    output_format: str = DEFAULT_FORMAT
+    cache: bool = True
+
+    def cache_params(self) -> dict[str, Any]:
+        return {
+            "format": self.output_format.lower(),
+            "model": os.getenv("HAIR_SAM2_MODEL", "facebook/sam2.1-hiera-tiny"),
+            "backend": os.getenv("HAIR_BACKEND", "auto"),
             "quality": WEBP_QUALITY if self.output_format.lower() == "webp" else 0,
         }
 
@@ -132,7 +151,7 @@ def load_model() -> None:
     ])
 
 
-def read_image(value: str) -> Image.Image:
+def _download_image_bytes(value: str) -> bytes:
     if value.startswith("data:"):
         try:
             payload = value.split(",", 1)[1]
@@ -141,25 +160,39 @@ def read_image(value: str) -> Image.Image:
             raise HTTPException(400, "invalid data URL") from error
         if len(data) > MAX_DOWNLOAD_BYTES:
             raise HTTPException(413, "source image is too large")
-    else:
-        parsed = urlparse(value)
-        if parsed.scheme not in {"http", "https"}:
-            raise HTTPException(400, "image_url must use http, https, or data")
-        try:
-            with requests.get(value, timeout=(10, 60), stream=True) as response:
-                response.raise_for_status()
-                chunks: list[bytes] = []
-                total = 0
-                for chunk in response.iter_content(1 << 20):
-                    total += len(chunk)
-                    if total > MAX_DOWNLOAD_BYTES:
-                        raise HTTPException(413, "source image is too large")
-                    chunks.append(chunk)
-                data = b"".join(chunks)
-        except requests.RequestException as error:
-            raise HTTPException(502, f"source image download failed: {error}") from error
+        return data
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(400, "image_url must use http, https, or data")
     try:
-        return ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+        with requests.get(value, timeout=(10, 60), stream=True) as response:
+            response.raise_for_status()
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(1 << 20):
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    raise HTTPException(413, "source image is too large")
+                chunks.append(chunk)
+            return b"".join(chunks)
+    except requests.RequestException as error:
+        raise HTTPException(502, f"source image download failed: {error}") from error
+
+
+def read_image(value: str) -> Image.Image:
+    try:
+        return ImageOps.exif_transpose(Image.open(io.BytesIO(_download_image_bytes(value)))).convert("RGB")
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(400, "source is not a supported image") from error
+
+
+def read_image_rgba(value: str) -> Image.Image:
+    try:
+        return ImageOps.exif_transpose(Image.open(io.BytesIO(_download_image_bytes(value)))).convert("RGBA")
+    except HTTPException:
+        raise
     except Exception as error:
         raise HTTPException(400, "source is not a supported image") from error
 
@@ -293,6 +326,7 @@ def health() -> dict[str, Any]:
         "matte_cuda": bool(omatte and omatte.cuda_available()),
         "output_format": DEFAULT_FORMAT,
         "webp_quality": WEBP_QUALITY,
+        "hair_layers": hair_layers is not None,
         "cache": object_store.describe() if (CACHE_ENABLED and object_store) else {"backend": "off"},
     }
 
@@ -371,6 +405,142 @@ def enqueue_background_removal(request: RemoveBackgroundRequest) -> dict[str, An
 
 @app.get("/v1/images/background-removals/jobs/{job_id}")
 def background_removal_job(job_id: str) -> dict[str, Any]:
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "unknown job")
+    job.pop("created", None)
+    job.pop("updated", None)
+    return job
+
+
+def _layer_data_url(content: bytes, media_type: str) -> str:
+    return f"data:{media_type};base64,{base64.b64encode(content).decode()}"
+
+
+def _store_hair_layer(image_url: str, kind: str, content: bytes, output_format: str, params: dict[str, Any]) -> tuple[str | None, str | None]:
+    media_type = "image/webp" if output_format == "webp" else "image/png"
+    if not (CACHE_ENABLED and object_store is not None):
+        return None, None
+    key = object_store.cache_key(image_url, {**params, "layer": kind}, prefix="hair", suffix=output_format)
+    try:
+        url = object_store.put(key, content, media_type)
+    except Exception as error:
+        print(f"hair layer upload failed: {error}")
+        return None, key
+    return url, key
+
+
+def ensure_cutout_rgba(image_url: str) -> Image.Image:
+    image = read_image_rgba(image_url)
+    alpha = np.asarray(image.getchannel("A"))
+    if alpha.size and float((alpha < 250).mean()) > 0.01:
+        return image
+    content = remove_background(image.convert("RGB"), 0.0, False, output_format="png")
+    return Image.open(io.BytesIO(content)).convert("RGBA")
+
+
+def produce_hair_layers(request: HairLayersRequest) -> dict[str, Any]:
+    if hair_layers is None:
+        raise HTTPException(503, "hair layer worker is not loaded")
+    output_format = request.output_format.lower()
+    if output_format not in {"webp", "png"}:
+        raise HTTPException(400, "output_format must be webp or png")
+    params = request.cache_params()
+    if CACHE_ENABLED and request.cache and object_store is not None:
+        front_key = object_store.cache_key(request.image_url, {**params, "layer": "front"}, prefix="hair", suffix=output_format)
+        back_key = object_store.cache_key(request.image_url, {**params, "layer": "back"}, prefix="hair", suffix=output_format)
+        if object_store.exists(front_key) and object_store.exists(back_key):
+            front_url = object_store.public_url(front_key)
+            back_url = object_store.public_url(back_key)
+            if front_url and back_url:
+                return {
+                    "cached": True,
+                    "skipped": False,
+                    "front_hair_url": front_url,
+                    "back_hair_url": back_url,
+                    "url": front_url,
+                    "backend": "cache",
+                }
+
+    rgba = ensure_cutout_rgba(request.image_url)
+    split = hair_layers.split_hair_layers(image=rgba)
+    payload: dict[str, Any] = {
+        "cached": False,
+        "skipped": bool(split["skipped"]),
+        "coverage": float(split["coverage"]),
+        "backend": split["backend"],
+    }
+    if split["skipped"]:
+        return payload
+
+    front_bytes, media_type = encode_image(split["front"], output_format)
+    back_bytes, _ = encode_image(split["back"], output_format)
+    front_url, front_key = _store_hair_layer(request.image_url, "front", front_bytes, output_format, params)
+    back_url, back_key = _store_hair_layer(request.image_url, "back", back_bytes, output_format, params)
+    payload.update({
+        "front_hair_url": front_url,
+        "back_hair_url": back_url,
+        "url": front_url,
+        "front_key": front_key,
+        "back_key": back_key,
+        "media_type": media_type,
+    })
+    if not front_url:
+        payload["front_hair"] = {"data_url": _layer_data_url(front_bytes, media_type)}
+        payload["front_hair_url"] = payload["front_hair"]["data_url"]
+    if not back_url:
+        payload["back_hair"] = {"data_url": _layer_data_url(back_bytes, media_type)}
+        payload["back_hair_url"] = payload["back_hair"]["data_url"]
+    if not payload.get("url"):
+        payload["url"] = payload.get("front_hair_url")
+    return payload
+
+
+def _run_hair_job(job_id: str, request: HairLayersRequest) -> None:
+    _set_job(job_id, status="running")
+    try:
+        result = produce_hair_layers(request)
+    except HTTPException as error:
+        _set_job(job_id, status="error", error=str(error.detail), http_status=error.status_code)
+        return
+    except Exception as error:  # pragma: no cover
+        _set_job(job_id, status="error", error=str(error), http_status=500)
+        return
+    _set_job(job_id, status="done", **result)
+
+
+@app.post("/v1/images/hair-layers")
+def hair_layers_sync(request: HairLayersRequest) -> dict[str, Any]:
+    return produce_hair_layers(request)
+
+
+@app.post("/v1/images/hair-layers/jobs")
+def enqueue_hair_layers(request: HairLayersRequest) -> dict[str, Any]:
+    if CACHE_ENABLED and request.cache and object_store is not None:
+        params = request.cache_params()
+        front_key = object_store.cache_key(request.image_url, {**params, "layer": "front"}, prefix="hair", suffix=request.output_format.lower())
+        back_key = object_store.cache_key(request.image_url, {**params, "layer": "back"}, prefix="hair", suffix=request.output_format.lower())
+        if object_store.exists(front_key) and object_store.exists(back_key):
+            front_url = object_store.public_url(front_key)
+            back_url = object_store.public_url(back_key)
+            if front_url and back_url:
+                return {
+                    "job_id": None,
+                    "status": "done",
+                    "cached": True,
+                    "skipped": False,
+                    "front_hair_url": front_url,
+                    "back_hair_url": back_url,
+                    "url": front_url,
+                }
+    job_id = uuid.uuid4().hex
+    _set_job(job_id, status="queued", cached=False)
+    _job_pool.submit(_run_hair_job, job_id, request)
+    return {"job_id": job_id, "status": "queued", "cached": False, "poll_after_ms": 700}
+
+
+@app.get("/v1/images/hair-layers/jobs/{job_id}")
+def hair_layers_job(job_id: str) -> dict[str, Any]:
     job = get_job(job_id)
     if job is None:
         raise HTTPException(404, "unknown job")

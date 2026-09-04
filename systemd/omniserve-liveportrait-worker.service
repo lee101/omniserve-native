@@ -1,0 +1,21 @@
+[Unit]
+Description=OmniServe LivePortrait cached expression worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/nvme0n1-disk/code/omniserve-native
+Environment=LIVEPORTRAIT_HOST=127.0.0.1
+Environment=LIVEPORTRAIT_PORT=9095
+Environment=LIVEPORTRAIT_UPSTREAM=https://livew.how.nz
+Environment=LIVEPORTRAIT_CACHE_SIZE=512
+Environment=LIVEPORTRAIT_CACHE_TTL_SECONDS=86400
+EnvironmentFile=-/etc/omniserve/liveportrait.env
+ExecStart=/nvme0n1-disk/code/omniserve-native/.venv/bin/python workers/liveportrait_worker.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+[Unit]
+Description=OmniServe Depth Anything V2 worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/nvme0n1-disk/code/omniserve-native
+Environment=DEPTH_HOST=127.0.0.1
+Environment=DEPTH_PORT=9099
+Environment=DEPTH_MODEL=depth-anything/Depth-Anything-V2-Small-hf
+Environment=DEPTH_LOCAL_CONCURRENCY=1
+Environment=DEPTH_PRICE_CREDITS=1
+Environment=DEPTH_TORCH_COMPILE=1
+EnvironmentFile=-/etc/omniserve/depth.env
+ExecStart=/nvme0n1-disk/code/omniserve-native/.venv/bin/python workers/depth_anything_worker.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+import http.server
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class Stub(http.server.BaseHTTPRequestHandler):
+    request_path = ""
+    request_body = b""
+
+    def do_POST(self):
+        Stub.request_path = self.path
+        Stub.request_body = self.rfile.read(int(self.headers.get("content-length") or 0))
+        body = json.dumps({"images": {"eyes_open_mouth_closed": "data:image/png;base64,eA=="}, "worker": "liveportrait"}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def main():
+    binary = os.environ.get("OMNISERVE_NATIVE_BIN")
+    if not binary or not os.path.exists(binary):
+        print("skip: OMNISERVE_NATIVE_BIN not set")
+        return 0
+    upstream_port, gateway_port = free_port(), free_port()
+    stub = http.server.HTTPServer(("127.0.0.1", upstream_port), Stub)
+    threading.Thread(target=stub.serve_forever, daemon=True).start()
+    env = {
+        **os.environ,
+        "OMNISERVE_NATIVE_BIND": "127.0.0.1",
+        "OMNISERVE_NATIVE_LIVEPORTRAIT_UPSTREAM": f"http://127.0.0.1:{upstream_port}",
+        "OMNISERVE_NATIVE_SLOTS": "2",
+        "OMNISERVE_NATIVE_LIVEPORTRAIT_PERMITS": "1",
+    }
+    for key in ("OMNISERVE_NATIVE_LLM_GGUF", "OMNISERVE_NATIVE_LLM_UPSTREAM", "OMNISERVE_NATIVE_SECRET"):
+        env.pop(key, None)
+    process = subprocess.Popen([binary, "--port", str(gateway_port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(100):
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{gateway_port}/v1/models", timeout=1).read()
+                break
+            except Exception:
+                if process.poll() is not None:
+                    print("gateway exited during startup")
+                    return 1
+                time.sleep(0.05)
+        payload = json.dumps({"image_url": "https://cdn.test/portrait.webp"}).encode()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{gateway_port}/v1/expression-pack",
+            data=payload,
+            headers={"content-type": "application/json", "x-omniserve-tier": "paid"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            result = json.loads(response.read())
+        if result.get("worker") != "liveportrait" or Stub.request_path != "/v1/expression-pack" or Stub.request_body != payload:
+            print("LivePortrait relay mismatch")
+            return 1
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{gateway_port}/v1/expression-pack", timeout=5)
+            print("GET unexpectedly accepted")
+            return 1
+        except urllib.error.HTTPError as error:
+            if error.code != 405:
+                print(f"GET returned {error.code}")
+                return 1
+        print("liveportrait route tests passed")
+        return 0
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+        stub.shutdown()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

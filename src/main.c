@@ -28,12 +28,14 @@ typedef struct {
     oproxy_target *image_upstream;
     oproxy_target *art_upstream;
     oproxy_target *birefnet_upstream;
+    oproxy_target *depth_upstream;
     oproxy_target *tts_upstream;
     oproxy_target *stt_upstream;
     oproxy_target *training_upstream;
     oproxy_target *embedding_upstream;
     oproxy_target *multimodal_upstream;
     oproxy_target *animation_upstream;
+    oproxy_target *liveportrait_upstream;
     oproxy_target *threed_upstream;
     oproxy_target *aux_upstream;
     int upstream_timeout_ms;
@@ -41,12 +43,14 @@ typedef struct {
     int image_permits;
     int art_permits;
     int birefnet_permits;
+    int depth_permits;
     int tts_permits;
     int stt_permits;
     int training_permits;
     int embedding_permits;
     int multimodal_permits;
     int animation_permits;
+    int liveportrait_permits;
     int threed_permits;
     int aux_permits;
     oscale *scale;
@@ -57,6 +61,7 @@ typedef struct {
      * work when the local device is full. Paid-only by default for the same
      * reason oscale is: free traffic must never be able to spend money. */
     oproxy_target *image_overflow;
+    oproxy_target *depth_overflow;
     oproxy_target *stt_overflow;
     oproxy_target *tts_overflow;
     unsigned overflow_tier_mask;
@@ -470,6 +475,10 @@ static void handle_models(ohttp_request *req, const app_state *app) {
                                     "Tongyi-MAI/Z-Image-Turbo", "background-art", "proxy-background");
     if (app->birefnet_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_BIREFNET_MODEL") ?:
                                          "ZhengPeng7/BiRefNet", "background-removal", "proxy-c-hot-path");
+    if (app->birefnet_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_HAIR_MODEL") ?:
+                                         "facebook/sam2.1-hiera-tiny", "hair-layers", "proxy-c-hot-path");
+    if (app->depth_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_DEPTH_MODEL") ?:
+                                      "depth-anything/Depth-Anything-V2-Small-hf", "depth-estimation", "proxy-c-hot-path");
     if (app->tts_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_TTS_MODEL") ?:
                                     "upstream-tts", "tts", "proxy");
     if (app->stt_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_STT_MODEL") ?:
@@ -480,6 +489,8 @@ static void handle_models(ohttp_request *req, const app_state *app) {
                                            "upstream-multimodal", "multimodal", "proxy");
     if (app->animation_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_ANIMATION_MODEL") ?:
                                           "nvidia-ace-animation", "animation", "proxy-background");
+    if (app->liveportrait_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_LIVEPORTRAIT_MODEL") ?:
+                                             "KwaiVGI/LivePortrait", "portrait-animation", "proxy-background");
     if (app->threed_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_3D_MODEL") ?:
                                        "microsoft/TRELLIS.2-4B", "image-to-3d", "proxy-background");
 #undef ADD_MODEL
@@ -670,6 +681,7 @@ static void reload_embedded_models_after_background(void) {
 static oproxy_target *overflow_for(const app_state *app, const oproxy_target *local, otier tier) {
     if (!(app->overflow_tier_mask & (1u << (unsigned)tier))) return NULL;
     if (local == app->image_upstream) return app->image_overflow;
+    if (local == app->depth_upstream) return app->depth_overflow;
     if (local == app->stt_upstream) return app->stt_overflow;
     if (local == app->tts_upstream) return app->tts_overflow;
     return NULL;
@@ -1255,18 +1267,40 @@ static void handle_images(ohttp_request *req, app_state *app) {
     char *prompt = oj_strdup(req->body, &toks[p]);
     if (!prompt) { free(toks); respond_error(req, 500, "allocation failed"); return; }
 
-    oimg_req ireq = { .prompt = prompt, .width = 768, .height = 768, .steps = 4, .seed = -1 };
+    char *negative_prompt = NULL;
+    int negative = oj_obj_get(req->body, toks, n, 0, "negative_prompt");
+    if (negative >= 0) {
+        if (toks[negative].type != OJ_STRING || !(negative_prompt = oj_strdup(req->body, &toks[negative]))) {
+            free(prompt);
+            free(toks);
+            respond_error(req, 400, "negative_prompt must be a string");
+            return;
+        }
+    }
+
+    oimg_req ireq = { .prompt = prompt, .negative_prompt = negative_prompt, .width = 768, .height = 768, .steps = 4, .seed = -1 };
     int t = oj_obj_get(req->body, toks, n, 0, "width");
     if (t >= 0) ireq.width = (int)oj_number(req->body, &toks[t], 768);
     t = oj_obj_get(req->body, toks, n, 0, "height");
     if (t >= 0) ireq.height = (int)oj_number(req->body, &toks[t], 768);
     t = oj_obj_get(req->body, toks, n, 0, "steps");
     if (t >= 0) ireq.steps = (int)oj_number(req->body, &toks[t], 4);
+    t = oj_obj_get(req->body, toks, n, 0, "seed");
+    if (t >= 0) ireq.seed = (int64_t)oj_number(req->body, &toks[t], -1);
+
+    if (ireq.seed < -1 || ireq.seed > 2147483647L) {
+        free(negative_prompt);
+        free(prompt);
+        free(toks);
+        respond_error(req, 400, "seed must be between -1 and 2147483647");
+        return;
+    }
 
     free(toks);
     otier tier = request_tier(req);
     int permits = tier == TIER_BACKGROUND ? osched_capacity(app->sched) : app->image_permits;
     if (!osched_acquire_n(app->sched, tier, permits)) {
+        free(negative_prompt);
         free(prompt);
         respond_error(req, 503, "admission timeout; retry");
         return;
@@ -1274,6 +1308,7 @@ static void handle_images(ohttp_request *req, app_state *app) {
     oimg_result result;
     bool ok = osd_generate(&ireq, &result);
     osched_release_n(app->sched, tier, permits);
+    free(negative_prompt);
     free(prompt);
     if (!ok) { respond_error(req, 500, "image generation failed"); return; }
     ohttp_respond(req, 200, "image/png", (const char *)result.png, result.png_len);
@@ -1742,7 +1777,8 @@ static void route(ohttp_request *req, void *user) {
      * HTTP calls - the worker owns the GPU queue - so they take a single permit
      * at the caller's own tier instead of the whole background capacity, or a
      * poll would block behind the very job it is asking about. */
-    if (path_starts_with(req, "/v1/images/background-removals/jobs")) {
+    if (path_starts_with(req, "/v1/images/background-removals/jobs") ||
+        path_starts_with(req, "/v1/images/hair-layers/jobs")) {
         const bool is_post = ohttp_method_is(req, "POST");
         if (!is_post && !ohttp_method_is(req, "GET")) {
             respond_error(req, 405, "GET or POST required");
@@ -1770,6 +1806,22 @@ static void route(ohttp_request *req, void *user) {
                         NULL, mapped_path);
         return;
     }
+    if (ohttp_path_is(req, "/v1/images/hair-layers")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_proxy_as(req, app, app->birefnet_upstream, app->birefnet_permits,
+                        "application/json", "/v1/images/hair-layers");
+        return;
+    }
+    if (ohttp_path_is(req, "/v1/depth-estimations") ||
+        ohttp_path_is(req, "/api/v1/depth-anything-v2")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_proxy_as(req, app, app->depth_upstream, app->depth_permits,
+                        "application/json",
+                        configured_path("OMNISERVE_NATIVE_DEPTH_PATH", "/v1/depth-estimations"));
+        return;
+    }
     if (ohttp_path_is(req, "/v1/animations/generations")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
@@ -1777,6 +1829,16 @@ static void route(ohttp_request *req, void *user) {
             req, app, app->animation_upstream, app->animation_permits,
             "application/json",
             configured_path("OMNISERVE_NATIVE_ANIMATION_PATH", "/v1/animations/generations"),
+            TIER_BACKGROUND);
+        return;
+    }
+    if (ohttp_path_is(req, "/v1/expression-pack")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_proxy_as_tier(
+            req, app, app->liveportrait_upstream, app->liveportrait_permits,
+            "application/json",
+            configured_path("OMNISERVE_NATIVE_LIVEPORTRAIT_PATH", "/v1/expression-pack"),
             TIER_BACKGROUND);
         return;
     }
@@ -1934,9 +1996,11 @@ int main(int argc, char **argv) {
                  "environment: OMNISERVE_NATIVE_LLM_GGUF, _EMBEDDING_GGUF, _SD_MODEL,\n"
                  "             _SECRET, _SLOTS, _LLM_UPSTREAM, _IMAGE_UPSTREAM,\n"
                  "             _ART_UPSTREAM, _ART_PATH, _ART_PERMITS,\n"
-                 "             _BIREFNET_UPSTREAM, _TTS_UPSTREAM, _STT_UPSTREAM,\n"
+                 "             _BIREFNET_UPSTREAM, _DEPTH_UPSTREAM, _DEPTH_PATH, _DEPTH_PERMITS,\n"
+                 "             _TTS_UPSTREAM, _STT_UPSTREAM,\n"
                  "             _EMBEDDING_UPSTREAM, _BIREFNET_PERMITS,\n"
-                 "             _MULTIMODAL_UPSTREAM, _ANIMATION_UPSTREAM, _AUX_UPSTREAM");
+                 "             _MULTIMODAL_UPSTREAM, _ANIMATION_UPSTREAM, _LIVEPORTRAIT_UPSTREAM,\n"
+                 "             _AUX_UPSTREAM");
             return 0;
         }
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = (uint16_t)atoi(argv[++i]);
@@ -1951,12 +2015,14 @@ int main(int argc, char **argv) {
     app.image_permits = configured_permits("OMNISERVE_NATIVE_IMAGE_PERMITS", slots, slots);
     app.art_permits = configured_permits("OMNISERVE_NATIVE_ART_PERMITS", slots, slots);
     app.birefnet_permits = configured_permits("OMNISERVE_NATIVE_BIREFNET_PERMITS", 1, slots);
+    app.depth_permits = configured_permits("OMNISERVE_NATIVE_DEPTH_PERMITS", 1, slots);
     app.tts_permits = configured_permits("OMNISERVE_NATIVE_TTS_PERMITS", 1, slots);
     app.stt_permits = configured_permits("OMNISERVE_NATIVE_STT_PERMITS", 1, slots);
     app.training_permits = configured_permits("OMNISERVE_NATIVE_TRAINING_PERMITS", slots, slots);
     app.embedding_permits = configured_permits("OMNISERVE_NATIVE_EMBEDDING_PERMITS", 1, slots);
     app.multimodal_permits = configured_permits("OMNISERVE_NATIVE_MULTIMODAL_PERMITS", 1, slots);
     app.animation_permits = configured_permits("OMNISERVE_NATIVE_ANIMATION_PERMITS", slots, slots);
+    app.liveportrait_permits = configured_permits("OMNISERVE_NATIVE_LIVEPORTRAIT_PERMITS", 1, slots);
     app.threed_permits = configured_permits("OMNISERVE_NATIVE_3D_PERMITS", slots, slots);
     app.aux_permits = configured_permits("OMNISERVE_NATIVE_AUX_PERMITS", 1, slots);
     const char *admission_env = getenv("OMNISERVE_NATIVE_ADMISSION_TIMEOUT_S");
@@ -2016,12 +2082,14 @@ int main(int argc, char **argv) {
     const char *image_upstream = getenv("OMNISERVE_NATIVE_IMAGE_UPSTREAM");
     const char *art_upstream = getenv("OMNISERVE_NATIVE_ART_UPSTREAM");
     const char *birefnet_upstream = getenv("OMNISERVE_NATIVE_BIREFNET_UPSTREAM");
+    const char *depth_upstream = getenv("OMNISERVE_NATIVE_DEPTH_UPSTREAM");
     const char *tts_upstream = getenv("OMNISERVE_NATIVE_TTS_UPSTREAM");
     const char *stt_upstream = getenv("OMNISERVE_NATIVE_STT_UPSTREAM");
     const char *training_upstream = getenv("OMNISERVE_NATIVE_TRAINING_UPSTREAM");
     const char *embedding_upstream = getenv("OMNISERVE_NATIVE_EMBEDDING_UPSTREAM");
     const char *multimodal_upstream = getenv("OMNISERVE_NATIVE_MULTIMODAL_UPSTREAM");
     const char *animation_upstream = getenv("OMNISERVE_NATIVE_ANIMATION_UPSTREAM");
+    const char *liveportrait_upstream = getenv("OMNISERVE_NATIVE_LIVEPORTRAIT_UPSTREAM");
     const char *threed_upstream = getenv("OMNISERVE_NATIVE_3D_UPSTREAM");
     const char *aux_upstream = getenv("OMNISERVE_NATIVE_AUX_UPSTREAM");
     if (!llm_upstream) llm_upstream = unified_upstream;
@@ -2047,21 +2115,25 @@ int main(int argc, char **argv) {
     CREATE_UPSTREAM(image_upstream, image_upstream, "image");
     CREATE_UPSTREAM(art_upstream, art_upstream, "background art");
     CREATE_UPSTREAM(birefnet_upstream, birefnet_upstream, "birefnet");
+    CREATE_UPSTREAM(depth_upstream, depth_upstream, "depth");
     CREATE_UPSTREAM(tts_upstream, tts_upstream, "TTS");
     CREATE_UPSTREAM(stt_upstream, stt_upstream, "STT");
     CREATE_UPSTREAM(training_upstream, training_upstream, "training");
     CREATE_UPSTREAM(embedding_upstream, embedding_upstream, "embedding");
     CREATE_UPSTREAM(multimodal_upstream, multimodal_upstream, "multimodal");
     CREATE_UPSTREAM(animation_upstream, animation_upstream, "animation");
+    CREATE_UPSTREAM(liveportrait_upstream, liveportrait_upstream, "LivePortrait");
     CREATE_UPSTREAM(threed_upstream, threed_upstream, "3D");
     CREATE_UPSTREAM(aux_upstream, aux_upstream, "auxiliary");
     /* Read once into a local like every other upstream above: the macro
      * expands its url argument twice, so a getenv() passed inline would be
      * called twice and the null check would not cover the dereference. */
     const char *image_overflow_url = getenv("OMNISERVE_NATIVE_IMAGE_OVERFLOW_UPSTREAM");
+    const char *depth_overflow_url = getenv("OMNISERVE_NATIVE_DEPTH_OVERFLOW_UPSTREAM");
     const char *stt_overflow_url = getenv("OMNISERVE_NATIVE_STT_OVERFLOW_UPSTREAM");
     const char *tts_overflow_url = getenv("OMNISERVE_NATIVE_TTS_OVERFLOW_UPSTREAM");
     CREATE_UPSTREAM(image_overflow, image_overflow_url, "image overflow");
+    CREATE_UPSTREAM(depth_overflow, depth_overflow_url, "depth overflow");
     CREATE_UPSTREAM(stt_overflow, stt_overflow_url, "STT overflow");
     CREATE_UPSTREAM(tts_overflow, tts_overflow_url, "TTS overflow");
 #undef CREATE_UPSTREAM
@@ -2188,15 +2260,18 @@ int main(int argc, char **argv) {
     oproxy_target_destroy(app.image_upstream);
     oproxy_target_destroy(app.art_upstream);
     oproxy_target_destroy(app.birefnet_upstream);
+    oproxy_target_destroy(app.depth_upstream);
     oproxy_target_destroy(app.tts_upstream);
     oproxy_target_destroy(app.stt_upstream);
     oproxy_target_destroy(app.training_upstream);
     oproxy_target_destroy(app.embedding_upstream);
     oproxy_target_destroy(app.multimodal_upstream);
     oproxy_target_destroy(app.animation_upstream);
+    oproxy_target_destroy(app.liveportrait_upstream);
     oproxy_target_destroy(app.threed_upstream);
     oproxy_target_destroy(app.aux_upstream);
     oproxy_target_destroy(app.image_overflow);
+    oproxy_target_destroy(app.depth_overflow);
     oproxy_target_destroy(app.stt_overflow);
     oproxy_target_destroy(app.tts_overflow);
     ocapacity_stop(app.capacity);
