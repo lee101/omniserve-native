@@ -28,6 +28,7 @@ void oimage_request_init(oimage_request *request) {
     request->generation.seed = 0;
     request->generation.teleport = false;
     request->generation.teleport_start_step = 0;
+    request->generation.strength = 0.6f;
     request->count = 1;
 }
 
@@ -233,6 +234,8 @@ void oimage_request_free(oimage_request *request) {
     if (!request) return;
     free(request->prompt);
     free(request->negative_prompt);
+    free(request->generation.image_base64);
+    free(request->generation.image_pixels);
     if (request->loras) {
         for (size_t i = 0; i < request->generation.lora_count; ++i) {
             free((char *)request->loras[i].path);
@@ -470,9 +473,17 @@ bool oimage_request_parse(const char *json, size_t json_len, oimage_request *req
         oimage_request_free(request);
         return false;
     }
+    token = oj_obj_get(json, tokens, token_count, 0, "cache");
+    if (token >= 0 && (!token_bool(json, &tokens[token], &request->generation.cache) ||
+                      (request->generation.cache && request->generation.seed < 0))) {
+        set_error(error, error_cap, "cache must be a boolean and requires a nonnegative seed");
+        oimage_request_free(request);
+        return false;
+    }
     token = oj_obj_get(json, tokens, token_count, 0, "teleport");
-    if (token >= 0 && !token_bool(json, &tokens[token], &request->generation.teleport)) {
-        set_error(error, error_cap, "teleport must be a boolean");
+    if (token >= 0 && (!token_bool(json, &tokens[token], &request->generation.teleport) ||
+                      (request->generation.teleport && request->generation.seed < 0))) {
+        set_error(error, error_cap, "teleport must be a boolean and requires a nonnegative seed");
         oimage_request_free(request);
         return false;
     }
@@ -628,6 +639,34 @@ bool oimage_request_parse(const char *json, size_t json_len, oimage_request *req
         return false;
     }
     request->generation.batch_count = request->count;
+    token = oj_obj_get(json, tokens, token_count, 0, "image_base64");
+    if (token >= 0) {
+        if (tokens[token].type != OJ_STRING ||
+            !(request->generation.image_base64 = oj_strdup(json, &tokens[token])) ||
+            !request->generation.image_base64[0] ||
+            strlen(request->generation.image_base64) > (8u << 20)) {
+            set_error(error, error_cap, "image_base64 must contain at most 8 MiB of base64 PNG or JPEG");
+            oimage_request_free(request);
+            return false;
+        }
+        if (request->generation.teleport) {
+            set_error(error, error_cap, "latent teleportation is not supported for img2img");
+            oimage_request_free(request);
+            return false;
+        }
+    }
+    token = oj_obj_get(json, tokens, token_count, 0, "strength");
+    if (token >= 0) {
+        double strength;
+        if (!request->generation.image_base64 ||
+            !token_finite_double(json, &tokens[token], &strength) ||
+            strength <= 0.0 || strength > 1.0) {
+            set_error(error, error_cap, "strength requires image_base64 and must be in (0, 1]");
+            oimage_request_free(request);
+            return false;
+        }
+        request->generation.strength = (float)strength;
+    }
     return true;
 }
 
@@ -705,6 +744,20 @@ bool oimage_openai_response(const oimg_result *result, const char *model, long l
             seed + (long long)i, (long long)(result->elapsed_ms + 0.5), format);
         if (wrote < 0 || (size_t)wrote >= capacity - used) { free(json); return false; }
         used += (size_t)wrote;
+        if (result->denoiser_cache_threshold > 0.0f) {
+            wrote = snprintf(json + used, capacity - used,
+                ",\"denoiser_cache\":{\"requested\":\"easycache\",\"approximate\":true,\"threshold\":%.6f}",
+                result->denoiser_cache_threshold);
+            if (wrote < 0 || (size_t)wrote >= capacity - used) { free(json); return false; }
+            used += (size_t)wrote;
+        }
+        if (result->cache_requested) {
+            wrote = snprintf(json + used, capacity - used,
+                ",\"cache\":{\"method\":\"exact_request_result\",\"hit\":%s}",
+                result->cache_hit ? "true" : "false");
+            if (wrote < 0 || (size_t)wrote >= capacity - used) { free(json); return false; }
+            used += (size_t)wrote;
+        }
         if (result->teleport_requested && count == 1) {
             const char *method = result->teleport_result_cache_hit
                 ? "exact_prompt_result_cache"

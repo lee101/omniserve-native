@@ -101,15 +101,31 @@ if(WITH_SD AND EXISTS "${SD_DIR}/build/bin/libstable-diffusion.so")
     target_include_directories(omniserve-native SYSTEM BEFORE PRIVATE "${SD_DIR}/ggml/examples")
     target_include_directories(omniserve-native SYSTEM PRIVATE "${SD_DIR}/include")
     target_include_directories(omniserve-native SYSTEM PRIVATE "${SD_DIR}/thirdparty")
+    add_executable(onative_image_decode_tests tests/test_image_decode.c src/backend_sd.c)
+    target_compile_definitions(onative_image_decode_tests PRIVATE USE_SD)
+    target_include_directories(onative_image_decode_tests SYSTEM PRIVATE
+        "${SD_DIR}/ggml/examples" "${SD_DIR}/include" "${SD_DIR}/thirdparty")
+    target_link_libraries(onative_image_decode_tests PRIVATE onative_core)
+    add_library(onative_sd_cache_stub SHARED tests/sd_cache_stub.c)
+    target_include_directories(onative_sd_cache_stub SYSTEM PRIVATE "${SD_DIR}/include")
 endif()
 
 enable_testing()
+if(TARGET onative_image_decode_tests)
+    add_test(NAME image_decode COMMAND onative_image_decode_tests)
+endif()
 add_executable(onative_tests tests/test_core.c src/backend_llama.c src/docs.c)
 target_include_directories(onative_tests PRIVATE include)
 target_link_libraries(onative_tests PRIVATE onative_core)
 add_test(NAME core COMMAND onative_tests)
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+    if(TARGET onative_sd_cache_stub)
+        add_test(NAME image_cache_concurrency COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/tests/test_image_cache_concurrency.py")
+        set_tests_properties(image_cache_concurrency PROPERTIES ENVIRONMENT
+            "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
+    endif()
     add_test(
         NAME trellis2_worker
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_trellis2_worker.py"

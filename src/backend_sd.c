@@ -3,6 +3,7 @@
 #ifdef USE_SD
 
 #include <dlfcn.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,58 @@
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#define STBI_NO_STDIO
+#define STBI_MAX_DIMENSIONS 4096
+#include "stb_image.h"
+
+static int decode_digit(unsigned char value) {
+    if (value >= 'A' && value <= 'Z') return value - 'A';
+    if (value >= 'a' && value <= 'z') return value - 'a' + 26;
+    if (value >= '0' && value <= '9') return value - '0' + 52;
+    if (value == '+') return 62;
+    if (value == '/') return 63;
+    return -1;
+}
+
+bool osd_prepare_image(oimg_req *req) {
+    if (!req->image_base64) return true;
+    const char *src = req->image_base64;
+    size_t len = strlen(src);
+    if (!len || len > (8u << 20) || len % 4) return false;
+    unsigned char *bytes = malloc(len / 4 * 3);
+    if (!bytes) return false;
+    size_t used = 0;
+    bool valid = true;
+    for (size_t i = 0; i < len; i += 4) {
+        int a = decode_digit((unsigned char)src[i]);
+        int b = decode_digit((unsigned char)src[i + 1]);
+        bool pad_c = src[i + 2] == '=';
+        bool pad_d = src[i + 3] == '=';
+        int c = pad_c ? 0 : decode_digit((unsigned char)src[i + 2]);
+        int d = pad_d ? 0 : decode_digit((unsigned char)src[i + 3]);
+        if (a < 0 || b < 0 || c < 0 || d < 0 ||
+            (pad_c && !pad_d) || ((pad_c || pad_d) && i + 4 != len) ||
+            (pad_c && (b & 15)) || (pad_d && !pad_c && (c & 3))) {
+            valid = false;
+            break;
+        }
+        bytes[used++] = (unsigned char)((a << 2) | (b >> 4));
+        if (!pad_c) bytes[used++] = (unsigned char)((b << 4) | (c >> 2));
+        if (!pad_d) bytes[used++] = (unsigned char)((c << 6) | d);
+    }
+    int width = 0, height = 0, channels = 0;
+    if (valid && stbi_info_from_memory(bytes, (int)used, &width, &height, &channels) &&
+        width > 0 && height > 0 && width <= 4096 && height <= 4096) {
+        req->image_pixels = stbi_load_from_memory(bytes, (int)used,
+            &req->image_width, &req->image_height, &channels, 3);
+    }
+    free(bytes);
+    return req->image_pixels != NULL;
+}
 
 typedef void (*fn_ctx_params_init)(sd_ctx_params_t *);
 typedef sd_ctx_t *(*fn_new_sd_ctx)(const sd_ctx_params_t *);
@@ -84,11 +137,17 @@ static bool sd_lib_load(void) {
 
 static sd_ctx_t *g_sd;
 static pthread_mutex_t g_sd_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_sd_name[256];
+static bool g_reference_edit;
+
+bool osd_reference_edit_ready(void) { return g_sd && g_reference_edit; }
 
 typedef struct {
     char *prompt;
     char *negative_prompt;
+    char *image_base64;
+    float strength;
     int width;
     int height;
     int steps;
@@ -134,7 +193,8 @@ static float sd_env_float(const char *name, float fallback, float minimum, float
     if (!value || !value[0]) return fallback;
     char *end = NULL;
     float parsed = strtof(value, &end);
-    if (!end || end == value || *end || parsed < minimum || parsed > maximum) return fallback;
+    if (!end || end == value || *end || !isfinite(parsed) ||
+        parsed < minimum || parsed > maximum) return fallback;
     return parsed;
 }
 
@@ -169,12 +229,15 @@ static char *lora_cache_key(const oimg_req *req) {
 static bool cache_key_equal(const latent_cache_entry *entry, const oimg_req *req,
                             int resume_step, const char *lora_key) {
     const char *negative = req->negative_prompt ? req->negative_prompt : "";
-    return entry->latent && entry->width == req->width && entry->height == req->height &&
+    return entry->prompt && entry->width == req->width && entry->height == req->height &&
            entry->steps == req->steps && entry->guidance_scale == req->guidance_scale &&
            entry->seed == req->seed && entry->resume_step == resume_step &&
            strcmp(entry->lora_key ? entry->lora_key : "", lora_key) == 0 &&
            strcmp(entry->prompt, req->prompt) == 0 &&
-           strcmp(entry->negative_prompt, negative) == 0;
+           strcmp(entry->negative_prompt, negative) == 0 &&
+           entry->strength == req->strength &&
+           strcmp(entry->image_base64 ? entry->image_base64 : "",
+                  req->image_base64 ? req->image_base64 : "") == 0;
 }
 
 static latent_cache_entry *cache_find(const oimg_req *req, int resume_step) {
@@ -195,6 +258,7 @@ static void cache_entry_clear(latent_cache_entry *entry) {
     if (entry->latent && p_free_latent) p_free_latent(entry->latent);
     free(entry->prompt);
     free(entry->negative_prompt);
+    free(entry->image_base64);
     free(entry->lora_key);
     free(entry->encoded_image);
     memset(entry, 0, sizeof *entry);
@@ -203,7 +267,7 @@ static void cache_entry_clear(latent_cache_entry *entry) {
 static bool cache_insert(const oimg_req *req, int resume_step, sd_latent_t *latent) {
     latent_cache_entry *slot = NULL;
     for (int i = 0; i < g_latent_cache_size; i++) {
-        if (!g_latent_cache[i].latent) {
+        if (!g_latent_cache[i].prompt) {
             slot = &g_latent_cache[i];
             break;
         }
@@ -213,15 +277,19 @@ static bool cache_insert(const oimg_req *req, int resume_step, sd_latent_t *late
     char *prompt = strdup(req->prompt);
     char *negative = strdup(req->negative_prompt ? req->negative_prompt : "");
     char *lora_key = lora_cache_key(req);
-    if (!prompt || !negative || !lora_key) {
+    char *image_base64 = req->image_base64 ? strdup(req->image_base64) : NULL;
+    if (!prompt || !negative || !lora_key || (req->image_base64 && !image_base64)) {
         free(prompt);
         free(negative);
         free(lora_key);
+        free(image_base64);
         return false;
     }
     cache_entry_clear(slot);
     slot->prompt = prompt;
     slot->negative_prompt = negative;
+    slot->image_base64 = image_base64;
+    slot->strength = req->strength;
     slot->width = req->width;
     slot->height = req->height;
     slot->steps = req->steps;
@@ -258,6 +326,23 @@ static bool cache_copy_encoded_result(const latent_cache_entry *entry, oimg_resu
     return true;
 }
 
+bool osd_try_cached_result(const oimg_req *req, oimg_result *out) {
+    if (!g_sd || !req->cache || req->teleport || req->seed < 0 || req->batch_count > 1) return false;
+    memset(out, 0, sizeof *out);
+    double started = now_ms();
+    pthread_mutex_lock(&g_cache_lock);
+    latent_cache_entry *entry = cache_find(req, 0);
+    bool found = entry && cache_copy_encoded_result(entry, out);
+    pthread_mutex_unlock(&g_cache_lock);
+    if (found) {
+        out->cache_requested = out->cache_hit = true;
+        out->denoiser_cache_threshold = sd_env_float(
+            "OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD", 0.0f, 0.0f, 1.0f);
+        out->elapsed_ms = now_ms() - started;
+    }
+    return found;
+}
+
 static void cache_store_encoded_result(latent_cache_entry *entry, const oimg_result *out) {
     if (!entry || out->image_count != 1 || !out->images || !out->image_lens ||
         !out->images[0] || !out->image_lens[0] || out->image_lens[0] > (64u << 20)) return;
@@ -277,6 +362,7 @@ bool osd_init(const char *model_path) {
     const char *diffusion = getenv("OMNISERVE_NATIVE_SD_DIFFUSION_MODEL");
     const char *vae = getenv("OMNISERVE_NATIVE_SD_VAE");
     const char *llm = getenv("OMNISERVE_NATIVE_SD_LLM");
+    const char *llm_vision = getenv("OMNISERVE_NATIVE_SD_LLM_VISION");
     const char *taesd = getenv("OMNISERVE_NATIVE_SD_TAESD");
     const char *max_vram = getenv("OMNISERVE_NATIVE_SD_MAX_VRAM");
     const char *backend = getenv("OMNISERVE_NATIVE_SD_BACKEND");
@@ -288,11 +374,12 @@ bool osd_init(const char *model_path) {
     }
     if (vae && vae[0]) params.vae_path = vae;
     if (llm && llm[0]) params.llm_path = llm;
+    if (llm_vision && llm_vision[0]) params.llm_vision_path = llm_vision;
     if (taesd && taesd[0]) params.taesd_path = taesd;
     if (max_vram && max_vram[0]) params.max_vram = max_vram;
     if (backend && backend[0]) params.backend = backend;
     if (params_backend && params_backend[0]) params.params_backend = params_backend;
-    params.n_threads = -1;
+    params.n_threads = sd_env_int("OMNISERVE_NATIVE_SD_THREADS", -1, 1, 256);
     params.flash_attn = sd_env_flag("OMNISERVE_NATIVE_SD_FLASH_ATTN", true);
     params.diffusion_flash_attn = sd_env_flag("OMNISERVE_NATIVE_SD_DIFFUSION_FLASH_ATTN", true);
     params.stream_layers = sd_env_flag("OMNISERVE_NATIVE_SD_STREAM_LAYERS", false);
@@ -303,14 +390,14 @@ bool osd_init(const char *model_path) {
     if (model_args && model_args[0]) params.model_args = model_args;
     g_sd = p_new_sd_ctx(&params);
     if (!g_sd) return false;
+    g_reference_edit = sd_env_flag("OMNISERVE_NATIVE_SD_REFERENCE_EDIT", false);
     const char *named_path = diffusion && diffusion[0] ? diffusion : model_path;
     const char *slash = strrchr(named_path, '/');
     snprintf(g_sd_name, sizeof g_sd_name, "%s", slash ? slash + 1 : named_path);
     char *dot = strrchr(g_sd_name, '.');
     if (dot) *dot = 0;
     g_latent_cache_size = sd_env_int("OMNISERVE_NATIVE_SD_TELEPORT_CACHE_SIZE", 64, 0, 256);
-    if (g_latent_cache_size > 0 && p_latent_params_init &&
-        p_generate_image_with_latent && p_free_latent) {
+    if (g_latent_cache_size > 0) {
         g_latent_cache = calloc((size_t)g_latent_cache_size, sizeof *g_latent_cache);
         if (!g_latent_cache) g_latent_cache_size = 0;
     }
@@ -388,6 +475,23 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
             "OMNISERVE_NATIVE_SD_VAE_TILE_OVERLAP", 0.5f, 0.0f, 0.95f);
     }
     params.seed = req->seed;
+    sd_image_t source_image = {0};
+    if (req->image_pixels) {
+        source_image = (sd_image_t){
+            .width = (uint32_t)req->image_width,
+            .height = (uint32_t)req->image_height,
+            .channel = 3, .data = req->image_pixels,
+        };
+        if (g_reference_edit) {
+            params.ref_images = &source_image;
+            params.ref_images_count = 1;
+            params.sample_params.flow_shift = sd_env_float(
+                "OMNISERVE_NATIVE_SD_FLOW_SHIFT", 3.0f, 0.1f, 20.0f);
+        } else {
+            params.init_image = source_image;
+            params.strength = req->strength;
+        }
+    }
     params.batch_count = req->batch_count > 0 ? req->batch_count : 1;
     sd_lora_t *loras = NULL;
     if (req->lora_count) {
@@ -402,6 +506,19 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     }
 
     out->teleport_requested = req->teleport;
+    out->cache_requested = req->cache;
+    /* Static per-process setting: result-cache entries never cross profiles.
+     * Latent replay requires a dense trajectory, so it cannot use EasyCache. */
+    if (!req->teleport) {
+        float threshold = sd_env_float("OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD", 0.0f, 0.0f, 1.0f);
+        if (threshold > 0.0f) {
+            params.cache.mode = SD_CACHE_EASYCACHE;
+            params.cache.reuse_threshold = threshold;
+            params.cache.start_percent = 0.2f;
+            params.cache.end_percent = 0.8f;
+            out->denoiser_cache_threshold = threshold;
+        }
+    }
     out->teleport_capture_step = -1;
     out->teleport_resume_step = 0;
 
@@ -411,7 +528,21 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     int image_count = 0;
     int cache_resume_step = 0;
     bool ok = false;
-    if (req->teleport && params.batch_count == 1 &&
+    bool result_cache = req->cache && !req->teleport && req->seed >= 0 && params.batch_count == 1;
+    if (result_cache) {
+        pthread_mutex_lock(&g_cache_lock);
+        latent_cache_entry *cached = cache_find(req, 0);
+        bool hit = cached && cache_copy_encoded_result(cached, out);
+        pthread_mutex_unlock(&g_cache_lock);
+        if (hit) {
+            out->cache_hit = true;
+            out->elapsed_ms = now_ms() - started;
+            pthread_mutex_unlock(&g_sd_lock);
+            free(loras);
+            return true;
+        }
+    }
+    if (req->teleport && !req->image_pixels && params.batch_count == 1 &&
         req->steps > 1 && latent_api_ready()) {
         int default_resume = sd_env_int(
             "OMNISERVE_NATIVE_SD_TELEPORT_START_STEP", req->steps - 1, 1, 99);
@@ -419,8 +550,11 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
             ? req->teleport_start_step : default_resume;
         if (resume_step >= req->steps) resume_step = req->steps - 1;
         cache_resume_step = resume_step;
+        pthread_mutex_lock(&g_cache_lock);
         latent_cache_entry *cached = cache_find(req, resume_step);
-        if (cached && cache_copy_encoded_result(cached, out)) {
+        bool hit = cached && cache_copy_encoded_result(cached, out);
+        pthread_mutex_unlock(&g_cache_lock);
+        if (hit) {
             out->teleport_used = true;
             out->teleport_cache_hit = true;
             out->teleport_result_cache_hit = true;
@@ -447,7 +581,10 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
             out->teleport_capture_step = resume_step - 1;
             out->teleport_resume_step = replay.resume_step;
             if (captured) {
-                if (!cache_insert(req, resume_step, captured)) {
+                pthread_mutex_lock(&g_cache_lock);
+                bool inserted = cache_insert(req, resume_step, captured);
+                pthread_mutex_unlock(&g_cache_lock);
+                if (!inserted) {
                     fprintf(stderr, "diffusion teleport latent cache insert failed\n");
                     p_free_latent(captured);
                 }
@@ -456,7 +593,11 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
             }
         } else {
             if (captured) p_free_latent(captured);
-            if (cached) cache_entry_clear(cached);
+            if (cached) {
+                pthread_mutex_lock(&g_cache_lock);
+                cache_entry_clear(cached);
+                pthread_mutex_unlock(&g_cache_lock);
+            }
         }
     }
     if (!ok) {
@@ -524,10 +665,19 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     out->png = out->images[0];
     out->png_len = out->image_lens[0];
     out->format = use_webp ? "webp" : "png";
+    if (result_cache) {
+        pthread_mutex_lock(&g_sd_lock);
+        pthread_mutex_lock(&g_cache_lock);
+        if (cache_insert(req, 0, NULL)) cache_store_encoded_result(cache_find(req, 0), out);
+        pthread_mutex_unlock(&g_cache_lock);
+        pthread_mutex_unlock(&g_sd_lock);
+    }
     if (out->teleport_used && cache_resume_step > 0 && out->image_count == 1) {
         pthread_mutex_lock(&g_sd_lock);
+        pthread_mutex_lock(&g_cache_lock);
         latent_cache_entry *entry = cache_find(req, cache_resume_step);
         if (entry) cache_store_encoded_result(entry, out);
+        pthread_mutex_unlock(&g_cache_lock);
         pthread_mutex_unlock(&g_sd_lock);
     }
     return true;

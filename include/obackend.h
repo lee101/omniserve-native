@@ -124,6 +124,13 @@ typedef struct {
     int teleport_start_step;
     const oimg_lora *loras;
     size_t lora_count;
+    /* Owned by oimage_request; decoded RGB is prepared before GPU admission. */
+    char *image_base64;
+    unsigned char *image_pixels;
+    int image_width;
+    int image_height;
+    float strength;
+    bool cache;
 } oimg_req;
 
 typedef struct {
@@ -136,6 +143,9 @@ typedef struct {
     bool images_malloc_owned;
     double elapsed_ms;
     bool teleport_requested;
+    bool cache_requested;
+    bool cache_hit;
+    float denoiser_cache_threshold; /* zero disables approximate EasyCache */
     bool teleport_used;
     bool teleport_cache_hit;
     bool teleport_result_cache_hit;
@@ -147,6 +157,9 @@ bool osd_init(const char *model_path);
 bool osd_ready(void);
 const char *osd_model_name(void);
 bool osd_generate(const oimg_req *req, oimg_result *out);
+bool osd_try_cached_result(const oimg_req *req, oimg_result *out);
+bool osd_prepare_image(oimg_req *req);
+bool osd_reference_edit_ready(void);
 void osd_result_free(oimg_result *r);
 
 #ifdef __cplusplus

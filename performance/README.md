@@ -1,5 +1,8 @@
 # Native performance profiles
 
+See [Qwen Edit and RTX 5090 evaluation](qwen-edit-5090.md) for native GPU
+encoder placement, exact-cache concurrency, query threads, and edit sweeps.
+
 `native-core.md` is a reproducible Callgrind and Massif report for the C HTTP,
 proxy, JSON, and scheduler test workload. Its raw inputs are retained beside it.
 
@@ -43,3 +46,12 @@ ModernBERT latency is model inference dominated. The transport and test profiles
 showed no allocation churn worth trading correctness or maintainability for, so
 no additional profile-only code changes were made; the production restart was
 limited to the API compatibility and routing deployment.
+# Shared production host
+
+See [2026-09-05 baseline and rollout gates](shared-host-2026-09-05.md).
+`python3 tools/shared_host_preflight.py --disk-path /nvme0n1-disk` prints a
+read-only JSON snapshot (no model loading, provider calls, or service changes).
+Add `--model /path/to/model.gguf --runtime-gib 2 --reserve-gib 2 --target-gib 24`
+to test a provisional capacity budget. Runtime/KV memory must be measured for
+the actual model, context, concurrency and backend; 2 GiB is not a guarantee.
+Exit 2 means insufficient/unknown GPU capacity. This is not a VRAM reservation.

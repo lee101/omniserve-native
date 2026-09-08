@@ -1,0 +1,353 @@
+[
+  {
+    "threads": 4,
+    "case": "short",
+    "repeat": 0,
+    "wall_ms": 8297.594224102795,
+    "usage": {
+      "prompt_tokens": 40,
+      "cached_prompt_tokens": 0,
+      "completion_tokens": 36,
+      "total_tokens": 76
+    },
+    "text": "1, 4, 9, 16, 25, 36, 49, 64, 81, 100"
+  },
+  {
+    "threads": 4,
+    "case": "short",
+    "repeat": 1,
+    "wall_ms": 7883.274949155748,
+    "usage": {
+      "prompt_tokens": 40,
+      "cached_prompt_tokens": 39,
+      "completion_tokens": 36,
+      "total_tokens": 76
+    },
+    "text": "1, 4, 9, 16, 25, 36, 49, 64, 81, 100"
+  },
+  {
+    "threads": 4,
+    "case": "short",
+    "repeat": 2,
+    "wall_ms": 9508.959618862718,
+    "usage": {
+      "prompt_tokens": 40,
+      "cached_prompt_tokens": 39,
+      "completion_tokens": 36,
+      "total_tokens": 76
+    },
+    "text": "1, 4, 9, 16, 25, 36, 49, 64, 81, 100"
+  },
+  {
+    "threads": 4,
+    "case": "long",
+    "repeat": 0,
+    "wall_ms": 3691.1638379096985,
+    "usage": {
+      "prompt_tokens": 494,
+      "cached_prompt_tokens": 19,
+      "completion_tokens": 1,
+      "total_tokens": 495
+    },
+    "text": "Copper"
+  },
+  {
+    "threads": 4,
+    "case": "long",
+    "repeat": 1,
+    "wall_ms": 521.9183987937868,
+    "usage": {
+      "prompt_tokens": 494,
+      "cached_prompt_tokens": 493,
+      "completion_tokens": 1,
+      "total_tokens": 495
+    },
+    "text": "Copper"
+  },
+  {
+    "threads": 4,
+    "case": "long",
+    "repeat": 2,
+    "wall_ms": 451.71034010127187,
+    "usage": {
+      "prompt_tokens": 494,
+      "cached_prompt_tokens": 493,
+      "completion_tokens": 1,
+      "total_tokens": 495
+    },
+    "text": "Copper"
+  },
+  {
+    "threads": 4,
+    "case": "code",
+    "repeat": 0,
+    "wall_ms": 13888.906366191804,
+    "usage": {
+      "prompt_tokens": 45,
+      "cached_prompt_tokens": 19,
+      "completion_tokens": 48,
+      "total_tokens": 93
+    },
+    "text": "```python\ndef get_larger(num1, num2):\n  \"\"\"\n  Returns the larger of two numbers.\n\n  Args:\n    num1: The first number.\n    num2: The second number."
+  },
+  {
+    "threads": 4,
+    "case": "code",
+    "repeat": 1,
+    "wall_ms": 10772.084431257099,
+    "usage": {
+      "prompt_tokens": 45,
+      "cached_prompt_tokens": 44,
+      "completion_tokens": 48,
+      "total_tokens": 93
+    },
+    "text": "```python\ndef get_larger(num1, num2):\n  \"\"\"\n  Returns the larger of two numbers.\n\n  Args:\n    num1: The first number.\n    num2: The second number."
+  },
+  {
+    "threads": 4,
+    "case": "code",
+    "repeat": 2,
+    "wall_ms": 11971.015113871545,
+    "usage": {
+      "prompt_tokens": 45,
+      "cached_prompt_tokens": 44,
+      "completion_tokens": 48,
+      "total_tokens": 93
+    },
+    "text": "```python\ndef get_larger(num1, num2):\n  \"\"\"\n  Returns the larger of two numbers.\n\n  Args:\n    num1: The first number.\n    num2: The second number."
+  },
+  {
+    "threads": 8,
+    "case": "short",
+    "repeat": 0,
+    "wall_ms": 7999.090142082423,
+    "usage": {
+      "prompt_tokens": 40,
+      "cached_prompt_tokens": 0,
+      "completion_tokens": 36,
+      "total_tokens": 76
+    },
+    "text": "1, 4, 9, 16, 25, 36, 49, 64, 81, 100"
+  },
+  {
+    "threads": 8,
+    "case": "short",
+    "repeat": 1,
+    "wall_ms": 7489.261620212346,
+    "usage": {
+      "prompt_tokens": 40,
+      "cached_prompt_tokens": 39,
+      "completion_tokens": 36,
+      "total_tokens": 76
+    },
+    "text": "1, 4, 9, 16, 25, 36, 49, 64, 81, 100"
+  },
+  {
+    "threads": 8,
+    "case": "short",
+    "repeat": 2,
+    "wall_ms": 7454.919452778995,
+    "usage": {
+      "prompt_tokens": 40,
+      "cached_prompt_tokens": 39,
+      "completion_tokens": 36,
+      "total_tokens": 76
+    },
+    "text": "1, 4, 9, 16, 25, 36, 49, 64, 81, 100"
+  },
+  {
+    "threads": 8,
+    "case": "long",
+    "repeat": 0,
+    "wall_ms": 3502.1938872523606,
+    "usage": {
+      "prompt_tokens": 494,
+      "cached_prompt_tokens": 19,
+      "completion_tokens": 1,
+      "total_tokens": 495
+    },
+    "text": "Copper"
+  },
+  {
+    "threads": 8,
+    "case": "long",
+    "repeat": 1,
+    "wall_ms": 335.30004508793354,
+    "usage": {
+      "prompt_tokens": 494,
+      "cached_prompt_tokens": 493,
+      "completion_tokens": 1,
+      "total_tokens": 495
+    },
+    "text": "Copper"
+  },
+  {
+    "threads": 8,
+    "case": "long",
+    "repeat": 2,
+    "wall_ms": 367.3671870492399,
+    "usage": {
+      "prompt_tokens": 494,
+      "cached_prompt_tokens": 493,
+      "completion_tokens": 1,
+      "total_tokens": 495
+    },
+    "text": "Copper"
+  },
+  {
+    "threads": 8,
+    "case": "code",
+    "repeat": 0,
+    "wall_ms": 11052.953389007598,
+    "usage": {
+      "prompt_tokens": 45,
+      "cached_prompt_tokens": 19,
+      "completion_tokens": 48,
+      "total_tokens": 93
+    },
+    "text": "```python\ndef get_larger(num1, num2):\n  \"\"\"\n  Returns the larger of two numbers.\n\n  Args:\n    num1: The first number.\n    num2: The second number."
+  },
+  {
+    "threads": 8,
+    "case": "code",
+    "repeat": 1,
+    "wall_ms": 8134.172091260552,
+    "usage": {
+      "prompt_tokens": 45,
+      "cached_prompt_tokens": 44,
+      "completion_tokens": 48,
+      "total_tokens": 93
+    },
+    "text": "```python\ndef get_larger(num1, num2):\n  \"\"\"\n  Returns the larger of two numbers.\n\n  Args:\n    num1: The first number.\n    num2: The second number."
+  },
+  {
+    "threads": 8,
+    "case": "code",
+    "repeat": 2,
+    "wall_ms": 7854.130837600678,
+    "usage": {
+      "prompt_tokens": 45,
+      "cached_prompt_tokens": 44,
+      "completion_tokens": 48,
+      "total_tokens": 93
+    },
+    "text": "```python\ndef get_larger(num1, num2):\n  \"\"\"\n  Returns the larger of two numbers.\n\n  Args:\n    num1: The first number.\n    num2: The second number."
+  },
+  {
+    "threads": 16,
+    "case": "short",
+    "repeat": 0,
+    "wall_ms": 8225.825275760144,
+    "usage": {
+      "prompt_tokens": 40,
+      "cached_prompt_tokens": 0,
+      "completion_tokens": 36,
+      "total_tokens": 76
+    },
+    "text": "1, 4, 9, 16, 25, 36, 49, 64, 81, 100"
+  },
+  {
+    "threads": 16,
+    "case": "short",
+    "repeat": 1,
+    "wall_ms": 7571.751823183149,
+    "usage": {
+      "prompt_tokens": 40,
+      "cached_prompt_tokens": 39,
+      "completion_tokens": 36,
+      "total_tokens": 76
+    },
+    "text": "1, 4, 9, 16, 25, 36, 49, 64, 81, 100"
+  },
+  {
+    "threads": 16,
+    "case": "short",
+    "repeat": 2,
+    "wall_ms": 8750.79665100202,
+    "usage": {
+      "prompt_tokens": 40,
+      "cached_prompt_tokens": 39,
+      "completion_tokens": 36,
+      "total_tokens": 76
+    },
+    "text": "1, 4, 9, 16, 25, 36, 49, 64, 81, 100"
+  },
+  {
+    "threads": 16,
+    "case": "long",
+    "repeat": 0,
+    "wall_ms": 3648.835873696953,
+    "usage": {
+      "prompt_tokens": 494,
+      "cached_prompt_tokens": 19,
+      "completion_tokens": 1,
+      "total_tokens": 495
+    },
+    "text": "Copper"
+  },
+  {
+    "threads": 16,
+    "case": "long",
+    "repeat": 1,
+    "wall_ms": 520.4602372832596,
+    "usage": {
+      "prompt_tokens": 494,
+      "cached_prompt_tokens": 493,
+      "completion_tokens": 1,
+      "total_tokens": 495
+    },
+    "text": "Copper"
+  },
+  {
+    "threads": 16,
+    "case": "long",
+    "repeat": 2,
+    "wall_ms": 468.54344522580504,
+    "usage": {
+      "prompt_tokens": 494,
+      "cached_prompt_tokens": 493,
+      "completion_tokens": 1,
+      "total_tokens": 495
+    },
+    "text": "Copper"
+  },
+  {
+    "threads": 16,
+    "case": "code",
+    "repeat": 0,
+    "wall_ms": 11309.617977123708,
+    "usage": {
+      "prompt_tokens": 45,
+      "cached_prompt_tokens": 19,
+      "completion_tokens": 48,
+      "total_tokens": 93
+    },
+    "text": "```python\ndef get_larger(num1, num2):\n  \"\"\"\n  Returns the larger of two numbers.\n\n  Args:\n    num1: The first number.\n    num2: The second number."
+  },
+  {
+    "threads": 16,
+    "case": "code",
+    "repeat": 1,
+    "wall_ms": 10360.659401398152,
+    "usage": {
+      "prompt_tokens": 45,
+      "cached_prompt_tokens": 44,
+      "completion_tokens": 48,
+      "total_tokens": 93
+    },
+    "text": "```python\ndef get_larger(num1, num2):\n  \"\"\"\n  Returns the larger of two numbers.\n\n  Args:\n    num1: The first number.\n    num2: The second number."
+  },
+  {
+    "threads": 16,
+    "case": "code",
+    "repeat": 2,
+    "wall_ms": 10953.052788041532,
+    "usage": {
+      "prompt_tokens": 45,
+      "cached_prompt_tokens": 44,
+      "completion_tokens": 48,
+      "total_tokens": 93
+    },
+    "text": "```python\ndef get_larger(num1, num2):\n  \"\"\"\n  Returns the larger of two numbers.\n\n  Args:\n    num1: The first number.\n    num2: The second number."
+  }
+]

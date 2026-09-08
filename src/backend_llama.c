@@ -343,6 +343,23 @@ static bool ollm_init_locked(const char *model_path, int n_gpu_layers, int ctx_l
     cp.type_v = kv_type;
     cp.flash_attn_type = flash_attn;
     cp.no_perf = true;
+    /* Decode and prefill have different bandwidth/compute profiles on a
+     * shared CPU host. Keep llama defaults unless explicitly tuned. */
+    const char *thread_names[] = {"OMNISERVE_NATIVE_LLM_THREADS",
+                                  "OMNISERVE_NATIVE_LLM_THREADS_BATCH"};
+    for (int i = 0; i < 2; ++i) {
+        const char *value = getenv(thread_names[i]);
+        if (!value || !value[0]) continue;
+        char *end = NULL;
+        long threads = strtol(value, &end, 10);
+        if (end == value || *end || threads < 1 || threads > 256) {
+            fprintf(stderr, "%s must be an integer in [1, 256]; using llama default\n", thread_names[i]);
+            continue;
+        }
+        if (i == 0) cp.n_threads = (int)threads;
+        else cp.n_threads_batch = (int)threads;
+    }
+    fprintf(stderr, "llm CPU threads: decode=%d prefill=%d\n", cp.n_threads, cp.n_threads_batch);
     for (int i = 0; i < g_slot_count; i++) {
         g_slots[i].ctx = llama_init_from_model(g_model, cp);
         if (!g_slots[i].ctx) {
@@ -1282,7 +1299,10 @@ void oembed_shutdown(void) {}
 #ifndef USE_SD
 bool osd_init(const char *model_path) { (void)model_path; return false; }
 bool osd_ready(void) { return false; }
+bool osd_prepare_image(oimg_req *req) { return !req->image_base64; }
+bool osd_reference_edit_ready(void) { return false; }
 const char *osd_model_name(void) { return "none"; }
 bool osd_generate(const oimg_req *req, oimg_result *out) { (void)req; (void)out; return false; }
+bool osd_try_cached_result(const oimg_req *req, oimg_result *out) { (void)req; (void)out; return false; }
 void osd_result_free(oimg_result *r) { (void)r; }
 #endif

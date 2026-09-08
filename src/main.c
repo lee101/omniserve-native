@@ -442,7 +442,7 @@ static void handle_status(ohttp_request *req, app_state *app) {
              "\"device\":\"%.80s\",\"kv_type\":\"%s\",\"flash_attn\":%s,\"degraded\":%s},"
              "\"llm\":{\"ready\":%s,\"model\":\"%s\"},"
              "\"embedding\":{\"ready\":%s,\"model\":\"%s\"},"
-             "\"diffusion\":{\"ready\":%s,\"model\":\"%s\"},"
+             "\"diffusion\":{\"ready\":%s,\"model\":\"%s\",\"reference_edit\":%s},"
              /* Key order must track the argument order below, which matches the
               * permits object: llm, image, birefnet, tts, stt, ... */
              "\"upstreams\":{\"llm\":%s,\"image\":%s,\"image_worker\":%s,\"h3\":%s,\"art\":%s,\"birefnet\":%s,\"tts\":%s,\"stt\":%s,\"forecast\":%s,"
@@ -477,6 +477,7 @@ static void handle_status(ohttp_request *req, app_state *app) {
              ollm_ready() ? "true" : "false", ollm_model_name(),
              oembed_ready() ? "true" : "false", oembed_model_name(),
              osd_ready() ? "true" : "false", osd_model_name(),
+             osd_reference_edit_ready() ? "true" : "false",
              app->llm_upstream ? "true" : "false", app->image_upstream ? "true" : "false",
              app->image_worker_upstream ? "true" : "false",
              app->h3_upstream ? "true" : "false",
@@ -1390,6 +1391,17 @@ static void handle_images(ohttp_request *req, app_state *app) {
         respond_error(req, 403, "public image requests must use a cache-validated lora_id");
         return;
     }
+    bool img2img = ohttp_path_is(req, "/v1/images/img2img") ||
+                  ohttp_path_is(req, "/v1/images/edits");
+    if (img2img != (image_request.generation.image_base64 != NULL) ||
+        !osd_prepare_image(&image_request.generation)) {
+        oimage_request_free(&image_request);
+        respond_error(req, 400, "img2img requires image_base64: a PNG or JPEG up to 4096x4096; generations does not accept source images");
+        return;
+    }
+    oimg_result result;
+    bool ok = osd_try_cached_result(&image_request.generation, &result);
+    if (ok) goto encode_image;
     otier tier = request_tier(req);
     int permits = app->image_permits;
     if (!osched_acquire_n(app->sched, tier, permits)) {
@@ -1428,8 +1440,7 @@ static void handle_images(ohttp_request *req, app_state *app) {
         respond_error(req, 503, headroom_error);
         return;
     }
-    oimg_result result;
-    bool ok = osd_generate(&image_request.generation, &result);
+    ok = osd_generate(&image_request.generation, &result);
     if (image_lease_id[0]) ovram_release(app->vram, image_lease_id);
     osched_release_n(app->sched, tier, permits);
     if (!ok) {
@@ -1437,6 +1448,7 @@ static void handle_images(ohttp_request *req, app_state *app) {
         respond_error(req, 500, "image generation failed");
         return;
     }
+encode_image:;
     char *json = NULL;
     size_t json_len = 0;
     ok = oimage_openai_response(&result, osd_model_name(),
@@ -2100,6 +2112,18 @@ static void route(ohttp_request *req, void *user) {
                                             "/v1/images/generations"));
         }
         else handle_images(req, app);
+        return;
+    }
+    if (ohttp_path_is(req, "/v1/images/img2img")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_images(req, app);
+        return;
+    }
+    if (ohttp_path_is(req, "/v1/images/edits") && osd_reference_edit_ready()) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_images(req, app);
         return;
     }
     /* Precise masks and masked edits are handled by a scale-to-zero GPU pool.

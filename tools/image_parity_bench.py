@@ -55,6 +55,8 @@ def decode_image_response(body: bytes, content_type: str, timeout: float) -> tup
             "inference_time_ms": row.get("inference_time_ms"),
             "format": row.get("format"),
             "teleport": row.get("teleport"),
+            "cache": row.get("cache"),
+            "denoiser_cache": row.get("denoiser_cache"),
         }
     url = row.get("url") or row.get("path") or doc.get("url") or doc.get("path")
     if not url:

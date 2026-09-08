@@ -1,0 +1,377 @@
+{
+  "complete": true,
+  "rows": [
+    {
+      "case": "p0-s90908-steps20-cfg2.5-r0",
+      "prompt": "Change the text on the sign from 'flux.cpp' to 'edit.cpp'. Keep the cat and background unchanged.",
+      "seed": 90908,
+      "steps": 20,
+      "guidance": 2.5,
+      "repeat": 0,
+      "wall_ms": 137275.5814967677,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 137164,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null
+      },
+      "pixel_sha256": "a6ac6c0ef2ae36e5eeff0a063acda0c9f6fffdb8d4e6cf66cd72c2a208d57642",
+      "baseline_ssim": 1.0,
+      "baseline_psnr": null,
+      "baseline_exact": true,
+      "entropy": 7.182163549743023,
+      "stddev": 63.89716731971206
+    },
+    {
+      "case": "p0-s90908-steps12-cfg2.5-r0",
+      "prompt": "Change the text on the sign from 'flux.cpp' to 'edit.cpp'. Keep the cat and background unchanged.",
+      "seed": 90908,
+      "steps": 12,
+      "guidance": 2.5,
+      "repeat": 0,
+      "wall_ms": 77736.97440791875,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 77621,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null
+      },
+      "pixel_sha256": "cca631bfc974fe426064b58783ad96b05583f5fec044a5eef517407118b1e7fe",
+      "baseline_ssim": 0.9973875568631276,
+      "baseline_psnr": 34.81957772672807,
+      "baseline_exact": false,
+      "entropy": 7.182361753784619,
+      "stddev": 63.745356968326405
+    },
+    {
+      "case": "p0-s90908-steps8-cfg2.5-r0",
+      "prompt": "Change the text on the sign from 'flux.cpp' to 'edit.cpp'. Keep the cat and background unchanged.",
+      "seed": 90908,
+      "steps": 8,
+      "guidance": 2.5,
+      "repeat": 0,
+      "wall_ms": 54255.26609597728,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 54143,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null
+      },
+      "pixel_sha256": "72f152c433b56fa191dccfb801a8ba1df0cd9d58dfba10df5d2a85ff929aa40d",
+      "baseline_ssim": 0.9958892591577072,
+      "baseline_psnr": 32.83656222115215,
+      "baseline_exact": false,
+      "entropy": 7.190578115638666,
+      "stddev": 63.905993624590245
+    },
+    {
+      "case": "p0-s90908-steps8-cfg2.5-r1",
+      "prompt": "Change the text on the sign from 'flux.cpp' to 'edit.cpp'. Keep the cat and background unchanged.",
+      "seed": 90908,
+      "steps": 8,
+      "guidance": 2.5,
+      "repeat": 1,
+      "wall_ms": 54668.01807982847,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 54557,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null
+      },
+      "pixel_sha256": "72f152c433b56fa191dccfb801a8ba1df0cd9d58dfba10df5d2a85ff929aa40d",
+      "baseline_ssim": 0.9958892591577072,
+      "baseline_psnr": 32.83656222115215,
+      "baseline_exact": false,
+      "entropy": 7.190578115638666,
+      "stddev": 63.905993624590245
+    },
+    {
+      "case": "p0-s90908-steps12-cfg2.5-r1",
+      "prompt": "Change the text on the sign from 'flux.cpp' to 'edit.cpp'. Keep the cat and background unchanged.",
+      "seed": 90908,
+      "steps": 12,
+      "guidance": 2.5,
+      "repeat": 1,
+      "wall_ms": 77650.01046517864,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 77548,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null
+      },
+      "pixel_sha256": "cca631bfc974fe426064b58783ad96b05583f5fec044a5eef517407118b1e7fe",
+      "baseline_ssim": 0.9973875568631276,
+      "baseline_psnr": 34.81957772672807,
+      "baseline_exact": false,
+      "entropy": 7.182361753784619,
+      "stddev": 63.745356968326405
+    },
+    {
+      "case": "p0-s90908-steps20-cfg2.5-r1",
+      "prompt": "Change the text on the sign from 'flux.cpp' to 'edit.cpp'. Keep the cat and background unchanged.",
+      "seed": 90908,
+      "steps": 20,
+      "guidance": 2.5,
+      "repeat": 1,
+      "wall_ms": 122747.64774320647,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 122616,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null
+      },
+      "pixel_sha256": "a6ac6c0ef2ae36e5eeff0a063acda0c9f6fffdb8d4e6cf66cd72c2a208d57642",
+      "baseline_ssim": 1.0,
+      "baseline_psnr": null,
+      "baseline_exact": true,
+      "entropy": 7.182163549743023,
+      "stddev": 63.89716731971206
+    },
+    {
+      "case": "p1-s90908-steps20-cfg2.5-r0",
+      "prompt": "Change the background to light blue. Keep the cat and the sign unchanged.",
+      "seed": 90908,
+      "steps": 20,
+      "guidance": 2.5,
+      "repeat": 0,
+      "wall_ms": 114567.58182495832,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 114447,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null
+      },
+      "pixel_sha256": "79c7aae86c884ecc45df1194cef856a309270bcfdc373a9d6f6cff22b2871513",
+      "baseline_ssim": 1.0,
+      "baseline_psnr": null,
+      "baseline_exact": true,
+      "entropy": 5.625376083760641,
+      "stddev": 66.87563416304285
+    },
+    {
+      "case": "p1-s90908-steps12-cfg2.5-r0",
+      "prompt": "Change the background to light blue. Keep the cat and the sign unchanged.",
+      "seed": 90908,
+      "steps": 12,
+      "guidance": 2.5,
+      "repeat": 0,
+      "wall_ms": 78020.93245415017,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 77925,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null
+      },
+      "pixel_sha256": "0a5b4c88e5e7f819f3edf99d9f5ff515425ee6596b29b5bf69edb6b3221cddae",
+      "baseline_ssim": 0.996820928450496,
+      "baseline_psnr": 31.76709566660435,
+      "baseline_exact": false,
+      "entropy": 5.733454920173207,
+      "stddev": 69.98280772688462
+    },
+    {
+      "case": "p1-s90908-steps8-cfg2.5-r0",
+      "prompt": "Change the background to light blue. Keep the cat and the sign unchanged.",
+      "seed": 90908,
+      "steps": 8,
+      "guidance": 2.5,
+      "repeat": 0,
+      "wall_ms": 53514.06054198742,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 53412,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null
+      },
+      "pixel_sha256": "fb83108988462a5b997365bfba494c9aceec8d332ee8131cad0c8f9e53bf7b32",
+      "baseline_ssim": 0.984135036355332,
+      "baseline_psnr": 24.040292121602022,
+      "baseline_exact": false,
+      "entropy": 5.718446414443412,
+      "stddev": 74.21411970200877
+    },
+    {
+      "case": "p1-s90908-steps8-cfg2.5-r1",
+      "prompt": "Change the background to light blue. Keep the cat and the sign unchanged.",
+      "seed": 90908,
+      "steps": 8,
+      "guidance": 2.5,
+      "repeat": 1,
+      "wall_ms": 55993.933505844325,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 55889,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null
+      },
+      "pixel_sha256": "fb83108988462a5b997365bfba494c9aceec8d332ee8131cad0c8f9e53bf7b32",
+      "baseline_ssim": 0.984135036355332,
+      "baseline_psnr": 24.040292121602022,
+      "baseline_exact": false,
+      "entropy": 5.718446414443412,
+      "stddev": 74.21411970200877
+    },
+    {
+      "case": "p1-s90908-steps12-cfg2.5-r1",
+      "prompt": "Change the background to light blue. Keep the cat and the sign unchanged.",
+      "seed": 90908,
+      "steps": 12,
+      "guidance": 2.5,
+      "repeat": 1,
+      "wall_ms": 78564.03036694974,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 78455,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null
+      },
+      "pixel_sha256": "0a5b4c88e5e7f819f3edf99d9f5ff515425ee6596b29b5bf69edb6b3221cddae",
+      "baseline_ssim": 0.996820928450496,
+      "baseline_psnr": 31.76709566660435,
+      "baseline_exact": false,
+      "entropy": 5.733454920173207,
+      "stddev": 69.98280772688462
+    },
+    {
+      "case": "p1-s90908-steps20-cfg2.5-r1",
+      "prompt": "Change the background to light blue. Keep the cat and the sign unchanged.",
+      "seed": 90908,
+      "steps": 20,
+      "guidance": 2.5,
+      "repeat": 1,
+      "wall_ms": 123300.77603179961,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 123207,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null
+      },
+      "pixel_sha256": "79c7aae86c884ecc45df1194cef856a309270bcfdc373a9d6f6cff22b2871513",
+      "baseline_ssim": 1.0,
+      "baseline_psnr": null,
+      "baseline_exact": true,
+      "entropy": 5.625376083760641,
+      "stddev": 66.87563416304285
+    }
+  ],
+  "failures": [],
+  "source": "/nvme0n1-disk/code/stable-diffusion.cpp/assets/flux/flux1-dev-q8_0.png",
+  "source_pixel_sha256": "cea661b288f96c7bfe09b15c3c34c766a81d8bcaa2506a1de4782c2404c13b5e",
+  "quality_status": "retention and repeat diagnostics; requires visual edit-adherence review",
+  "summaries": [
+    {
+      "prompt_index": 0,
+      "seed": 90908,
+      "steps": 20,
+      "guidance": 2.5,
+      "median_ms": 130011.61461998709,
+      "wall_ms": [
+        137275.5814967677,
+        122747.64774320647
+      ]
+    },
+    {
+      "prompt_index": 0,
+      "seed": 90908,
+      "steps": 12,
+      "guidance": 2.5,
+      "median_ms": 77693.4924365487,
+      "wall_ms": [
+        77736.97440791875,
+        77650.01046517864
+      ]
+    },
+    {
+      "prompt_index": 0,
+      "seed": 90908,
+      "steps": 8,
+      "guidance": 2.5,
+      "median_ms": 54461.642087902874,
+      "wall_ms": [
+        54255.26609597728,
+        54668.01807982847
+      ]
+    },
+    {
+      "prompt_index": 1,
+      "seed": 90908,
+      "steps": 20,
+      "guidance": 2.5,
+      "median_ms": 118934.17892837897,
+      "wall_ms": [
+        114567.58182495832,
+        123300.77603179961
+      ]
+    },
+    {
+      "prompt_index": 1,
+      "seed": 90908,
+      "steps": 12,
+      "guidance": 2.5,
+      "median_ms": 78292.48141054995,
+      "wall_ms": [
+        78020.93245415017,
+        78564.03036694974
+      ]
+    },
+    {
+      "prompt_index": 1,
+      "seed": 90908,
+      "steps": 8,
+      "guidance": 2.5,
+      "median_ms": 54753.99702391587,
+      "wall_ms": [
+        53514.06054198742,
+        55993.933505844325
+      ]
+    }
+  ]
+}

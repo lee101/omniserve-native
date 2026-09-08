@@ -91,6 +91,23 @@ static void test_image_contract(void) {
                        "\"guidance_scale\":1.5,\"seed\":42,\"n\":1}";
     oimage_request request;
     char error[160];
+    const char *edit = "{\"prompt\":\"watercolor\",\"image_base64\":\"YWJj\",\"strength\":0.4}";
+    CHECK(oimage_request_parse(edit, strlen(edit), &request, error, sizeof error));
+    CHECK(request.generation.image_base64 && strcmp(request.generation.image_base64, "YWJj") == 0);
+    CHECK(fabsf(request.generation.strength - 0.4f) < 0.0001f);
+    oimage_request_free(&request);
+    const char *bad_edits[] = {
+        "{\"prompt\":\"p\",\"image_base64\":\"\"}",
+        "{\"prompt\":\"p\",\"image_base64\":true}",
+        "{\"prompt\":\"p\",\"strength\":0.4}",
+        "{\"prompt\":\"p\",\"image_base64\":\"YWJj\",\"strength\":0}",
+        "{\"prompt\":\"p\",\"image_base64\":\"YWJj\",\"strength\":1.1}",
+        "{\"prompt\":\"p\",\"image_base64\":\"YWJj\",\"teleport\":true}",
+    };
+    for (size_t i = 0; i < sizeof bad_edits / sizeof bad_edits[0]; ++i) {
+        CHECK(!oimage_request_parse(bad_edits[i], strlen(bad_edits[i]),
+                                   &request, error, sizeof error));
+    }
     CHECK(oimage_request_parse(body, strlen(body), &request, error, sizeof error));
     CHECK(request.generation.prompt && strcmp(request.generation.prompt, "red cube") == 0);
     CHECK(request.generation.negative_prompt && strcmp(request.generation.negative_prompt, "blur") == 0);
@@ -254,6 +271,14 @@ static void test_image_contract(void) {
     CHECK(strstr(json, "\"resume_step\":7") != NULL);
     oj_tok response_tokens[32];
     CHECK(oj_parse(json, json_len, response_tokens, 32) > 0);
+    free(json);
+
+    image_result.teleport_requested = false;
+    image_result.denoiser_cache_threshold = 0.1f;
+    CHECK(oimage_openai_response(&image_result, "qwen-edit", 42, &json, &json_len));
+    CHECK(strstr(json, "\"requested\":\"easycache\"") != NULL);
+    CHECK(strstr(json, "\"approximate\":true") != NULL);
+    CHECK(strstr(json, "\"threshold\":0.100000") != NULL);
     free(json);
 
     unsigned char *batch_images[] = {(unsigned char *)image, (unsigned char *)image};

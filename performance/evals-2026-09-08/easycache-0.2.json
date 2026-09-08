@@ -1,0 +1,149 @@
+{
+  "complete": true,
+  "rows": [
+    {
+      "case": "p0-s90908-steps20-cfg2.5-r0",
+      "prompt": "Change the text on the sign from 'flux.cpp' to 'edit.cpp'. Keep the cat and background unchanged.",
+      "seed": 90908,
+      "steps": 20,
+      "guidance": 2.5,
+      "repeat": 0,
+      "wall_ms": 78111.36750597507,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 78002,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": {
+          "requested": "easycache",
+          "approximate": true,
+          "threshold": 0.2
+        }
+      },
+      "pixel_sha256": "f35f806bab68bd9de043f7597b29fd74e40d599aa1a067a49504ca0a155e21bf",
+      "baseline_ssim": 0.9927659478713897,
+      "baseline_psnr": 30.51510921103992,
+      "baseline_exact": false,
+      "entropy": 7.162957681504942,
+      "stddev": 61.62383289085449
+    },
+    {
+      "case": "p0-s90908-steps20-cfg2.5-r1",
+      "prompt": "Change the text on the sign from 'flux.cpp' to 'edit.cpp'. Keep the cat and background unchanged.",
+      "seed": 90908,
+      "steps": 20,
+      "guidance": 2.5,
+      "repeat": 1,
+      "wall_ms": 68294.45033194497,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 68193,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": {
+          "requested": "easycache",
+          "approximate": true,
+          "threshold": 0.2
+        }
+      },
+      "pixel_sha256": "f35f806bab68bd9de043f7597b29fd74e40d599aa1a067a49504ca0a155e21bf",
+      "baseline_ssim": 0.9927659478713897,
+      "baseline_psnr": 30.51510921103992,
+      "baseline_exact": false,
+      "entropy": 7.162957681504942,
+      "stddev": 61.62383289085449
+    },
+    {
+      "case": "p1-s90908-steps20-cfg2.5-r0",
+      "prompt": "Change the background to light blue. Keep the cat and the sign unchanged.",
+      "seed": 90908,
+      "steps": 20,
+      "guidance": 2.5,
+      "repeat": 0,
+      "wall_ms": 68551.21311824769,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 68429,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": {
+          "requested": "easycache",
+          "approximate": true,
+          "threshold": 0.2
+        }
+      },
+      "pixel_sha256": "b22cea2901753b2757d9ee112120ffe7b11a8429362edf858302d8c2bb372b38",
+      "baseline_ssim": 0.997455020237966,
+      "baseline_psnr": 32.521119706701796,
+      "baseline_exact": false,
+      "entropy": 5.857812807805088,
+      "stddev": 63.65388685138504
+    },
+    {
+      "case": "p1-s90908-steps20-cfg2.5-r1",
+      "prompt": "Change the background to light blue. Keep the cat and the sign unchanged.",
+      "seed": 90908,
+      "steps": 20,
+      "guidance": 2.5,
+      "repeat": 1,
+      "wall_ms": 75088.2594450377,
+      "metadata": {
+        "transport": "b64_json",
+        "model": "qwen-image-edit-2511-Q4_K_M",
+        "seed": 90908,
+        "inference_time_ms": 74972,
+        "format": "png",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": {
+          "requested": "easycache",
+          "approximate": true,
+          "threshold": 0.2
+        }
+      },
+      "pixel_sha256": "b22cea2901753b2757d9ee112120ffe7b11a8429362edf858302d8c2bb372b38",
+      "baseline_ssim": 0.997455020237966,
+      "baseline_psnr": 32.521119706701796,
+      "baseline_exact": false,
+      "entropy": 5.857812807805088,
+      "stddev": 63.65388685138504
+    }
+  ],
+  "failures": [],
+  "source": "/nvme0n1-disk/code/stable-diffusion.cpp/assets/flux/flux1-dev-q8_0.png",
+  "source_pixel_sha256": "cea661b288f96c7bfe09b15c3c34c766a81d8bcaa2506a1de4782c2404c13b5e",
+  "quality_status": "retention and repeat diagnostics; requires visual edit-adherence review",
+  "summaries": [
+    {
+      "prompt_index": 0,
+      "seed": 90908,
+      "steps": 20,
+      "guidance": 2.5,
+      "median_ms": 73202.90891896002,
+      "wall_ms": [
+        78111.36750597507,
+        68294.45033194497
+      ]
+    },
+    {
+      "prompt_index": 1,
+      "seed": 90908,
+      "steps": 20,
+      "guidance": 2.5,
+      "median_ms": 71819.73628164269,
+      "wall_ms": [
+        68551.21311824769,
+        75088.2594450377
+      ]
+    }
+  ]
+}
