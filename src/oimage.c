@@ -746,7 +746,8 @@ bool oimage_openai_response(const oimg_result *result, const char *model, long l
         used += (size_t)wrote;
         if (result->denoiser_cache_threshold > 0.0f) {
             wrote = snprintf(json + used, capacity - used,
-                ",\"denoiser_cache\":{\"requested\":\"easycache\",\"approximate\":true,\"threshold\":%.6f}",
+                ",\"denoiser_cache\":{\"requested\":\"%s\",\"approximate\":true,\"threshold\":%.6f}",
+                result->denoiser_cache_mode ? result->denoiser_cache_mode : "easycache",
                 result->denoiser_cache_threshold);
             if (wrote < 0 || (size_t)wrote >= capacity - used) { free(json); return false; }
             used += (size_t)wrote;

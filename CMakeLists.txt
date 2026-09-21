@@ -96,6 +96,19 @@ endif()
 
 if(WITH_SD AND EXISTS "${SD_DIR}/build/bin/libstable-diffusion.so")
     target_compile_definitions(omniserve-native PRIVATE USE_SD "OMNISERVE_SD_LIB_DEFAULT=\"${SD_DIR}/build/bin/libstable-diffusion.so\"")
+    # Upstream stable-diffusion.cpp lacks the exact-prompt latent replay API carried by
+    # the production fork; detect it so backend_sd.c can fall back to dense generation.
+    file(READ "${SD_DIR}/include/stable-diffusion.h" _sd_header)
+    if(_sd_header MATCHES "stream_layers")
+        target_compile_definitions(omniserve-native PRIVATE OMNISERVE_SD_STREAM_LAYERS=1)
+    else()
+        target_compile_definitions(omniserve-native PRIVATE OMNISERVE_SD_STREAM_LAYERS=0)
+    endif()
+    if(_sd_header MATCHES "sd_latent_replay_params_t")
+        target_compile_definitions(omniserve-native PRIVATE OMNISERVE_SD_LATENT_API=1)
+    else()
+        target_compile_definitions(omniserve-native PRIVATE OMNISERVE_SD_LATENT_API=0)
+    endif()
     # SYSTEM so the vendored stb/sd headers do not trip our own strict warning
     # set; they are third-party code and are not ours to fix.
     target_include_directories(omniserve-native SYSTEM BEFORE PRIVATE "${SD_DIR}/ggml/examples")

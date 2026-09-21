@@ -146,6 +146,7 @@ typedef struct {
     bool cache_requested;
     bool cache_hit;
     float denoiser_cache_threshold; /* zero disables approximate EasyCache */
+    const char *denoiser_cache_mode; /* static string: easycache|taylorseer|spectrum|cache-dit|dbcache|ucache */
     bool teleport_used;
     bool teleport_cache_hit;
     bool teleport_result_cache_hit;

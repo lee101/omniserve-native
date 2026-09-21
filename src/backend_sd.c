@@ -73,6 +73,19 @@ typedef sd_ctx_t *(*fn_new_sd_ctx)(const sd_ctx_params_t *);
 typedef void (*fn_img_params_init)(sd_img_gen_params_t *);
 typedef bool (*fn_generate_image)(sd_ctx_t *, const sd_img_gen_params_t *, sd_image_t **, int *);
 typedef void (*fn_free_images)(sd_image_t *, int);
+#if !OMNISERVE_SD_LATENT_API
+/* Compatibility shim for upstream stable-diffusion.cpp: the symbols are looked up
+ * with dlsym and stay NULL, so latent_api_ready() reports false and every
+ * teleport request takes the full_generation_fallback path. */
+typedef struct sd_latent_t sd_latent_t;
+typedef struct {
+    const sd_latent_t *resume_latent;
+    int capture_step;
+    sd_latent_t **captured_latent_out;
+    bool cache_hit;
+    int resume_step;
+} sd_latent_replay_params_t;
+#endif
 typedef void (*fn_latent_params_init)(sd_latent_replay_params_t *);
 typedef bool (*fn_generate_image_with_latent)(sd_ctx_t *, const sd_img_gen_params_t *,
                                               sd_latent_replay_params_t *, sd_image_t **, int *);
@@ -382,7 +395,9 @@ bool osd_init(const char *model_path) {
     params.n_threads = sd_env_int("OMNISERVE_NATIVE_SD_THREADS", -1, 1, 256);
     params.flash_attn = sd_env_flag("OMNISERVE_NATIVE_SD_FLASH_ATTN", true);
     params.diffusion_flash_attn = sd_env_flag("OMNISERVE_NATIVE_SD_DIFFUSION_FLASH_ATTN", true);
+#if OMNISERVE_SD_STREAM_LAYERS
     params.stream_layers = sd_env_flag("OMNISERVE_NATIVE_SD_STREAM_LAYERS", false);
+#endif
     params.enable_mmap = sd_env_flag("OMNISERVE_NATIVE_SD_MMAP", true);
     params.eager_load = sd_env_flag("OMNISERVE_NATIVE_SD_EAGER_LOAD", false);
     params.auto_fit = sd_env_flag("OMNISERVE_NATIVE_SD_AUTO_FIT", false);
@@ -459,10 +474,12 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     params.width = req->width > 0 ? req->width : 768;
     params.height = req->height > 0 ? req->height : 768;
     params.sample_params.sample_steps = req->steps > 0 ? req->steps : 4;
-    /* Zero is intentional for distilled Flux/Z-Image pipelines. Treating it as
-     * an unset sentinel changes both image quality and the latent replay key. */
+    /* stable-diffusion.cpp treats txt_cfg 0 as unconditioned mode (prompt
+     * ignored). Distilled Flux/Z-Image pipelines want cfg 1.0, so an omitted or
+     * zero guidance maps there unless OMNISERVE_NATIVE_SD_ZERO_GUIDANCE
+     * overrides it. */
     params.sample_params.guidance.txt_cfg = req->guidance_scale == 0.0f
-        ? sd_env_float("OMNISERVE_NATIVE_SD_ZERO_GUIDANCE", 0.0f, 0.0f, 30.0f)
+        ? sd_env_float("OMNISERVE_NATIVE_SD_ZERO_GUIDANCE", 1.0f, 0.0f, 30.0f)
         : req->guidance_scale;
     params.vae_tiling_params.enabled = sd_env_flag(
         "OMNISERVE_NATIVE_SD_VAE_TILING", params.vae_tiling_params.enabled);
@@ -510,13 +527,37 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     /* Static per-process setting: result-cache entries never cross profiles.
      * Latent replay requires a dense trajectory, so it cannot use EasyCache. */
     if (!req->teleport) {
+        /* OMNISERVE_NATIVE_SD_CACHE_MODE selects the stable-diffusion.cpp denoiser
+         * cache: easycache | taylorseer | spectrum | cache-dit | dbcache | ucache.
+         * The legacy OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD alone still means easycache. */
+        const char *mode = getenv("OMNISERVE_NATIVE_SD_CACHE_MODE");
         float threshold = sd_env_float("OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD", 0.0f, 0.0f, 1.0f);
-        if (threshold > 0.0f) {
-            params.cache.mode = SD_CACHE_EASYCACHE;
-            params.cache.reuse_threshold = threshold;
-            params.cache.start_percent = 0.2f;
-            params.cache.end_percent = 0.8f;
-            out->denoiser_cache_threshold = threshold;
+        if ((!mode || !mode[0]) && threshold > 0.0f) mode = "easycache";
+        if (mode && mode[0] && strcmp(mode, "off") != 0 && strcmp(mode, "none") != 0) {
+            params.cache.start_percent = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_START", 0.15f, 0.0f, 1.0f);
+            params.cache.end_percent = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_END", 0.95f, 0.0f, 1.0f);
+            if (strcmp(mode, "easycache") == 0 || strcmp(mode, "ucache") == 0) {
+                params.cache.mode = strcmp(mode, "ucache") == 0 ? SD_CACHE_UCACHE : SD_CACHE_EASYCACHE;
+                params.cache.reuse_threshold = threshold > 0.0f ? threshold : 0.2f;
+                out->denoiser_cache_threshold = params.cache.reuse_threshold;
+            } else if (strcmp(mode, "taylorseer") == 0) {
+                params.cache.mode = SD_CACHE_TAYLORSEER;
+                params.cache.taylorseer_n_derivatives = sd_env_int("OMNISERVE_NATIVE_SD_TAYLORSEER_DERIVATIVES", 1, 1, 4);
+                params.cache.taylorseer_skip_interval = sd_env_int("OMNISERVE_NATIVE_SD_TAYLORSEER_SKIP_INTERVAL", 2, 1, 8);
+                out->denoiser_cache_threshold = (float)params.cache.taylorseer_skip_interval;
+            } else if (strcmp(mode, "spectrum") == 0) {
+                params.cache.mode = SD_CACHE_SPECTRUM;
+                params.cache.spectrum_warmup_steps = sd_env_int("OMNISERVE_NATIVE_SD_SPECTRUM_WARMUP", 4, 1, 64);
+                params.cache.spectrum_stop_percent = sd_env_float("OMNISERVE_NATIVE_SD_SPECTRUM_STOP", 0.9f, 0.0f, 1.0f);
+                out->denoiser_cache_threshold = params.cache.spectrum_stop_percent;
+            } else if (strcmp(mode, "cache-dit") == 0 || strcmp(mode, "dbcache") == 0) {
+                params.cache.mode = strcmp(mode, "dbcache") == 0 ? SD_CACHE_DBCACHE : SD_CACHE_CACHE_DIT;
+                params.cache.residual_diff_threshold = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_RESIDUAL_DIFF", 0.08f, 0.0f, 10.0f);
+                out->denoiser_cache_threshold = params.cache.residual_diff_threshold;
+            } else {
+                mode = NULL;
+            }
+            out->denoiser_cache_mode = mode;
         }
     }
     out->teleport_capture_step = -1;
