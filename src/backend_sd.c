@@ -34,6 +34,17 @@ static int decode_digit(unsigned char value) {
 
 static void webp_lib_load(void);
 static bool webp_lib_loaded;
+typedef unsigned char *(*fn_webp_decode_rgb)(const unsigned char *, size_t, int *, int *);
+typedef void (*fn_webp_free)(void *);
+static fn_webp_decode_rgb p_webp_decode_rgb;
+static fn_webp_free p_webp_free;
+/* libwebp is resolved lazily by name, and the reference-image path below uses
+ * these before the encoder does, so both the types and the pointers are
+ * declared here rather than with the rest of the function table. */
+typedef void (*fn_webp_free)(void *);
+typedef unsigned char *(*fn_webp_decode_rgb)(const unsigned char *, size_t, int *, int *);
+static fn_webp_free p_webp_free;
+static fn_webp_decode_rgb p_webp_decode_rgb; /* reference/init images may arrive as WebP; stb_image cannot decode it */
 
 bool osd_prepare_image(oimg_req *req) {
     if (!req->image_base64) return true;
@@ -108,7 +119,6 @@ typedef bool (*fn_generate_image_with_latent)(sd_ctx_t *, const sd_img_gen_param
 typedef void (*fn_free_latent)(sd_latent_t *);
 typedef size_t (*fn_webp_encode_rgb)(const unsigned char *, int, int, int, float,
                                      unsigned char **);
-typedef void (*fn_webp_free)(void *);
 typedef size_t (*fn_webp_encode_rgba)(const unsigned char *, int, int, int, float,
                                       unsigned char **);
 
@@ -121,10 +131,7 @@ static fn_latent_params_init p_latent_params_init;
 static fn_generate_image_with_latent p_generate_image_with_latent;
 static fn_free_latent p_free_latent;
 static fn_webp_encode_rgb p_webp_encode_rgb;
-static fn_webp_free p_webp_free;
 static fn_webp_encode_rgba p_webp_encode_rgba; /* Qwen Image 2.1 decodes RGBA (layered/transparent output) */
-typedef unsigned char *(*fn_webp_decode_rgb)(const unsigned char *, size_t, int *, int *);
-static fn_webp_decode_rgb p_webp_decode_rgb; /* reference/init images may arrive as WebP; stb_image cannot decode it */
 static bool g_webp_enabled = true;
 static float g_webp_quality = 85.0f;
 
