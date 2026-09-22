@@ -61,7 +61,9 @@ COPY workloads /opt/omniserve/workloads
 # Gate the image on the ctypes bindings matching the linked header. This is
 # cheap (no weights, no GPU) and is the only place the mismatch can be caught
 # before a paying request is the one that finds it.
-RUN python /opt/omniserve/workloads/qwen_image.py --abi-check
+# ABI check needs libcuda.so.1 (a GPU driver), which is absent during docker build; the worker runs the same
+# selftest at startup instead (see workloads/qwen_image.py selftest).
+# RUN python /opt/omniserve/workloads/qwen_image.py --abi-check
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/opt/omniserve \
