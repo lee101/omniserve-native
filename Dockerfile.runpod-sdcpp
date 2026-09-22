@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 RUN git init -q . && git remote add origin "$SDCPP_REPO" \
     && git fetch -q --depth 1 origin "$SDCPP_COMMIT" \
-    && git checkout -q FETCH_HEAD \
+    && git checkout -q FETCH_HEAD && git submodule update --init --depth 1 --recursive \
     && git log -1 --format='sd.cpp %H %ci'
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
         -DSD_CUDA=ON -DSD_BUILD_SHARED_LIBS=ON \
