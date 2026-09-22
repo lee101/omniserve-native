@@ -185,9 +185,6 @@ class SdCacheParams(ctypes.Structure):
         ("spectrum_flex_window", ctypes.c_float),
         ("spectrum_warmup_steps", ctypes.c_int),
         ("spectrum_stop_percent", ctypes.c_float),
-        ("taylorseer_adaptive_threshold", ctypes.c_float),
-        ("taylorseer_max_skip", ctypes.c_int),
-        ("taylorseer_tail_steps", ctypes.c_int),
     ]
 
 
