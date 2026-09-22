@@ -93,6 +93,8 @@ typedef void (*fn_free_latent)(sd_latent_t *);
 typedef size_t (*fn_webp_encode_rgb)(const unsigned char *, int, int, int, float,
                                      unsigned char **);
 typedef void (*fn_webp_free)(void *);
+typedef size_t (*fn_webp_encode_rgba)(const unsigned char *, int, int, int, float,
+                                      unsigned char **);
 
 static fn_ctx_params_init p_ctx_params_init;
 static fn_new_sd_ctx p_new_sd_ctx;
@@ -104,6 +106,7 @@ static fn_generate_image_with_latent p_generate_image_with_latent;
 static fn_free_latent p_free_latent;
 static fn_webp_encode_rgb p_webp_encode_rgb;
 static fn_webp_free p_webp_free;
+static fn_webp_encode_rgba p_webp_encode_rgba; /* Qwen Image 2.1 decodes RGBA (layered/transparent output) */
 static bool g_webp_enabled = true;
 static float g_webp_quality = 85.0f;
 
@@ -116,6 +119,7 @@ static void webp_lib_load(void) {
         if (!lib) continue;
         p_webp_encode_rgb = (fn_webp_encode_rgb)dlsym(lib, "WebPEncodeRGB");
         p_webp_free = (fn_webp_free)dlsym(lib, "WebPFree");
+        p_webp_encode_rgba = (fn_webp_encode_rgba)dlsym(lib, "WebPEncodeRGBA");
         if (p_webp_encode_rgb && p_webp_free) return;
         p_webp_encode_rgb = NULL;
         p_webp_free = NULL;
@@ -667,8 +671,9 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     }
     bool use_webp = g_webp_enabled && p_webp_encode_rgb && p_webp_free;
     for (int i = 0; i < image_count; ++i) {
-        if (use_webp && images[i].channel == 3) {
-            out->image_lens[i] = p_webp_encode_rgb(
+        if (use_webp && (images[i].channel == 3 || (images[i].channel == 4 && p_webp_encode_rgba))) {
+            fn_webp_encode_rgb encode = images[i].channel == 4 ? (fn_webp_encode_rgb)p_webp_encode_rgba : p_webp_encode_rgb;
+            out->image_lens[i] = encode(
                 images[i].data, (int)images[i].width, (int)images[i].height,
                 (int)(images[i].width * images[i].channel), g_webp_quality,
                 &out->images[i]);
