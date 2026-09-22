@@ -77,7 +77,7 @@ WantedBy=multi-user.target
 EOF
   # secret shared with the zimage instance so netwrck/cutedsl can reuse their config
   if [ ! -f /etc/omniserve-qwen.env ]; then
-    SECRET=$(sudo grep -h OMNISERVE_NATIVE_SECRET /etc/omniserve-h3.env /etc/systemd/system/omniserve-native.service 2>/dev/null | head -1 | sed 's/^Environment=//')
+    SECRET=$(sudo grep -h OMNISERVE_NATIVE_SECRET /etc/omniserve-h3.env /etc/systemd/system/omniserve-native.service /etc/systemd/system/omniserve-native.service.d/*.conf 2>/dev/null | head -1 | sed 's/^Environment=//' || true)
     echo "${SECRET:-OMNISERVE_NATIVE_SECRET=change-me}" | sudo tee /etc/omniserve-qwen.env > /dev/null
     sudo chmod 600 /etc/omniserve-qwen.env
   fi
@@ -88,7 +88,7 @@ EOF
 start() { sudo systemctl restart omniserve-native-qwen.service; sleep 20; systemctl --no-pager status omniserve-native-qwen.service | head -8; }
 
 smoke() {
-  SECRET=$(sudo grep -h OMNISERVE_NATIVE_SECRET /etc/omniserve-qwen.env | sed 's/.*=//')
+  SECRET=$(sudo grep -h OMNISERVE_NATIVE_SECRET /etc/omniserve-qwen.env 2>/dev/null | sed 's/.*=//' || true)
   curl -s "localhost:$PORT/status" | head -c 400; echo
   time curl -s "localhost:$PORT/v1/images/generations" -H "X-API-Key: $SECRET" \
     -d '{"prompt":"editorial portrait of a smiling woman, golden hour, 85mm","width":1024,"height":1024,"steps":20,"seed":3,"output_format":"webp"}' \
