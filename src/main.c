@@ -1705,6 +1705,13 @@ static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_targ
         return;
     }
     const char *path = configured_path("OMNISERVE_NATIVE_IMAGE_OVERFLOW_PATH", "/predict-sync");
+    size_t path_len = strlen(path);
+    /* "passthrough" chains to another omniserve gateway: generations and edits
+     * keep their own routes instead of collapsing onto one worker path. */
+    if (strcmp(path, "passthrough") == 0) {
+        path = req->path;
+        path_len = req->path_len;
+    }
     size_t content_type_len = 0;
     const char *content_type = ohttp_req_header(req, "Content-Type", &content_type_len);
     if (!content_type) {
@@ -1716,7 +1723,7 @@ static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_targ
     bool ok = oproxy_target_relay(
         overflow,
         req->method, req->method_len,
-        path, strlen(path),
+        path, path_len,
         req->query, req->query_len,
         req->body, req->body_len,
         content_type, content_type_len,

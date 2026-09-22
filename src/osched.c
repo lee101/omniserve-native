@@ -320,9 +320,11 @@ static void nvml_load_locked(void) {
     if (!nvml_lib) {
         nvml_lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
         if (!nvml_lib) return;
-        nvml_init = (nvml_init_fn)dlsym(nvml_lib, "nvmlInit_v2");
-        nvml_handle_by_index = (nvml_handle_fn)dlsym(nvml_lib, "nvmlDeviceGetHandleByIndex_v2");
-        nvml_mem_info = (nvml_mem_fn)dlsym(nvml_lib, "nvmlDeviceGetMemoryInfo");
+        /* POSIX dlsym returns an object pointer; copy the bits so -Wpedantic
+         * does not object to the object-to-function pointer conversion. */
+        *(void **)&nvml_init = dlsym(nvml_lib, "nvmlInit_v2");
+        *(void **)&nvml_handle_by_index = dlsym(nvml_lib, "nvmlDeviceGetHandleByIndex_v2");
+        *(void **)&nvml_mem_info = dlsym(nvml_lib, "nvmlDeviceGetMemoryInfo");
     }
     if (!nvml_init || !nvml_handle_by_index || nvml_init() != 0) return;
     nvml_dev = NULL;
