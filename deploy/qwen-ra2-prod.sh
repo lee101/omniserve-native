@@ -7,7 +7,7 @@ set -euo pipefail
 STEP=${1:-all}
 CODE=/nvme0n1-disk/code
 SD_MASTER=$CODE/stable-diffusion.cpp-master          # upstream master worktree (Qwen 2.1 + cache modes)
-OMNI=${OMNI:-$CODE/omniserve-native-qwen}                 # git worktree of branch qwen-ra2, separate from the zimage checkout
+OMNI=${OMNI:-$CODE/omniserve-native-ra2overflow}          # git worktree of branch ra2-overflow (gateway with model routing + overflow)
 MODELS=/nvme0n1-disk/models/omniserve-native/qwen-image-2.1
 PORT=${RA2_PORT:-8792}
 CUDA_ARCH=${CUDA_ARCH:-120}                            # RTX 5090
