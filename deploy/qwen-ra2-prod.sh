@@ -14,6 +14,8 @@ CUDA_ARCH=${CUDA_ARCH:-120}                            # RTX 5090
 # "*=cpu" streams every weight from RAM (fits next to the other tenants: ~11 s sampling + 3 s decode at 1024^2 on the 5090);
 # switch to "te=cpu" (7 s sampling) once >=8 GB VRAM is free at load time.
 RA2_PARAMS_BACKEND=${RA2_PARAMS_BACKEND:-*=cpu}
+# EasyCache 0.05 is the fastest sd.cpp setting that keeps SSIM>=0.985 / PSNR>=37 vs dense (0.2 is 2x but SSIM ~0.94).
+RA2_EASYCACHE=${RA2_EASYCACHE:-0.05}
 HF=${HF:-/nvme0n1-disk/code/omniserve-native/.venv/bin/hf}
 NVCC=${NVCC:-/usr/local/cuda-12.9/bin/nvcc}
 
@@ -69,7 +71,7 @@ Environment=OMNISERVE_NATIVE_SD_VAE_TILING=1
 Environment=OMNISERVE_NATIVE_SD_VAE_TILE_X=32
 Environment=OMNISERVE_NATIVE_SD_VAE_TILE_Y=32
 Environment=OMNISERVE_NATIVE_SD_CACHE_MODE=easycache
-Environment=OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD=0.2
+Environment=OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD=${RA2_EASYCACHE:-0.05}
 Environment=OMNISERVE_NATIVE_SD_ZERO_GUIDANCE=1.0
 Environment=OMNISERVE_NATIVE_SD_WEBP_QUALITY=88
 ExecStart=$OMNI/build-qwen/omniserve-native --port $PORT
