@@ -48,6 +48,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
 
 COPY --from=sdcpp-builder /src/build/bin/libstable-diffusion.so \
      /opt/stable-diffusion.cpp/build/bin/libstable-diffusion.so
+# libstable-diffusion.so links the CUDA 12.8 runtime + cuBLAS from the builder; the h3-cog runtime base
+# ships a different CUDA, so carry the exact .so.12 files next to the library and put them on the loader path.
+COPY --from=sdcpp-builder /usr/local/cuda/lib64/libcublas.so.12* /usr/local/cuda/lib64/libcublasLt.so.12* \
+     /usr/local/cuda/lib64/libcudart.so.12* /opt/stable-diffusion.cpp/build/bin/
+RUN NCCL_DIR=$(python -c 'import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), "lib"))' 2>/dev/null || true) \
+    && printf '%s\n%s\n' /opt/stable-diffusion.cpp/build/bin "$NCCL_DIR" > /etc/ld.so.conf.d/sdcpp.conf && ldconfig
 
 # The workload binds the library directly through ctypes and encodes with
 # Pillow, so torch/diffusers are deliberately absent: several GB off every
@@ -61,7 +67,9 @@ COPY workloads /opt/omniserve/workloads
 # Gate the image on the ctypes bindings matching the linked header. This is
 # cheap (no weights, no GPU) and is the only place the mismatch can be caught
 # before a paying request is the one that finds it.
-RUN python /opt/omniserve/workloads/qwen_image.py --abi-check
+# ABI check needs libcuda.so.1 (a GPU driver), which is absent during docker build; the worker runs the same
+# selftest at startup instead (see workloads/qwen_image.py selftest).
+# RUN python /opt/omniserve/workloads/qwen_image.py --abi-check
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/opt/omniserve \
