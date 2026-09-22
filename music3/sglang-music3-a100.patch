@@ -1,8 +1,16 @@
 diff --git a/sglang_omni/models/minimax_music3/acoustic.py b/sglang_omni/models/minimax_music3/acoustic.py
-index a166a49..e33898a 100644
+index a73e07b3..bceb7a3b 100644
 --- a/sglang_omni/models/minimax_music3/acoustic.py
 +++ b/sglang_omni/models/minimax_music3/acoustic.py
-@@ -209,7 +209,7 @@ class MiniMaxMusic3AcousticDecoder:
+@@ -106,6 +106,7 @@ def _resolve_acoustic_dtype(value: str | torch.dtype) -> torch.dtype:
+     return {
+         "float32": torch.float32,
+         "bfloat16": torch.bfloat16,
++        "float16": torch.float16,
+     }[name]
+ 
+ 
+@@ -209,7 +210,7 @@ class MiniMaxMusic3AcousticDecoder:
          logger.info(
              f"Loading MiniMax Music 3 PyTorch DIT from {dit_path} on device={self.device} dtype={self.dtype}"
          )
@@ -11,7 +19,7 @@ index a166a49..e33898a 100644
          logger.info(
              f"MiniMax Music 3 DIT checkpoint variant=FM8/ELMo condition_hidden=32768 state_keys={len(state)}"
          )
-@@ -220,7 +220,7 @@ class MiniMaxMusic3AcousticDecoder:
+@@ -220,7 +221,7 @@ class MiniMaxMusic3AcousticDecoder:
              )
          self.dit.load_state_dict(state, strict=True, assign=True)
          del state
@@ -20,8 +28,7 @@ index a166a49..e33898a 100644
          window = self.dit.aligned_mel_length(AR_CHUNK_FRAMES)
          if self.compile_acoustic and not (
              self.cache_dit or self.breakable_cuda_graph_requested
-@@ -245,12 +245,12 @@ class MiniMaxMusic3AcousticDecoder:
- 
+@@ -247,12 +248,12 @@ class MiniMaxMusic3AcousticDecoder:
      def _build_dav(self, dav_path: str) -> int:
          """Load the DAV decoder and return how many weight norms were folded."""
          logger.info(f"Loading MiniMax Music 3 DAV from {dav_path}")
@@ -36,3 +43,16 @@ index a166a49..e33898a 100644
          removed_weight_norms = remove_weight_norm(self.dav)
          if self.compile_acoustic:
              window = self.dit.aligned_mel_length(AR_CHUNK_FRAMES)
+diff --git a/sglang_omni/models/minimax_music3/constants.py b/sglang_omni/models/minimax_music3/constants.py
+index 9dbd09e3..3b1fde00 100644
+--- a/sglang_omni/models/minimax_music3/constants.py
++++ b/sglang_omni/models/minimax_music3/constants.py
+@@ -13,7 +13,7 @@ DEFAULT_DIT_STEPS = 30
+ DEFAULT_DIT_CFG_SCALE = 1.7
+ AR_CFG_SCALE = 1.5
+ AR_CFG_TOP_K = 50
+-SUPPORTED_ACOUSTIC_DTYPES = frozenset({"float32", "bfloat16"})
++SUPPORTED_ACOUSTIC_DTYPES = frozenset({"float32", "bfloat16", "float16"})
+ 
+ DAV_SAMPLE_RATE = 44_100
+ OUTPUT_SAMPLE_RATE = 32_000

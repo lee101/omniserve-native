@@ -111,7 +111,7 @@ OMNISERVE_NATIVE_IMAGE_PERMITS=4 \
 
 `OMNISERVE_NATIVE_IMAGE_UPSTREAM` is the canonical OpenAI/control-plane image API. `OMNISERVE_NATIVE_IMAGE_WORKER_UPSTREAM` optionally sends legacy CuteDSL routes such as `/generate_image`, `/caption`, and `/aesthetic_score` directly to their contract-compatible worker while retaining native admission, pooling, and metrics.
 
-For distilled pipelines whose public API uses zero as a guidance sentinel while the native scheduler expects a nonzero CFG, `OMNISERVE_NATIVE_SD_ZERO_GUIDANCE` maps only an exact request value of `0.0`. Z-Image-Turbo uses `1.0`; explicit nonzero request guidance is never changed.
+An omitted or exact `0.0` request guidance maps to `OMNISERVE_NATIVE_SD_ZERO_GUIDANCE` (default `1.0`, which is what distilled Flux/Z-Image-Turbo pipelines expect); stable-diffusion.cpp treats a literal `0` CFG as unconditioned mode and ignores the prompt. Explicit nonzero request guidance is never changed.
 
 Constrained GPU VAE decode can use `OMNISERVE_NATIVE_SD_VAE_TILING=1` without
 moving the VAE to CPU. Latent tile width and height default to 32 and are controlled by
@@ -339,6 +339,10 @@ Invariants, in the order they are enforced:
    capacity and the observed eligible backlog, so a huge backlog is not a blank
    cheque and a thin one is refused as `not-worth-it`. Value must clear
    `price_usd_hr × margin` (default 1.5x).
+   Additional instances are valued only against demand left after subtracting
+   existing active capacity (including warming instances), so the same backlog
+   cannot pay for multiple rentals. This uses the same one-hour estimate;
+   cold-start latency and heterogeneous instance speeds are not modeled yet.
 6. **Caps and hysteresis**: `MAX_INSTANCES`, a lane `MAX_USD_HR` ceiling, and a
    cooldown between actions. Hard ceilings are reported ahead of the cooldown so
    the refusal names the real constraint.

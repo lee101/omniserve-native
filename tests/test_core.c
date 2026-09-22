@@ -1085,6 +1085,7 @@ static void test_scale_caps_and_cooldown(void) {
     oscale_policy policy;
     oscale_observation obs;
     saturated_paid_lane(&policy, &obs);
+    obs.backlog_reqs = 2000.0; /* Enough uncovered demand for both instances. */
     policy.max_instances = 2;
     policy.max_usd_hr = 1.0; /* room for two $0.34 instances */
     oscale *s = oscale_create();
@@ -1120,6 +1121,37 @@ static void test_scale_caps_and_cooldown(void) {
     CHECK(oscale_decide(lane, &obs, 1400.0, &reason) == OSCALE_HOLD);
     CHECK(reason == OSCALE_REASON_INSTANCE_CAP);
     CHECK(oscale_lane_spend_rate_usd_hr(lane) > 0.67);
+    oscale_destroy(s);
+}
+
+static void test_scale_marginal_demand(void) {
+    oscale_policy policy;
+    oscale_observation obs;
+    saturated_paid_lane(&policy, &obs);
+    oscale *s = oscale_create();
+    CHECK(oscale_add_lane(s, &policy) == 0);
+    oscale_lane *lane = oscale_lane_at(s, 0);
+    oscale_reason reason = OSCALE_REASON_NONE;
+    CHECK(oscale_decide(lane, &obs, 1000.0, &reason) == OSCALE_UP);
+    int slot = oscale_begin_instance(lane, 1000.0);
+    oscale_instance_touch(lane, slot, 1130.0);
+
+    /* 200 requests fit in the first instance's 720 req/hour capacity.
+     * Neither warming nor ready capacity can justify a duplicate rental. */
+    for (int ready = 0; ready < 2; ready++) {
+        lane->instances[slot].ready = ready != 0;
+        obs.backlog_reqs = 200.0;
+        CHECK(oscale_decide(lane, &obs, 1130.0, &reason) == OSCALE_HOLD);
+        CHECK(reason == OSCALE_REASON_NOT_WORTH_IT);
+        obs.backlog_reqs = 723.0; /* Three marginal requests do not pay rent. */
+        CHECK(oscale_decide(lane, &obs, 1130.0, &reason) == OSCALE_HOLD);
+        CHECK(reason == OSCALE_REASON_NOT_WORTH_IT);
+        obs.backlog_reqs = 920.0;
+        CHECK(oscale_decide(lane, &obs, 1130.0, &reason) == OSCALE_UP);
+    }
+    oscale_release_instance(lane, slot, 1130.0, OSCALE_REASON_IDLE);
+    obs.backlog_reqs = 200.0;
+    CHECK(oscale_decide(lane, &obs, 1260.0, &reason) == OSCALE_UP);
     oscale_destroy(s);
 }
 
@@ -1891,6 +1923,7 @@ int main(void) {
     test_scale_prefers_local_capacity();
     test_scale_cost_gate();
     test_scale_caps_and_cooldown();
+    test_scale_marginal_demand();
     test_scale_down_to_zero();
     test_scale_hard_ttl_beats_everything();
     test_tune_profiles();
