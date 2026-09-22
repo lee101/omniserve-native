@@ -11,6 +11,9 @@ OMNI=${OMNI:-$CODE/omniserve-native-qwen}                 # git worktree of bran
 MODELS=/nvme0n1-disk/models/omniserve-native/qwen-image-2.1
 PORT=${RA2_PORT:-8792}
 CUDA_ARCH=${CUDA_ARCH:-120}                            # RTX 5090
+# "*=cpu" streams every weight from RAM (fits next to the other tenants: ~11 s sampling + 3 s decode at 1024^2 on the 5090);
+# switch to "te=cpu" (7 s sampling) once >=8 GB VRAM is free at load time.
+RA2_PARAMS_BACKEND=${RA2_PARAMS_BACKEND:-*=cpu}
 HF=${HF:-/nvme0n1-disk/code/omniserve-native/.venv/bin/hf}
 NVCC=${NVCC:-/usr/local/cuda-12.9/bin/nvcc}
 
@@ -60,7 +63,7 @@ Environment=OMNISERVE_NATIVE_SD_LLM_VISION=$MODELS/mmproj-Qwen3VL-8B-Instruct-F1
 Environment=OMNISERVE_NATIVE_SD_VAE=$MODELS/vae/qwen_image_2.1_vae_bf16.safetensors
 Environment=OMNISERVE_NATIVE_SD_REFERENCE_EDIT=1
 Environment=OMNISERVE_NATIVE_SD_EAGER_LOAD=1
-Environment=OMNISERVE_NATIVE_SD_PARAMS_BACKEND=te=cpu
+Environment=OMNISERVE_NATIVE_SD_PARAMS_BACKEND=${RA2_PARAMS_BACKEND}
 Environment=OMNISERVE_NATIVE_SD_MIN_FREE_MB=256
 Environment=OMNISERVE_NATIVE_SD_VAE_TILING=1
 Environment=OMNISERVE_NATIVE_SD_VAE_TILE_X=32
