@@ -98,6 +98,8 @@ extern const char *OPENAPI_JSON;
 
 static bool env_flag(const char *name, int fallback);
 static const char *configured_path(const char *name, const char *fallback);
+static bool overflow_path_passthrough(void);
+static const char *overflow_path_label(void);
 /* Relays are built from these wherever a lane can send work to a standing
  * remote, so they are declared here rather than beside their definitions. */
 static const char *service_key_for(const app_state *app, const oproxy_target *target);
@@ -576,7 +578,7 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  placement.spec_draft_max, placement.spec_rounds, placement.spec_drafted,
                  placement.spec_accepted, acceptance, placement.spec_saved_calls,
                  app->image_overflow ? "true" : "false",
-                 configured_path("OMNISERVE_NATIVE_IMAGE_OVERFLOW_PATH", "/predict-sync"),
+                 overflow_path_label(),
                  app->overflow_tier_mask,
                  app->overflow_saturated, app->overflow_failover,
                  capacity_json);
@@ -1614,6 +1616,16 @@ static const char *configured_path(const char *name, const char *fallback) {
     return path && path[0] == '/' ? path : fallback;
 }
 
+static bool overflow_path_passthrough(void) {
+    const char *raw = getenv("OMNISERVE_NATIVE_IMAGE_OVERFLOW_PATH");
+    return raw && strcmp(raw, "passthrough") == 0;
+}
+
+static const char *overflow_path_label(void) {
+    return overflow_path_passthrough() ? "passthrough"
+         : configured_path("OMNISERVE_NATIVE_IMAGE_OVERFLOW_PATH", "/predict-sync");
+}
+
 static bool env_flag(const char *name, int fallback) {
     const char *value = getenv(name);
     if (!value || !value[0]) return fallback != 0;
@@ -1708,7 +1720,7 @@ static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_targ
     size_t path_len = strlen(path);
     /* "passthrough" chains to another omniserve gateway: generations and edits
      * keep their own routes instead of collapsing onto one worker path. */
-    if (strcmp(path, "passthrough") == 0) {
+    if (overflow_path_passthrough()) {
         path = req->path;
         path_len = req->path_len;
     }
