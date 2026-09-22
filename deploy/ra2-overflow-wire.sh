@@ -7,7 +7,8 @@
 set -euo pipefail
 STEP=${1:-status}
 APPNZ=${APPNZ_BASE:-http://127.0.0.1:8787}
-key() { sudo cat /proc/$(pgrep -f "[b]uild-full/omniserve-native" | head -1)/environ | tr '\0' '\n' | grep -oE '^OMNISERVE_NATIVE_H3_API_KEY=.*' | cut -d= -f2-; }
+KEYFILE=/etc/omniserve-ra2-appnz.key   # app.nz API key (papers_api row named omniserve-ra2-overflow), 0600
+key() { sudo cat "$KEYFILE" 2>/dev/null | tr -d '\n'; }
 case $STEP in
   cog)
     K=$(key); [ -n "$K" ] || { echo "no app.nz API key found in the main gateway env" >&2; exit 1; }
