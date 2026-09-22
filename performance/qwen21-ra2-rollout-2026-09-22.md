@@ -53,3 +53,13 @@ bash deploy/qwen-ra2-prod.sh start && bash deploy/qwen-ra2-prod.sh smoke
 Then set `RA2_LOCAL_IMAGE_URL=http://127.0.0.1:8792/v1/images/generations` + secret in the netwrck prod env, `RA2_BACKEND_URL=http://127.0.0.1:8792` + secret for cutedsl, deploy both, and flip back with `RA2_DEFAULT=0` if needed. The omniserve, netwrck and cutedsl-site changes still need commits and pushes before the prod checkouts can pull them.
 
 Follow-ups worth doing: port the latent-replay patch to upstream so Qwen repeats are 3x; tune EasyCache threshold (0.15-0.3) on the 5090; try Spectrum as the default if its quality edge holds across more prompts; webp output from the Qwen instance currently comes back as png (see bench README).
+
+## Update 2026-09-22 13:20 NZST: prod instance live
+
+- `omniserve-native-qwen.service` (port 8792, branch `qwen-ra2`, worktree `/nvme0n1-disk/code/omniserve-native-qwen`, sd.cpp master at `/nvme0n1-disk/code/stable-diffusion.cpp-master`) is running on prod with every weight streamed from RAM (`OMNISERVE_NATIVE_SD_PARAMS_BACKEND=*=cpu`) because only ~2-8 GB VRAM is free next to the other tenants. Measured through the gateway: 1024x1024, 20 steps, EasyCache 0.2 = 10-11 s wall, WebP out (RGBA WebP fix `5f848c0`). With `te=cpu` (DiT resident) sampling is 7.0 s but the VAE decode then fails for lack of VRAM; that config needs ~8 GB free at load, i.e. the stray `build-dev/omniserve-native` (pid 1429811, 5.4 GB, manual, 2 days old) stopped.
+- Secret: `/etc/omniserve-qwen.env` (random, generated at install). The zimage instance on 8791 runs without a secret.
+- Disk was freed by the user (44 GB free), models live in `/nvme0n1-disk/models/omniserve-native/qwen-image-2.1/`.
+
+Remaining wiring (user-facing, not done): netwrck prod needs `RA2_LOCAL_IMAGE_URL=http://127.0.0.1:8792/v1/images/generations` and `RA2_LOCAL_IMAGE_SECRET=<from /etc/omniserve-qwen.env>` in its environment plus a rebuild/restart from branch `ra2-art-generator`; cutedsl-site prod needs `RA2_BACKEND_URL=http://127.0.0.1:8792` and `RA2_BACKEND_SECRET` plus a deploy from its `ra2-art-generator` branch. Both flip the site default to ra2 (`RA2_DEFAULT=0` reverts).
+
+Local optimisation loop result (ComfyUI/python, 3090 Ti): floor SSIM>=0.985/PSNR>=37 is met fastest by adaptive sigma-aware Taylor (15 real calls, 10.75 s, PSNR 38.4, SSIM 0.988); details in `qwen-image-2.1-bench/README.md`. The same error-gated skipping is being ported into sd.cpp's TaylorSeer for prod (`stable-diffusion.cpp-master` branch `qwen-adaptive-taylor`, bench in `qwen-image-2.1-bench/comparison/sdcpp_optim/`).
