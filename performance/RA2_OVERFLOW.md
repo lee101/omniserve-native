@@ -103,6 +103,26 @@ Two consequences follow, and they are the whole design:
    request is looked at, so the only way to spend money is a paid request that
    the local device could not take.
 
+## Shared image admission on :8791
+
+Configure the main Z-Image gateway on `:8791` to route Qwen requests to the
+loopback sibling on `:8792`:
+
+```bash
+OMNISERVE_NATIVE_IMAGE_MODEL_UPSTREAMS=ra2=http://127.0.0.1:8792,qwen-image-2.1=http://127.0.0.1:8792,qwen=http://127.0.0.1:8792
+OMNISERVE_NATIVE_IMAGE_MODEL_UPSTREAM_SECRET=<8792 instance's OMNISERVE_NATIVE_SECRET>
+```
+
+Send all image traffic through `:8791`, with `"model":"ra2"` for Qwen; keep
+`:8792` private and do not configure a reciprocal mapping there. The main
+scheduler holds its image permits throughout each sibling response, balancing
+Qwen against local Z-Image and other admitted GPU work. This includes edits and
+img2img even if Z-Image lacks reference-edit support. The sibling retains its
+own overflow policy below. Watch `/status.image_model_upstreams` and
+`omniserve_image_model_relay_total{model="ra2"}` on the main gateway. Removing
+the mappings restores existing routing after restart. These are configuration
+instructions only; this change does not modify production services.
+
 ## Production environment
 
 `ra2` instance (`/etc/omniserve-qwen.env`, service `omniserve-native-qwen`):

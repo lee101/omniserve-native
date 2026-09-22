@@ -24,6 +24,13 @@
 
 #define MAX_TOKS 4096
 #define MAX_MSGS 128
+#define MAX_IMAGE_MODEL_UPSTREAMS 16
+
+typedef struct {
+    char model[64];
+    oproxy_target *target;
+    unsigned long long relay_total;
+} image_model_upstream;
 
 typedef struct {
     osched *sched;
@@ -78,6 +85,9 @@ typedef struct {
      * gateway is the one paying, so the pass-through stays as it was. */
     const char *image_overflow_api_key;
     int image_overflow_timeout_ms;
+    image_model_upstream image_model_upstreams[MAX_IMAGE_MODEL_UPSTREAMS];
+    int image_model_upstream_count;
+    const char *image_model_upstream_secret;
     unsigned overflow_tier_mask;
     unsigned long long overflow_saturated;
     unsigned long long overflow_failover;
@@ -280,7 +290,7 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
     double vram_free = -1.0, vram_total = -1.0;
     bool vram_ok = ogpu_memory_gib(&vram_free, &vram_total);
 
-    char body[4096];
+    char body[8192];
     size_t len = (size_t)snprintf(body, sizeof body,
         "# HELP omniserve_responses_total HTTP responses by status class.\n"
         "# TYPE omniserve_responses_total counter\n"
@@ -381,6 +391,12 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
             "omniserve_overflow_total{cause=\"saturated\"} %llu\n"
             "omniserve_overflow_total{cause=\"local_failed\"} %llu\n",
             app->overflow_saturated, app->overflow_failover);
+    }
+    for (int i = 0; i < app->image_model_upstream_count && len < sizeof body; i++) {
+        image_model_upstream *model = &app->image_model_upstreams[i];
+        len += (size_t)snprintf(body + len, sizeof body - len,
+            "omniserve_image_model_relay_total{model=\"%s\"} %llu\n",
+            model->model, __atomic_load_n(&model->relay_total, __ATOMIC_RELAXED));
     }
     ohttp_respond(req, 200, "text/plain; version=0.0.4", body, len);
 }
@@ -565,6 +581,16 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  app->overflow_saturated, app->overflow_failover,
                  capacity_json);
     }
+    len = strlen(body);
+    if (len > 0 && body[len - 1] == '}') body[--len] = '\0';
+    len += (size_t)snprintf(body + len, sizeof body - len, ",\"image_model_upstreams\":{");
+    for (int i = 0; i < app->image_model_upstream_count; i++) {
+        image_model_upstream *model = &app->image_model_upstreams[i];
+        len += (size_t)snprintf(body + len, sizeof body - len,
+            "%s\"%s\":{\"relay_total\":%llu}", i ? "," : "", model->model,
+            __atomic_load_n(&model->relay_total, __ATOMIC_RELAXED));
+    }
+    snprintf(body + len, sizeof body - len, "}}");
     ohttp_force_close(req);
     ohttp_respond_str(req, 200, "application/json", body);
 }
@@ -1371,6 +1397,76 @@ static void handle_completion(ohttp_request *req, app_state *app, bool legacy, b
  * both before that. */
 static oproxy_target *image_overflow_for(const app_state *app, otier tier);
 static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_target *overflow);
+
+/* Inspect only routing metadata: sibling bodies need not satisfy Z-Image's
+ * parser, and source images must not be decoded by this gateway. */
+static bool relay_image_model(ohttp_request *req, app_state *app) {
+    if (!app->image_model_upstream_count || !req->body) return false;
+    oj_tok tokens[MAX_TOKS];
+    int count = oj_parse(req->body, req->body_len, tokens, MAX_TOKS);
+    if (count <= 0 || tokens[0].type != OJ_OBJECT) return false;
+    int token = oj_obj_get(req->body, tokens, count, 0, "model");
+    if (token < 0 || tokens[token].type != OJ_STRING) return false;
+    char name[64];
+    size_t length = oj_unescape(req->body, &tokens[token], name, sizeof name);
+    if (!length || length >= sizeof name || strlen(name) != length) return false;
+    if (!strcasecmp(name, "z-image") || !strcasecmp(name, "zimage") ||
+        !strcasecmp(name, "local")) return false;
+    image_model_upstream *model = NULL;
+    for (int i = 0; i < app->image_model_upstream_count; i++) {
+        if (!strcasecmp(name, app->image_model_upstreams[i].model)) {
+            model = &app->image_model_upstreams[i];
+            break;
+        }
+    }
+    if (!model) return false;
+    otier tier = request_tier(req);
+    /* This sibling uses the same GPU, so it must queue. The standing remote
+     * overflow is not an alternative backend for this selected model. */
+    if (!osched_acquire_n(app->sched, tier, app->image_permits)) {
+        respond_error(req, 503, "admission timeout; retry");
+        return true;
+    }
+    char auth[1024];
+    oproxy_header forwarded[20];
+    int n = build_relay_headers(app, req, model->target, -1, forwarded, 17,
+                                auth, sizeof auth);
+    /* The sibling authenticates this gateway, never the original caller.
+     * No proxy-origin headers are allowlisted, so loopback trust is retained. */
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        if (!oproxy_is_caller_credential(forwarded[i].name, forwarded[i].name_len))
+            forwarded[kept++] = forwarded[i];
+    }
+    n = kept;
+    const char *secret = app->image_model_upstream_secret;
+    if (secret && secret[0]) forwarded[n++] = (oproxy_header){
+        "X-API-Key", sizeof "X-API-Key" - 1, secret, strlen(secret)};
+    const char *tier_name = otier_name(tier);
+    forwarded[n++] = (oproxy_header){
+        "X-Omniserve-Tier", sizeof "X-Omniserve-Tier" - 1, tier_name, strlen(tier_name)};
+    size_t content_type_len = 0;
+    const char *content_type = ohttp_req_header(req, "Content-Type", &content_type_len);
+    if (!content_type) {
+        content_type = "application/json";
+        content_type_len = strlen(content_type);
+    }
+    char error[256];
+    oproxy_result result;
+    __atomic_fetch_add(&model->relay_total, 1, __ATOMIC_RELAXED);
+    bool ok = oproxy_target_relay(model->target,
+        req->method, req->method_len, req->path, req->path_len,
+        NULL, 0, req->body, req->body_len, content_type, content_type_len,
+        forwarded, n, app->upstream_timeout_ms, proxy_sink_raw, req,
+        &result, error, sizeof error);
+    osched_release_n(app->sched, tier, app->image_permits);
+    if (!ok) {
+        fprintf(stderr, "image model %s relay failed: %s\n", model->model, error);
+        if (!result.response_started) respond_error(req, 502, "image model backend unavailable");
+        else ohttp_force_close(req);
+    } else if (result.downstream_close) ohttp_force_close(req);
+    return true;
+}
 
 static void handle_images(ohttp_request *req, app_state *app) {
     otier tier = request_tier(req);
@@ -2253,6 +2349,14 @@ static void route(ohttp_request *req, void *user) {
         }
         return;
     }
+    if (app->image_model_upstream_count &&
+        (ohttp_path_is(req, "/v1/images/generations") ||
+         ohttp_path_is(req, "/v1/images/edits") ||
+         ohttp_path_is(req, "/v1/images/img2img"))) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        if (relay_image_model(req, app)) return;
+    }
     if (ohttp_path_is(req, "/v1/images/generations")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
@@ -2752,6 +2856,43 @@ int main(int argc, char **argv) {
     CREATE_UPSTREAM(image_overflow, image_overflow_url, "image overflow");
     CREATE_UPSTREAM(stt_overflow, stt_overflow_url, "STT overflow");
     CREATE_UPSTREAM(tts_overflow, tts_overflow_url, "TTS overflow");
+    const char *model_upstreams = getenv("OMNISERVE_NATIVE_IMAGE_MODEL_UPSTREAMS");
+    if (model_upstreams && model_upstreams[0]) {
+        char *entries = strdup(model_upstreams);
+        if (!entries) return 1;
+        for (char *save = NULL, *entry = strtok_r(entries, ",", &save); entry;
+             entry = strtok_r(NULL, ",", &save)) {
+            char *eq = strchr(entry, '=');
+            size_t len = eq ? (size_t)(eq - entry) : 0;
+            if (!len || len >= sizeof app.image_model_upstreams[0].model ||
+                strspn(entry, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.") != len ||
+                app.image_model_upstream_count == MAX_IMAGE_MODEL_UPSTREAMS) {
+                fprintf(stderr, "invalid image model upstream mapping\n");
+                free(entries);
+                return 1;
+            }
+            *eq++ = 0;
+            image_model_upstream *model = &app.image_model_upstreams[app.image_model_upstream_count];
+            for (size_t j = 0; j < len; j++)
+                model->model[j] = entry[j] >= 'A' && entry[j] <= 'Z' ? entry[j] + ('a' - 'A') : entry[j];
+            for (int j = 0; j < app.image_model_upstream_count; j++) {
+                if (!strcmp(model->model, app.image_model_upstreams[j].model)) {
+                    fprintf(stderr, "duplicate image model upstream: %s\n", model->model);
+                    free(entries);
+                    return 1;
+                }
+            }
+            model->target = oproxy_target_create(eq, upstream_idle, upstream_error, sizeof upstream_error);
+            if (!model->target) {
+                fprintf(stderr, "invalid image model upstream: %s\n", upstream_error);
+                free(entries);
+                return 1;
+            }
+            app.image_model_upstream_count++;
+        }
+        free(entries);
+    }
+    app.image_model_upstream_secret = getenv("OMNISERVE_NATIVE_IMAGE_MODEL_UPSTREAM_SECRET");
 #undef CREATE_UPSTREAM
     /* Defaults to paid only. Widening this is a decision to let cheaper
      * traffic reach a metered endpoint, so it must be written down, not
@@ -2906,6 +3047,8 @@ int main(int argc, char **argv) {
     oproxy_target_destroy(app.animation_upstream);
     oproxy_target_destroy(app.threed_upstream);
     oproxy_target_destroy(app.aux_upstream);
+    for (int i = 0; i < app.image_model_upstream_count; i++)
+        oproxy_target_destroy(app.image_model_upstreams[i].target);
     oproxy_target_destroy(app.image_overflow);
     oproxy_target_destroy(app.stt_overflow);
     oproxy_target_destroy(app.tts_overflow);

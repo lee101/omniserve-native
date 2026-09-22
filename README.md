@@ -462,6 +462,22 @@ serverless cold start plus ~11 GB of weight streaming, hence 10 minutes rather
 than the chat default. `performance/RA2_OVERFLOW.md` has the cost model, the
 break-even math, the deploy commands and the rollback.
 
+Sibling image models on the same GPU can share this gateway's admission with
+`OMNISERVE_NATIVE_IMAGE_MODEL_UPSTREAMS="ra2=http://127.0.0.1:8792,qwen-image-2.1=http://127.0.0.1:8792,qwen=http://127.0.0.1:8792"`.
+The top-level JSON `model` matches case-insensitively; generations, edits and
+img2img append their original request path and relay the body unchanged. Missing,
+unknown, `z-image`, `zimage` and `local` models retain the existing route.
+Sibling calls queue with the request's trusted tier and hold `IMAGE_PERMITS`
+until the response finishes, including failures; they do not use the main
+instance's remote overflow. Set `OMNISERVE_NATIVE_IMAGE_MODEL_UPSTREAM_SECRET`
+to the sibling's `OMNISERVE_NATIVE_SECRET` to send it as `X-API-Key`. Caller
+credentials and query parameters are dropped. Loopback siblings receive the
+gateway's resolved tier. `/status.image_model_upstreams` lists configured names
+and their `relay_total` attempt counters; metrics expose
+`omniserve_image_model_relay_total{model="ra2"}`. Mappings are read at startup
+(up to 16 unique names, each 1–63 ASCII letters, digits, dots, underscores or
+hyphens), and relays use `OMNISERVE_NATIVE_UPSTREAM_TIMEOUT_MS`.
+
 ## VRAM brokering between co-tenants
 
 Four processes hold VRAM on this box and each sizes its workload from
