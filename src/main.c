@@ -73,6 +73,11 @@ typedef struct {
     oproxy_target *image_overflow;
     oproxy_target *stt_overflow;
     oproxy_target *tts_overflow;
+    /* Credential and time budget for the image lane's remote. The key is what
+     * makes the relay strip the caller's own: without one, nothing proves this
+     * gateway is the one paying, so the pass-through stays as it was. */
+    const char *image_overflow_api_key;
+    int image_overflow_timeout_ms;
     unsigned overflow_tier_mask;
     unsigned long long overflow_saturated;
     unsigned long long overflow_failover;
@@ -82,6 +87,14 @@ extern const char *DOCS_HTML;
 extern const char *OPENAPI_JSON;
 
 static bool env_flag(const char *name, int fallback);
+static const char *configured_path(const char *name, const char *fallback);
+/* Relays are built from these wherever a lane can send work to a standing
+ * remote, so they are declared here rather than beside their definitions. */
+static const char *service_key_for(const app_state *app, const oproxy_target *target);
+static int build_relay_headers(const app_state *app, const ohttp_request *req,
+                               const oproxy_target *target, int tier_override,
+                               oproxy_header *forwarded, int capacity,
+                               char *auth, size_t auth_cap);
 
 /* The native LLM is an embedded backend, so the Python scheduler cannot evict
  * it unless the gateway exposes the same lifecycle it exposes for a proxy
@@ -540,10 +553,16 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  ",\"tune\":{\"class\":\"%s\",\"n_batch\":%d,\"n_ubatch\":%d},"
                  "\"speculation\":{\"draft_max\":%d,\"rounds\":%llu,\"drafted\":%llu,"
                  "\"accepted\":%llu,\"acceptance\":%.3f,\"calls_saved\":%llu},"
+                 "\"overflow\":{\"image\":%s,\"image_path\":\"%s\",\"tiers\":%u,"
+                 "\"saturated\":%llu,\"local_failed\":%llu},"
                  "\"capacity\":%s}",
                  placement.tune_class, placement.n_batch, placement.n_ubatch,
                  placement.spec_draft_max, placement.spec_rounds, placement.spec_drafted,
                  placement.spec_accepted, acceptance, placement.spec_saved_calls,
+                 app->image_overflow ? "true" : "false",
+                 configured_path("OMNISERVE_NATIVE_IMAGE_OVERFLOW_PATH", "/predict-sync"),
+                 app->overflow_tier_mask,
+                 app->overflow_saturated, app->overflow_failover,
                  capacity_json);
     }
     ohttp_force_close(req);
@@ -827,51 +846,14 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
           env_flag("OMNISERVE_NATIVE_TRAINING_SWAP_EMBEDDED_MODELS", 1)));
     if (swap_embedded_models) unload_embedded_models_for_background();
 
+    char service_auth[1024];
     oproxy_header forwarded[17];
-    int forwarded_n = 0;
-    bool h3_service_auth = local == app->h3_upstream && app->h3_api_key && app->h3_api_key[0];
-    int forwarded_limit = tier_override >= 0 ? 13 : (h3_service_auth ? 15 : 16);
-    for (int i = 0; i < req->header_count && forwarded_n < forwarded_limit; i++) {
-        if (!proxy_header_allowed(&req->headers[i])) continue;
-        if (h3_service_auth &&
-            ((req->headers[i].name_len == sizeof "Authorization" - 1 &&
-              strncasecmp(req->headers[i].name, "Authorization", sizeof "Authorization" - 1) == 0) ||
-             (req->headers[i].name_len == sizeof "X-API-Key" - 1 &&
-              strncasecmp(req->headers[i].name, "X-API-Key", sizeof "X-API-Key" - 1) == 0)))
-            continue;
-        forwarded[forwarded_n++] = (oproxy_header){
-            .name = req->headers[i].name,
-            .name_len = req->headers[i].name_len,
-            .value = req->headers[i].value,
-            .value_len = req->headers[i].value_len,
-        };
-    }
-    char h3_authorization[1024];
-    if (h3_service_auth) {
-        int n = snprintf(h3_authorization, sizeof h3_authorization, "Bearer %s", app->h3_api_key);
-        if (n <= 7 || (size_t)n >= sizeof h3_authorization) {
-            osched_release_n(app->sched, tier, permits);
-            respond_error(req, 500, "H3 service credential is invalid");
-            return;
-        }
-        forwarded[forwarded_n++] = (oproxy_header){
-            .name = "Authorization", .name_len = sizeof "Authorization" - 1,
-            .value = h3_authorization, .value_len = (size_t)n,
-        };
-    }
-    if (tier_override >= 0) {
-        forwarded[forwarded_n++] = (oproxy_header){
-            .name = "X-Omniserve-Tier", .name_len = sizeof "X-Omniserve-Tier" - 1,
-            .value = "background", .value_len = sizeof "background" - 1,
-        };
-        forwarded[forwarded_n++] = (oproxy_header){
-            .name = "X-Animation-Publish", .name_len = sizeof "X-Animation-Publish" - 1,
-            .value = "r2-searchable", .value_len = sizeof "r2-searchable" - 1,
-        };
-        forwarded[forwarded_n++] = (oproxy_header){
-            .name = "X-3D-Publish", .name_len = sizeof "X-3D-Publish" - 1,
-            .value = "r2-searchable", .value_len = sizeof "r2-searchable" - 1,
-        };
+    int forwarded_n = build_relay_headers(app, req, upstream, tier_override,
+                                          forwarded, 17, service_auth, sizeof service_auth);
+    if (forwarded_n < 0) {
+        osched_release_n(app->sched, tier, permits);
+        respond_error(req, 500, "service credential is invalid");
+        return;
     }
     size_t content_type_len = 0;
     const char *content_type = ohttp_req_header(req, "Content-Type", &content_type_len);
@@ -909,6 +891,17 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
         permits = 0;
         app->overflow_failover++;
         fprintf(stderr, "local upstream failed (%s); retrying on overflow\n", error);
+        /* The destination changed, so the credential must too: the remote is
+         * billed for this request and must not be handed the caller's key. */
+        char overflow_auth[1024];
+        oproxy_header overflow_headers[17];
+        int overflow_n = build_relay_headers(app, req, overflow, tier_override,
+                                             overflow_headers, 17,
+                                             overflow_auth, sizeof overflow_auth);
+        if (overflow_n < 0) {
+            respond_error(req, 500, "overflow service credential is invalid");
+            return;
+        }
         ok = oproxy_target_relay(
             overflow,
             req->method, req->method_len,
@@ -916,7 +909,7 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
             req->query, req->query_len,
             req->body, req->body_len,
             content_type, content_type_len,
-            forwarded, forwarded_n,
+            overflow_headers, overflow_n,
             upstream_timeout_ms,
             proxy_sink_raw, req,
             &result, error, sizeof error);
@@ -1374,8 +1367,23 @@ static void handle_completion(ohttp_request *req, app_state *app, bool legacy, b
     free(body);
 }
 
+/* Defined with the other relay helpers below; the embedded image lane needs
+ * both before that. */
+static oproxy_target *image_overflow_for(const app_state *app, otier tier);
+static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_target *overflow);
+
 static void handle_images(ohttp_request *req, app_state *app) {
+    otier tier = request_tier(req);
+    /* Resolved before admission, so a saturated or unavailable local lane can
+     * be answered by the remote instead of a queue wait or a 503. */
+    oproxy_target *overflow = image_overflow_for(app, tier);
     if (!osd_ready()) {
+        if (overflow) {
+            app->overflow_failover++;
+            fprintf(stderr, "no diffusion model loaded; relaying to the image overflow\n");
+            relay_image_overflow(req, app, overflow);
+            return;
+        }
         respond_error(req, 503, "no diffusion model loaded; start with OMNISERVE_NATIVE_SD_MODEL");
         return;
     }
@@ -1402,9 +1410,19 @@ static void handle_images(ohttp_request *req, app_state *app) {
     oimg_result result;
     bool ok = osd_try_cached_result(&image_request.generation, &result);
     if (ok) goto encode_image;
-    otier tier = request_tier(req);
     int permits = app->image_permits;
-    if (!osched_acquire_n(app->sched, tier, permits)) {
+    /* With a remote available, queueing locally is the wrong default: the wait
+     * buys nothing the remote would not have already delivered. Try-acquire
+     * refuses while anyone is queued, so a caller with somewhere else to go
+     * cannot jump ahead of one that has already paid the latency. */
+    if (overflow) {
+        if (!osched_try_acquire_n(app->sched, tier, permits)) {
+            app->overflow_saturated++;
+            oimage_request_free(&image_request);
+            relay_image_overflow(req, app, overflow);
+            return;
+        }
+    } else if (!osched_acquire_n(app->sched, tier, permits)) {
         oimage_request_free(&image_request);
         respond_error(req, 503, "admission timeout; retry");
         return;
@@ -1426,6 +1444,14 @@ static void handle_images(ohttp_request *req, app_state *app) {
                  required_headroom_mb);
         osched_release_n(app->sched, tier, permits);
         oimage_request_free(&image_request);
+        /* A device that cannot take this request is a capacity refusal, not a
+         * backend fault: it is the same answer as a taken permit, and the remote
+         * can serve it. */
+        if (overflow) {
+            app->overflow_saturated++;
+            relay_image_overflow(req, app, overflow);
+            return;
+        }
         respond_error(req, 503, lease_error);
         return;
     }
@@ -1437,6 +1463,11 @@ static void handle_images(ohttp_request *req, app_state *app) {
         if (image_lease_id[0]) ovram_release(app->vram, image_lease_id);
         osched_release_n(app->sched, tier, permits);
         oimage_request_free(&image_request);
+        if (overflow) {
+            app->overflow_saturated++;
+            relay_image_overflow(req, app, overflow);
+            return;
+        }
         respond_error(req, 503, headroom_error);
         return;
     }
@@ -1445,6 +1476,14 @@ static void handle_images(ohttp_request *req, app_state *app) {
     osched_release_n(app->sched, tier, permits);
     if (!ok) {
         oimage_request_free(&image_request);
+        /* Nothing has been written to the caller yet, so this is still a safe
+         * place to spend a remote on. */
+        if (overflow) {
+            app->overflow_failover++;
+            fprintf(stderr, "local image generation failed; relaying to the image overflow\n");
+            relay_image_overflow(req, app, overflow);
+            return;
+        }
         respond_error(req, 500, "image generation failed");
         return;
     }
@@ -1483,6 +1522,119 @@ static bool env_flag(const char *name, int fallback) {
     const char *value = getenv(name);
     if (!value || !value[0]) return fallback != 0;
     return value[0] == '1' || value[0] == 't' || value[0] == 'T' || value[0] == 'y' || value[0] == 'Y';
+}
+
+/* The credential this gateway presents at a destination, or NULL when the
+ * destination carries none of its own. */
+static const char *service_key_for(const app_state *app, const oproxy_target *target) {
+    if (target == app->h3_upstream) return app->h3_api_key;
+    if (target == app->image_overflow) return app->image_overflow_api_key;
+    return NULL;
+}
+
+/* Builds the forwarded header set for one relay: the caller's allowlisted
+ * headers, minus the credential headers this destination must not receive, plus
+ * the service credential it must. Returns the header count, or -1 when a
+ * configured credential cannot be rendered — the caller refuses the relay
+ * rather than forwarding the caller's key to a backend that bills us.
+ *
+ * Rebuilt per destination rather than once per request, because a failover
+ * changes which credential is correct. */
+static int build_relay_headers(const app_state *app, const ohttp_request *req,
+                               const oproxy_target *target, int tier_override,
+                               oproxy_header *forwarded, int capacity,
+                               char *auth, size_t auth_cap) {
+    const char *service_key = service_key_for(app, target);
+    int reserve = 1 + (service_key ? 1 : 0) + (tier_override >= 0 ? 3 : 0);
+    int limit = capacity - reserve;
+    if (limit < 0) limit = 0;
+    int count = 0;
+    for (int i = 0; i < req->header_count && count < limit; i++) {
+        if (!proxy_header_allowed(&req->headers[i])) continue;
+        if (service_key &&
+            oproxy_is_caller_credential(req->headers[i].name, req->headers[i].name_len))
+            continue;
+        forwarded[count++] = (oproxy_header){
+            .name = req->headers[i].name,
+            .name_len = req->headers[i].name_len,
+            .value = req->headers[i].value,
+            .value_len = req->headers[i].value_len,
+        };
+    }
+    if (service_key) {
+        oproxy_header header;
+        if (count >= capacity || !oproxy_service_bearer(&header, auth, auth_cap, service_key))
+            return -1;
+        forwarded[count++] = header;
+    }
+    if (tier_override >= 0) {
+        forwarded[count++] = (oproxy_header){
+            .name = "X-Omniserve-Tier", .name_len = sizeof "X-Omniserve-Tier" - 1,
+            .value = "background", .value_len = sizeof "background" - 1,
+        };
+        forwarded[count++] = (oproxy_header){
+            .name = "X-Animation-Publish", .name_len = sizeof "X-Animation-Publish" - 1,
+            .value = "r2-searchable", .value_len = sizeof "r2-searchable" - 1,
+        };
+        forwarded[count++] = (oproxy_header){
+            .name = "X-3D-Publish", .name_len = sizeof "X-3D-Publish" - 1,
+            .value = "r2-searchable", .value_len = sizeof "r2-searchable" - 1,
+        };
+    }
+    return count;
+}
+
+/* The standing remote for the embedded image lane. The lanes that proxy have a
+ * local target to key off; this one's local backend is the SD context inside
+ * this process, so the lane is named directly. NULL when the lane has no remote
+ * or this tier may not spend: free and background traffic must never reach a
+ * metered endpoint. */
+static oproxy_target *image_overflow_for(const app_state *app, otier tier) {
+    if (!app->image_overflow) return NULL;
+    if (!(app->overflow_tier_mask & (1u << (unsigned)tier))) return NULL;
+    return app->image_overflow;
+}
+
+/* Relays one image request to the standing remote, streaming its response back
+ * as the caller's own. The body goes across unchanged: the remote is handed
+ * exactly the JSON this gateway parses, which is what lets the app.nz cog seam
+ * be addressed like any other upstream. */
+static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_target *overflow) {
+    char auth[1024];
+    oproxy_header forwarded[17];
+    int forwarded_n = build_relay_headers(app, req, overflow, -1, forwarded, 17,
+                                          auth, sizeof auth);
+    if (forwarded_n < 0) {
+        respond_error(req, 500, "image overflow credential is invalid");
+        return;
+    }
+    const char *path = configured_path("OMNISERVE_NATIVE_IMAGE_OVERFLOW_PATH", "/predict-sync");
+    size_t content_type_len = 0;
+    const char *content_type = ohttp_req_header(req, "Content-Type", &content_type_len);
+    if (!content_type) {
+        content_type = "application/json";
+        content_type_len = sizeof "application/json" - 1;
+    }
+    char error[256];
+    oproxy_result result;
+    bool ok = oproxy_target_relay(
+        overflow,
+        req->method, req->method_len,
+        path, strlen(path),
+        req->query, req->query_len,
+        req->body, req->body_len,
+        content_type, content_type_len,
+        forwarded, forwarded_n,
+        app->image_overflow_timeout_ms,
+        proxy_sink_raw, req,
+        &result, error, sizeof error);
+    if (!ok) {
+        fprintf(stderr, "image overflow request failed: %s\n", error);
+        if (!result.response_started) respond_error(req, 502, "overflow backend unavailable");
+        else ohttp_force_close(req);
+    } else if (result.downstream_close) {
+        ohttp_force_close(req);
+    }
 }
 
 static bool request_forces_local_model(const ohttp_request *req) {
@@ -2621,6 +2773,11 @@ int main(int argc, char **argv) {
     app.upstream_timeout_ms = upstream_timeout ? atoi(upstream_timeout) : 600000;
     const char *h3_timeout = getenv("OMNISERVE_NATIVE_H3_TIMEOUT_MS");
     app.h3_timeout_ms = h3_timeout ? atoi(h3_timeout) : 1800000;
+    /* The image overflow is reached by a metered cog that has to cold start a
+     * worker and load ~11 GB of weights before it samples, so the default is
+     * generous: a timeout here is a paid request thrown away. */
+    app.image_overflow_api_key = getenv("OMNISERVE_NATIVE_IMAGE_OVERFLOW_API_KEY");
+    app.image_overflow_timeout_ms = env_int("OMNISERVE_NATIVE_IMAGE_OVERFLOW_TIMEOUT_MS", 600000);
 
     const char *gguf = getenv("OMNISERVE_NATIVE_LLM_GGUF");
     if (gguf && gguf[0]) {

@@ -1,0 +1,88 @@
+# Qwen Image 2.1 ("ra2") RunPod image: the OmniServe manifest runtime plus a
+# CUDA build of stable-diffusion.cpp, so one image serves the serverless worker
+# (`runtime/handler.py`) and the app.nz Cog pod (`runtime/cog_pod.py`) with the
+# same weights and the same code.
+#
+# Dockerfile.runpod is the multi-workload video image; this one is deliberately
+# separate because it needs a CUDA toolchain that the pinned runtime base does
+# not carry, and because the ra2 lane must not be able to change the video
+# image's layer set.
+#
+# Build (from the repo root):
+#   docker build -f Dockerfile.runpod-sdcpp -t ghcr.io/lee101/omniserve-native:ra2 .
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04 AS sdcpp-builder
+
+# Pinned to the commit the local ra2 lane and its benchmarks were validated
+# against (upstream leejet/stable-diffusion.cpp). The C API struct layout and
+# the CUDA kernels are version-coupled to the ctypes bindings in
+# workloads/qwen_image.py, so tracking master would be a silent ABI break —
+# the build fails instead, via `--abi-check` below.
+ARG SDCPP_REPO=https://github.com/leejet/stable-diffusion.cpp
+ARG SDCPP_COMMIT=c678dfe704a2230342376b46add9c8ca736a653d
+# sm_86 (A40/3090), sm_89 (4090/L40S), sm_120 (5090). GEMM-bound: the build is
+# cached per arch, and a missing arch falls back to JIT, which costs the first
+# request on every cold worker.
+ARG CUDA_ARCHS="86;89;120"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates cmake git \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN git init -q . && git remote add origin "$SDCPP_REPO" \
+    && git fetch -q --depth 1 origin "$SDCPP_COMMIT" \
+    && git checkout -q FETCH_HEAD \
+    && git log -1 --format='sd.cpp %H %ci'
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
+        -DSD_CUDA=ON -DSD_BUILD_SHARED_LIBS=ON \
+        -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
+    && cmake --build build -j"$(nproc)" --target stable-diffusion \
+    && ls -l build/bin/
+
+# The pinned runtime base, matching Dockerfile.runpod: CUDA 12.8, Python 3.12,
+# the RunPod SDK, and ffmpeg.
+FROM ghcr.io/lee101/h3-cog@sha256:632903993661f8e63c79d67dadbe28e300081d88c9c1dc22376f4cb95ad0c353
+
+# ggml's CUDA backend still routes some ops through OpenMP.
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sdcpp-builder /src/build/bin/libstable-diffusion.so \
+     /opt/stable-diffusion.cpp/build/bin/libstable-diffusion.so
+
+# The workload binds the library directly through ctypes and encodes with
+# Pillow, so torch/diffusers are deliberately absent: several GB off every
+# serverless cold start, paid on the first request of every scale-up.
+RUN python -m pip install --no-cache-dir \
+        "huggingface-hub==1.27.0" hf_transfer pillow requests
+
+COPY runtime /opt/omniserve/runtime
+COPY workloads /opt/omniserve/workloads
+
+# Gate the image on the ctypes bindings matching the linked header. This is
+# cheap (no weights, no GPU) and is the only place the mismatch can be caught
+# before a paying request is the one that finds it.
+RUN python /opt/omniserve/workloads/qwen_image.py --abi-check
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/opt/omniserve \
+    OMNISERVE_WORKLOAD_MANIFEST=/opt/omniserve/workloads/workloads.json \
+    OMNISERVE_DEFAULT_WORKLOAD=qwen-image-2.1 \
+    OMNISERVE_VRAM_BROKER_REQUIRED=0 \
+    RA2_SD_LIB=/opt/stable-diffusion.cpp/build/bin/libstable-diffusion.so \
+    RA2_MODELS_DIR=/runpod-volume/omniserve/qwen-image-2.1 \
+    RA2_CACHE_MODE=easycache \
+    RA2_CACHE_THRESHOLD=0.05 \
+    RA2_STEPS=20 \
+    RA2_GUIDANCE=1.0 \
+    RA2_REFERENCE_EDIT=1 \
+    RA2_VAE_TILING=1 \
+    RA2_WEBP_QUALITY=85
+
+# Weights live on the shared network volume (Serverless) or the pod weights
+# volume, which the workload probes for; HF_HOME is only a fallback cache for
+# the first start that seeds that volume.
+ENV HF_HOME=/runpod-volume/omniserve/huggingface \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    TMPDIR=/runpod-volume/omniserve/tmp
+
+ENTRYPOINT ["python", "-u", "/opt/omniserve/runtime/handler.py"]

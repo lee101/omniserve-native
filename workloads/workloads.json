@@ -14,6 +14,11 @@
     "required_mib": 12800,
     "aliases": ["anima", "anima-image", "anime-illustration"]
   },
+  "qwen-image-2.1": {
+    "module": "workloads.qwen_image",
+    "required_mib": 12000,
+    "aliases": ["ra2", "qwen-image", "qwen_image", "ra2-image"]
+  },
   "wan-animate-2": {
     "module": "workloads.wan_animate_2",
     "required_mib": 24576,

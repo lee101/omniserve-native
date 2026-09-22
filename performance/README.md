@@ -3,6 +3,10 @@
 See [Qwen Edit and RTX 5090 evaluation](qwen-edit-5090.md) for native GPU
 encoder placement, exact-cache concurrency, query threads, and edit sweeps.
 
+[RA2 overflow](RA2_OVERFLOW.md) is the cost model, production env, deploy and
+rollback for the Qwen Image 2.1 lane's paid-only overflow to app.nz (RunPod
+serverless, promoted to a pod only while sustained traffic is cheaper).
+
 `native-core.md` is a reproducible Callgrind and Massif report for the C HTTP,
 proxy, JSON, and scheduler test workload. Its raw inputs are retained beside it.
 

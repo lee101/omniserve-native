@@ -143,6 +143,13 @@ if(Python3_Interpreter_FOUND)
         NAME trellis2_worker
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_trellis2_worker.py"
     )
+    # The pod-mode entry app.nz drives over HTTP: /healthz, /predictions with
+    # {"input": ...} in and {"output": ...} out. Runs a stub workload, so it
+    # needs no GPU and no weights.
+    add_test(
+        NAME cog_pod_contract
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_cog_pod_contract.py"
+    )
     add_test(
         NAME asr_training
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_asr_training.py"
@@ -190,6 +197,16 @@ if(Python3_Interpreter_FOUND)
     )
     set_tests_properties(image_worker_routing PROPERTIES
         ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    # Drives the real gateway with the stub diffusion backend: a saturated
+    # embedded image lane must relay to its standing remote instead of queueing.
+    if(TARGET onative_sd_cache_stub)
+        add_test(
+            NAME image_overflow_routing
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_image_overflow_routing.py"
+        )
+        set_tests_properties(image_overflow_routing PROPERTIES
+            ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
+    endif()
     add_test(
         NAME h3_routing
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_h3_routing.py"

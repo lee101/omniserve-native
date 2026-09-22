@@ -439,6 +439,29 @@ OMNISERVE_NATIVE_TTS_OVERFLOW_UPSTREAM=https://... \
 OMNISERVE_NATIVE_OVERFLOW_TIERS=paid
 ```
 
+The embedded image lane is the first to use that remote end to end. Its local
+backend is the SD context in this process rather than a proxy target, so the
+lane is named directly and both routes it serves overflow: generation and
+reference edits, with the request body relayed unchanged (`image_base64`
+included). A lane with no model loaded, a broker that denies the headroom, and a
+generation that fails before anything is written all take the same path.
+
+```bash
+OMNISERVE_NATIVE_IMAGE_OVERFLOW_UPSTREAM=http://127.0.0.1:8787/api/cogs/$RA2_COG_ID \
+OMNISERVE_NATIVE_IMAGE_OVERFLOW_PATH=/predict-sync \
+OMNISERVE_NATIVE_IMAGE_OVERFLOW_API_KEY=<app.nz key for the cog owner> \
+OMNISERVE_NATIVE_IMAGE_OVERFLOW_TIMEOUT_MS=600000 \
+OMNISERVE_NATIVE_OVERFLOW_TIERS=paid
+```
+
+The key is what makes the relay safe to bill: when one is configured the
+caller's `Authorization`, `X-API-Key`, `X-Rapid-API-Key` and `secret` are dropped
+and replaced with this gateway's own credential, because the remote is paid for
+by the caller's request but authenticated as us. A timeout has to cover a
+serverless cold start plus ~11 GB of weight streaming, hence 10 minutes rather
+than the chat default. `performance/RA2_OVERFLOW.md` has the cost model, the
+break-even math, the deploy commands and the rollback.
+
 ## VRAM brokering between co-tenants
 
 Four processes hold VRAM on this box and each sizes its workload from

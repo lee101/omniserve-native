@@ -751,6 +751,46 @@ static void test_proxy_relay(void) {
     free(sink.data);
 }
 
+static void test_proxy_service_credentials(void) {
+    /* Every header this gateway accepts as a caller credential must be
+     * recognised, or a metered backend would receive the caller's key. */
+    CHECK(oproxy_is_caller_credential("Authorization", sizeof "Authorization" - 1));
+    CHECK(oproxy_is_caller_credential("authorization", sizeof "authorization" - 1));
+    CHECK(oproxy_is_caller_credential("X-API-Key", sizeof "X-API-Key" - 1));
+    CHECK(oproxy_is_caller_credential("x-api-key", sizeof "x-api-key" - 1));
+    CHECK(oproxy_is_caller_credential("X-Rapid-API-Key", sizeof "X-Rapid-API-Key" - 1));
+    CHECK(oproxy_is_caller_credential("secret", sizeof "secret" - 1));
+    /* Content negotiation and tracing still pass through untouched. */
+    CHECK(!oproxy_is_caller_credential("Accept", sizeof "Accept" - 1));
+    CHECK(!oproxy_is_caller_credential("Content-Type", sizeof "Content-Type" - 1));
+    /* A prefix is not a match: "Authorization-Extra" is a different header. */
+    CHECK(!oproxy_is_caller_credential("Authorization-Extra", sizeof "Authorization-Extra" - 1));
+    CHECK(!oproxy_is_caller_credential("X-API-Key2", sizeof "X-API-Key2" - 1));
+    CHECK(!oproxy_is_caller_credential("secre", sizeof "secre" - 1));
+    CHECK(!oproxy_is_caller_credential(NULL, 0));
+
+    /* The injected credential is what the backend bills against. */
+    char buffer[64];
+    oproxy_header header;
+    CHECK(oproxy_service_bearer(&header, buffer, sizeof buffer, "appnz-service-key"));
+    CHECK(header.name_len == sizeof "Authorization" - 1);
+    CHECK(strncmp(header.name, "Authorization", header.name_len) == 0);
+    CHECK(header.value_len == strlen("Bearer appnz-service-key"));
+    CHECK(strncmp(header.value, "Bearer appnz-service-key", header.value_len) == 0);
+
+    /* Refusals: no key, empty key, and a key that cannot be rendered. Missing
+     * them would relay a request with the caller's credential still attached. */
+    CHECK(!oproxy_service_bearer(&header, buffer, sizeof buffer, NULL));
+    CHECK(!oproxy_service_bearer(&header, buffer, sizeof buffer, ""));
+    char tight[16];
+    CHECK(!oproxy_service_bearer(&header, tight, sizeof tight, "appnz-service-key"));
+    CHECK(!oproxy_service_bearer(&header, buffer, 0, "appnz-service-key"));
+    /* Exactly the separator and nothing after it is a misconfiguration, not a
+     * credential worth forwarding. */
+    char separator[16];
+    CHECK(!oproxy_service_bearer(&header, separator, sizeof separator, ""));
+}
+
 static void test_http_server(void) {
     char target_error[256];
     echo_context context = {
@@ -1855,6 +1895,7 @@ int main(void) {
     test_scale_hard_ttl_beats_everything();
     test_tune_profiles();
     test_capacity_controller();
+    test_proxy_service_credentials();
     test_http_server();
     test_response_accounting();
     test_access_log();

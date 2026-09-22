@@ -3,7 +3,10 @@ set -Eeuo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 state_file="${OMNISERVE_RUNPOD_STATE:-${VIDEO_BACKGROUND_RUNPOD_STATE:-$root/.runpod.env}}"
-config="$root/deploy/runpod.json"
+# A second runtime (the ra2 image) has its own Dockerfile and endpoint shape, so
+# both are overridable rather than edited in place between deployments.
+config="${OMNISERVE_RUNPOD_CONFIG:-$root/deploy/runpod.json}"
+dockerfile_override="${OMNISERVE_DOCKERFILE:-}"
 worker="$root"
 
 if [[ -f "$root/.env" ]]; then
@@ -30,7 +33,7 @@ for command_name in curl docker jq sha256sum; do
   command -v "$command_name" >/dev/null || { echo "ERROR: missing $command_name" >&2; exit 1; }
 done
 
-dockerfile="$worker/Dockerfile.runpod"
+dockerfile="${dockerfile_override:-$worker/Dockerfile.runpod}"
 tag="$(find "$worker/runtime" "$worker/workloads" "$worker/src" -type f \
   ! -name '*.pyc' ! -path '*/__pycache__/*' -print0 \
   | sort -z | xargs -0 sha256sum; sha256sum "$dockerfile")"
@@ -64,8 +67,9 @@ if [[ -n "$network_volume_id" && -z "$network_volume_datacenter" ]]; then
   network_volume_response="$(curl --fail-with-body -sS "$api/networkvolumes/$network_volume_id" "${auth[@]}")"
   network_volume_datacenter="$(jq -r '.dataCenterId // empty' <<<"$network_volume_response")"
 fi
-template_payload="$(jq -n --arg image "$image" --arg registry_auth "$registry_auth_id" '{
-  imageName:$image, name:"omniserve-native", category:"NVIDIA",
+endpoint_name="$(jq -r '.name // "omniserve-native"' "$config")"
+template_payload="$(jq -n --arg image "$image" --arg registry_auth "$registry_auth_id" --arg name "$endpoint_name" '{
+  imageName:$image, name:$name, category:"NVIDIA",
   containerDiskInGb:20, dockerEntrypoint:[], dockerStartCmd:[], env:{},
   isPublic:false, isServerless:true, ports:[], readme:"OmniServe multi-workload native GPU runtime"
 } | if $registry_auth != "" then .containerRegistryAuthId = $registry_auth else . end')"
@@ -116,7 +120,7 @@ if [[ "$use_network_volume" == "0" ]]; then
   # The REST API accepts an empty dataCenterIds list but can retain the legacy
   # GraphQL `locations` value from a previously attached regional volume.
   # Clear it explicitly so scale-to-zero workers can allocate in any region.
-  graphql_query="mutation { saveEndpoint(input: { id: \"$endpoint_id\", gpuIds: \"AMPERE_48,ADA_48_PRO\", locations: \"\", name: \"omniserve-native\", templateId: \"$template_id\", workersMax: $(jq -r .workersMax "$config"), workersMin: $(jq -r .workersMin "$config") }) { id locations } }"
+  graphql_query="mutation { saveEndpoint(input: { id: \"$endpoint_id\", gpuIds: \"AMPERE_48,ADA_48_PRO\", locations: \"\", name: \"$endpoint_name\", templateId: \"$template_id\", workersMax: $(jq -r .workersMax "$config"), workersMin: $(jq -r .workersMin "$config") }) { id locations } }"
   graphql_response="$(curl --fail-with-body -sS -X POST \
     -H "Content-Type: application/json" \
     "https://api.runpod.io/graphql?api_key=$runpod_key" \
