@@ -32,6 +32,9 @@ static int decode_digit(unsigned char value) {
     return -1;
 }
 
+static void webp_lib_load(void);
+static bool webp_lib_loaded;
+
 bool osd_prepare_image(oimg_req *req) {
     if (!req->image_base64) return true;
     const char *src = req->image_base64;
@@ -63,6 +66,19 @@ bool osd_prepare_image(oimg_req *req) {
         width > 0 && height > 0 && width <= 4096 && height <= 4096) {
         req->image_pixels = stbi_load_from_memory(bytes, (int)used,
             &req->image_width, &req->image_height, &channels, 3);
+    } else if (valid && used > 12 && memcmp(bytes, "RIFF", 4) == 0 && memcmp(bytes + 8, "WEBP", 4) == 0) {
+        if (!webp_lib_loaded) { webp_lib_load(); webp_lib_loaded = true; }
+        if (p_webp_decode_rgb) {
+            int w = 0, h = 0;
+            unsigned char *rgb = p_webp_decode_rgb(bytes, used, &w, &h);
+            if (rgb && w > 0 && h > 0 && w <= 4096 && h <= 4096) {
+                /* stbi_image_free is free(); WebP buffers must go through WebPFree, so copy. */
+                size_t n = (size_t)w * (size_t)h * 3;
+                req->image_pixels = malloc(n);
+                if (req->image_pixels) { memcpy(req->image_pixels, rgb, n); req->image_width = w; req->image_height = h; }
+            }
+            if (rgb && p_webp_free) p_webp_free(rgb);
+        }
     }
     free(bytes);
     return req->image_pixels != NULL;
@@ -107,6 +123,8 @@ static fn_free_latent p_free_latent;
 static fn_webp_encode_rgb p_webp_encode_rgb;
 static fn_webp_free p_webp_free;
 static fn_webp_encode_rgba p_webp_encode_rgba; /* Qwen Image 2.1 decodes RGBA (layered/transparent output) */
+typedef unsigned char *(*fn_webp_decode_rgb)(const unsigned char *, size_t, int *, int *);
+static fn_webp_decode_rgb p_webp_decode_rgb; /* reference/init images may arrive as WebP; stb_image cannot decode it */
 static bool g_webp_enabled = true;
 static float g_webp_quality = 85.0f;
 
@@ -120,6 +138,7 @@ static void webp_lib_load(void) {
         p_webp_encode_rgb = (fn_webp_encode_rgb)dlsym(lib, "WebPEncodeRGB");
         p_webp_free = (fn_webp_free)dlsym(lib, "WebPFree");
         p_webp_encode_rgba = (fn_webp_encode_rgba)dlsym(lib, "WebPEncodeRGBA");
+        p_webp_decode_rgb = (fn_webp_decode_rgb)dlsym(lib, "WebPDecodeRGB");
         if (p_webp_encode_rgb && p_webp_free) return;
         p_webp_encode_rgb = NULL;
         p_webp_free = NULL;
