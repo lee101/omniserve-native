@@ -39,7 +39,10 @@ models() {
   mkdir -p "$MODELS"
   FREE_GB=$(df -BG --output=avail /nvme0n1-disk | tail -1 | tr -dc 0-9)
   if [ "$FREE_GB" -lt 14 ]; then echo "need >=14 GB free on /nvme0n1-disk for the Qwen 2.1 models, have ${FREE_GB}G; free space first" >&2; exit 1; fi
-  $HF download abenzerps/Qwen-Image-2.1-Uncensored-GGUF qwen-image-2.1-Q4_K_M.gguf vae/qwen_image_2.1_vae_bf16.safetensors --local-dir "$MODELS"
+  # The original Q4_K_M DiT was removed upstream; netwrck/ra2 mirrors the same bytes (sha256 833439e9...).
+  $HF download netwrck/ra2 ra2-dit-q4_k_m.gguf --local-dir "$MODELS"
+  [ -e "$MODELS/qwen-image-2.1-Q4_K_M.gguf" ] || ln -s ra2-dit-q4_k_m.gguf "$MODELS/qwen-image-2.1-Q4_K_M.gguf"
+  $HF download abenzerps/Qwen-Image-2.1-Uncensored-GGUF vae/qwen_image_2.1_vae_bf16.safetensors --local-dir "$MODELS"
   $HF download Qwen/Qwen3-VL-8B-Instruct-GGUF Qwen3VL-8B-Instruct-Q4_K_M.gguf mmproj-Qwen3VL-8B-Instruct-F16.gguf --local-dir "$MODELS"
   ls -la "$MODELS" "$MODELS/vae"
 }

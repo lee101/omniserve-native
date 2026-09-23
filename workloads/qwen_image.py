@@ -52,13 +52,13 @@ ALLOWED_INPUTS = {
     "image_base64", "strength", "n",
 }
 
-DIT_REPO = os.getenv("RA2_DIT_REPO", "abenzerps/Qwen-Image-2.1-Uncensored-GGUF")
+DIT_REPO = os.getenv("RA2_DIT_REPO", "netwrck/ra2")
 TEXT_ENCODER_REPO = os.getenv("RA2_TEXT_ENCODER_REPO", "Qwen/Qwen3-VL-8B-Instruct-GGUF")
 # The VAE comes from the same repo as the DiT, which is exactly where
 # `deploy/qwen-ra2-prod.sh models` pulls it from: worker and local lane load
 # identical bytes.
 VAE_REPO = os.getenv("RA2_VAE_REPO", "abenzerps/Qwen-Image-2.1-Uncensored-GGUF")
-DIT_FILE = os.getenv("RA2_DIT_FILE", "qwen-image-2.1-Q4_K_M.gguf")
+DIT_FILE = os.getenv("RA2_DIT_FILE", "ra2-dit-q4_k_m.gguf")
 TEXT_ENCODER_FILE = os.getenv("RA2_TEXT_ENCODER_FILE", "Qwen3VL-8B-Instruct-Q4_K_M.gguf")
 MMPROJ_FILE = os.getenv("RA2_MMPROJ_FILE", "mmproj-Qwen3VL-8B-Instruct-F16.gguf")
 VAE_FILE = os.getenv("RA2_VAE_FILE", "vae/qwen_image_2.1_vae_bf16.safetensors")
