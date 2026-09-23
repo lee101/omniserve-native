@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Last-resort image overflow: omniserve-native relays OpenAI-shaped image
-requests here (plain http, localhost); they run as RunPod serverless jobs on the
-omniserve-ra2-overflow endpoint and the worker's OpenAI-shaped output is
-returned unchanged. Stdlib only."""
+"""Image overflow adapter: omniserve-native relays OpenAI-shaped image requests
+here (plain http, localhost). If PRIMARY_UPSTREAM is set (another gateway, e.g.
+a LAN GPU box) it is tried first; anything it cannot serve (connection error,
+5xx, timeout) runs as a RunPod serverless job on the omniserve-ra2-overflow
+endpoint and the worker's OpenAI-shaped output is returned unchanged. Stdlib only."""
 import http.server, json, os, time, urllib.request, urllib.error
 
 RUNPOD_KEY = os.environ["RUNPOD_API_KEY"]
@@ -10,6 +11,31 @@ ENDPOINT = os.environ.get("RUNPOD_RA2_ENDPOINT_ID", "tlofa06vj7iab7")
 TOKEN = os.environ.get("OVERFLOW_TOKEN", "")
 BASE = f"https://api.runpod.ai/v2/{ENDPOINT}"
 DEADLINE_S = float(os.environ.get("OVERFLOW_DEADLINE_S", "580"))
+PRIMARY = os.environ.get("PRIMARY_UPSTREAM", "").rstrip("/")
+PRIMARY_TOKEN = os.environ.get("PRIMARY_TOKEN", "")
+PRIMARY_TIMEOUT_S = float(os.environ.get("PRIMARY_TIMEOUT_S", "240"))
+
+
+def try_primary(path, raw, tier):
+    """Return (status, body) from the primary gateway, or None to fall back."""
+    if not PRIMARY:
+        return None
+    headers = {"Content-Type": "application/json"}
+    if PRIMARY_TOKEN:
+        headers["Authorization"] = "Bearer " + PRIMARY_TOKEN
+    if tier:
+        headers["X-Omniserve-Tier"] = tier
+    req = urllib.request.Request(PRIMARY + path, data=raw, method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=PRIMARY_TIMEOUT_S) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code < 500:
+            return exc.code, exc.read()
+        print(f"primary {exc.code}; falling back to runpod", flush=True)
+    except Exception as exc:
+        print(f"primary unavailable ({type(exc).__name__}); falling back to runpod", flush=True)
+    return None
 
 
 def runpod(method, path, body=None):
@@ -42,7 +68,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path not in ("/v1/images/generations", "/v1/images/edits", "/v1/images/img2img"):
             return self.reply(404, {"error": {"message": "unsupported path"}})
         try:
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            primary = try_primary(self.path, raw, self.headers.get("X-Omniserve-Tier", ""))
+            if primary is not None:
+                code, payload = primary
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            body = json.loads(raw or b"{}")
             job = runpod("POST", "/run", {"input": body})
             job_id, started = job["id"], time.monotonic()
             while time.monotonic() - started < DEADLINE_S:
