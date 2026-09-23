@@ -19,7 +19,7 @@
  },
  "workloads": {
   "ra2": {
-   "note": "Qwen Image 2.1 Q4_K_M, 1024x1024, 20 steps. Local EasyCache 0.08; RunPod worker EasyCache 0.05 (stricter). Same GGUF weights.",
+   "note": "Qwen Image 2.1 Q4_K_M, 1024x1024, 20 steps, EasyCache 0.08 on local and on the qwen-mt RunPod worker. Same GGUF weights.",
    "deadline_ms": 45000,
    "reference_quality": 1.0,
    "candidates": [
@@ -34,6 +34,19 @@
      "evidence": "performance/qwen21-ra2-rollout-2026-09-22.md: 12.2 s resident, 8-11 s streamed via 8791"
     },
     {
+     "id": "runpod:d6opzplchn2w3a",
+     "kind": "runpod",
+     "endpoint": "d6opzplchn2w3a",
+     "gpu": "RTX4090 (L40S/6000Ada/L40 fallback)",
+     "usd_per_h": 1.1,
+     "p50_ms": 38800,
+     "p95_ms": 96300,
+     "cold_ms": 38800,
+     "usd_per_job": 0.0032,
+     "quality": 1.0,
+     "evidence": "performance/runpod-multitenant-qwen.md: qwen-mt image, weights baked, EasyCache 0.08 as local; 4090 warm exec 8.8-9.5 s (wall 10.4-10.5), cold wall 38.8 s (delay 28.3 s); SSIM vs local 0.969-0.998; p50 set to the cold wall because sparse overflow traffic mostly lands on a cold worker (ledger replaces after 5 jobs)"
+    },
+    {
      "id": "runpod:tlofa06vj7iab7",
      "kind": "runpod",
      "endpoint": "tlofa06vj7iab7",
@@ -44,7 +57,9 @@
      "cold_ms": 108000,
      "usd_per_job": 0.017,
      "quality": 1.0,
-     "evidence": "2026-09-23 canary, 3 parallel overflows while local busy: wall 60.5/84.3/145.5 s (exec 58.8/60.1/131.7 s, 2 cold); single warm probe 34.5 s; billing 0.744 $/h"
+     "evidence": "2026-09-23 canary, 3 parallel overflows while local busy: wall 60.5/84.3/145.5 s (exec 58.8/60.1/131.7 s, 2 cold); single warm probe 34.5 s; billing 0.744 $/h",
+     "available": false,
+     "note": "rollback only: superseded by d6opzplchn2w3a (workersMax 0)"
     },
     {
      "id": "gateway:ra2-daisy",
@@ -121,7 +136,7 @@
    ]
   },
   "qwen-edit": {
-   "note": "Qwen Image Edit 2511 Q4_K_M, 512px, 12 steps, CFG 2.5 (local canaries only; no remote image yet).",
+   "note": "Qwen Image Edit 2511 Q4_K_M + Qwen2.5-VL-7B bf16, 512px, 20 steps, CFG 2.5, dense. Remote = qwen-mt worker task edit.",
    "deadline_ms": 180000,
    "reference_quality": 1.0,
    "candidates": [
@@ -134,6 +149,19 @@
      "usd_per_job": 0.002,
      "quality": 1.0,
      "evidence": "performance/qwen-edit-5090.md: warm 72.5-75.0 s, first 87.2 s"
+    },
+    {
+     "id": "runpod:d6opzplchn2w3a",
+     "kind": "runpod",
+     "endpoint": "d6opzplchn2w3a",
+     "gpu": "RTX4090 (L40S/6000Ada/L40 fallback)",
+     "usd_per_h": 1.1,
+     "p50_ms": 80000,
+     "p95_ms": 130000,
+     "cold_ms": 80000,
+     "usd_per_job": 0.0075,
+     "quality": 1.0,
+     "evidence": "performance/runpod-multitenant-qwen.md: 4090 warm 23.4 s wall (22.1 exec), first edit after ra2 50.2 s (ctx swap 18.9 s); SSIM vs local 0.9959/0.9998; p50 set to the cold wall because sparse overflow traffic mostly lands on a cold worker (ledger replaces after 5 jobs)"
     }
    ]
   }
