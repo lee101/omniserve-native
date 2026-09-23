@@ -17,6 +17,11 @@ ENDPOINT = os.environ.get("RUNPOD_RA2_ENDPOINT_ID", "tlofa06vj7iab7")
 TOKEN = os.environ.get("OVERFLOW_TOKEN", "")
 ENDPOINTS = [e.strip() for e in os.environ.get("RUNPOD_RA2_ENDPOINTS", ENDPOINT).split(",") if e.strip()] or [ENDPOINT]
 WORKLOAD = os.environ.get("FRONTIER_WORKLOAD", "ra2")
+# Qwen Image Edit 2511 overflow: requests naming an edit model go to these endpoints as workload
+# qwen-edit. Endpoints in RUNPOD_MT_ENDPOINTS run workloads/qwen_mt.py and take an input `task`.
+EDIT_MODELS = {"qwen-edit", "qwen-image-edit", "qwen-image-edit-2511", "edit"}
+EDIT_ENDPOINTS = [e.strip() for e in os.environ.get("RUNPOD_EDIT_ENDPOINTS", "").split(",") if e.strip()]
+MT_ENDPOINTS = {e.strip() for e in os.environ.get("RUNPOD_MT_ENDPOINTS", "").split(",") if e.strip()}
 ROUTING = os.environ.get("FRONTIER_ROUTING", "0") == "1"
 PRIMARY_BREAKER_S = float(os.environ.get("PRIMARY_BREAKER_S", "0"))
 # The RunPod qwen_image worker rejects any input outside workloads/qwen_image.py ALLOWED_INPUTS,
@@ -24,6 +29,7 @@ PRIMARY_BREAKER_S = float(os.environ.get("PRIMARY_BREAKER_S", "0"))
 INPUT_KEYS = set(filter(None, os.environ.get(
     "RUNPOD_INPUT_KEYS", "workload,kind,profile,prompt,negative_prompt,width,height,size,steps,num_inference_steps,"
     "guidance_scale,seed,output_format,image_base64,strength,n").split(",")))
+INPUT_KEYS.add("task")
 _primary_down_until = 0.0
 _breaker_lock = threading.Lock()
 DEADLINE_S = float(os.environ.get("OVERFLOW_DEADLINE_S", "580"))
@@ -34,9 +40,14 @@ PRIMARY_TOKEN = os.environ.get("PRIMARY_TOKEN", "")
 PRIMARY_TIMEOUT_S = float(os.environ.get("PRIMARY_TIMEOUT_S", "240"))
 
 
-def ledger(**row):
+def ledger(workload=None, **row):
     if frontier is not None:
-        frontier.record(workload=WORKLOAD, source="runpod_overflow", **row)
+        frontier.record(workload=workload or WORKLOAD, source="runpod_overflow", **row)
+
+
+def workload_of(body):
+    names = {str(body.get(k, "")).strip().lower() for k in ("model", "task")}
+    return "qwen-edit" if names & EDIT_MODELS else WORKLOAD
 
 
 def trip_primary():
@@ -46,13 +57,17 @@ def trip_primary():
             _primary_down_until = time.monotonic() + PRIMARY_BREAKER_S
 
 
-def pick_endpoint(tier):
+def pick_endpoint(tier, workload=None):
+    workload = workload or WORKLOAD
+    pool = EDIT_ENDPOINTS if workload == "qwen-edit" else ENDPOINTS
+    if not pool:
+        return None
     if ROUTING and frontier is not None:
-        for candidate in frontier.get_router().remote_order(WORKLOAD, tier or "free"):
+        for candidate in frontier.get_router().remote_order(workload, tier or "free"):
             endpoint = candidate.split(":", 1)[-1]
-            if endpoint in ENDPOINTS:
+            if endpoint in pool:
                 return endpoint
-    return ENDPOINTS[0]
+    return pool[0]
 
 
 def try_primary(path, raw, tier):
@@ -100,6 +115,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             return self.reply(200, {"status": "ok", "endpoint": ENDPOINTS[0], "endpoints": ENDPOINTS,
+                                    "edit_endpoints": EDIT_ENDPOINTS, "mt_endpoints": sorted(MT_ENDPOINTS),
                                     "routing": ROUTING, "ledger": bool(frontier and frontier.get_ledger())})
         led = frontier.get_ledger() if frontier is not None else None
         if led is not None and self.path.startswith("/ledger/summary"):
@@ -123,7 +139,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             tier = self.headers.get("X-Omniserve-Tier", "")
             started = time.monotonic()
-            primary = try_primary(self.path, raw, tier)
+            body = json.loads(raw or b"{}")
+            workload = workload_of(body)
+            primary = try_primary(self.path, raw, tier) if workload == WORKLOAD else None
             if primary is not None:
                 code, payload = primary
                 ledger(backend="gateway", endpoint="primary", tier=tier or "free", status=str(code),
@@ -135,17 +153,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
                 return
-            body = json.loads(raw or b"{}")
             dropped = sorted(k for k in body if k not in INPUT_KEYS) if INPUT_KEYS else []
             for key in dropped:
                 body.pop(key)
-            endpoint = pick_endpoint(tier)
+            endpoint = pick_endpoint(tier, workload)
+            if endpoint is None:
+                return self.reply(503, {"error": {"message": f"no RunPod endpoint for {workload}"}})
+            if endpoint in MT_ENDPOINTS:
+                body["task"] = "edit" if workload == "qwen-edit" else "ra2"
+            else:
+                body.pop("task", None)
             job = runpod("POST", "/run", {"input": body}, endpoint)
             job_id, submitted = job["id"], time.monotonic()
             state, status = {}, "TIMED_OUT"
 
             def done(code, obj):
-                ledger(backend="runpod", endpoint=endpoint, tier=tier or "free", status=status, job_id=job_id,
+                ledger(workload=workload, backend="runpod", endpoint=endpoint, tier=tier or "free", status=status, job_id=job_id,
                        queue_ms=state.get("delayTime"), exec_ms=state.get("executionTime"),
                        wall_ms=(time.monotonic() - started) * 1000, quality_tier="equal",
                        detail={"http": code, "path": self.path, "dropped": dropped})
