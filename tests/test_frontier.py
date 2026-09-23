@@ -33,6 +33,10 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(decide("cheapest_within_deadline", 35000, 10000, 30000, 40000), "remote")
         self.assertEqual(decide("cheapest_within_deadline", 50000, 10000, 70000, 40000), "local")
         self.assertEqual(decide("cheapest_within_deadline", 90000, 10000, 70000, 40000), "remote")
+        self.assertEqual(decide("background", 1e9, 10000, 1000), "local")
+        self.assertEqual(decide("background", 50000, 10000, 30000, 40000), "remote")
+        self.assertEqual(decide("background", 20000, 10000, 30000, 40000), "local")
+        self.assertEqual(decide("background", 50000, 10000, 30000, allow_overflow=True), "remote")
 
 
 class ParetoTests(unittest.TestCase):
@@ -55,8 +59,23 @@ class ParetoTests(unittest.TestCase):
             "paid": {"policy": "cheapest_within_deadline", "deadline_ms": 40000}, "sub": {"policy": "fastest"},
             "free": {"policy": "local_only"}, "background": {"policy": "overflow_on_busy"}}})
 
+    def test_tier_overrides_and_background_flag(self):
+        s = seeds()
+        s["tiers"]["background"] = {"policy": "background"}
+        gw = build_routing(s)["workloads"]["w"]["gateway"]["tiers"]
+        self.assertEqual(gw["background"], {"policy": "background"})
+        env = {"FRONTIER_TIER_OVERRIDES": '{"free": {"policy": "cheapest_within_deadline"}}',
+               "FRONTIER_BACKGROUND_OVERFLOW": "1"}
+        with mock.patch.dict(os.environ, env):
+            gw = build_routing(s)["workloads"]["w"]["gateway"]["tiers"]
+        self.assertEqual(gw["free"]["policy"], "cheapest_within_deadline")
+        self.assertEqual(gw["background"], {"policy": "background", "allow_overflow": True})
+
     def test_repo_seeds_build(self):
         routing = build_routing(load_seeds())
+        gw = routing["workloads"]["ra2"]["gateway"]["tiers"]
+        self.assertEqual((gw["free"]["policy"], gw["background"]["policy"], gw["paid"]["policy"]),
+                         ("local_only", "background", "cheapest_within_deadline"))
         self.assertIn("local", routing["workloads"]["ra2"]["frontier"])
         self.assertEqual(routing["workloads"]["pixal3d"]["frontier"], ["runpod:akgefm0nzzr4jo"])
         self.assertNotIn("gateway", routing["workloads"]["pixal3d"])

@@ -63,7 +63,7 @@ class Router:
         if not local or local.get("p50_ms") is None:
             return "remote"
         return decide(policy["policy"], local_wait_ms, local["p50_ms"], remote["p50_ms"],
-                      deadline_ms or policy.get("deadline_ms"))
+                      deadline_ms or policy.get("deadline_ms"), bool(policy.get("allow_overflow")))
 
     def remote_order(self, workload: str, tier: str) -> list[str]:
         policy = self.tier_policy(workload, tier) or {}

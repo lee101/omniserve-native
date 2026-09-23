@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
 SEEDS = Path(__file__).with_name("seeds.json")
-POLICIES = ("local_only", "overflow_on_busy", "fastest", "cheapest_within_deadline")
+POLICIES = ("local_only", "overflow_on_busy", "fastest", "cheapest_within_deadline", "background")
 GATEWAY_TIERS = ("paid", "sub", "free", "background")
 MIN_SAMPLES = 5
 
 
 def decide(policy: str, local_wait_ms: float, local_p50_ms: float, remote_p50_ms: float,
-           deadline_ms: float | None = None) -> str:
+           deadline_ms: float | None = None, allow_overflow: bool = False) -> str:
     local_eta = local_wait_ms + local_p50_ms
     if policy == "local_only":
+        return "local"
+    if policy == "background":
+        if allow_overflow:
+            return "remote" if remote_p50_ms < local_eta else "local"
+        if deadline_ms and deadline_ms > 0 and local_eta > deadline_ms and remote_p50_ms <= deadline_ms:
+            return "remote"
         return "local"
     if policy == "fastest":
         return "remote" if remote_p50_ms < local_eta else "local"
@@ -69,7 +76,10 @@ def build_routing(seeds: dict, ledger=None, days: float = 7, now: float | None =
     now = now or time.time()
     since = now - days * 86400
     tolerance = float(seeds.get("quality_tolerance", 0.01))
-    tier_policies = seeds.get("tiers", {})
+    tier_policies = dict(seeds.get("tiers", {}))
+    overrides = json.loads(os.getenv("FRONTIER_TIER_OVERRIDES", "") or "{}")
+    tier_policies.update(overrides)
+    background_overflow = os.getenv("FRONTIER_BACKGROUND_OVERFLOW", "0") == "1"
     out = {"version": 1, "generated_at": now, "window_days": days, "workloads": {}}
     for name, spec in seeds.get("workloads", {}).items():
         reference = float(spec.get("reference_quality", 1.0))
@@ -89,14 +99,17 @@ def build_routing(seeds: dict, ledger=None, days: float = 7, now: float | None =
                    and c.get("p50_ms") is not None]
         tiers = {}
         for tier in (*GATEWAY_TIERS, "priority"):
-            policy = spec.get("tiers", {}).get(tier) or tier_policies.get(tier) or {"policy": "overflow_on_busy"}
+            policy = (overrides.get(tier) or spec.get("tiers", {}).get(tier) or tier_policies.get(tier)
+                      or {"policy": "overflow_on_busy"})
             policy = dict(policy)
+            if policy.get("policy") == "background" and background_overflow:
+                policy["allow_overflow"] = True
             if policy.get("policy") not in POLICIES:
                 policy["policy"] = "overflow_on_busy"
             if policy["policy"] == "cheapest_within_deadline" and not policy.get("deadline_ms"):
                 policy["deadline_ms"] = spec.get("deadline_ms")
             key = (lambda c: (c["usd_per_job"], c["p50_ms"])) if policy["policy"] in (
-                "cheapest_within_deadline", "local_only") else (lambda c: (c["p50_ms"], c["usd_per_job"]))
+                "cheapest_within_deadline", "local_only", "background") else (lambda c: (c["p50_ms"], c["usd_per_job"]))
             deadline = policy.get("deadline_ms")
             ordered = sorted(remotes, key=key)
             if policy["policy"] == "cheapest_within_deadline" and deadline:
@@ -108,7 +121,7 @@ def build_routing(seeds: dict, ledger=None, days: float = 7, now: float | None =
         if local and local.get("p50_ms") and best_remote:
             entry["gateway"] = {"local_p50_ms": round(local["p50_ms"], 1),
                                 "remote_p50_ms": round(best_remote["p50_ms"], 1),
-                                "tiers": {t: {k: v for k, v in tiers[t].items() if k in ("policy", "deadline_ms") and v}
+                                "tiers": {t: {k: v for k, v in tiers[t].items() if k in ("policy", "deadline_ms", "allow_overflow") and v}
                                           for t in GATEWAY_TIERS}}
         out["workloads"][name] = entry
     return out

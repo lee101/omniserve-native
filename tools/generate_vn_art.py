@@ -22,7 +22,7 @@ from PIL import Image, ImageOps
 def request_json(url: str, method: str = "GET", payload: dict[str, Any] | None = None,
                  timeout: int = 360) -> dict[str, Any]:
     body = json.dumps(payload).encode() if payload is not None else None
-    headers = {"Content-Type": "application/json"} if body is not None else {}
+    headers = {"Content-Type": "application/json", "X-Omniserve-Tier": "background"} if body is not None else {}
     request = Request(url, data=body, headers=headers, method=method)
     try:
         with urlopen(request, timeout=timeout) as response:
@@ -55,7 +55,7 @@ def generated_image(payload: dict[str, Any]) -> Image.Image:
 
 def post_image(url: str, payload: dict[str, Any], timeout: int = 360) -> Image.Image:
     request = Request(url, data=json.dumps(payload).encode(),
-                      headers={"Content-Type": "application/json"}, method="POST")
+                      headers={"Content-Type": "application/json", "X-Omniserve-Tier": "background"}, method="POST")
     try:
         with urlopen(request, timeout=timeout) as response:
             raw = response.read(80 << 20)

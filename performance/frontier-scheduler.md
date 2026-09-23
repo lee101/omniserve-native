@@ -26,14 +26,43 @@ Busy local lane only (an idle lane always runs locally). `local_eta = wait + loc
 
 | policy | rule | default tiers |
 | --- | --- | --- |
-| `local_only` | queue locally | background |
-| `cheapest_within_deadline` | local if `local_eta <= deadline`, else remote if `remote_eta <= deadline`, else the faster | paid; free for ra2 and yue (credit-charged traffic sent without a tier header) |
+| `local_only` | queue locally | free (since 2026-09-23 17:30 NZST, once netwrck/cutedsl tag paid traffic) |
+| `background` | never preempts; waits for an idle lane; overflows only if `allow_overflow` (`FRONTIER_BACKGROUND_OVERFLOW=1`, default off) or a stated deadline would be missed locally but met remotely | background |
+| `cheapest_within_deadline` | local if `local_eta <= deadline`, else remote if `remote_eta <= deadline`, else the faster | paid |
 | `fastest` | remote if `remote_eta < local_eta` | sub, priority |
 | `overflow_on_busy` | legacy: always overflow | anything unlisted, and the whole gateway when no routing file is loaded |
 
 Deadline: workload default (ra2 45 s, yue 180 s) or `X-Omniserve-Deadline-Ms` from an
 internal caller. If the local queue then times out (150 s admission), non-local-only
 tiers still overflow.
+
+### Tiers and admission
+
+Admission order is paid > sub > free > background (`osched` keeps waiters sorted by
+rank, FIFO within a rank). Background also needs the device otherwise idle, so it
+never shares the lane with a running job. Starvation bound
+(`OMNISERVE_NATIVE_BACKGROUND_MAX_WAIT_S`, prod 600 s): a background waiter older
+than the bound is ranked as free, older than twice the bound as paid (behind those
+already queued). Background has its own queue timeout
+(`OMNISERVE_NATIVE_BACKGROUND_ADMISSION_TIMEOUT_S`, prod 1800 s; others 150 s); on
+timeout it gets 503 unless overflow is allowed. Public callers cannot claim
+background (only loopback, unproxied requests may).
+
+Caller tags (deployed): netwrck `ra2Post` (generate, edit, FAL qwen proxy) and cutedsl
+`proxyToRA2` send `X-Omniserve-Tier: paid`; netwrck radio YuE renders (untracked WIP, not yet in a prod build),
+`cmd/generate_talking_avatars` (was the unknown tier `portrait`, i.e. free),
+`cmd/generate_character_portraits` and `tools/generate_vn_art.py` send `background`.
+The manifoldgen farm uses the 8100 Z-Image worker's own low-priority mode, not this
+gateway. netwrck's user-facing YuE route calls RunPod directly (no gateway).
+
+Revert free to the old spill behaviour: set
+`FRONTIER_TIER_OVERRIDES={"free":{"policy":"cheapest_within_deadline"}}` in
+`omniserve-frontier.service` and run it once (the gateway hot-reloads).
+
+Live canary 2026-09-23 (`:8792`, 1024², uncached): plan paid, background (+1.5 s),
+background (+3 s), paid (+4.5 s). The late paid request was admitted before both
+waiting background jobs: paid 13.7 s / 19.0 s wall (queue 9.2 s), background 32.7 s /
+41.0 s (queue 22.0 / 31.2 s), all local, no RunPod spend.
 
 ## Measured frontier (2026-09-23)
 
@@ -128,6 +157,10 @@ conservative about spending.
   (keep the input allowlist; without it every RunPod overflow fails).
 - YuE / 3D: remove their drop-ins, restart.
 - `systemctl disable --now omniserve-frontier.timer`.
+- Background admission: drop the two `OMNISERVE_NATIVE_BACKGROUND_*` lines from
+  `zz-frontier.conf` and restart (priority order itself is unchanged osched behaviour).
+- Caller tags: netwrck `bin/netwrckprod149` (supervisor `netwrckprod145` command),
+  cutedsl `/opt/cutedsl-site/server/cutedsl-server.pre-tier-20260923`.
 - RunPod: `PATCH /v1/endpoints/tlofa06vj7iab7 {"workersMax":2}`; flashboot can stay on.
 
 ## Follow-ups
@@ -137,8 +170,6 @@ conservative about spending.
 - The ra2 RunPod worker is 3x slower than local even warm (pool includes A5000/L4/3090
   and streams weights): pin the endpoint to 4090 or keep weights resident to make it a
   real frontier point.
-- Tier headers: netwrck/cutedsl send none, so all ra2 traffic is `free`; send
-  `X-Omniserve-Tier: paid` from credit-charged routes so free can become `local_only`.
 - `8791` runs the ra2overflow `build-full-ra2` binary without the frontier code (its
   image overflow is disabled); rebuild only when Z-Image overflow is restored.
 - Another agent's `qwen21_canary.py` launches gateways with the production unit env

@@ -5,7 +5,7 @@
    "policy": "local_only"
   },
   "background": {
-   "policy": "local_only"
+   "policy": "background"
   },
   "paid": {
    "policy": "cheapest_within_deadline"
@@ -57,13 +57,7 @@
      "quality": 1.0,
      "evidence": "offload-tiers-2026-09-22.md; tunnel returns 530 since 2026-09-22"
     }
-   ],
-   "tiers": {
-    "free": {
-     "policy": "cheapest_within_deadline",
-     "note": "netwrck/cutedsl send credit-charged ra2 jobs without a tier header, so free is billed traffic; OVERFLOW_TIERS already lets it spill"
-    }
-   }
+   ]
   },
   "yue": {
    "note": "YuE2-3B clip (1500 semantic tokens), BF16, full planning, 32 ODE steps, pinned revisions on both backends.",
@@ -94,13 +88,7 @@
      "quality": 1.0,
      "evidence": "performance/yue2-music.md 2026-09-20 benchmark: warm wall 32.2 s, first 249.8 s; 2026-09-23 canary (300 tokens, cold): delay 6.8 s + exec 66.5 s, wall 74.7 s"
     }
-   ],
-   "tiers": {
-    "free": {
-     "policy": "cheapest_within_deadline",
-     "note": "music is credit-charged; callers send no tier header"
-    }
-   }
+   ]
   },
   "pixal3d": {
    "note": "TencentARC/Pixal3D image-to-3D. Local runtime not installed and needs 23 GiB free; RunPod 4090 is the only live backend.",

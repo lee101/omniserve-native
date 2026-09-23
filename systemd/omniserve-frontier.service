@@ -12,3 +12,5 @@ Environment=FRONTIER_ROUTING_FILE=/nvme0n1-disk/data/omniserve-frontier/routing.
 Environment=FRONTIER_GATEWAY_LOGS=/nvme0n1-disk/data/omniserve-frontier/gateway-ra2.jsonl
 ExecStart=/usr/bin/python3 -m frontier cycle
 Nice=10
+Environment=FRONTIER_BACKGROUND_OVERFLOW=0
+Environment=FRONTIER_TIER_OVERRIDES=
