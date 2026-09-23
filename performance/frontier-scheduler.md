@@ -62,7 +62,10 @@ Revert free to the old spill behaviour: set
 Live canary 2026-09-23 (`:8792`, 1024², uncached): plan paid, background (+1.5 s),
 background (+3 s), paid (+4.5 s). The late paid request was admitted before both
 waiting background jobs: paid 13.7 s / 19.0 s wall (queue 9.2 s), background 32.7 s /
-41.0 s (queue 22.0 / 31.2 s), all local, no RunPod spend.
+41.0 s (queue 22.0 / 31.2 s), all local, no RunPod spend. End to end: a netwrck `POST /api/ra2-art-generator`
+(prod `netwrckprod154`) landed as a `tier=paid` ledger row on `:8792` (28.7 s, local).
+cutedsl's tag is covered by `server/ra2_test.go` and the deployed binary; no organic
+cutedsl ra2 request arrived during the window.
 
 ## Measured frontier (2026-09-23)
 
@@ -159,8 +162,9 @@ conservative about spending.
 - `systemctl disable --now omniserve-frontier.timer`.
 - Background admission: drop the two `OMNISERVE_NATIVE_BACKGROUND_*` lines from
   `zz-frontier.conf` and restart (priority order itself is unchanged osched behaviour).
-- Caller tags: netwrck `bin/netwrckprod149` (supervisor `netwrckprod145` command),
-  cutedsl `/opt/cutedsl-site/server/cutedsl-server.pre-tier-20260923`.
+- Caller tags: netwrck revert commit `85dbc601` and rebuild (prod is now
+  `netwrckprod154`, built by another operator on top of it); cutedsl
+  `/opt/cutedsl-site/server/cutedsl-server.pre-tier-20260923`.
 - RunPod: `PATCH /v1/endpoints/tlofa06vj7iab7 {"workersMax":2}`; flashboot can stay on.
 
 ## Follow-ups
