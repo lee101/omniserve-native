@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "obackend.h"
 #include "ocapacity.h"
+#include "ofrontier.h"
 #include "ohttp.h"
 #include "oimage.h"
 #include "ojson.h"
@@ -91,6 +92,9 @@ typedef struct {
     unsigned overflow_tier_mask;
     unsigned long long overflow_saturated;
     unsigned long long overflow_failover;
+    ofrontier *frontier;
+    bool frontier_routing;
+    unsigned long long frontier_kept_local;
 } app_state;
 
 extern const char *DOCS_HTML;
@@ -391,8 +395,11 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
             "# HELP omniserve_overflow_total Requests sent to a standing remote endpoint.\n"
             "# TYPE omniserve_overflow_total counter\n"
             "omniserve_overflow_total{cause=\"saturated\"} %llu\n"
-            "omniserve_overflow_total{cause=\"local_failed\"} %llu\n",
-            app->overflow_saturated, app->overflow_failover);
+            "omniserve_overflow_total{cause=\"local_failed\"} %llu\n"
+            "# HELP omniserve_frontier_kept_local_total Busy-lane requests the frontier policy queued locally.\n"
+            "# TYPE omniserve_frontier_kept_local_total counter\n"
+            "omniserve_frontier_kept_local_total %llu\n",
+            app->overflow_saturated, app->overflow_failover, app->frontier_kept_local);
     }
     for (int i = 0; i < app->image_model_upstream_count && len < sizeof body; i++) {
         image_model_upstream *model = &app->image_model_upstreams[i];
@@ -572,7 +579,8 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  "\"speculation\":{\"draft_max\":%d,\"rounds\":%llu,\"drafted\":%llu,"
                  "\"accepted\":%llu,\"acceptance\":%.3f,\"calls_saved\":%llu},"
                  "\"overflow\":{\"image\":%s,\"image_path\":\"%s\",\"tiers\":%u,"
-                 "\"saturated\":%llu,\"local_failed\":%llu},"
+                 "\"saturated\":%llu,\"local_failed\":%llu,"
+                 "\"frontier\":%s,\"frontier_kept_local\":%llu},"
                  "\"capacity\":%s}",
                  placement.tune_class, placement.n_batch, placement.n_ubatch,
                  placement.spec_draft_max, placement.spec_rounds, placement.spec_drafted,
@@ -581,6 +589,7 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  overflow_path_label(),
                  app->overflow_tier_mask,
                  app->overflow_saturated, app->overflow_failover,
+                 app->frontier_routing ? "true" : "false", app->frontier_kept_local,
                  capacity_json);
     }
     len = strlen(body);
@@ -1470,6 +1479,24 @@ static bool relay_image_model(ohttp_request *req, app_state *app) {
     return true;
 }
 
+static double frontier_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static double request_deadline_ms(const ohttp_request *req) {
+    if (!request_is_internal(req)) return 0;
+    size_t len = 0;
+    const char *v = ohttp_req_header(req, "X-Omniserve-Deadline-Ms", &len);
+    if (!v || !len || len > 12) return 0;
+    char buf[16];
+    memcpy(buf, v, len);
+    buf[len] = 0;
+    double d = atof(buf);
+    return d > 0 ? d : 0;
+}
+
 static void handle_images(ohttp_request *req, app_state *app) {
     otier tier = request_tier(req);
     /* Resolved before admission, so a saturated or unavailable local lane can
@@ -1506,8 +1533,13 @@ static void handle_images(ohttp_request *req, app_state *app) {
         return;
     }
     oimg_result result;
+    double frontier_started = frontier_now_ms();
+    double frontier_queue_ms = 0, frontier_wait_ms = 0;
     bool ok = osd_try_cached_result(&image_request.generation, &result);
-    if (ok) goto encode_image;
+    if (ok) {
+        ofrontier_log(app->frontier, tier, "cache", "exact", 0, frontier_now_ms() - frontier_started, 0, 200);
+        goto encode_image;
+    }
     int permits = app->image_permits;
     /* With a remote available, queueing locally is the wrong default: the wait
      * buys nothing the remote would not have already delivered. Try-acquire
@@ -1515,10 +1547,43 @@ static void handle_images(ohttp_request *req, app_state *app) {
      * cannot jump ahead of one that has already paid the latency. */
     if (overflow) {
         if (!osched_try_acquire_n(app->sched, tier, permits)) {
-            app->overflow_saturated++;
-            oimage_request_free(&image_request);
-            relay_image_overflow(req, app, overflow);
-            return;
+            ofr_table table;
+            bool keep_local = false;
+            if (app->frontier_routing && ofrontier_snapshot(app->frontier, &table)) {
+                osched_stats stats;
+                osched_snapshot(app->sched, &stats);
+                frontier_wait_ms = ofrontier_local_wait_ms(&stats, tier, permits, table.local_p50_ms);
+                keep_local = ofrontier_decide(&table, tier, frontier_wait_ms,
+                                              request_deadline_ms(req)) == OFR_LOCAL;
+            }
+            if (!keep_local) {
+                app->overflow_saturated++;
+                oimage_request_free(&image_request);
+                double relay_started = frontier_now_ms();
+                relay_image_overflow(req, app, overflow);
+                ofrontier_log(app->frontier, tier, "overflow", "saturated", 0,
+                              frontier_now_ms() - relay_started, frontier_wait_ms, 0);
+                return;
+            }
+            __atomic_fetch_add(&app->frontier_kept_local, 1, __ATOMIC_RELAXED);
+            double queued = frontier_now_ms();
+            if (!osched_acquire_n(app->sched, tier, permits)) {
+                oimage_request_free(&image_request);
+                if (ofrontier_decide(&table, tier, 1e12, 0) == OFR_LOCAL) {
+                    ofrontier_log(app->frontier, tier, "local", "admission_timeout",
+                                  frontier_now_ms() - queued, 0, frontier_wait_ms, 503);
+                    respond_error(req, 503, "admission timeout; retry");
+                    return;
+                }
+                app->overflow_saturated++;
+                double relay_started = frontier_now_ms();
+                relay_image_overflow(req, app, overflow);
+                ofrontier_log(app->frontier, tier, "overflow", "admission_timeout",
+                              relay_started - queued, frontier_now_ms() - relay_started,
+                              frontier_wait_ms, 0);
+                return;
+            }
+            frontier_queue_ms = frontier_now_ms() - queued;
         }
     } else if (!osched_acquire_n(app->sched, tier, permits)) {
         oimage_request_free(&image_request);
@@ -1569,9 +1634,12 @@ static void handle_images(ohttp_request *req, app_state *app) {
         respond_error(req, 503, headroom_error);
         return;
     }
+    double exec_started = frontier_now_ms();
     ok = osd_generate(&image_request.generation, &result);
     if (image_lease_id[0]) ovram_release(app->vram, image_lease_id);
     osched_release_n(app->sched, tier, permits);
+    ofrontier_log(app->frontier, tier, "local", frontier_queue_ms > 0 ? "queued" : "admitted",
+                  frontier_queue_ms, frontier_now_ms() - exec_started, frontier_wait_ms, ok ? 200 : 500);
     if (!ok) {
         oimage_request_free(&image_request);
         /* Nothing has been written to the caller yet, so this is still a safe
@@ -1710,11 +1778,16 @@ static oproxy_target *image_overflow_for(const app_state *app, otier tier) {
 static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_target *overflow) {
     char auth[1024];
     oproxy_header forwarded[17];
-    int forwarded_n = build_relay_headers(app, req, overflow, -1, forwarded, 17,
+    int forwarded_n = build_relay_headers(app, req, overflow, -1, forwarded, 16,
                                           auth, sizeof auth);
     if (forwarded_n < 0) {
         respond_error(req, 500, "image overflow credential is invalid");
         return;
+    }
+    if (app->frontier) {
+        const char *tier_name = otier_name(request_tier(req));
+        forwarded[forwarded_n++] = (oproxy_header){
+            "X-Omniserve-Tier", sizeof "X-Omniserve-Tier" - 1, tier_name, strlen(tier_name)};
     }
     const char *path = configured_path("OMNISERVE_NATIVE_IMAGE_OVERFLOW_PATH", "/predict-sync");
     size_t path_len = strlen(path);
@@ -2938,6 +3011,12 @@ int main(int argc, char **argv) {
      * generous: a timeout here is a paid request thrown away. */
     app.image_overflow_api_key = getenv("OMNISERVE_NATIVE_IMAGE_OVERFLOW_API_KEY");
     app.image_overflow_timeout_ms = env_int("OMNISERVE_NATIVE_IMAGE_OVERFLOW_TIMEOUT_MS", 600000);
+    {
+        const char *policy = getenv("OMNISERVE_NATIVE_FRONTIER_POLICY");
+        app.frontier = ofrontier_open(policy, getenv("OMNISERVE_NATIVE_FRONTIER_WORKLOAD"),
+                                      getenv("OMNISERVE_NATIVE_FRONTIER_LOG"), (int)port);
+        app.frontier_routing = app.frontier && policy && policy[0];
+    }
 
     const char *gguf = getenv("OMNISERVE_NATIVE_LLM_GGUF");
     if (gguf && gguf[0]) {

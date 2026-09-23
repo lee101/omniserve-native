@@ -4,7 +4,7 @@ override CPPFLAGS += -D_POSIX_C_SOURCE=200809L -Isrc -Iinclude
 
 BIN := build/omniserve
 CORE_SRC := src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c \
-	src/omatte.c src/onsfw.c src/oproxy.c src/osched.c src/ohost.c src/ovram.c \
+	src/omatte.c src/onsfw.c src/oproxy.c src/osched.c src/ofrontier.c src/ohost.c src/ovram.c \
 	src/ospec.c src/oscale.c src/otext.c src/otune.c
 BIN_SRC := src/main.c src/docs.c src/backend_llama.c src/backend_sd.c $(CORE_SRC)
 TESTS := build/test_admission build/test_breaker build/test_wavwrap

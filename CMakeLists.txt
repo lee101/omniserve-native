@@ -68,7 +68,7 @@ endif()
 set(LLAMA_DIR "${CMAKE_SOURCE_DIR}/../llama.cpp" CACHE PATH "llama.cpp checkout")
 set(SD_DIR "${CMAKE_SOURCE_DIR}/../stable-diffusion.cpp" CACHE PATH "stable-diffusion.cpp checkout")
 
-set(CORE_SRC src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c src/omatte.c src/onsfw.c src/oproxy.c src/osched.c
+set(CORE_SRC src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c src/omatte.c src/onsfw.c src/oproxy.c src/osched.c src/ofrontier.c
              src/ohost.c src/ovram.c src/ospec.c
              src/oscale.c src/otext.c src/otune.c)
 
@@ -131,6 +131,9 @@ add_executable(onative_tests tests/test_core.c src/backend_llama.c src/docs.c)
 target_include_directories(onative_tests PRIVATE include)
 target_link_libraries(onative_tests PRIVATE onative_core)
 add_test(NAME core COMMAND onative_tests)
+add_executable(onative_frontier_tests tests/test_frontier.c)
+target_link_libraries(onative_frontier_tests PRIVATE onative_core)
+add_test(NAME frontier COMMAND onative_frontier_tests)
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
     if(TARGET onative_sd_cache_stub)
@@ -211,6 +214,12 @@ if(Python3_Interpreter_FOUND)
         set_tests_properties(image_model_routing PROPERTIES
             ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
         set_tests_properties(image_overflow_routing PROPERTIES
+            ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
+        add_test(
+            NAME image_frontier_routing
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_image_frontier_routing.py"
+        )
+        set_tests_properties(image_frontier_routing PROPERTIES
             ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
     endif()
     add_test(
