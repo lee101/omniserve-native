@@ -12,6 +12,8 @@ TOKEN = os.environ.get("OVERFLOW_TOKEN", "")
 BASE = f"https://api.runpod.ai/v2/{ENDPOINT}"
 DEADLINE_S = float(os.environ.get("OVERFLOW_DEADLINE_S", "580"))
 PRIMARY = os.environ.get("PRIMARY_UPSTREAM", "").rstrip("/")
+# Cloudflare's bot rules reject Python-urllib's default user agent (error 1010).
+UA = "omniserve-overflow/1.0"
 PRIMARY_TOKEN = os.environ.get("PRIMARY_TOKEN", "")
 PRIMARY_TIMEOUT_S = float(os.environ.get("PRIMARY_TIMEOUT_S", "240"))
 
@@ -20,7 +22,7 @@ def try_primary(path, raw, tier):
     """Return (status, body) from the primary gateway, or None to fall back."""
     if not PRIMARY:
         return None
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "User-Agent": UA}
     if PRIMARY_TOKEN:
         headers["Authorization"] = "Bearer " + PRIMARY_TOKEN
     if tier:
@@ -30,7 +32,7 @@ def try_primary(path, raw, tier):
         with urllib.request.urlopen(req, timeout=PRIMARY_TIMEOUT_S) as r:
             return r.status, r.read()
     except urllib.error.HTTPError as exc:
-        if exc.code < 500:
+        if exc.code < 500 and exc.code not in (403, 404, 429):
             return exc.code, exc.read()
         print(f"primary {exc.code}; falling back to runpod", flush=True)
     except Exception as exc:
@@ -41,7 +43,7 @@ def try_primary(path, raw, tier):
 def runpod(method, path, body=None):
     req = urllib.request.Request(BASE + path, method=method,
         data=None if body is None else json.dumps(body).encode(),
-        headers={"Authorization": "Bearer " + RUNPOD_KEY, "Content-Type": "application/json"})
+        headers={"Authorization": "Bearer " + RUNPOD_KEY, "Content-Type": "application/json", "User-Agent": UA})
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.load(r)
 
