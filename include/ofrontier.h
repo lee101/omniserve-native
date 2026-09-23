@@ -10,7 +10,8 @@ typedef enum {
     OFR_POLICY_OVERFLOW = 0,
     OFR_POLICY_LOCAL = 1,
     OFR_POLICY_FASTEST = 2,
-    OFR_POLICY_DEADLINE = 3
+    OFR_POLICY_DEADLINE = 3,
+    OFR_POLICY_BACKGROUND = 4
 } ofr_policy;
 
 typedef enum { OFR_LOCAL = 0, OFR_REMOTE = 1 } ofr_choice;
@@ -21,6 +22,7 @@ typedef struct {
     double remote_p50_ms;
     ofr_policy policy[4];
     double deadline_ms[4];
+    bool allow_overflow[4];
 } ofr_table;
 
 typedef struct ofrontier ofrontier;

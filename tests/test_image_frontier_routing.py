@@ -23,7 +23,7 @@ def policy(paid="cheapest_within_deadline", deadline=5000):
     return {"version": 1, "workloads": {"ra2": {"gateway": {
         "local_p50_ms": 2000, "remote_p50_ms": 3000,
         "tiers": {"paid": {"policy": paid, "deadline_ms": deadline},
-                  "free": {"policy": "local_only"}}}}}}
+                  "free": {"policy": "local_only"}, "background": {"policy": "background"}}}}}}
 
 
 def write_policy(path, body):
@@ -104,6 +104,32 @@ def main() -> int:
             queued = [r for r in rows if r["backend"] == "local" and r["reason"] == "queued"]
             if len(queued) != 2 or min(r["queue_ms"] for r in queued) < 500 or any(r["workload"] != "ra2" for r in rows):
                 print("FAIL: queued rows", queued)
+                return 1
+            background = {"Authorization": f"Bearer {CALLER_KEY}", "X-Omniserve-Tier": "background"}
+            write_policy(policy_path, policy())
+            seen = len(OverflowStub.seen)
+            done = {}
+
+            def timed(name, headers, seed):
+                code, out = post(port, "/v1/images/generations", {**body, "seed": seed}, headers)
+                done[name] = (time.monotonic(), code, bool(out.get("overflow")))
+
+            with concurrent.futures.ThreadPoolExecutor(3) as pool:
+                pool.submit(timed, "holder", paid, 20)
+                wait_busy(port)
+                pool.submit(timed, "background", background, 21)
+                deadline = time.monotonic() + 10
+                while status(port)["admission"]["waiting"]["background"] < 1:
+                    if time.monotonic() > deadline:
+                        print("FAIL: background never queued")
+                        return 1
+                    time.sleep(0.02)
+                pool.submit(timed, "paid", paid, 22)
+            if any(v[1] != 200 or v[2] for v in done.values()) or len(OverflowStub.seen) != seen:
+                print("FAIL: mixed burst left the local lane", done)
+                return 1
+            if not done["holder"][0] < done["paid"][0] < done["background"][0]:
+                print("FAIL: background was admitted before the later paid request", done)
                 return 1
         finally:
             gateway.terminate()

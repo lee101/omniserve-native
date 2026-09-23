@@ -2833,6 +2833,11 @@ int main(int argc, char **argv) {
     app.aux_permits = configured_permits("OMNISERVE_NATIVE_AUX_PERMITS", 1, slots);
     const char *admission_env = getenv("OMNISERVE_NATIVE_ADMISSION_TIMEOUT_S");
     app.sched = osched_create(slots, admission_env ? atof(admission_env) : 30.0);
+    {
+        const char *bg_timeout = getenv("OMNISERVE_NATIVE_BACKGROUND_ADMISSION_TIMEOUT_S");
+        const char *bg_age = getenv("OMNISERVE_NATIVE_BACKGROUND_MAX_WAIT_S");
+        osched_set_background(app.sched, bg_timeout ? atof(bg_timeout) : 0, bg_age ? atof(bg_age) : 0);
+    }
     if (env_flag("OMNISERVE_NATIVE_VRAM_BROKER", 1)) {
         const char *keep_env = getenv("OMNISERVE_NATIVE_VRAM_KEEP_FREE_MB");
         const char *ttl_env = getenv("OMNISERVE_NATIVE_VRAM_LEASE_TTL_S");

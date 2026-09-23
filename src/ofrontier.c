@@ -42,6 +42,7 @@ const char *ofrontier_policy_name(ofr_policy p) {
     case OFR_POLICY_LOCAL: return "local_only";
     case OFR_POLICY_FASTEST: return "fastest";
     case OFR_POLICY_DEADLINE: return "cheapest_within_deadline";
+    case OFR_POLICY_BACKGROUND: return "background";
     default: return "overflow_on_busy";
     }
 }
@@ -50,6 +51,7 @@ static ofr_policy parse_policy(const char *js, const oj_tok *t) {
     if (oj_str_eq(js, t, "local_only") || oj_str_eq(js, t, "local")) return OFR_POLICY_LOCAL;
     if (oj_str_eq(js, t, "fastest")) return OFR_POLICY_FASTEST;
     if (oj_str_eq(js, t, "cheapest_within_deadline")) return OFR_POLICY_DEADLINE;
+    if (oj_str_eq(js, t, "background")) return OFR_POLICY_BACKGROUND;
     return OFR_POLICY_OVERFLOW;
 }
 
@@ -79,6 +81,8 @@ bool ofrontier_parse(const char *json, size_t len, const char *workload, ofr_tab
         if (p >= 0 && toks[p].type == OJ_STRING) out->policy[i] = parse_policy(json, &toks[p]);
         int d = oj_obj_get(json, toks, n, tier, "deadline_ms");
         if (d >= 0) out->deadline_ms[i] = oj_number(json, &toks[d], 0);
+        int a = oj_obj_get(json, toks, n, tier, "allow_overflow");
+        if (a >= 0) out->allow_overflow[i] = oj_bool(json, &toks[a], false);
     }
     out->loaded = true;
     ok = true;
@@ -117,6 +121,12 @@ ofr_choice ofrontier_decide(const ofr_table *t, otier tier, double local_wait_ms
             if (remote_eta <= deadline_ms) return OFR_REMOTE;
         }
         return remote_eta < local_eta ? OFR_REMOTE : OFR_LOCAL;
+    case OFR_POLICY_BACKGROUND:
+        /* Never preempts: waits for an idle lane unless overflow is explicitly
+         * allowed or a stated deadline would be missed locally but met remotely. */
+        if (t->allow_overflow[tier]) return remote_eta < local_eta ? OFR_REMOTE : OFR_LOCAL;
+        if (deadline_ms > 0 && local_eta > deadline_ms && remote_eta <= deadline_ms) return OFR_REMOTE;
+        return OFR_LOCAL;
     default:
         return OFR_REMOTE;
     }
