@@ -30,6 +30,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import remote_3d  # noqa: E402
+
 
 MODEL_TRELLIS = "microsoft/TRELLIS.2-4B"
 MODEL_PIXAL = "TencentARC/Pixal3D"
@@ -244,7 +247,15 @@ def run_with_gpu_holds(job) -> tuple[int, dict]:
                 print(f"[omniserve-3d] failed to release GPU hold at {base}: {exc}", file=sys.stderr)
 
 
-def run_job(payload: dict, server_base: str) -> tuple[int, dict]:
+def pixal_remote() -> bool:
+    if not remote_3d.configured():
+        return False
+    installed = runtime_installed(MODEL_PIXAL)
+    free_mib = gpu_memory_mib()[0] if installed else None
+    return remote_3d.should_route(installed, free_mib, int(os.getenv("OMNISERVE_3D_MIN_FREE_MIB", "24576")))
+
+
+def run_job(payload: dict, server_base: str, remote: bool | None = None) -> tuple[int, dict]:
     model = str(payload.get("model") or MODEL_TRELLIS)
     if model not in ALLOWED_MODELS:
         return HTTPStatus.BAD_REQUEST, {"error": "unsupported model"}
@@ -276,6 +287,9 @@ def run_job(payload: dict, server_base: str) -> tuple[int, dict]:
     if not -(2**31) <= seed < 2**31:
         return HTTPStatus.BAD_REQUEST, {"error": "seed must be a signed 32-bit integer"}
 
+    if model == MODEL_PIXAL and (pixal_remote() if remote is None else remote):
+        return remote_3d.run(model, image_url, resolution, texture_size, decimation_target, seed,
+                             Path(os.getenv("OMNISERVE_3D_OUTPUT_DIR", "/nvme0n1-disk/models/omniserve-3d/outputs")))
     repo, python, runner = model_runtime(model)
     if not runtime_installed(model):
         return HTTPStatus.SERVICE_UNAVAILABLE, {
@@ -580,7 +594,8 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "JSON object required"})
             return
-        if not JOB_LOCK.acquire(blocking=False):
+        remote = payload.get("model") == MODEL_PIXAL and pixal_remote()
+        if not remote and not JOB_LOCK.acquire(blocking=False):
             self.send_json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"error": "worker_busy", "retry_after_seconds": 30},
@@ -591,10 +606,11 @@ class Handler(BaseHTTPRequestHandler):
                 "OMNISERVE_3D_PUBLIC_BASE",
                 f"http://127.0.0.1:{self.server.server_port}",
             ).rstrip("/")
-            status, response = run_job(payload, public_base)
+            status, response = run_job(payload, public_base, remote)
             self.send_json(status, response)
         finally:
-            JOB_LOCK.release()
+            if not remote:
+                JOB_LOCK.release()
 
     def log_message(self, message: str, *args: object) -> None:
         sys.stderr.write(f"[omniserve-3d] {self.address_string()} {message % args}\n")

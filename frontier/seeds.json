@@ -1,0 +1,153 @@
+{
+ "quality_tolerance": 0.01,
+ "tiers": {
+  "free": {
+   "policy": "local_only"
+  },
+  "background": {
+   "policy": "local_only"
+  },
+  "paid": {
+   "policy": "cheapest_within_deadline"
+  },
+  "sub": {
+   "policy": "fastest"
+  },
+  "priority": {
+   "policy": "fastest"
+  }
+ },
+ "workloads": {
+  "ra2": {
+   "note": "Qwen Image 2.1 Q4_K_M, 1024x1024, 20 steps. Local EasyCache 0.08; RunPod worker EasyCache 0.05 (stricter). Same GGUF weights.",
+   "deadline_ms": 45000,
+   "reference_quality": 1.0,
+   "candidates": [
+    {
+     "id": "local",
+     "kind": "local",
+     "gpu": "RTX5090-shared",
+     "p50_ms": 12000,
+     "p95_ms": 16000,
+     "usd_per_job": 0.00033,
+     "quality": 1.0,
+     "evidence": "performance/qwen21-ra2-rollout-2026-09-22.md: 12.2 s resident, 8-11 s streamed via 8791"
+    },
+    {
+     "id": "runpod:tlofa06vj7iab7",
+     "kind": "runpod",
+     "endpoint": "tlofa06vj7iab7",
+     "gpu": "RTX4090/A5000/L4/3090",
+     "usd_per_h": 0.74,
+     "p50_ms": 72000,
+     "p95_ms": 145500,
+     "cold_ms": 108000,
+     "usd_per_job": 0.017,
+     "quality": 1.0,
+     "evidence": "2026-09-23 canary, 3 parallel overflows while local busy: wall 60.5/84.3/145.5 s (exec 58.8/60.1/131.7 s, 2 cold); single warm probe 34.5 s; billing 0.744 $/h"
+    },
+    {
+     "id": "gateway:ra2-daisy",
+     "kind": "gateway",
+     "gpu": "RTX3090-daisy",
+     "available": false,
+     "p50_ms": 16000,
+     "p95_ms": 22000,
+     "usd_per_job": 0.0005,
+     "quality": 1.0,
+     "evidence": "offload-tiers-2026-09-22.md; tunnel returns 530 since 2026-09-22"
+    }
+   ],
+   "tiers": {
+    "free": {
+     "policy": "cheapest_within_deadline",
+     "note": "netwrck/cutedsl send credit-charged ra2 jobs without a tier header, so free is billed traffic; OVERFLOW_TIERS already lets it spill"
+    }
+   }
+  },
+  "yue": {
+   "note": "YuE2-3B clip (1500 semantic tokens), BF16, full planning, 32 ODE steps, pinned revisions on both backends.",
+   "deadline_ms": 180000,
+   "reference_quality": 1.0,
+   "candidates": [
+    {
+     "id": "local",
+     "kind": "local",
+     "gpu": "RTX5090-shared",
+     "p50_ms": 25000,
+     "p95_ms": 70000,
+     "usd_per_job": 0.0007,
+     "quality": 1.0,
+     "estimate": true,
+     "evidence": "4090 warm runtime 24.9 s used as upper bound; local needs 18 GiB free (performance/yue2-music.md)"
+    },
+    {
+     "id": "runpod:tmozxvnm9fuuud",
+     "kind": "runpod",
+     "endpoint": "tmozxvnm9fuuud",
+     "gpu": "RTX4090",
+     "usd_per_h": 1.1,
+     "p50_ms": 32231,
+     "p95_ms": 249821,
+     "cold_ms": 249821,
+     "usd_per_job": 0.014,
+     "quality": 1.0,
+     "evidence": "performance/yue2-music.md 2026-09-20 benchmark: warm wall 32.2 s, first 249.8 s; 2026-09-23 canary (300 tokens, cold): delay 6.8 s + exec 66.5 s, wall 74.7 s"
+    }
+   ],
+   "tiers": {
+    "free": {
+     "policy": "cheapest_within_deadline",
+     "note": "music is credit-charged; callers send no tier header"
+    }
+   }
+  },
+  "pixal3d": {
+   "note": "TencentARC/Pixal3D image-to-3D. Local runtime not installed and needs 23 GiB free; RunPod 4090 is the only live backend.",
+   "deadline_ms": 900000,
+   "reference_quality": 1.0,
+   "candidates": [
+    {
+     "id": "local",
+     "kind": "local",
+     "gpu": "RTX5090-shared",
+     "available": false,
+     "p50_ms": null,
+     "usd_per_job": null,
+     "quality": 1.0,
+     "evidence": "/nvme0n1-disk/code/Pixal3D absent; OMNISERVE_3D_MIN_FREE_MIB=23040"
+    },
+    {
+     "id": "runpod:akgefm0nzzr4jo",
+     "kind": "runpod",
+     "endpoint": "akgefm0nzzr4jo",
+     "gpu": "RTX4090",
+     "usd_per_h": 1.1,
+     "p50_ms": 287000,
+     "p95_ms": 400000,
+     "usd_per_job": 0.087,
+     "quality": 1.0,
+     "estimate": false,
+     "evidence": "2026-09-23 canary via 3D worker: cold, delay 19.4 s + exec 266.7 s (predict 124 s), 1024 res, 1024 texture"
+    }
+   ]
+  },
+  "qwen-edit": {
+   "note": "Qwen Image Edit 2511 Q4_K_M, 512px, 12 steps, CFG 2.5 (local canaries only; no remote image yet).",
+   "deadline_ms": 180000,
+   "reference_quality": 1.0,
+   "candidates": [
+    {
+     "id": "local",
+     "kind": "local",
+     "gpu": "RTX5090-shared",
+     "p50_ms": 73500,
+     "p95_ms": 87210,
+     "usd_per_job": 0.002,
+     "quality": 1.0,
+     "evidence": "performance/qwen-edit-5090.md: warm 72.5-75.0 s, first 87.2 s"
+    }
+   ]
+  }
+ }
+}

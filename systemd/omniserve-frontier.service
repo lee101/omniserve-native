@@ -1,0 +1,14 @@
+[Unit]
+Description=OmniServe frontier scheduler: ingest gateway ledger, reconcile RunPod billing, rebuild routing.json
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=administrator
+WorkingDirectory=/nvme0n1-disk/code/omniserve-native
+EnvironmentFile=-/etc/omniserve-runpod-overflow.env
+Environment=FRONTIER_LEDGER_DB=/nvme0n1-disk/data/omniserve-frontier/ledger.db
+Environment=FRONTIER_ROUTING_FILE=/nvme0n1-disk/data/omniserve-frontier/routing.json
+Environment=FRONTIER_GATEWAY_LOGS=/nvme0n1-disk/data/omniserve-frontier/gateway-ra2.jsonl
+ExecStart=/usr/bin/python3 -m frontier cycle
+Nice=10
