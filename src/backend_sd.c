@@ -153,6 +153,16 @@ static void webp_lib_load(void) {
     }
 }
 
+static int sd_env_int(const char *name, int fallback, int minimum, int maximum);
+static int g_sd_log_min = SD_LOG_WARN;
+
+static void sd_log_to_stderr(enum sd_log_level_t level, const char *text, void *data) {
+    (void)data;
+    if ((int)level >= g_sd_log_min && text) {
+        fputs(text, stderr);
+    }
+}
+
 static bool sd_lib_load(void) {
     const char *path = getenv("OMNISERVE_NATIVE_SD_LIB");
     if (!path || !path[0]) {
@@ -175,6 +185,14 @@ static bool sd_lib_load(void) {
     p_latent_params_init = (fn_latent_params_init)dlsym(lib, "sd_latent_replay_params_init");
     p_generate_image_with_latent = (fn_generate_image_with_latent)dlsym(lib, "generate_image_with_latent");
     p_free_latent = (fn_free_latent)dlsym(lib, "free_sd_latent");
+    /* Without a callback sd.cpp/ggml drop their logs, including the CUDA error
+     * text printed right before GGML_ABORT. */
+    typedef void (*fn_set_log_callback)(sd_log_cb_t, void *);
+    fn_set_log_callback set_log = (fn_set_log_callback)dlsym(lib, "sd_set_log_callback");
+    if (set_log) {
+        g_sd_log_min = sd_env_int("OMNISERVE_NATIVE_SD_LOG_LEVEL", SD_LOG_WARN, SD_LOG_DEBUG, SD_LOG_ERROR);
+        set_log(sd_log_to_stderr, NULL);
+    }
     return p_ctx_params_init && p_new_sd_ctx && p_img_params_init && p_generate_image && p_free_images;
 }
 
