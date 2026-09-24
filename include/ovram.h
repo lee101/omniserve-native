@@ -100,6 +100,12 @@ int ovram_lease_wait(ovram *v, const char *owner, int pid, int mb, int min_mb, o
 typedef int (*ovram_pressure_fn)(void *ctx, otier waiter_tier, int deficit_mb);
 void ovram_set_pressure_hook(ovram *v, ovram_pressure_fn fn, void *ctx, int after_ms);
 
+/* Record a lease even though it does not fit: the holder will run anyway
+ * (it already did before brokering) and everyone else should queue behind it
+ * rather than race it into OOM. */
+int ovram_lease_force(ovram *v, const char *owner, int pid, int mb, otier tier, double ttl_s,
+                      char *id_out, size_t id_cap);
+
 /* A queued higher tier blocks lower tiers for at most this long (default 15 s,
  * 0 = no limit), and only while its need is coverable once live leases end. */
 void ovram_set_block_max_s(ovram *v, double s);

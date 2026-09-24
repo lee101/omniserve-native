@@ -68,6 +68,7 @@ struct ovram {
     unsigned long long expirations;
     unsigned long long waits;
     unsigned long long wait_timeouts;
+    unsigned long long forced;
     unsigned long long pressure_calls;
     long long pressure_freed_mb;
 };
@@ -348,9 +349,9 @@ static bool higher_tier_waiting_locked(const ovram *v, otier tier, double now_s,
 /* Returns granted MB (0 = does not fit). Caller holds the lock and has expired. */
 static int grant_locked(ovram *v, const char *owner, int pid, int mb, int min_mb, otier tier,
                         double ttl_s, double now_s, int device_free_mb,
-                        char *id_out, size_t id_cap) {
+                        char *id_out, size_t id_cap, bool force) {
     int available = headroom_locked(v, tier, device_free_mb);
-    int granted = mb < available ? mb : available;
+    int granted = force ? mb : (mb < available ? mb : available);
     if (granted < min_mb || granted <= 0) return 0;
     int slot = -1;
     for (int i = 0; i < OVRAM_MAX_LEASES; i++) {
@@ -373,12 +374,27 @@ static int grant_locked(ovram *v, const char *owner, int pid, int mb, int min_mb
     lease->active = true;
 
     v->grants++;
+    if (force) v->forced++;
     if (granted < mb) v->partial_grants++;
     ovram_owner *o = owner_locked(v, name, pid);
     o->grants++;
     o->last_active_s = now_s;
     if (granted > o->peak_mb) o->peak_mb = granted;
     if (id_out && id_cap) snprintf(id_out, id_cap, "%s", lease->id);
+    return granted;
+}
+
+int ovram_lease_force(ovram *v, const char *owner, int pid, int mb, otier tier, double ttl_s,
+                      char *id_out, size_t id_cap) {
+    if (id_out && id_cap) id_out[0] = '\0';
+    if (!v || mb <= 0) return 0;
+    refresh_procs(v);
+    double now = monotonic_s();
+    pthread_mutex_lock(&v->lock);
+    expire_locked(v, now);
+    int granted = grant_locked(v, owner && owner[0] ? owner : "anon", pid, mb, mb, tier, ttl_s, now,
+                               0, id_out, id_cap, true);
+    pthread_mutex_unlock(&v->lock);
     return granted;
 }
 
@@ -394,7 +410,7 @@ int ovram_lease_pid_at(ovram *v, const char *owner, int pid, int mb, int min_mb,
     expire_locked(v, now_s);
     /* A lower tier may not take headroom a queued higher tier is waiting for. */
     int granted = higher_tier_waiting_locked(v, tier, now_s, device_free_mb) ? 0
-        : grant_locked(v, owner, pid, mb, min_mb, tier, ttl_s, now_s, device_free_mb, id_out, id_cap);
+        : grant_locked(v, owner, pid, mb, min_mb, tier, ttl_s, now_s, device_free_mb, id_out, id_cap, false);
     if (granted <= 0) {
         v->denials++;
         ovram_owner *o = owner_locked(v, owner && owner[0] ? owner : "anon", pid);
@@ -442,7 +458,7 @@ int ovram_lease_wait(ovram *v, const char *owner, int pid, int mb, int min_mb, o
         expire_locked(v, now);
         if (!higher_tier_waiting_locked(v, tier, now, device_free)) {
             granted = grant_locked(v, name, pid, mb, min_mb, tier, ttl_s, now, device_free,
-                                   id_out, id_cap);
+                                   id_out, id_cap, false);
         }
         if (granted > 0 || now >= deadline) {
             ovram_owner *o = owner_locked(v, name, pid);
@@ -693,10 +709,10 @@ size_t ovram_ledger_json(ovram *v, char *out, size_t cap) {
            headroom_locked(v, TIER_FREE, device_free), headroom_locked(v, TIER_BACKGROUND, device_free),
            v->waiting[0], v->waiting[1], v->waiting[2], v->waiting[3]);
     APPEND("\"counters\":{\"grants\":%llu,\"partial\":%llu,\"denials\":%llu,\"releases\":%llu,"
-           "\"expirations\":%llu,\"waits\":%llu,\"wait_timeouts\":%llu,\"pressure_calls\":%llu,"
+           "\"expirations\":%llu,\"waits\":%llu,\"wait_timeouts\":%llu,\"forced\":%llu,\"pressure_calls\":%llu,"
            "\"pressure_freed_mb\":%lld},",
            v->grants, v->partial_grants, v->denials, v->releases, v->expirations,
-           v->waits, v->wait_timeouts, v->pressure_calls, v->pressure_freed_mb);
+           v->waits, v->wait_timeouts, v->forced, v->pressure_calls, v->pressure_freed_mb);
     APPEND("\"leases\":[");
     bool first = true;
     for (int i = 0; i < OVRAM_MAX_LEASES; i++) {

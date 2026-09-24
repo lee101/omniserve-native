@@ -88,7 +88,7 @@ static long json_int(const char *s, const char *key, long fallback) {
 }
 
 int obroker_lease(const char *base_url, const char *owner, int pid, int mb, int min_mb,
-                  otier tier, double ttl_s, int wait_ms, char *id_out, size_t id_cap,
+                  otier tier, double ttl_s, int wait_ms, bool force, char *id_out, size_t id_cap,
                   int *waited_ms_out) {
     if (id_out && id_cap) id_out[0] = 0;
     if (waited_ms_out) *waited_ms_out = 0;
@@ -101,8 +101,9 @@ int obroker_lease(const char *base_url, const char *owner, int pid, int mb, int 
     char body[256];
     snprintf(body, sizeof body,
              "{\"owner\":\"%s\",\"pid\":%d,\"mb\":%d,\"min_mb\":%d,\"tier\":\"%s\","
-             "\"ttl_s\":%.0f,\"wait_ms\":%d}",
-             safe_owner, pid, mb, min_mb, otier_name(tier), ttl_s, wait_ms > 0 ? wait_ms : 0);
+             "\"ttl_s\":%.0f,\"wait_ms\":%d,\"force\":%s}",
+             safe_owner, pid, mb, min_mb, otier_name(tier), ttl_s, wait_ms > 0 ? wait_ms : 0,
+             force ? "true" : "false");
     char resp[512];
     int status = post_json(base_url, "/v1/gpu/lease", body, (wait_ms > 0 ? wait_ms : 0) + 5000,
                            resp, sizeof resp);

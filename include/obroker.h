@@ -14,7 +14,7 @@
  * not be reached (callers fail open: a dead broker must not stop serving).
  */
 int obroker_lease(const char *base_url, const char *owner, int pid, int mb, int min_mb,
-                  otier tier, double ttl_s, int wait_ms, char *id_out, size_t id_cap,
+                  otier tier, double ttl_s, int wait_ms, bool force, char *id_out, size_t id_cap,
                   int *waited_ms_out);
 bool obroker_release(const char *base_url, const char *lease_id);
 

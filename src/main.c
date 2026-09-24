@@ -1624,6 +1624,7 @@ typedef struct {
     int wait_ms[4];
     int sd_lease_mb, sd_edit_lease_mb;
     bool lease_scale_by_pixels;
+    unsigned force_tier_mask; /* tiers that run anyway after the wait, holding a forced lease */
     unsigned long long image_waits, image_wait_denials, broker_unreachable;
 } gpu_sched_state;
 
@@ -1816,8 +1817,9 @@ static int image_gpu_lease(app_state *app, int mb, otier tier, char *id, size_t 
     *waited_ms = 0;
     int wait = gs_wait_ms(tier);
     if (app->vram_broker_url) {
+        bool force = (g_gs.force_tier_mask >> (unsigned)tier) & 1u;
         int got = obroker_lease(app->vram_broker_url, app->vram_owner, (int)getpid(), mb, mb,
-                                tier, 600.0, wait, id, id_cap, waited_ms);
+                                tier, 600.0, wait, force, id, id_cap, waited_ms);
         if (got < 0) {
             pthread_mutex_lock(&g_gs_lock);
             g_gs.broker_unreachable++;
@@ -1831,8 +1833,12 @@ static int image_gpu_lease(app_state *app, int mb, otier tier, char *id, size_t 
         return got;
     }
     if (!app->vram) return mb;
-    return ovram_lease_wait(app->vram, app->vram_owner, (int)getpid(), mb, mb, tier, 600.0,
-                            wait, id, id_cap, waited_ms);
+    int got = ovram_lease_wait(app->vram, app->vram_owner, (int)getpid(), mb, mb, tier, 600.0,
+                               wait, id, id_cap, waited_ms);
+    if (got < mb && ((g_gs.force_tier_mask >> (unsigned)tier) & 1u)) {
+        got = ovram_lease_force(app->vram, app->vram_owner, (int)getpid(), mb, tier, 600.0, id, id_cap);
+    }
+    return got;
 }
 
 static void image_gpu_release(app_state *app, const char *id, bool remote) {
@@ -3322,6 +3328,9 @@ static void handle_vram_lease(ohttp_request *req, app_state *app) {
     int wait_ms = wait_tok >= 0 ? (int)oj_number(req->body, &toks[wait_tok], 0) : 0;
     if (wait_ms < 0) wait_ms = 0;
     if (wait_ms > 120000) wait_ms = 120000;
+    int force_tok = oj_obj_get(req->body, toks, n, 0, "force");
+    bool force = force_tok >= 0 && req->body_len > (size_t)toks[force_tok].start &&
+                 req->body[toks[force_tok].start] == 't';
 
     /* An internal caller may name its own tier here; request_tier already
      * refuses to honour the header for anyone else, and this endpoint is
@@ -3341,6 +3350,11 @@ static void handle_vram_lease(ohttp_request *req, app_state *app) {
     int waited_ms = 0;
     int granted = ovram_lease_wait(app->vram, owner, pid, mb, min_mb, tier, ttl_s, wait_ms,
                                    id, sizeof id, &waited_ms);
+    bool forced = false;
+    if (granted <= 0 && force) {
+        granted = ovram_lease_force(app->vram, owner, pid, mb, tier, ttl_s, id, sizeof id);
+        forced = granted > 0;
+    }
     char body[320];
     if (granted > 0) {
         /* Reported so the holder knows when the broker will take the headroom
@@ -3348,8 +3362,9 @@ static void handle_vram_lease(ohttp_request *req, app_state *app) {
         double effective_ttl = ttl_s > 0.0 ? ttl_s : ovram_default_ttl_s(app->vram);
         snprintf(body, sizeof body,
                  "{\"granted\":true,\"lease_id\":\"%s\",\"mb\":%d,\"tier\":\"%s\","
-                 "\"expires_in_s\":%d,\"waited_ms\":%d}",
-                 id, granted, otier_name(tier), (int)effective_ttl, waited_ms);
+                 "\"expires_in_s\":%d,\"waited_ms\":%d,\"forced\":%s}",
+                 id, granted, otier_name(tier), (int)effective_ttl, waited_ms,
+                 forced ? "true" : "false");
     } else {
         /* A denial is a normal answer, not a fault: the caller's fallback path
          * is exactly what "no headroom" should trigger, and a 5xx here would
@@ -4003,6 +4018,8 @@ int main(int argc, char **argv) {
         g_gs.sd_lease_mb = env_int("OMNISERVE_NATIVE_SD_LEASE_MB", oimage_gpu_headroom_mb());
         g_gs.sd_edit_lease_mb = env_int("OMNISERVE_NATIVE_SD_EDIT_LEASE_MB", g_gs.sd_lease_mb);
         g_gs.lease_scale_by_pixels = env_flag("OMNISERVE_NATIVE_SD_LEASE_SCALE_PIXELS", 0);
+        const char *force_env = getenv("OMNISERVE_NATIVE_VRAM_FORCE_TIERS");
+        g_gs.force_tier_mask = force_env && force_env[0] ? parse_tier_mask(force_env) : 0;
         if (app.vram) ovram_set_block_max_s(app.vram, env_int("OMNISERVE_NATIVE_VRAM_BLOCK_MAX_S", 15));
         g_gs.llm_idle_s = env_int("OMNISERVE_NATIVE_EVICT_LLM_IDLE_S", 0);
         const char *evict_tier = getenv("OMNISERVE_NATIVE_EVICT_LLM_MAX_TIER");
