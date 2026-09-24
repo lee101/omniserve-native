@@ -7,7 +7,7 @@ p5(){ curl -s localhost:$1/metrics | awk '/responses_total\{class="5xx"\}/{a=$2}
 A0=$(p5 8791); Q0=$(p5 8792)
 env -i PATH=/usr/bin:/bin HOME=$HOME $(cat "$ENVF") OMNISERVE_ACCESS_LOG=0 OMNISERVE_NATIVE_GUARD=0 OMNISERVE_NATIVE_GUARD_JUDGE=0 \
  OMNISERVE_NATIVE_RAM_PREFETCH_ENABLED=0 OMNISERVE_NATIVE_VRAM_BROKER_URL=http://127.0.0.1:8791 OMNISERVE_NATIVE_VRAM_OWNER=canary-qwen \
- OMNISERVE_NATIVE_SD_LEASE_MB=10752 OMNISERVE_NATIVE_SD_EDIT_LEASE_MB=12288 \
+ OMNISERVE_NATIVE_SD_LEASE_MB=10240 OMNISERVE_NATIVE_SD_EDIT_LEASE_MB=11264 OMNISERVE_NATIVE_SD_LEASE_SCALE_PIXELS=1 OMNISERVE_NATIVE_VRAM_WAIT_MS_PAID=20000 OMNISERVE_NATIVE_VRAM_FORCE_TIERS=paid,sub,free,background \
  setsid "$D/deploy-sched-${REV:?}/omniserve-native-qwen" --port 8798 > "$LOG" 2>&1 < /dev/null &
 trap 'P=$(ss -ltnp | rg ":8798 " | rg -o "pid=[0-9]+" | cut -d= -f2); [ -n "$P" ] && kill $P' EXIT
 for i in $(seq 180); do curl -fs -o /dev/null localhost:8798/readyz && break; sleep 1; done
