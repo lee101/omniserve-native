@@ -346,6 +346,8 @@ static pthread_mutex_t nvml_lock = PTHREAD_MUTEX_INITIALIZER;
 static nvml_init_fn nvml_init;
 static nvml_handle_fn nvml_handle_by_index;
 static nvml_mem_fn nvml_mem_info;
+typedef int (*nvml_procs_fn)(void *, unsigned *, void *);
+static nvml_procs_fn nvml_procs;
 static void *nvml_lib;
 static void *nvml_dev;
 static double nvml_next_retry_s;
@@ -375,6 +377,8 @@ static void nvml_load_locked(void) {
         *(void **)&nvml_init = dlsym(nvml_lib, "nvmlInit_v2");
         *(void **)&nvml_handle_by_index = dlsym(nvml_lib, "nvmlDeviceGetHandleByIndex_v2");
         *(void **)&nvml_mem_info = dlsym(nvml_lib, "nvmlDeviceGetMemoryInfo");
+        *(void **)&nvml_procs = dlsym(nvml_lib, "nvmlDeviceGetComputeRunningProcesses_v3");
+        if (!nvml_procs) *(void **)&nvml_procs = dlsym(nvml_lib, "nvmlDeviceGetComputeRunningProcesses_v2");
     }
     if (!nvml_init || !nvml_handle_by_index || nvml_init() != 0) return;
     nvml_dev = NULL;
@@ -400,6 +404,28 @@ bool ogpu_memory_gib(double *free_gib, double *total_gib) {
     if (free_gib) *free_gib = (double)mem.free_b / (1024.0 * 1024.0 * 1024.0);
     if (total_gib) *total_gib = (double)mem.total / (1024.0 * 1024.0 * 1024.0);
     return true;
+}
+
+/* nvmlProcessInfo_v2_t / nvmlProcessInfo_t (v3 has the same layout). */
+struct nvml_proc_info { unsigned pid; unsigned long long used; unsigned gi, ci; };
+
+int ogpu_processes(ogpu_proc *out, int cap) {
+    if (!out || cap <= 0) return -1;
+    struct nvml_proc_info info[64];
+    unsigned count = 64;
+    pthread_mutex_lock(&nvml_lock);
+    nvml_load_locked();
+    int rc = nvml_dev && nvml_procs ? nvml_procs(nvml_dev, &count, info) : -1;
+    pthread_mutex_unlock(&nvml_lock);
+    if (rc != 0) return -1;
+    int n = 0;
+    for (unsigned i = 0; i < count && n < cap; i++) {
+        out[n].pid = (int)info[i].pid;
+        /* NVML reports NVML_VALUE_NOT_AVAILABLE (all ones) for some contexts. */
+        out[n].used_mb = info[i].used == ~0ULL ? 0 : (int)(info[i].used / (1024ULL * 1024ULL));
+        n++;
+    }
+    return n;
 }
 
 double ogpu_free_gib(void) {

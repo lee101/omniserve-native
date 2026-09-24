@@ -12,7 +12,10 @@
 #include "osched.h"
 #include "ohost.h"
 #include "otext.h"
+#include <unistd.h>
+
 #include "ovram.h"
+#include "obroker.h"
 
 #include <math.h>
 #include <limits.h>
@@ -78,6 +81,11 @@ typedef struct {
     oscale *scale;
     ocapacity *capacity;
     ovram *vram;
+    /* Box-wide broker in another process (the :8791 gateway). When set, this
+     * gateway's image lane leases there instead of from its own ovram, so
+     * co-resident gateways arbitrate one ledger rather than two. */
+    const char *vram_broker_url;
+    char vram_owner[32];
     /* Standing remote endpoints, distinct from oscale's rented instances: no
      * provisioning, no per-hour bill to reason about, just somewhere to send
      * work when the local device is full. Paid-only by default for the same
@@ -105,6 +113,7 @@ extern const char *DOCS_HTML;
 extern const char *OPENAPI_JSON;
 
 static bool env_flag(const char *name, int fallback);
+static size_t gpu_sched_json(char *out, size_t cap);
 static const char *configured_path(const char *name, const char *fallback);
 static bool overflow_path_passthrough(void);
 static const char *overflow_path_label(void);
@@ -1019,7 +1028,9 @@ static void handle_status(ohttp_request *req, app_state *app) {
             "%s\"%s\":{\"relay_total\":%llu}", i ? "," : "", model->model,
             __atomic_load_n(&model->relay_total, __ATOMIC_RELAXED));
     }
-    snprintf(body + len, sizeof body - len, "}}");
+    char sched_json[1024];
+    gpu_sched_json(sched_json, sizeof sched_json);
+    snprintf(body + len, sizeof body - len, "},\"gpu_sched\":%s}", sched_json);
     free(ovr_esc);
     ohttp_force_close(req);
     ohttp_respond_str(req, 200, "application/json", body);
@@ -1560,17 +1571,273 @@ static void guard_embed_free(float *values) {
     oembed_result_free(&r);
 }
 
+/* The judge can be admitted and evicted at runtime by the GPU scheduler, so
+ * every use holds the read side and load/unload holds the write side. */
+static pthread_rwlock_t g_judge_rw = PTHREAD_RWLOCK_INITIALIZER;
+
 static bool guard_judge_ready(void) {
-    return ojudge_ready();
+    pthread_rwlock_rdlock(&g_judge_rw);
+    bool ready = ojudge_ready();
+    pthread_rwlock_unlock(&g_judge_rw);
+    return ready;
 }
 
 static bool guard_judge_score(const char *prompt, size_t len, double *pyes, double *ms) {
-    return ojudge_score(prompt, len, pyes, ms);
+    pthread_rwlock_rdlock(&g_judge_rw);
+    bool ok = ojudge_score(prompt, len, pyes, ms);
+    pthread_rwlock_unlock(&g_judge_rw);
+    return ok;
 }
 
 static bool guard_judge_multi(const char **prompts, const size_t *lens, int n,
                               double *pyes, double *ms) {
-    return ojudge_score_multi(prompts, lens, n, pyes, ms);
+    pthread_rwlock_rdlock(&g_judge_rw);
+    bool ok = ojudge_score_multi(prompts, lens, n, pyes, ms);
+    pthread_rwlock_unlock(&g_judge_rw);
+    return ok;
+}
+
+/* ---- GPU scheduler: queue, evict idle residents, admit optional ones ----
+ *
+ * The broker (ovram) queues leases by tier. When a waiter stays blocked, the
+ * pressure hook frees what is resident but idle in this process, cheapest
+ * first: the optional guard judge, then the embedded LLM once it has been idle
+ * for OMNISERVE_NATIVE_EVICT_LLM_IDLE_S. An evicted LLM reloads on its next
+ * request (weights are page-cache warm: ~2.7 s for gemma-roleplay-v2 q8). */
+typedef struct {
+    int llm_idle_s;          /* 0 = never evict the LLM */
+    otier llm_evict_max_tier; /* waiters at this tier or better may evict */
+    bool llm_evicted;
+    char llm_path[PATH_MAX];
+    char llm_ngl[32];
+    int llm_ctx, llm_contexts;
+    int llm_mb;              /* device MB freed by the last eviction */
+    double llm_last_used_s;
+    unsigned long long llm_evictions, llm_reloads, llm_reload_failures;
+    double llm_reload_ms_last;
+    bool judge_auto;
+    const char *judge_gguf;
+    int judge_threads;
+    int judge_margin_mb;
+    double judge_next_admit_s;
+    unsigned long long judge_admits, judge_evictions;
+    int wait_ms[4];
+    int sd_lease_mb, sd_edit_lease_mb;
+    unsigned long long image_waits, image_wait_denials, broker_unreachable;
+} gpu_sched_state;
+
+static gpu_sched_state g_gs;
+static pthread_mutex_t g_gs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static double gs_now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void gs_llm_touch(void) {
+    double now = gs_now_s();
+    __atomic_store(&g_gs.llm_last_used_s, &now, __ATOMIC_RELAXED);
+}
+
+static int gs_device_free_mb(void) {
+    double free_gib = -1.0;
+    return ogpu_memory_gib(&free_gib, NULL) && free_gib >= 0.0 ? (int)(free_gib * 1024.0) : -1;
+}
+
+static int gs_judge_need_mb(void) {
+    unsigned long long b = ojudge_vram_reserve_bytes();
+    return b ? (int)(b / (1024ULL * 1024ULL)) : 2304;
+}
+
+static int gpu_pressure(void *ctx, otier tier, int deficit_mb) {
+    (void)ctx;
+    int freed = 0;
+    if (g_gs.judge_auto && guard_judge_ready()) {
+        int before = gs_device_free_mb();
+        pthread_rwlock_wrlock(&g_judge_rw);
+        ojudge_shutdown();
+        pthread_rwlock_unlock(&g_judge_rw);
+        int delta = gs_device_free_mb() - before;
+        freed += delta > 0 ? delta : gs_judge_need_mb();
+        pthread_mutex_lock(&g_gs_lock);
+        g_gs.judge_evictions++;
+        g_gs.judge_next_admit_s = gs_now_s() + 600.0;
+        pthread_mutex_unlock(&g_gs_lock);
+        fprintf(stderr, "gpu-sched: evicted guard judge for a %s waiter (deficit %d MB, freed %d MB)\n",
+                otier_name(tier), deficit_mb, delta);
+        if (freed >= deficit_mb) return freed;
+    }
+    double last = 0.0;
+    __atomic_load(&g_gs.llm_last_used_s, &last, __ATOMIC_RELAXED);
+    double idle = gs_now_s() - last;
+    if (g_gs.llm_idle_s > 0 && tier <= g_gs.llm_evict_max_tier && ollm_ready() &&
+        idle >= g_gs.llm_idle_s && pthread_mutex_trylock(&g_llm_swap_lock) == 0) {
+        if (ollm_ready()) {
+            snprintf(g_gs.llm_path, sizeof g_gs.llm_path, "%s",
+                     g_llm_active_path[0] ? g_llm_active_path : getenv("OMNISERVE_NATIVE_LLM_GGUF"));
+            snprintf(g_gs.llm_ngl, sizeof g_gs.llm_ngl, "%s", g_llm_active_ngl[0] ? g_llm_active_ngl : "auto");
+            g_gs.llm_ctx = g_llm_active_ctx > 0 ? g_llm_active_ctx : 8192;
+            g_gs.llm_contexts = g_llm_active_contexts > 0 ? g_llm_active_contexts : 1;
+            int before = gs_device_free_mb();
+            ollm_shutdown();
+            int delta = gs_device_free_mb() - before;
+            pthread_mutex_lock(&g_gs_lock);
+            g_gs.llm_evicted = true;
+            g_gs.llm_evictions++;
+            if (delta > 0) g_gs.llm_mb = delta;
+            pthread_mutex_unlock(&g_gs_lock);
+            freed += delta > 0 ? delta : 0;
+            fprintf(stderr, "gpu-sched: evicted idle LLM (idle %.0f s) for a %s waiter "
+                    "(deficit %d MB, freed %d MB)\n", idle, otier_name(tier), deficit_mb, delta);
+        }
+        pthread_mutex_unlock(&g_llm_swap_lock);
+    }
+    return freed;
+}
+
+static int gs_wait_ms(otier tier) {
+    return (int)tier >= TIER_PAID && (int)tier <= TIER_BACKGROUND ? g_gs.wait_ms[tier] : 0;
+}
+
+/* Reload an LLM the scheduler evicted. Leases its footprint first so the
+ * reload neither lands on CPU nor pushes a neighbour into OOM. */
+static bool llm_ensure_loaded(app_state *app, otier tier) {
+    if (ollm_ready()) { gs_llm_touch(); return true; }
+    if (!g_gs.llm_evicted) return false;
+    gs_llm_touch();
+    pthread_mutex_lock(&g_llm_swap_lock);
+    if (!ollm_ready() && g_gs.llm_evicted) {
+        int need = g_gs.llm_mb > 512 ? g_gs.llm_mb : 6144;
+        char id[40] = {0};
+        int waited = 0;
+        int got = app->vram ? ovram_lease_wait(app->vram, "llm-reload", (int)getpid(), need, need,
+                                               tier, 120.0, gs_wait_ms(tier), id, sizeof id, &waited)
+                            : need;
+        if (got >= need) {
+            double t0 = gs_now_s();
+            int ngl = resolve_llm_ngl(g_gs.llm_path, g_gs.llm_ngl, 999, g_gs.llm_ctx, g_gs.llm_contexts);
+            bool ok = ollm_init(g_gs.llm_path, ngl, g_gs.llm_ctx, g_gs.llm_contexts);
+            ollm_placement placement;
+            ollm_placement_snapshot(&placement);
+            if (ok && placement.gpu_requested && !placement.on_gpu) {
+                fprintf(stderr, "gpu-sched: LLM reload landed on CPU; unloading\n");
+                ollm_shutdown();
+                ok = false;
+            }
+            pthread_mutex_lock(&g_gs_lock);
+            if (ok) {
+                g_gs.llm_evicted = false;
+                g_gs.llm_reloads++;
+                g_gs.llm_reload_ms_last = (gs_now_s() - t0) * 1000.0;
+            } else {
+                g_gs.llm_reload_failures++;
+            }
+            pthread_mutex_unlock(&g_gs_lock);
+            fprintf(stderr, "gpu-sched: LLM reload %s in %.0f ms (queued %d ms)\n",
+                    ok ? "ok" : "FAILED", (gs_now_s() - t0) * 1000.0, waited);
+        } else {
+            pthread_mutex_lock(&g_gs_lock);
+            g_gs.llm_reload_failures++;
+            pthread_mutex_unlock(&g_gs_lock);
+            fprintf(stderr, "gpu-sched: LLM reload denied VRAM after %d ms\n", waited);
+        }
+        if (id[0]) ovram_release(app->vram, id);
+    }
+    pthread_mutex_unlock(&g_llm_swap_lock);
+    return ollm_ready();
+}
+
+/* Admit the optional guard judge only while the device has had spare
+ * headroom for a minute and nobody is queued; evicted first under pressure. */
+static void *judge_admit_main(void *arg) {
+    app_state *app = arg;
+    int stable = 0;
+    for (;;) {
+        sleep(15);
+        if (guard_judge_ready()) { stable = 0; continue; }
+        if (gs_now_s() < g_gs.judge_next_admit_s) { stable = 0; continue; }
+        int need = gs_judge_need_mb();
+        bool quiet = true;
+        for (int t = TIER_PAID; t <= TIER_BACKGROUND; t++) {
+            if (ovram_waiting(app->vram, (otier)t) > 0) quiet = false;
+        }
+        int head = ovram_headroom(app->vram, TIER_BACKGROUND);
+        stable = quiet && head >= need + g_gs.judge_margin_mb ? stable + 1 : 0;
+        if (stable < 4) continue;
+        stable = 0;
+        char id[40] = {0};
+        if (ovram_lease_wait(app->vram, "guard-judge", (int)getpid(), need, need, TIER_BACKGROUND,
+                             120.0, 0, id, sizeof id, NULL) < need) continue;
+        pthread_rwlock_wrlock(&g_judge_rw);
+        bool ok = ojudge_init(g_gs.judge_gguf, 4096, g_gs.judge_threads);
+        pthread_rwlock_unlock(&g_judge_rw);
+        ovram_release(app->vram, id);
+        pthread_mutex_lock(&g_gs_lock);
+        if (ok) g_gs.judge_admits++;
+        else g_gs.judge_next_admit_s = gs_now_s() + 1800.0;
+        pthread_mutex_unlock(&g_gs_lock);
+        fprintf(stderr, "gpu-sched: guard judge admit %s (headroom %d MB, need %d MB)\n",
+                ok ? "ok" : "failed", head, need);
+    }
+    return NULL;
+}
+
+static size_t gpu_sched_json(char *out, size_t cap) {
+    double last = 0.0;
+    __atomic_load(&g_gs.llm_last_used_s, &last, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_gs_lock);
+    int n = snprintf(out, cap,
+        "{\"wait_ms\":{\"paid\":%d,\"sub\":%d,\"free\":%d,\"background\":%d},"
+        "\"image_lease_mb\":%d,\"image_edit_lease_mb\":%d,\"image_waits\":%llu,"
+        "\"image_wait_denials\":%llu,\"broker_unreachable\":%llu,"
+        "\"llm\":{\"evict_idle_s\":%d,\"evict_max_tier\":\"%s\",\"loaded\":%s,\"evicted\":%s,"
+        "\"idle_s\":%.0f,\"evictions\":%llu,\"reloads\":%llu,\"reload_failures\":%llu,"
+        "\"reload_ms_last\":%.0f,\"freed_mb_last\":%d},"
+        "\"judge\":{\"auto\":%s,\"loaded\":%s,\"admits\":%llu,\"evictions\":%llu}}",
+        g_gs.wait_ms[0], g_gs.wait_ms[1], g_gs.wait_ms[2], g_gs.wait_ms[3],
+        g_gs.sd_lease_mb, g_gs.sd_edit_lease_mb, g_gs.image_waits, g_gs.image_wait_denials,
+        g_gs.broker_unreachable,
+        g_gs.llm_idle_s, otier_name(g_gs.llm_evict_max_tier), ollm_ready() ? "true" : "false",
+        g_gs.llm_evicted ? "true" : "false", last > 0 ? gs_now_s() - last : -1.0,
+        g_gs.llm_evictions, g_gs.llm_reloads, g_gs.llm_reload_failures, g_gs.llm_reload_ms_last,
+        g_gs.llm_mb, g_gs.judge_auto ? "true" : "false", ojudge_ready() ? "true" : "false",
+        g_gs.judge_admits, g_gs.judge_evictions);
+    pthread_mutex_unlock(&g_gs_lock);
+    return n > 0 ? ((size_t)n < cap ? (size_t)n : cap - 1) : 0;
+}
+
+/* Image-lane lease: remote broker when configured (fail open if unreachable),
+ * else the local one. Returns granted MB; *remote tells the release path. */
+static int image_gpu_lease(app_state *app, int mb, otier tier, char *id, size_t id_cap,
+                           bool *remote, int *waited_ms) {
+    *remote = false;
+    *waited_ms = 0;
+    int wait = gs_wait_ms(tier);
+    if (app->vram_broker_url) {
+        int got = obroker_lease(app->vram_broker_url, app->vram_owner, (int)getpid(), mb, mb,
+                                tier, 600.0, wait, id, id_cap, waited_ms);
+        if (got < 0) {
+            pthread_mutex_lock(&g_gs_lock);
+            g_gs.broker_unreachable++;
+            pthread_mutex_unlock(&g_gs_lock);
+            fprintf(stderr, "gpu-sched: broker %s unreachable; using local headroom check\n",
+                    app->vram_broker_url);
+            id[0] = 0;
+            return mb;
+        }
+        *remote = true;
+        return got;
+    }
+    if (!app->vram) return mb;
+    return ovram_lease_wait(app->vram, app->vram_owner, (int)getpid(), mb, mb, tier, 600.0,
+                            wait, id, id_cap, waited_ms);
+}
+
+static void image_gpu_release(app_state *app, const char *id, bool remote) {
+    if (!id || !id[0]) return;
+    if (remote) (void)obroker_release(app->vram_broker_url, id);
+    else if (app->vram) ovram_release(app->vram, id);
 }
 
 #define OGUARD_REFUSAL "I can't help with that."
@@ -1620,7 +1887,7 @@ static void guard_refuse_completion(ohttp_request *req, bool legacy, oguard_cate
 }
 
 static void handle_chat(ohttp_request *req, app_state *app) {
-    if (!ollm_ready()) {
+    if (!llm_ensure_loaded(app, request_tier(req))) {
         respond_error(req, 503, "no LLM model loaded; start with OMNISERVE_NATIVE_LLM_GGUF");
         return;
     }
@@ -1849,7 +2116,7 @@ static void parse_sampling(const char *js, const oj_tok *toks, int n, int root,
 }
 
 static void handle_completion(ohttp_request *req, app_state *app, bool legacy, bool autocomplete) {
-    if (!ollm_ready()) {
+    if (!llm_ensure_loaded(app, request_tier(req))) {
         respond_error(req, 503, "no LLM model loaded or configured upstream");
         return;
     }
@@ -2266,16 +2533,20 @@ static void handle_images(ohttp_request *req, app_state *app) {
      * lets another tenant claim the same bytes between admission and a late
      * denoising cache allocation. */
     char image_lease_id[40] = {0};
-    int required_headroom_mb = oimage_gpu_headroom_mb();
-    if (app->vram && required_headroom_mb > 0 &&
-        ovram_lease(app->vram, "embedded-zimage", required_headroom_mb,
-                    required_headroom_mb, tier, 0.0,
-                    image_lease_id, sizeof image_lease_id) != required_headroom_mb) {
+    bool image_lease_remote = false;
+    int required_headroom_mb = img2img ? g_gs.sd_edit_lease_mb : g_gs.sd_lease_mb;
+    int image_waited_ms = 0;
+    if (required_headroom_mb > 0 &&
+        image_gpu_lease(app, required_headroom_mb, tier, image_lease_id, sizeof image_lease_id,
+                        &image_lease_remote, &image_waited_ms) < required_headroom_mb) {
+        pthread_mutex_lock(&g_gs_lock);
+        g_gs.image_wait_denials++;
+        pthread_mutex_unlock(&g_gs_lock);
         char lease_error[160];
         snprintf(lease_error, sizeof lease_error,
                  "image generation needs at least %d MB free GPU memory; "
-                 "managed GPU capacity is busy",
-                 required_headroom_mb);
+                 "managed GPU capacity is busy (queued %d ms)",
+                 required_headroom_mb, image_waited_ms);
         osched_release_n(app->sched, tier, permits);
         oimage_request_free(&image_request);
         /* A device that cannot take this request is a capacity refusal, not a
@@ -2294,7 +2565,7 @@ static void handle_images(ohttp_request *req, app_state *app) {
     char headroom_error[160];
     if (ogpu_memory_gib(&free_gib, &total_gib) &&
         !oimage_gpu_headroom_ok(free_gib, headroom_error, sizeof headroom_error)) {
-        if (image_lease_id[0]) ovram_release(app->vram, image_lease_id);
+        image_gpu_release(app, image_lease_id, image_lease_remote);
         osched_release_n(app->sched, tier, permits);
         oimage_request_free(&image_request);
         if (overflow) {
@@ -2306,8 +2577,13 @@ static void handle_images(ohttp_request *req, app_state *app) {
         return;
     }
     double exec_started = frontier_now_ms();
+    if (image_waited_ms > 0) {
+        pthread_mutex_lock(&g_gs_lock);
+        g_gs.image_waits++;
+        pthread_mutex_unlock(&g_gs_lock);
+    }
     ok = osd_generate(&image_request.generation, &result);
-    if (image_lease_id[0]) ovram_release(app->vram, image_lease_id);
+    image_gpu_release(app, image_lease_id, image_lease_remote);
     osched_release_n(app->sched, tier, permits);
     ofrontier_log(app->frontier, tier, "local", frontier_queue_ms > 0 ? "queued" : "admitted",
                   frontier_queue_ms, frontier_now_ms() - exec_started, frontier_wait_ms, ok ? 200 : 500);
@@ -2666,7 +2942,7 @@ static void handle_embedding(ohttp_request *req, bool openai_shape) {
 }
 
 static void handle_summarization(ohttp_request *req, app_state *app) {
-    if (!ollm_ready()) {
+    if (!llm_ensure_loaded(app, request_tier(req))) {
         if (app->aux_upstream) {
             handle_proxy(req, app, app->aux_upstream, app->aux_permits, "application/json");
         } else {
@@ -2983,6 +3259,22 @@ static void handle_vram_status(ohttp_request *req, app_state *app) {
     ohttp_respond_str(req, 200, "application/json", body);
 }
 
+static void handle_gpu_status(ohttp_request *req, app_state *app) {
+    size_t cap = 32768;
+    char *body = malloc(cap);
+    if (!body) { respond_error(req, 500, "out of memory"); return; }
+    size_t len = (size_t)snprintf(body, cap, "{\"broker\":%s,\"owner\":\"%s\",\"ledger\":",
+                                  app->vram_broker_url ? "\"remote\"" : app->vram ? "\"local\"" : "null",
+                                  app->vram_owner);
+    if (app->vram) len += ovram_ledger_json(app->vram, body + len, cap - len - 1024);
+    else len += (size_t)snprintf(body + len, cap - len, "null");
+    len += (size_t)snprintf(body + len, cap - len, ",\"sched\":");
+    len += gpu_sched_json(body + len, cap - len - 2);
+    snprintf(body + len, cap - len, "}");
+    ohttp_respond_str(req, 200, "application/json", body);
+    free(body);
+}
+
 static void handle_vram_lease(ohttp_request *req, app_state *app) {
     if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
     if (!app->vram) { respond_error(req, 503, "vram broker is not enabled"); return; }
@@ -3011,6 +3303,13 @@ static void handle_vram_lease(ohttp_request *req, app_state *app) {
     int min_mb = min_tok >= 0 ? (int)oj_number(req->body, &toks[min_tok], 0) : 0;
     int ttl_tok = oj_obj_get(req->body, toks, n, 0, "ttl_s");
     double ttl_s = ttl_tok >= 0 ? oj_number(req->body, &toks[ttl_tok], 0) : 0;
+    int pid_tok = oj_obj_get(req->body, toks, n, 0, "pid");
+    int pid = pid_tok >= 0 ? (int)oj_number(req->body, &toks[pid_tok], 0) : 0;
+    /* A waiting lease holds an HTTP worker, so the wait is bounded. */
+    int wait_tok = oj_obj_get(req->body, toks, n, 0, "wait_ms");
+    int wait_ms = wait_tok >= 0 ? (int)oj_number(req->body, &toks[wait_tok], 0) : 0;
+    if (wait_ms < 0) wait_ms = 0;
+    if (wait_ms > 120000) wait_ms = 120000;
 
     /* An internal caller may name its own tier here; request_tier already
      * refuses to honour the header for anyone else, and this endpoint is
@@ -3027,7 +3326,9 @@ static void handle_vram_lease(ohttp_request *req, app_state *app) {
     if (mb <= 0) { respond_error(req, 400, "mb must be positive"); return; }
 
     char id[40] = {0};
-    int granted = ovram_lease(app->vram, owner, mb, min_mb, tier, ttl_s, id, sizeof id);
+    int waited_ms = 0;
+    int granted = ovram_lease_wait(app->vram, owner, pid, mb, min_mb, tier, ttl_s, wait_ms,
+                                   id, sizeof id, &waited_ms);
     char body[320];
     if (granted > 0) {
         /* Reported so the holder knows when the broker will take the headroom
@@ -3035,15 +3336,16 @@ static void handle_vram_lease(ohttp_request *req, app_state *app) {
         double effective_ttl = ttl_s > 0.0 ? ttl_s : ovram_default_ttl_s(app->vram);
         snprintf(body, sizeof body,
                  "{\"granted\":true,\"lease_id\":\"%s\",\"mb\":%d,\"tier\":\"%s\","
-                 "\"expires_in_s\":%d}",
-                 id, granted, otier_name(tier), (int)effective_ttl);
+                 "\"expires_in_s\":%d,\"waited_ms\":%d}",
+                 id, granted, otier_name(tier), (int)effective_ttl, waited_ms);
     } else {
         /* A denial is a normal answer, not a fault: the caller's fallback path
          * is exactly what "no headroom" should trigger, and a 5xx here would
          * make a healthy broker look broken to every monitor watching it. */
         snprintf(body, sizeof body,
-                 "{\"granted\":false,\"mb\":0,\"reason\":\"no_headroom\",\"tier\":\"%s\"}",
-                 otier_name(tier));
+                 "{\"granted\":false,\"mb\":0,\"reason\":\"no_headroom\",\"tier\":\"%s\","
+                 "\"waited_ms\":%d}",
+                 otier_name(tier), waited_ms);
     }
     ohttp_respond_str(req, 200, "application/json", body);
 }
@@ -3146,6 +3448,7 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/errors")) { handle_errors(req); return; }
     if (ohttp_path_is(req, "/status") || ohttp_path_is(req, "/backend_status")) { handle_status(req, app); return; }
     if (ohttp_path_is(req, "/v1/gpu/vram")) { handle_vram_status(req, app); return; }
+    if (ohttp_path_is(req, "/v1/gpu/status")) { handle_gpu_status(req, app); return; }
     if (ohttp_path_is(req, "/v1/host/memory")) { handle_host_memory(req); return; }
     if (ohttp_path_is(req, "/v1/gpu/lease")) { handle_vram_lease(req, app); return; }
     if (ohttp_path_is(req, "/v1/gpu/renew")) { handle_vram_renew(req, app); return; }
@@ -3670,6 +3973,38 @@ int main(int argc, char **argv) {
         }
     }
 
+    {
+        const char *url = getenv("OMNISERVE_NATIVE_VRAM_BROKER_URL");
+        app.vram_broker_url = url && url[0] ? url : NULL;
+        const char *owner = getenv("OMNISERVE_NATIVE_VRAM_OWNER");
+        snprintf(app.vram_owner, sizeof app.vram_owner, "%s", owner && owner[0] ? owner : "embedded-zimage");
+        /* Queue budget per tier before an image request gives up on local
+         * VRAM (then overflow or 503). 0 restores the old instant refusal. */
+        static const char *wait_env[4] = {
+            "OMNISERVE_NATIVE_VRAM_WAIT_MS_PAID", "OMNISERVE_NATIVE_VRAM_WAIT_MS_SUB",
+            "OMNISERVE_NATIVE_VRAM_WAIT_MS_FREE", "OMNISERVE_NATIVE_VRAM_WAIT_MS_BACKGROUND"};
+        static const int wait_default[4] = {60000, 45000, 30000, 20000};
+        for (int t = 0; t < 4; t++) {
+            int w = env_int(wait_env[t], wait_default[t]);
+            g_gs.wait_ms[t] = w < 0 ? 0 : w > 120000 ? 120000 : w;
+        }
+        g_gs.sd_lease_mb = env_int("OMNISERVE_NATIVE_SD_LEASE_MB", oimage_gpu_headroom_mb());
+        g_gs.sd_edit_lease_mb = env_int("OMNISERVE_NATIVE_SD_EDIT_LEASE_MB", g_gs.sd_lease_mb);
+        g_gs.llm_idle_s = env_int("OMNISERVE_NATIVE_EVICT_LLM_IDLE_S", 0);
+        const char *evict_tier = getenv("OMNISERVE_NATIVE_EVICT_LLM_MAX_TIER");
+        g_gs.llm_evict_max_tier = evict_tier && evict_tier[0]
+            ? otier_parse(evict_tier, (int)strlen(evict_tier)) : TIER_SUB;
+        gs_llm_touch();
+        if (app.vram && !app.vram_broker_url) {
+            ovram_set_pressure_hook(app.vram, gpu_pressure, &app,
+                                    env_int("OMNISERVE_NATIVE_VRAM_PRESSURE_AFTER_MS", 1500));
+        }
+        if (app.vram_broker_url) {
+            fprintf(stderr, "gpu-sched: image lane leases from %s as %s (%d/%d MB)\n",
+                    app.vram_broker_url, app.vram_owner, g_gs.sd_lease_mb, g_gs.sd_edit_lease_mb);
+        }
+    }
+
     /* Warm the weights the broker may later ask us to drop. Defaults to the
      * models this process already loads, so the common case needs no config;
      * an explicit list can add files owned by co-tenants. */
@@ -3899,7 +4234,23 @@ int main(int argc, char **argv) {
             fprintf(stderr, "embedding model load failed\n");
         }
     }
-    if (env_flag("OMNISERVE_NATIVE_GUARD_JUDGE", 1)) {
+    g_gs.judge_auto = app.vram && !app.vram_broker_url &&
+                      env_flag("OMNISERVE_NATIVE_GUARD_JUDGE_AUTO", 0);
+    if (g_gs.judge_auto) {
+        /* oguard consults the judge only when this flag is on; the scheduler
+         * decides when it is actually resident. */
+        setenv("OMNISERVE_NATIVE_GUARD_JUDGE", "1", 1);
+        g_gs.judge_gguf = getenv("OMNISERVE_NATIVE_GUARD_JUDGE_GGUF");
+        if (!g_gs.judge_gguf || !g_gs.judge_gguf[0])
+            g_gs.judge_gguf = "/nvme0n1-disk/models/omniserve-native/shieldgemma-2b-q4_k_m.gguf";
+        const char *jt = getenv("OMNISERVE_NATIVE_GUARD_JUDGE_THREADS");
+        g_gs.judge_threads = jt ? atoi(jt) : 24;
+        g_gs.judge_margin_mb = env_int("OMNISERVE_NATIVE_GUARD_JUDGE_MARGIN_MB", 6144);
+        pthread_t judge_thread;
+        if (pthread_create(&judge_thread, NULL, judge_admit_main, &app) == 0) pthread_detach(judge_thread);
+        fprintf(stderr, "gpu-sched: guard judge admitted on headroom (need %d MB + margin %d MB)\n",
+                gs_judge_need_mb(), g_gs.judge_margin_mb);
+    } else if (env_flag("OMNISERVE_NATIVE_GUARD_JUDGE", 1)) {
         const char *judge_gguf = getenv("OMNISERVE_NATIVE_GUARD_JUDGE_GGUF");
         if (!judge_gguf || !judge_gguf[0])
             judge_gguf = "/nvme0n1-disk/models/omniserve-native/shieldgemma-2b-q4_k_m.gguf";

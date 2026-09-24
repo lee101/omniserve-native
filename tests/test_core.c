@@ -1912,6 +1912,67 @@ static void test_vram_arbitration(void) {
     ovram_destroy(v);
 }
 
+/* Materialisation credit: once a holder has grown into its lease, the driver's
+ * free figure already shows those bytes and the lease must stop charging them. */
+static void test_vram_credit(void) {
+    ovram *v = ovram_create(1024, 60.0);
+    CHECK(v != NULL);
+    ogpu_proc procs[2] = {{4242, 1000}, {5151, 500}};
+    ovram_set_procs(v, procs, 2);
+    char id[40];
+    CHECK(ovram_lease_pid_at(v, "qwen", 4242, 10000, 10000, TIER_PAID, 60.0, 10.0, 20000,
+                             id, sizeof id) == 10000);
+    /* Nothing materialised yet: the full lease is withheld (20000-256-10000). */
+    CHECK(ovram_headroom_at(v, TIER_PAID, 11.0, 20000) == 9744);
+    /* Holder grew by 8000 and the device shows it: only 2000 still withheld. */
+    procs[0].used_mb = 9000;
+    ovram_set_procs(v, procs, 2);
+    CHECK(ovram_headroom_at(v, TIER_PAID, 12.0, 12000) == 12000 - 256 - 2000);
+    /* Growth beyond the lease never goes negative. */
+    procs[0].used_mb = 15000;
+    ovram_set_procs(v, procs, 2);
+    CHECK(ovram_headroom_at(v, TIER_PAID, 13.0, 6000) == 6000 - 256);
+    CHECK(ovram_release(v, id));
+    ovram_destroy(v);
+}
+
+typedef struct { ovram *v; int got; } vram_waiter_arg;
+
+static void *vram_paid_waiter(void *p) {
+    vram_waiter_arg *a = p;
+    char id[40];
+    /* Can never fit, so it stays queued for its whole wait. */
+    a->got = ovram_lease_wait(a->v, "paid-waiter", 0, 100000000, 100000000, TIER_PAID, 60.0, 400,
+                              id, sizeof id, NULL);
+    return NULL;
+}
+
+/* A queued higher tier blocks lower tiers from taking headroom it waits for. */
+static void test_vram_priority(void) {
+    ovram *v = ovram_create(1024, 60.0);
+    CHECK(v != NULL);
+    vram_waiter_arg a = {v, -1};
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, vram_paid_waiter, &a) == 0);
+    for (int i = 0; i < 100 && ovram_waiting(v, TIER_PAID) == 0; i++) usleep(5000);
+    CHECK(ovram_waiting(v, TIER_PAID) == 1);
+    char id[40];
+    CHECK(ovram_lease_at(v, "free-tenant", 1024, 1024, TIER_FREE, 60.0, 1.0, 8192, id, sizeof id) == 0);
+    /* Same or higher tier is not blocked by a paid waiter. */
+    CHECK(ovram_lease_at(v, "paid-tenant", 1024, 1024, TIER_PAID, 60.0, 1.0, 8192, id, sizeof id) == 1024);
+    CHECK(ovram_release(v, id));
+    pthread_join(t, NULL);
+    CHECK(a.got == 0);
+    CHECK(ovram_waiting(v, TIER_PAID) == 0);
+    CHECK(ovram_lease_at(v, "free-tenant", 1024, 1024, TIER_FREE, 60.0, 2.0, 8192, id, sizeof id) == 1024);
+    CHECK(ovram_release(v, id));
+    char ledger[16384];
+    CHECK(ovram_ledger_json(v, ledger, sizeof ledger) > 0);
+    CHECK(strstr(ledger, "\"wait_timeouts\":1") != NULL);
+    CHECK(strstr(ledger, "\"owner\":\"paid-waiter\"") != NULL);
+    ovram_destroy(v);
+}
+
 static void test_host_prefetch_policy(void) {
     ohost_meminfo mi = {0};
     mi.mem_total_kb = 256L * 1024 * 1024;      /* 256 GiB */
@@ -2110,6 +2171,8 @@ int main(void) {
     test_spec_mtp_config();
     test_host_prefetch_policy();
     test_vram_arbitration();
+    test_vram_credit();
+    test_vram_priority();
     test_json();
     test_image_contract();
     test_matte();

@@ -59,4 +59,9 @@ double ogpu_total_gib(void);
  * conditions and must not both surface as 0.00. */
 bool ogpu_memory_gib(double *free_gib, double *total_gib);
 
+/* Per-process device memory (NVML compute processes). Returns the count
+ * written, or -1 when the driver cannot be asked. */
+typedef struct { int pid; int used_mb; } ogpu_proc;
+int ogpu_processes(ogpu_proc *out, int cap);
+
 #endif
