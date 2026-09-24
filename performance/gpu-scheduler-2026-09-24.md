@@ -108,8 +108,13 @@ Rollback: `sudo rm /etc/systemd/system/omniserve-native.service.d/zzz-gpu-sched.
 2. `EVICT_LLM_MAX_TIER=free` if paid/sub-only eviction proves too rare.
 3. birefnet: send `pid` with its lease (credit) or lease per job; today it
    withholds 3.5 GB from background work around the clock.
-4. Z-Image full residency (params on GPU, +~3.9 GB): sampling is 1.5 s/it
-   streamed; resident Q4 should be several times faster, worth ~10 s x 5.8k
-   renders/day of lane time. Now affordable because idle gemma can be evicted.
+4. Z-Image residency. Canary (`canary_b2.sh`, all params on GPU, leased from
+   prod as background): sampling 0.53-0.58 s/it vs 1.5 s/it streamed (2.7x),
+   ~7.5 s saved per render x 5.8k renders/day = ~12 h/day of image-lane time;
+   cost: process peak 9.6 GB vs ~1-2 GB streamed growth (diffusion 3.9 GB +
+   Qwen3-4B encoder 2.5 GB + compute). Pairs with evicting idle gemma (5.9 GB,
+   idle 91 % of the day); try diffusion-only residency (encoder on CPU) first.
+   The broker refused the canary's 2nd/3rd background leases once its resident
+   weights ate the headroom, which is the intended behaviour.
 5. Access log has no port: `:8791` and `:8792` (and test gateways) share
    `/var/log/omniserve/access.log`.
