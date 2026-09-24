@@ -110,6 +110,11 @@ int ovram_lease_force(ovram *v, const char *owner, int pid, int mb, otier tier, 
  * 0 = no limit), and only while its need is coverable once live leases end. */
 void ovram_set_block_max_s(ovram *v, double s);
 
+/* Lower-tier leases younger than this still count against higher tiers
+ * (in-flight jobs); older ones are standing reservations that higher tiers may
+ * squeeze. Default 180 s; 0 restores "higher tiers ignore lower leases". */
+void ovram_set_job_lease_s(ovram *v, double s);
+
 /* Current headroom for a tier, and queued waiters for a tier. */
 int ovram_headroom(ovram *v, otier tier);
 int ovram_waiting(ovram *v, otier tier);

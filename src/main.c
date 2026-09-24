@@ -4021,6 +4021,7 @@ int main(int argc, char **argv) {
         const char *force_env = getenv("OMNISERVE_NATIVE_VRAM_FORCE_TIERS");
         g_gs.force_tier_mask = force_env && force_env[0] ? parse_tier_mask(force_env) : 0;
         if (app.vram) ovram_set_block_max_s(app.vram, env_int("OMNISERVE_NATIVE_VRAM_BLOCK_MAX_S", 15));
+        if (app.vram) ovram_set_job_lease_s(app.vram, env_int("OMNISERVE_NATIVE_VRAM_JOB_LEASE_S", 180));
         g_gs.llm_idle_s = env_int("OMNISERVE_NATIVE_EVICT_LLM_IDLE_S", 0);
         const char *evict_tier = getenv("OMNISERVE_NATIVE_EVICT_LLM_MAX_TIER");
         g_gs.llm_evict_max_tier = evict_tier && evict_tier[0]

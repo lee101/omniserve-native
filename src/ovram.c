@@ -57,6 +57,8 @@ struct ovram {
     int waiting[4];
     struct { bool used; otier tier; int need; double since; } waiters[OVRAM_MAX_WAITERS];
     double block_max_s;
+    double job_lease_s;
+    double now; /* clock of the current locked operation (set by expire_locked) */
     ovram_pressure_fn pressure;
     void *pressure_ctx;
     int pressure_after_ms;
@@ -139,6 +141,7 @@ static ovram_owner *owner_locked(ovram *v, const char *name, int pid) {
 }
 
 static int expire_locked(ovram *v, double now_s) {
+    v->now = now_s;
     int reclaimed = 0;
     for (int i = 0; i < OVRAM_MAX_LEASES; i++) {
         if (!v->leases[i].active) continue;
@@ -209,13 +212,22 @@ static int leased_mb_locked(const ovram *v) {
     return total;
 }
 
+/*
+ * A tier is charged for leases of its own or higher priority, and for lower
+ * tiers' leases while they are young (in-flight jobs about to allocate). A
+ * lower-tier lease older than job_lease_s is a standing residency reservation
+ * (e.g. a worker keeping its model's peak free for half an hour); higher tiers
+ * may squeeze it rather than be starved by it. Ignoring young lower-tier leases
+ * too let a paid Qwen render start on top of a background Z-Image that had
+ * just been granted, and the Z-Image OOMed (canary 2026-09-24).
+ */
 static int leased_mb_for_tier_locked(const ovram *v, otier tier) {
     int charge[OVRAM_MAX_LEASES];
     charges_locked(v, charge);
     int total = 0;
     for (int i = 0; i < OVRAM_MAX_LEASES; i++) {
         if (!v->leases[i].active) continue;
-        if (v->leases[i].tier <= tier) total += charge[i];
+        if (v->leases[i].tier <= tier || v->now - v->leases[i].granted_s < v->job_lease_s) total += charge[i];
     }
     return total;
 }
@@ -256,6 +268,7 @@ ovram *ovram_create(int keep_free_mb, double default_ttl_s) {
     v->default_ttl_s = default_ttl_s > 0.0 ? default_ttl_s : 120.0;
     v->pressure_after_ms = 1000;
     v->block_max_s = 15.0;
+    v->job_lease_s = 180.0;
     v->next_id = 1;
     return v;
 }
@@ -273,6 +286,13 @@ void ovram_set_pressure_hook(ovram *v, ovram_pressure_fn fn, void *ctx, int afte
     v->pressure = fn;
     v->pressure_ctx = ctx;
     v->pressure_after_ms = after_ms >= 0 ? after_ms : 0;
+    pthread_mutex_unlock(&v->lock);
+}
+
+void ovram_set_job_lease_s(ovram *v, double s) {
+    if (!v) return;
+    pthread_mutex_lock(&v->lock);
+    v->job_lease_s = s >= 0 ? s : 0;
     pthread_mutex_unlock(&v->lock);
 }
 

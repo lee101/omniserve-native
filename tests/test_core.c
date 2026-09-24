@@ -1837,6 +1837,8 @@ static void test_vram_arbitration(void) {
     char id_a[40], id_b[40];
     ovram *v = ovram_create(1024, 60.0);
     CHECK(v != NULL);
+    /* This test predates in-flight lower-tier charging; keep its policy. */
+    ovram_set_job_lease_s(v, 0.0);
 
     /* 8192 free, 1024 floor for background: 7168 grantable. */
     CHECK(ovram_headroom_at(v, TIER_BACKGROUND, 100.0, 8192) == 7168);
@@ -1983,6 +1985,16 @@ static void test_vram_priority(void) {
     char ledger[16384];
     CHECK(ovram_ledger_json(v, ledger, sizeof ledger) > 0);
     CHECK(strstr(ledger, "\"wait_timeouts\":1") != NULL);
+    ovram_destroy(v);
+
+    /* A young background lease binds paid too (in-flight job); an old one is a
+     * reservation paid may squeeze. */
+    v = ovram_create(1024, 60.0);
+    ovram_set_job_lease_s(v, 30.0);
+    CHECK(ovram_lease_at(v, "bg-job", 4096, 4096, TIER_BACKGROUND, 600.0, 100.0, 8192, id, sizeof id) == 4096);
+    CHECK(ovram_headroom_at(v, TIER_PAID, 110.0, 8192) == 8192 - 256 - 4096);
+    CHECK(ovram_headroom_at(v, TIER_PAID, 140.0, 8192) == 8192 - 256);
+    CHECK(ovram_release(v, id));
     CHECK(strstr(ledger, "\"owner\":\"paid-waiter\"") != NULL);
     ovram_destroy(v);
 
