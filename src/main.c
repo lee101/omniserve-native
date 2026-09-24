@@ -1740,6 +1740,10 @@ static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_targ
 
 /* Inspect only routing metadata: sibling bodies need not satisfy Z-Image's
  * parser, and source images must not be decoded by this gateway. */
+static void relay_image_model_to(ohttp_request *req, app_state *app, image_model_upstream *model,
+                                 const char *body, size_t body_len,
+                                 const char *content_type, size_t content_type_len);
+
 static bool relay_image_model(ohttp_request *req, app_state *app) {
     if (!app->image_model_upstream_count || !req->body) return false;
     oj_tok tokens[MAX_TOKS];
@@ -1760,12 +1764,25 @@ static bool relay_image_model(ohttp_request *req, app_state *app) {
         }
     }
     if (!model) return false;
+    size_t content_type_len = 0;
+    const char *content_type = ohttp_req_header(req, "Content-Type", &content_type_len);
+    if (!content_type) {
+        content_type = "application/json";
+        content_type_len = strlen(content_type);
+    }
+    relay_image_model_to(req, app, model, req->body, req->body_len, content_type, content_type_len);
+    return true;
+}
+
+static void relay_image_model_to(ohttp_request *req, app_state *app, image_model_upstream *model,
+                                 const char *body, size_t body_len,
+                                 const char *content_type, size_t content_type_len) {
     otier tier = request_tier(req);
     /* This sibling uses the same GPU, so it must queue. The standing remote
      * overflow is not an alternative backend for this selected model. */
     if (!osched_acquire_n(app->sched, tier, app->image_permits)) {
         respond_error(req, 503, "admission timeout; retry");
-        return true;
+        return;
     }
     char auth[1024];
     oproxy_header forwarded[20];
@@ -1785,18 +1802,12 @@ static bool relay_image_model(ohttp_request *req, app_state *app) {
     const char *tier_name = otier_name(tier);
     forwarded[n++] = (oproxy_header){
         "X-Omniserve-Tier", sizeof "X-Omniserve-Tier" - 1, tier_name, strlen(tier_name)};
-    size_t content_type_len = 0;
-    const char *content_type = ohttp_req_header(req, "Content-Type", &content_type_len);
-    if (!content_type) {
-        content_type = "application/json";
-        content_type_len = strlen(content_type);
-    }
     char error[256];
     oproxy_result result;
     __atomic_fetch_add(&model->relay_total, 1, __ATOMIC_RELAXED);
     bool ok = oproxy_target_relay(model->target,
         req->method, req->method_len, req->path, req->path_len,
-        NULL, 0, req->body, req->body_len, content_type, content_type_len,
+        NULL, 0, body, body_len, content_type, content_type_len,
         forwarded, n, app->upstream_timeout_ms, proxy_sink_raw, req,
         &result, error, sizeof error);
     osched_release_n(app->sched, tier, app->image_permits);
@@ -1805,6 +1816,47 @@ static bool relay_image_model(ohttp_request *req, app_state *app) {
         if (!result.response_started) respond_error(req, 502, "image model backend unavailable");
         else ohttp_force_close(req);
     } else if (result.downstream_close) ohttp_force_close(req);
+}
+
+static image_model_upstream *image_model_named(app_state *app, const char *name) {
+    if (!name || !name[0]) return NULL;
+    for (int i = 0; i < app->image_model_upstream_count; i++)
+        if (!strcasecmp(name, app->image_model_upstreams[i].model))
+            return &app->image_model_upstreams[i];
+    return NULL;
+}
+
+/* /v1/images/edits without a routable model: OpenAI multipart is converted to
+ * the sibling's JSON reference-edit contract, and JSON is relayed unchanged,
+ * to OMNISERVE_NATIVE_IMAGE_EDIT_MODEL (default: the first image model). A
+ * configured masked-edit pool keeps JSON requests; local reference edit wins. */
+static bool relay_image_edit_default(ohttp_request *req, app_state *app) {
+    if (!app->image_model_upstream_count || !req->body) return false;
+    size_t content_type_len = 0;
+    const char *content_type = ohttp_req_header(req, "Content-Type", &content_type_len);
+    bool multipart = content_type && content_type_len >= 19 &&
+                     !strncasecmp(content_type, "multipart/form-data", 19);
+    if (!multipart && (app->image_editor_upstream || osd_reference_edit_ready())) return false;
+    image_model_upstream *model = image_model_named(app, getenv("OMNISERVE_NATIVE_IMAGE_EDIT_MODEL"));
+    if (!model) model = &app->image_model_upstreams[0];
+    if (!multipart) {
+        relay_image_model_to(req, app, model, req->body, req->body_len,
+                             "application/json", strlen("application/json"));
+        return true;
+    }
+    char named[64], error[256];
+    size_t json_len = 0;
+    char *json = oimage_edit_multipart_to_json(content_type, content_type_len, req->body,
+                                               req->body_len, &json_len, named, sizeof named,
+                                               error, sizeof error);
+    if (!json) {
+        respond_error(req, 400, error);
+        return true;
+    }
+    image_model_upstream *chosen = image_model_named(app, named);
+    relay_image_model_to(req, app, chosen ? chosen : model, json, json_len,
+                         "application/json", strlen("application/json"));
+    free(json);
     return true;
 }
 
@@ -2910,6 +2962,7 @@ static void route(ohttp_request *req, void *user) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
         if (relay_image_model(req, app)) return;
+        if (ohttp_path_is(req, "/v1/images/edits") && relay_image_edit_default(req, app)) return;
     }
     if (ohttp_path_is(req, "/v1/images/generations")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
