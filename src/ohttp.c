@@ -354,19 +354,35 @@ bool ohttp_method_is(const ohttp_request *req, const char *method) {
     return req->method_len == mlen && memcmp(req->method, method, mlen) == 0;
 }
 
+static int retry_after_s(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("OMNISERVE_NATIVE_RETRY_AFTER_S");
+        int n = v && *v ? atoi(v) : 5;
+        cached = n > 0 && n <= 3600 ? n : 5;
+    }
+    return cached;
+}
+
 void ohttp_respond(ohttp_request *req, int status, const char *content_type,
                    const char *body, size_t body_len) {
     struct ohttp_conn *c = req->conn;
-    char head[512];
+    char head[560];
+    char retry[40] = "";
+    /* Every locally generated 503 is a capacity or upstream-availability
+     * refusal; tell well-behaved clients when to come back. */
+    if (status == 503 || status == 429)
+        snprintf(retry, sizeof retry, "Retry-After: %d\r\n", retry_after_s());
     int hn = snprintf(head, sizeof head,
                       "HTTP/1.1 %d %s\r\n"
+                      "%s"
                       "Content-Type: %s\r\n"
                       "Content-Length: %zu\r\n"
                       "Access-Control-Allow-Origin: *\r\n"
                       "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
                       "Access-Control-Allow-Headers: Authorization, Content-Type, secret, X-API-Key, X-Rapid-API-Key, X-Omniserve-Tier\r\n"
                       "Connection: %s\r\n\r\n",
-                      status, status_text(status), content_type, body_len,
+                      status, status_text(status), retry, content_type, body_len,
                       c->keep_alive ? "keep-alive" : "close");
     struct iovec iov[2] = {
         { .iov_base = head, .iov_len = (size_t)hn },

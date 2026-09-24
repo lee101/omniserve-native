@@ -751,6 +751,37 @@ static void test_proxy_relay(void) {
     free(sink.data);
 }
 
+static void test_proxy_breaker(void) {
+    char error[256];
+    oproxy_target *t = oproxy_target_create("http://127.0.0.1:1", 1, error, sizeof error);
+    CHECK(t != NULL);
+    if (!t) return;
+    oproxy_target_breaker_config(t, 2, 40, 100);
+    relay_sink sink = {0};
+    oproxy_result result;
+    for (int i = 0; i < 2; i++) {
+        CHECK(oproxy_target_allow(t));
+        CHECK(!oproxy_target_relay(t, "GET", 3, "/x", 2, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+                                   500, collect_relay, &sink, &result, error, sizeof error));
+        CHECK(!result.response_started);
+    }
+    CHECK(oproxy_target_open_ms(t) > 0);
+    CHECK(!oproxy_target_allow(t));
+    usleep(50 * 1000);
+    CHECK(oproxy_target_open_ms(t) == 0);
+    CHECK(oproxy_target_allow(t));   /* half-open probe claimed */
+    CHECK(!oproxy_target_allow(t));  /* concurrent callers stay out */
+    oproxy_target_record(t, false);  /* probe failed: reopen, cooldown doubles */
+    oproxy_stats st;
+    oproxy_target_snapshot(t, &st);
+    CHECK(st.open_ms_left > 40 && st.breaker_opens == 1 && st.breaker_rejects >= 2);
+    oproxy_target_record(t, true);
+    CHECK(oproxy_target_open_ms(t) == 0);
+    CHECK(oproxy_target_allow(t));
+    free(sink.data);
+    oproxy_target_destroy(t);
+}
+
 static void test_proxy_service_credentials(void) {
     /* Every header this gateway accepts as a caller credential must be
      * recognised, or a metered backend would receive the caller's key. */
@@ -859,6 +890,7 @@ static void test_http_server(void) {
     CHECK(proxy_stats.failures == 0);
 
     test_proxy_relay();
+    test_proxy_breaker();
 
     int fd = connect_local(18791);
     CHECK(fd >= 0);

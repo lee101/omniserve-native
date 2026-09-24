@@ -77,6 +77,15 @@ struct oproxy_target {
     atomic_ullong connections_opened;
     atomic_ullong connections_reused;
     atomic_ullong failures;
+    atomic_uint consecutive_failures;
+    atomic_llong open_until_ms;
+    atomic_int cooldown_ms;
+    atomic_ullong breaker_opens;
+    atomic_ullong breaker_rejects;
+    unsigned failure_limit;
+    int base_cooldown_ms;
+    int max_cooldown_ms;
+    int connect_timeout_ms;
 };
 
 typedef struct {
@@ -85,6 +94,7 @@ typedef struct {
     bool no_body;
     bool connection_close;
     size_t content_length;
+    int status;
 } response_framing;
 
 typedef enum {
@@ -121,6 +131,76 @@ static int64_t monotonic_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int env_int(const char *name, int fallback, int lo, int hi) {
+    const char *v = getenv(name);
+    if (!v || !*v) return fallback;
+    char *end = NULL;
+    long n = strtol(v, &end, 10);
+    if (end == v || n < lo || n > hi) return fallback;
+    return (int)n;
+}
+
+void oproxy_target_breaker_config(oproxy_target *target, unsigned failure_limit,
+                                  int cooldown_ms, int max_cooldown_ms) {
+    if (!target) return;
+    target->failure_limit = failure_limit;
+    target->base_cooldown_ms = cooldown_ms > 0 ? cooldown_ms : 1;
+    target->max_cooldown_ms = max_cooldown_ms >= target->base_cooldown_ms
+        ? max_cooldown_ms : target->base_cooldown_ms;
+    atomic_store(&target->cooldown_ms, target->base_cooldown_ms);
+}
+
+bool oproxy_target_allow(oproxy_target *target) {
+    if (!target || target->failure_limit == 0) return target != NULL;
+    long long until = atomic_load(&target->open_until_ms);
+    if (until == 0) return true;
+    long long now = monotonic_ms();
+    /* Half-open: the first caller past the cooldown claims the probe by pushing
+     * the window out one cooldown, so a probe that never reports back cannot
+     * wedge the target shut and concurrent callers do not stampede it. */
+    if (now >= until &&
+        atomic_compare_exchange_strong(&target->open_until_ms, &until,
+                                       now + atomic_load(&target->cooldown_ms)))
+        return true;
+    atomic_fetch_add_explicit(&target->breaker_rejects, 1, memory_order_relaxed);
+    return false;
+}
+
+void oproxy_target_record(oproxy_target *target, bool ok) {
+    if (!target) return;
+    if (ok) {
+        atomic_store(&target->consecutive_failures, 0);
+        atomic_store(&target->open_until_ms, 0);
+        atomic_store(&target->cooldown_ms, target->base_cooldown_ms);
+        return;
+    }
+    atomic_fetch_add_explicit(&target->failures, 1, memory_order_relaxed);
+    unsigned n = atomic_fetch_add(&target->consecutive_failures, 1) + 1;
+    if (target->failure_limit == 0 || n < target->failure_limit) return;
+    long long now = monotonic_ms();
+    bool was_open = atomic_load(&target->open_until_ms) != 0;
+    int cooldown = atomic_load(&target->cooldown_ms);
+    if (was_open) {
+        long long next = (long long)cooldown * 2;
+        cooldown = next > target->max_cooldown_ms ? target->max_cooldown_ms : (int)next;
+        atomic_store(&target->cooldown_ms, cooldown);
+    }
+    atomic_store(&target->open_until_ms, now + cooldown);
+    if (!was_open) {
+        atomic_fetch_add_explicit(&target->breaker_opens, 1, memory_order_relaxed);
+        fprintf(stderr, "breaker open: %s:%s%s after %u failures, %d ms\n",
+                target->host, target->port, target->prefix, n, cooldown);
+    }
+}
+
+long long oproxy_target_open_ms(oproxy_target *target) {
+    if (!target) return 0;
+    long long until = atomic_load(&target->open_until_ms);
+    if (until == 0) return 0;
+    long long left = until - monotonic_ms();
+    return left > 0 ? left : 0;
 }
 
 static bool parse_base_url(const char *url, oproxy_target *out,
@@ -252,6 +332,11 @@ oproxy_target *oproxy_target_create(const char *base_url, int max_idle,
         }
     }
     pthread_mutex_init(&target->pool_lock, NULL);
+    oproxy_target_breaker_config(target,
+        (unsigned)env_int("OMNISERVE_NATIVE_BREAKER_FAILURES", 3, 0, 1000),
+        env_int("OMNISERVE_NATIVE_BREAKER_COOLDOWN_MS", 30000, 1, 86400000),
+        env_int("OMNISERVE_NATIVE_BREAKER_MAX_COOLDOWN_MS", 300000, 1, 86400000));
+    target->connect_timeout_ms = env_int("OMNISERVE_NATIVE_CONNECT_TIMEOUT_MS", 3000, 0, 600000);
     return target;
 }
 
@@ -277,6 +362,10 @@ void oproxy_target_snapshot(oproxy_target *target, oproxy_stats *out) {
     out->connections_opened = atomic_load_explicit(&target->connections_opened, memory_order_relaxed);
     out->connections_reused = atomic_load_explicit(&target->connections_reused, memory_order_relaxed);
     out->failures = atomic_load_explicit(&target->failures, memory_order_relaxed);
+    out->consecutive_failures = atomic_load(&target->consecutive_failures);
+    out->breaker_opens = atomic_load(&target->breaker_opens);
+    out->breaker_rejects = atomic_load(&target->breaker_rejects);
+    out->open_ms_left = oproxy_target_open_ms(target);
 }
 
 static bool wait_fd(int fd, short events, int64_t deadline) {
@@ -294,6 +383,10 @@ static bool wait_fd(int fd, short events, int64_t deadline) {
 static int connect_deadline(oproxy_target *target, int64_t deadline,
                             char *error, size_t error_cap) {
     int fd = -1;
+    if (target->connect_timeout_ms > 0) {
+        int64_t connect_by = monotonic_ms() + target->connect_timeout_ms;
+        if (connect_by < deadline) deadline = connect_by;
+    }
     for (size_t i = 0; i < target->address_count; i++) {
         const proxy_addr *address = &target->addresses[i];
         fd = socket(address->family, address->socktype | SOCK_NONBLOCK, address->protocol);
@@ -529,6 +622,7 @@ static bool parse_response_headers(const char *data, size_t header_len,
     if (!space || line_end - space < 4 || space[1] < '0' || space[1] > '9' ||
         space[2] < '0' || space[2] > '9' || space[3] < '0' || space[3] > '9') return false;
     int status = (space[1] - '0') * 100 + (space[2] - '0') * 10 + (space[3] - '0');
+    out->status = status;
     out->no_body = (status >= 100 && status < 200) || status == 204 || status == 304;
     out->connection_close = http_10;
 
@@ -694,7 +788,7 @@ bool oproxy_target_relay(oproxy_target *target,
     bool reused = false;
     int fd = target_take_connection(target, deadline, &reused, error, error_cap);
     if (fd < 0) {
-        atomic_fetch_add_explicit(&target->failures, 1, memory_order_relaxed);
+        oproxy_target_record(target, false);
         return false;
     }
     if (out) out->upstream_reused = reused;
@@ -729,7 +823,7 @@ bool oproxy_target_relay(oproxy_target *target,
         set_error(error, error_cap, "could not allocate upstream request");
         free(head);
         close(fd);
-        atomic_fetch_add_explicit(&target->failures, 1, memory_order_relaxed);
+        oproxy_target_record(target, false);
         return false;
     }
 
@@ -742,7 +836,7 @@ bool oproxy_target_relay(oproxy_target *target,
     if (!ok) {
         set_error(error, error_cap, "timed out writing upstream request");
         close(fd);
-        atomic_fetch_add_explicit(&target->failures, 1, memory_order_relaxed);
+        oproxy_target_record(target, false);
         return false;
     }
 
@@ -792,11 +886,13 @@ bool oproxy_target_relay(oproxy_target *target,
     if (!ok) {
         if (response != initial) free(response);
         close(fd);
-        atomic_fetch_add_explicit(&target->failures, 1, memory_order_relaxed);
+        oproxy_target_record(target, false);
         return false;
     }
 
+    oproxy_target_record(target, framing.status < 500);
     if (out) {
+        out->status = framing.status;
         out->response_started = true;
         out->downstream_close = framing.connection_close ||
                                 (!framing.no_body && !framing.chunked && !framing.has_content_length);

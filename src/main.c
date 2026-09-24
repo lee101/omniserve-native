@@ -401,6 +401,23 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
             "omniserve_frontier_kept_local_total %llu\n",
             app->overflow_saturated, app->overflow_failover, app->frontier_kept_local);
     }
+    const struct { const char *name; oproxy_target *target; } remotes[] = {
+        {"image_overflow", app->image_overflow}, {"stt_overflow", app->stt_overflow},
+        {"tts_overflow", app->tts_overflow},
+    };
+    for (size_t i = 0; i < sizeof remotes / sizeof remotes[0] && len < sizeof body; i++) {
+        if (!remotes[i].target) continue;
+        oproxy_stats rs;
+        oproxy_target_snapshot(remotes[i].target, &rs);
+        len += (size_t)snprintf(body + len, sizeof body - len,
+            "omniserve_upstream_breaker_open{upstream=\"%s\"} %d\n"
+            "omniserve_upstream_breaker_opens_total{upstream=\"%s\"} %llu\n"
+            "omniserve_upstream_breaker_rejects_total{upstream=\"%s\"} %llu\n"
+            "omniserve_upstream_failures_total{upstream=\"%s\"} %llu\n",
+            remotes[i].name, rs.open_ms_left > 0,
+            remotes[i].name, rs.breaker_opens, remotes[i].name, rs.breaker_rejects,
+            remotes[i].name, rs.failures);
+    }
     for (int i = 0; i < app->image_model_upstream_count && len < sizeof body; i++) {
         image_model_upstream *model = &app->image_model_upstreams[i];
         len += (size_t)snprintf(body + len, sizeof body - len,
@@ -572,6 +589,8 @@ static void handle_status(ohttp_request *req, app_state *app) {
     if (len > 1 && body[len - 1] == '}') {
         char capacity_json[2048];
         ocapacity_status_json(app->capacity, capacity_json, sizeof capacity_json);
+        oproxy_stats overflow_stats;
+        oproxy_target_snapshot(app->image_overflow, &overflow_stats);
         double acceptance = placement.spec_drafted
             ? (double)placement.spec_accepted / (double)placement.spec_drafted : 0.0;
         snprintf(body + len - 1, sizeof body - (len - 1),
@@ -580,7 +599,9 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  "\"accepted\":%llu,\"acceptance\":%.3f,\"calls_saved\":%llu},"
                  "\"overflow\":{\"image\":%s,\"image_path\":\"%s\",\"tiers\":%u,"
                  "\"saturated\":%llu,\"local_failed\":%llu,"
-                 "\"frontier\":%s,\"frontier_kept_local\":%llu},"
+                 "\"frontier\":%s,\"frontier_kept_local\":%llu,"
+                 "\"breaker\":{\"open_ms\":%lld,\"consecutive_failures\":%u,"
+                 "\"opens\":%llu,\"rejects\":%llu}},"
                  "\"capacity\":%s}",
                  placement.tune_class, placement.n_batch, placement.n_ubatch,
                  placement.spec_draft_max, placement.spec_rounds, placement.spec_drafted,
@@ -590,6 +611,8 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  app->overflow_tier_mask,
                  app->overflow_saturated, app->overflow_failover,
                  app->frontier_routing ? "true" : "false", app->frontier_kept_local,
+                 overflow_stats.open_ms_left, overflow_stats.consecutive_failures,
+                 overflow_stats.breaker_opens, overflow_stats.breaker_rejects,
                  capacity_json);
     }
     len = strlen(body);
@@ -835,10 +858,13 @@ static void reload_embedded_models_after_background(void) {
  * to carry a lane name they otherwise never need. */
 static oproxy_target *overflow_for(const app_state *app, const oproxy_target *local, otier tier) {
     if (!(app->overflow_tier_mask & (1u << (unsigned)tier))) return NULL;
-    if (local == app->image_upstream) return app->image_overflow;
-    if (local == app->stt_upstream) return app->stt_overflow;
-    if (local == app->tts_upstream) return app->tts_overflow;
-    return NULL;
+    oproxy_target *remote = NULL;
+    if (local == app->image_upstream) remote = app->image_overflow;
+    else if (local == app->stt_upstream) remote = app->stt_overflow;
+    else if (local == app->tts_upstream) remote = app->tts_overflow;
+    /* An open breaker makes the lane behave as if it had no remote: queue
+     * locally instead of spending a round trip on a known-dead upstream. */
+    return remote && oproxy_target_open_ms(remote) == 0 ? remote : NULL;
 }
 
 static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_target *upstream,
@@ -859,7 +885,7 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
     oproxy_target *overflow = admit ? overflow_for(app, local, tier) : NULL;
     bool on_overflow = false;
     if (overflow) {
-        if (!osched_try_acquire_n(app->sched, tier, permits)) {
+        if (!osched_try_acquire_n(app->sched, tier, permits) && oproxy_target_allow(overflow)) {
             upstream = overflow;
             on_overflow = true;
             app->overflow_saturated++;
@@ -923,7 +949,8 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
      * retrying would splice a second response onto a partial one. The local
      * slot is released first so the retry cannot hold the device it just
      * failed to use. */
-    if (!ok && !result.response_started && !on_overflow && overflow) {
+    if (!ok && !result.response_started && !on_overflow && overflow &&
+        oproxy_target_allow(overflow)) {
         osched_release_n(app->sched, tier, permits);
         permits = 0;
         app->overflow_failover++;
@@ -1407,7 +1434,8 @@ static void handle_completion(ohttp_request *req, app_state *app, bool legacy, b
 /* Defined with the other relay helpers below; the embedded image lane needs
  * both before that. */
 static oproxy_target *image_overflow_for(const app_state *app, otier tier);
-static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_target *overflow);
+static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_target *overflow,
+                                 bool claimed);
 
 /* Inspect only routing metadata: sibling bodies need not satisfy Z-Image's
  * parser, and source images must not be decoded by this gateway. */
@@ -1506,7 +1534,7 @@ static void handle_images(ohttp_request *req, app_state *app) {
         if (overflow) {
             app->overflow_failover++;
             fprintf(stderr, "no diffusion model loaded; relaying to the image overflow\n");
-            relay_image_overflow(req, app, overflow);
+            relay_image_overflow(req, app, overflow, false);
             return;
         }
         respond_error(req, 503, "no diffusion model loaded; start with OMNISERVE_NATIVE_SD_MODEL");
@@ -1548,19 +1576,23 @@ static void handle_images(ohttp_request *req, app_state *app) {
     if (overflow) {
         if (!osched_try_acquire_n(app->sched, tier, permits)) {
             ofr_table table;
-            bool keep_local = false;
+            bool keep_local = false, have_table = false;
             if (app->frontier_routing && ofrontier_snapshot(app->frontier, &table)) {
+                have_table = true;
                 osched_stats stats;
                 osched_snapshot(app->sched, &stats);
                 frontier_wait_ms = ofrontier_local_wait_ms(&stats, tier, permits, table.local_p50_ms);
                 keep_local = ofrontier_decide(&table, tier, frontier_wait_ms,
                                               request_deadline_ms(req)) == OFR_LOCAL;
             }
-            if (!keep_local) {
+            /* Breaker open (or another caller holds the half-open probe): the
+             * local queue is the next upstream in the chain. */
+            bool claimed = !keep_local && oproxy_target_allow(overflow);
+            if (claimed) {
                 app->overflow_saturated++;
                 oimage_request_free(&image_request);
                 double relay_started = frontier_now_ms();
-                relay_image_overflow(req, app, overflow);
+                relay_image_overflow(req, app, overflow, true);
                 ofrontier_log(app->frontier, tier, "overflow", "saturated", 0,
                               frontier_now_ms() - relay_started, frontier_wait_ms, 0);
                 return;
@@ -1569,7 +1601,7 @@ static void handle_images(ohttp_request *req, app_state *app) {
             double queued = frontier_now_ms();
             if (!osched_acquire_n(app->sched, tier, permits)) {
                 oimage_request_free(&image_request);
-                if (ofrontier_decide(&table, tier, 1e12, 0) == OFR_LOCAL) {
+                if (!have_table || ofrontier_decide(&table, tier, 1e12, 0) == OFR_LOCAL) {
                     ofrontier_log(app->frontier, tier, "local", "admission_timeout",
                                   frontier_now_ms() - queued, 0, frontier_wait_ms, 503);
                     respond_error(req, 503, "admission timeout; retry");
@@ -1577,7 +1609,7 @@ static void handle_images(ohttp_request *req, app_state *app) {
                 }
                 app->overflow_saturated++;
                 double relay_started = frontier_now_ms();
-                relay_image_overflow(req, app, overflow);
+                relay_image_overflow(req, app, overflow, false);
                 ofrontier_log(app->frontier, tier, "overflow", "admission_timeout",
                               relay_started - queued, frontier_now_ms() - relay_started,
                               frontier_wait_ms, 0);
@@ -1612,7 +1644,7 @@ static void handle_images(ohttp_request *req, app_state *app) {
          * can serve it. */
         if (overflow) {
             app->overflow_saturated++;
-            relay_image_overflow(req, app, overflow);
+            relay_image_overflow(req, app, overflow, false);
             return;
         }
         respond_error(req, 503, lease_error);
@@ -1628,7 +1660,7 @@ static void handle_images(ohttp_request *req, app_state *app) {
         oimage_request_free(&image_request);
         if (overflow) {
             app->overflow_saturated++;
-            relay_image_overflow(req, app, overflow);
+            relay_image_overflow(req, app, overflow, false);
             return;
         }
         respond_error(req, 503, headroom_error);
@@ -1647,7 +1679,7 @@ static void handle_images(ohttp_request *req, app_state *app) {
         if (overflow) {
             app->overflow_failover++;
             fprintf(stderr, "local image generation failed; relaying to the image overflow\n");
-            relay_image_overflow(req, app, overflow);
+            relay_image_overflow(req, app, overflow, false);
             return;
         }
         respond_error(req, 500, "image generation failed");
@@ -1768,6 +1800,7 @@ static int build_relay_headers(const app_state *app, const ohttp_request *req,
 static oproxy_target *image_overflow_for(const app_state *app, otier tier) {
     if (!app->image_overflow) return NULL;
     if (!(app->overflow_tier_mask & (1u << (unsigned)tier))) return NULL;
+    if (oproxy_target_open_ms(app->image_overflow) > 0) return NULL;
     return app->image_overflow;
 }
 
@@ -1775,7 +1808,12 @@ static oproxy_target *image_overflow_for(const app_state *app, otier tier) {
  * as the caller's own. The body goes across unchanged: the remote is handed
  * exactly the JSON this gateway parses, which is what lets the app.nz cog seam
  * be addressed like any other upstream. */
-static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_target *overflow) {
+static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_target *overflow,
+                                 bool claimed) {
+    if (!claimed && !oproxy_target_allow(overflow)) {
+        respond_error(req, 503, "overflow backend unavailable; retry");
+        return;
+    }
     char auth[1024];
     oproxy_header forwarded[17];
     int forwarded_n = build_relay_headers(app, req, overflow, -1, forwarded, 16,
