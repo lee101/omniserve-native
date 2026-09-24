@@ -95,6 +95,11 @@ VRAM each and write to the prod access log; run it with
 - `:8792`: `omniserve-native-qwen.service.d/zzzz-gpu-sched.conf`, leases
   10240 MB (edit 11264) at 1024^2 scaled by pixels, forced after 20/20/25/30 s.
 
+First 20 min after the final deploy (11:08-11:28 UTC): 0 VRAM-related 5xx on
+`:8791`/`:8792` (3 unrelated `/v1/images/segmentations` 503s: no
+IMAGE_EDITOR_UPSTREAM), 10 image requests queued for headroom and served
+instead of the old instant 503, 0 prod wait timeouts, ra2 smoke render 200.
+
 This drop-in overrides `ExecStart` from `overflow-daisy.conf`: a later binary
 deploy must update `zzz-gpu-sched.conf` (or remove it), not only overflow-daisy.
 
