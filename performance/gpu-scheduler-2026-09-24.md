@@ -87,8 +87,11 @@ VRAM each and write to the prod access log; run it with
 
 - `:8791`: `/etc/systemd/system/omniserve-native.service.d/zzz-gpu-sched.conf`
   (source `systemd/gpu-sched/`), binary `deploy-sched-<rev>/omniserve-native`
-  (ra2-moe 85a5370 auth + gpu-sched). Z-Image lease 2560 MB (was 4096), LLM
-  eviction for paid/sub waiters after 600 s idle, judge auto off.
+  (ra2-moe 85a5370 auth + gpu-sched). Z-Image lease stays 4096 MB
+  (= `SD_MIN_FREE_MB`; a smaller lease would pass the queue and then fail the
+  point check that protects the conditioner from aborting; credit returns the
+  unused ~2.4 GB to others while it renders). LLM eviction for paid/sub
+  waiters after 600 s idle, judge auto off.
 - `:8792`: `omniserve-native-qwen.service.d/zzzz-gpu-sched.conf`, leases
   10240 MB (edit 11264) at 1024^2 scaled by pixels, forced after 20/20/25/30 s.
 
