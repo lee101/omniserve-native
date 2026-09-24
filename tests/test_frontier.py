@@ -90,10 +90,10 @@ class LedgerTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_costs(self):
-        self.assertAlmostEqual(estimate_usd("runpod", exec_ms=3.6e6, endpoint="tmozxvnm9fuuud")[0], 1.10)
+        self.assertAlmostEqual(estimate_usd("runpod", exec_ms=3.6e6, endpoint="tmozxvnm9fuuud")[0], 1.11)
         usd, cold = estimate_usd("runpod", exec_ms=1.8e6, queue_ms=1.8e6, endpoint="tmozxvnm9fuuud")
         self.assertTrue(cold)
-        self.assertAlmostEqual(usd, 1.10)
+        self.assertAlmostEqual(usd, 1.11)
         self.assertAlmostEqual(estimate_usd("local", exec_ms=3.6e6)[0], 0.10)
         self.assertAlmostEqual(estimate_usd("local", exec_ms=3.6e6, saturated=True)[0], 0.80)
         self.assertEqual(estimate_usd("local", exec_ms=3.6e6, cache_hit=True)[0], 0.0)

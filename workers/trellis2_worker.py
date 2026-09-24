@@ -87,8 +87,11 @@ def validate_public_url(raw: str) -> str:
         addresses = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise ValueError("image_url hostname could not be resolved") from exc
+    allow_loopback = os.getenv("OMNISERVE_3D_ALLOW_LOOPBACK_URLS") == "1"
     for address in addresses:
         ip = ipaddress.ip_address(address[4][0])
+        if allow_loopback and ip.is_loopback:
+            continue
         if not ip.is_global:
             raise ValueError("image_url cannot resolve to a private or local address")
     return raw.strip()
@@ -172,11 +175,16 @@ def cached_hf_model(repo_id: str) -> bool:
     return False
 
 
+def dino_repo() -> str:
+    return os.getenv("OMNISERVE_3D_DINOV3_REPO", "").strip() or DINO_TRELLIS
+
+
 def model_dependency_issue(model: str) -> dict | None:
-    if model == MODEL_TRELLIS and not cached_hf_model(DINO_TRELLIS):
+    dino = dino_repo()
+    if model == MODEL_TRELLIS and not cached_hf_model(dino):
         return {
-            "dependency": DINO_TRELLIS,
-            "approval_url": f"https://huggingface.co/{DINO_TRELLIS}",
+            "dependency": dino,
+            "approval_url": f"https://huggingface.co/{dino}",
             "message": (
                 "TRELLIS.2 requires the gated DINOv3 image encoder; accept its "
                 "terms and prefetch it into HF_HOME before serving jobs"

@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "obackend.h"
 #include "ocapacity.h"
 #include "ohttp.h"
 #include "oimage.h"
@@ -1769,6 +1770,35 @@ static void test_spec_governor(void) {
     CHECK(g3.accepted == 2 && g3.saved_calls == 2);
 }
 
+static void test_spec_mtp_config(void) {
+    ollm_spec_mtp_config cfg;
+    ollm_spec_mtp_default(&cfg);
+    CHECK(cfg.draft_max == 1);
+    CHECK(cfg.p_min == 0.0f);
+
+    CHECK(ollm_spec_mtp_parse(&cfg, NULL, NULL) == 0);
+    CHECK(cfg.draft_max == 1 && cfg.p_min == 0.0f);
+    CHECK(ollm_spec_mtp_parse(&cfg, "", "") == 0);
+    CHECK(cfg.draft_max == 1 && cfg.p_min == 0.0f);
+
+    CHECK(ollm_spec_mtp_parse(&cfg, "2", "0") == 0);
+    CHECK(cfg.draft_max == 2 && cfg.p_min == 0.0f);
+    CHECK(ollm_spec_mtp_parse(&cfg, "0", "1") == 0);
+    CHECK(cfg.draft_max == 0 && cfg.p_min == 1.0f);
+    CHECK(ollm_spec_mtp_parse(&cfg, "1", "0.75") == 0);
+    CHECK(cfg.draft_max == 1 && cfg.p_min > 0.74f && cfg.p_min < 0.76f);
+
+    CHECK(ollm_spec_mtp_parse(&cfg, "3", NULL) != 0);
+    CHECK(ollm_spec_mtp_parse(&cfg, "-1", NULL) != 0);
+    CHECK(ollm_spec_mtp_parse(&cfg, "x", NULL) != 0);
+    CHECK(ollm_spec_mtp_parse(&cfg, "1x", NULL) != 0);
+    CHECK(ollm_spec_mtp_parse(&cfg, NULL, "1.5") != 0);
+    CHECK(ollm_spec_mtp_parse(&cfg, NULL, "-0.1") != 0);
+    CHECK(ollm_spec_mtp_parse(&cfg, NULL, "nan") != 0);
+    CHECK(ollm_spec_mtp_parse(&cfg, NULL, "x") != 0);
+    CHECK(ollm_spec_mtp_parse(NULL, NULL, NULL) != 0);
+}
+
 /* The deterministic entry points take the clock and the device figure as
  * arguments precisely so the arbitration policy is provable without a GPU. */
 static void test_vram_arbitration(void) {
@@ -1901,10 +1931,151 @@ static void test_sched_try_acquire(void) {
     osched_destroy(s);
 }
 
+static void test_tensor_overrides(void) {
+    ollm_tensor_override out[8];
+    CHECK(ollm_parse_tensor_overrides(NULL, out, 8) == 0);
+    CHECK(ollm_parse_tensor_overrides("", out, 8) == 0);
+    CHECK(ollm_parse_tensor_overrides("blk\\.3\\.ffn_.*_exps=CPU", out, 8) == 1);
+    CHECK(strcmp(out[0].pattern, "blk\\.3\\.ffn_.*_exps") == 0 && out[0].cpu);
+    CHECK(ollm_parse_tensor_overrides("a=CPU,b=CUDA0", out, 8) == 2);
+    CHECK(out[0].cpu && !out[1].cpu);
+    CHECK(ollm_parse_tensor_overrides(" a = cpu ", out, 8) == 1 && out[0].cpu);
+    CHECK(ollm_parse_tensor_overrides("noequals", out, 8) < 0);
+    CHECK(ollm_parse_tensor_overrides("=CPU", out, 8) < 0);
+    CHECK(ollm_parse_tensor_overrides("a=", out, 8) < 0);
+    CHECK(ollm_parse_tensor_overrides("a=CUDA1", out, 8) < 0);
+    CHECK(ollm_parse_tensor_overrides("a=CPU", out, 0) < 0);
+    CHECK(ollm_parse_tensor_overrides("a=CPU,b=CPU", out, 1) < 0);
+
+    ollm_moe_mode mode = OLLM_MOE_OFF;
+    int n = -1;
+    CHECK(ollm_parse_moe_cpu_experts(NULL, &mode, &n) == 0 && mode == OLLM_MOE_OFF);
+    CHECK(ollm_parse_moe_cpu_experts("", &mode, &n) == 0 && mode == OLLM_MOE_OFF);
+    CHECK(ollm_parse_moe_cpu_experts("0", &mode, &n) == 0 && mode == OLLM_MOE_OFF);
+    CHECK(ollm_parse_moe_cpu_experts("8", &mode, &n) == 0 && mode == OLLM_MOE_N && n == 8);
+    CHECK(ollm_parse_moe_cpu_experts("all", &mode, &n) == 0 && mode == OLLM_MOE_ALL);
+    CHECK(ollm_parse_moe_cpu_experts("auto", &mode, &n) == 0 && mode == OLLM_MOE_AUTO);
+    CHECK(ollm_parse_moe_cpu_experts("bogus", &mode, &n) != 0);
+    CHECK(ollm_parse_moe_cpu_experts("-1", &mode, &n) != 0);
+    CHECK(ollm_parse_moe_cpu_experts("4x", &mode, &n) != 0);
+
+    CHECK(ollm_tensor_is_expert("blk.3.ffn_up_exps.weight"));
+    CHECK(ollm_tensor_is_expert("blk.12.ffn_gate_inp.weight") == false);
+    CHECK(ollm_tensor_is_expert("blk.0.ffn_up.weight") == false);
+    CHECK(ollm_tensor_block_index("blk.3.ffn_up_exps.weight") == 3);
+    CHECK(ollm_tensor_block_index("blk.12.attn_q.weight") == 12);
+    CHECK(ollm_tensor_block_index("token_embd.weight") < 0);
+    CHECK(ollm_tensor_block_index("blk.x.foo") < 0);
+
+    unsigned long long exps[4] = {100, 100, 100, 100};
+    CHECK(ollm_gpu_expert_layers(exps, 4, 1000, 100, 50, 2000) == 4);
+    CHECK(ollm_gpu_expert_layers(exps, 4, 1000, 100, 50, 1350) == 2);
+    CHECK(ollm_gpu_expert_layers(exps, 4, 1000, 100, 50, 1150) == 0);
+    CHECK(ollm_gpu_expert_layers(exps, 4, 1000, 100, 50, 1149) == 0);
+    CHECK(ollm_gpu_expert_layers(NULL, 4, 0, 0, 0, 100) == 0);
+    CHECK(ollm_gpu_expert_layers(exps, 0, 0, 0, 0, 100) == 0);
+    CHECK(ollm_kv_type_size("q8_0") < 1.1 && ollm_kv_type_size("q8_0") > 1.0);
+    CHECK(ollm_kv_type_size("q4_0") < 0.6 && ollm_kv_type_size("q4_0") > 0.5);
+    CHECK(ollm_kv_type_size("f16") == 2.0);
+    CHECK(ollm_kv_type_size(NULL) == 2.0);
+
+    char stripped[128];
+    ollm_strip_channels("plain text", stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "plain text") == 0);
+    ollm_strip_channels("<|channel>thought\n<channel|>Hello", stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "Hello") == 0);
+    ollm_strip_channels("a<|channel>x<channel|>b<|channel>y<channel|>c", stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "abc") == 0);
+    ollm_strip_channels("keep <|channel>unterminated", stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "keep ") == 0);
+    ollm_strip_channels("a<channel|>b", stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "ab") == 0);
+    ollm_strip_channels("a<channel|>b<|channel>c<channel|>d", stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "abd") == 0);
+    ollm_strip_channels(NULL, stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "") == 0);
+    ollm_strip_channels("abcdef", stripped, 4);
+    CHECK(strcmp(stripped, "abc") == 0);
+    strcpy(stripped, "a<|channel>x<channel|>b<|channel>unterminated");
+    ollm_strip_channels(stripped, stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "ab") == 0);
+
+    char final[128];
+    strcpy(final, "Hello <|channel>thought\nsecret");
+    ollm_strip_channels_final(final, sizeof final);
+    CHECK(strcmp(final, "Hello ") == 0);
+    strcpy(final, "a<channel|>b");
+    ollm_strip_channels_final(final, sizeof final);
+    CHECK(strcmp(final, "ab") == 0);
+    strcpy(final, "Hello <|chan");
+    ollm_strip_channels_final(final, sizeof final);
+    CHECK(strcmp(final, "Hello ") == 0);
+    strcpy(final, "Hello <channe");
+    ollm_strip_channels_final(final, sizeof final);
+    CHECK(strcmp(final, "Hello ") == 0);
+    strcpy(final, "a<|channel>thought\n<channe");
+    ollm_strip_channels_final(final, sizeof final);
+    CHECK(strcmp(final, "a") == 0);
+    strcpy(final, "score a<");
+    ollm_strip_channels_final(final, sizeof final);
+    CHECK(strcmp(final, "score a<") == 0);
+    strcpy(final, "clean prose");
+    ollm_strip_channels_final(final, sizeof final);
+    CHECK(strcmp(final, "clean prose") == 0);
+
+    CHECK(ollm_regex_balanced("blk\\.3\\.ffn_.*_exps"));
+    CHECK(ollm_regex_balanced("a(b|c)*"));
+    CHECK(ollm_regex_balanced("[ab]+\\d"));
+    CHECK(ollm_regex_balanced("blk\\.(25|26)\\.ffn_(up|down)_exps"));
+    CHECK(!ollm_regex_balanced("(a"));
+    CHECK(!ollm_regex_balanced("a)"));
+    CHECK(!ollm_regex_balanced("[ab"));
+    CHECK(!ollm_regex_balanced("a\\"));
+    CHECK(!ollm_regex_balanced("*a"));
+    CHECK(!ollm_regex_balanced("a|*b"));
+    CHECK(!ollm_regex_balanced(""));
+    CHECK(!ollm_regex_balanced(NULL));
+
+    char pat[512];
+    CHECK(ollm_moe_cpu_pattern(25, 30, pat, sizeof pat) == 0);
+    CHECK(strcmp(pat, "blk\\.(25|26|27|28|29)\\.ffn_(up|down|gate|gate_up)_(ch|)exps") == 0);
+    CHECK(ollm_moe_cpu_pattern(0, 1, pat, sizeof pat) == 0);
+    CHECK(strcmp(pat, "blk\\.(0)\\.ffn_(up|down|gate|gate_up)_(ch|)exps") == 0);
+    CHECK(ollm_moe_cpu_pattern(0, 0, pat, sizeof pat) != 0);
+    CHECK(ollm_moe_cpu_pattern(5, 5, pat, sizeof pat) != 0);
+    CHECK(ollm_moe_cpu_pattern(-1, 3, pat, sizeof pat) != 0);
+    CHECK(ollm_moe_cpu_pattern(0, 30, pat, 32) != 0);
+    CHECK(ollm_moe_cpu_pattern(0, 1, NULL, 0) != 0);
+
+    const char *saved_think = getenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT");
+    char saved_buf[32] = {0};
+    if (saved_think) snprintf(saved_buf, sizeof saved_buf, "%s", saved_think);
+    unsetenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT");
+    CHECK(ollm_thinking_default() == false);
+    setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", "0", 1);
+    CHECK(ollm_thinking_default() == false);
+    setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", "false", 1);
+    CHECK(ollm_thinking_default() == false);
+    setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", "", 1);
+    CHECK(ollm_thinking_default() == false);
+    setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", "bogus", 1);
+    CHECK(ollm_thinking_default() == false);
+    setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", "1", 1);
+    CHECK(ollm_thinking_default() == true);
+    setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", "TRUE", 1);
+    CHECK(ollm_thinking_default() == true);
+    setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", "on", 1);
+    CHECK(ollm_thinking_default() == true);
+    if (saved_think) setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", saved_buf, 1);
+    else unsetenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT");
+}
+
 int main(void) {
+    test_tensor_overrides();
     test_sched_try_acquire();
     test_spec_draft();
     test_spec_governor();
+    test_spec_mtp_config();
     test_host_prefetch_policy();
     test_vram_arbitration();
     test_json();

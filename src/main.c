@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "obackend.h"
 #include "ocapacity.h"
+#include "oguard.h"
 #include "ohttp.h"
 #include "oimage.h"
 #include "ojson.h"
@@ -44,6 +45,7 @@ typedef struct {
     oproxy_target *birefnet_upstream;
     oproxy_target *tts_upstream;
     oproxy_target *stt_upstream;
+    oproxy_target *music_upstream;
     oproxy_target *forecast_upstream;
     oproxy_target *training_upstream;
     oproxy_target *embedding_upstream;
@@ -52,6 +54,7 @@ typedef struct {
     oproxy_target *threed_upstream;
     oproxy_target *aux_upstream;
     int upstream_timeout_ms;
+    int music_timeout_ms;
     int h3_timeout_ms;
     int llm_permits;
     int image_permits;
@@ -117,6 +120,10 @@ static int build_relay_headers(const app_state *app, const ohttp_request *req,
 static pthread_mutex_t g_llm_swap_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_llm_active_path[PATH_MAX];
 static char g_llm_active_ngl[32];
+static char g_llm_active_tensor_override[512];
+static char g_llm_active_moe_cpu_experts[32];
+static char g_llm_active_spec_mtp[PATH_MAX];
+static bool g_llm_active_placement_set;
 static int g_llm_active_ctx;
 static int g_llm_active_contexts;
 
@@ -144,14 +151,13 @@ static bool llm_swap_path(const char *requested, char *resolved, size_t resolved
  * configurable runtime margin fits in the driver's current free memory. A
  * caller that wants a partial split can continue to pass an explicit layer
  * count. */
-static int resolve_llm_ngl(const char *model_path, const char *value, int fallback) {
+static int resolve_llm_ngl(const char *model_path, const char *value, int fallback,
+                           int ctx, int contexts) {
     if (!value || !value[0] || strcasecmp(value, "auto") != 0) {
         return value && value[0] ? atoi(value) : fallback;
     }
 
     struct stat st;
-    double free_gib = -1.0;
-    bool have_vram = ogpu_memory_gib(&free_gib, NULL);
     long long keep_mb = 2048;
     const char *keep_env = getenv("OMNISERVE_NATIVE_NGL_AUTO_KEEP_FREE_MB");
     if (keep_env && keep_env[0]) keep_mb = atoll(keep_env);
@@ -161,15 +167,35 @@ static int resolve_llm_ngl(const char *model_path, const char *value, int fallba
     if (stat(model_path, &st) == 0 && st.st_size > 0) {
         model_bytes = (unsigned long long)st.st_size;
     }
+    unsigned long long offloaded = ollm_cpu_offloaded_bytes(model_path, ctx, contexts);
+    if (offloaded > model_bytes) offloaded = model_bytes;
     unsigned long long margin_bytes = (unsigned long long)keep_mb * 1024ULL * 1024ULL;
-    unsigned long long required_bytes = model_bytes + margin_bytes;
-    unsigned long long free_bytes = have_vram && free_gib > 0.0
-        ? (unsigned long long)(free_gib * 1024.0 * 1024.0 * 1024.0) : 0;
-    bool fits = have_vram && model_bytes > 0 && free_bytes >= required_bytes;
+
+    /* The MoE decision sampled free VRAM once; the verdict reuses that exact
+     * sample so the log line and the placement can never disagree. */
+    bool moe_active = ollm_moe_last_active();
+    unsigned long long est_bytes = ollm_moe_last_est_bytes();
+    unsigned long long free_bytes = ollm_moe_last_free_bytes();
+    bool have_vram = moe_active && free_bytes > 0;
+    if (!have_vram) {
+        double free_gib = -1.0;
+        have_vram = ogpu_memory_gib(&free_gib, NULL) && free_gib > 0.0;
+        free_bytes = have_vram
+            ? (unsigned long long)(free_gib * 1024.0 * 1024.0 * 1024.0) : 0;
+    }
+    bool fits;
+    if (moe_active && est_bytes > 0) {
+        fits = have_vram && model_bytes > 0 && free_bytes >= margin_bytes &&
+            est_bytes <= free_bytes - margin_bytes;
+    } else {
+        unsigned long long required_bytes = model_bytes - offloaded + margin_bytes;
+        fits = have_vram && model_bytes > 0 && free_bytes >= required_bytes;
+    }
 
     fprintf(stderr,
-            "llm NGL=auto: model=%llu MiB free=%llu MiB keep_free=%lld MiB -> %s\n",
-            model_bytes / (1024ULL * 1024ULL), free_bytes / (1024ULL * 1024ULL),
+            "llm NGL=auto: model=%llu MiB cpu_experts=%llu MiB est=%llu MiB free=%llu MiB keep_free=%lld MiB -> %s\n",
+            model_bytes / (1024ULL * 1024ULL), offloaded / (1024ULL * 1024ULL),
+            est_bytes / (1024ULL * 1024ULL), free_bytes / (1024ULL * 1024ULL),
             keep_mb, fits ? "full GPU offload" : "CPU placement");
     return fits ? 999 : 0;
 }
@@ -400,6 +426,7 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
             "omniserve_image_model_relay_total{model=\"%s\"} %llu\n",
             model->model, __atomic_load_n(&model->relay_total, __ATOMIC_RELAXED));
     }
+    oguard_metrics_append(body, sizeof body, &len);
     ohttp_respond(req, 200, "text/plain; version=0.0.4", body, len);
 }
 
@@ -466,12 +493,18 @@ static void handle_status(ohttp_request *req, app_state *app) {
     /* Zero-initialised because the capacity object below is appended by seeking
      * to strlen(body); starting from a known state keeps that arithmetic sound
      * even if the first format is ever truncated. */
+    char *ovr_esc = NULL;
+    size_t ovr_len = 0, ovr_cap = 0;
+    (void)oj_escape_append(&ovr_esc, &ovr_len, &ovr_cap,
+                           placement.tensor_override, strlen(placement.tensor_override));
     char body[8192] = {0};
     snprintf(body, sizeof body,
              "{\"vram_free_gib\":%.2f,\"vram_total_gib\":%.2f,\"vram_available\":%s,"
              "\"gpu\":{\"device_present\":%s,\"requested\":%s,\"placement\":\"%s\","
              "\"device\":\"%.80s\",\"kv_type\":\"%s\",\"flash_attn\":%s,\"degraded\":%s},"
-             "\"llm\":{\"ready\":%s,\"model\":\"%s\"},"
+             "\"llm\":{\"ready\":%s,\"model\":\"%s\","
+             "\"gpu_expert_layers\":%d,\"cpu_expert_layers\":%d,"
+             "\"tensor_override\":\"%s\",\"est_gpu_bytes\":%llu},"
              "\"embedding\":{\"ready\":%s,\"model\":\"%s\"},"
              "\"diffusion\":{\"ready\":%s,\"model\":\"%s\",\"reference_edit\":%s},"
              /* Key order must track the argument order below, which matches the
@@ -506,6 +539,8 @@ static void handle_status(ohttp_request *req, app_state *app) {
              placement.kv_type, placement.flash_attn ? "true" : "false",
              (ollm_ready() && placement.gpu_requested && !placement.on_gpu) ? "true" : "false",
              ollm_ready() ? "true" : "false", ollm_model_name(),
+             placement.gpu_expert_layers, placement.cpu_expert_layers,
+             ovr_esc ? ovr_esc : "", placement.est_gpu_bytes,
              oembed_ready() ? "true" : "false", oembed_model_name(),
              osd_ready() ? "true" : "false", osd_model_name(),
              osd_reference_edit_ready() ? "true" : "false",
@@ -565,23 +600,27 @@ static void handle_status(ohttp_request *req, app_state *app) {
     if (len > 1 && body[len - 1] == '}') {
         char capacity_json[2048];
         ocapacity_status_json(app->capacity, capacity_json, sizeof capacity_json);
+        char guard_json[1024];
+        oguard_status_json(guard_json, sizeof guard_json);
         double acceptance = placement.spec_drafted
             ? (double)placement.spec_accepted / (double)placement.spec_drafted : 0.0;
         snprintf(body + len - 1, sizeof body - (len - 1),
                  ",\"tune\":{\"class\":\"%s\",\"n_batch\":%d,\"n_ubatch\":%d},"
-                 "\"speculation\":{\"draft_max\":%d,\"rounds\":%llu,\"drafted\":%llu,"
-                 "\"accepted\":%llu,\"acceptance\":%.3f,\"calls_saved\":%llu},"
+                 "\"speculation\":{\"source\":\"%s\",\"draft_max\":%d,\"rounds\":%llu,"
+                 "\"drafted\":%llu,\"accepted\":%llu,\"acceptance\":%.3f,"
+                 "\"calls_saved\":%llu},"
                  "\"overflow\":{\"image\":%s,\"image_path\":\"%s\",\"tiers\":%u,"
                  "\"saturated\":%llu,\"local_failed\":%llu},"
-                 "\"capacity\":%s}",
+                 "\"capacity\":%s,\"guard\":%s}",
                  placement.tune_class, placement.n_batch, placement.n_ubatch,
-                 placement.spec_draft_max, placement.spec_rounds, placement.spec_drafted,
-                 placement.spec_accepted, acceptance, placement.spec_saved_calls,
+                 placement.spec_source, placement.spec_draft_max, placement.spec_rounds,
+                 placement.spec_drafted, placement.spec_accepted, acceptance,
+                 placement.spec_saved_calls,
                  app->image_overflow ? "true" : "false",
                  overflow_path_label(),
                  app->overflow_tier_mask,
                  app->overflow_saturated, app->overflow_failover,
-                 capacity_json);
+                 capacity_json, guard_json);
     }
     len = strlen(body);
     if (len > 0 && body[len - 1] == '}') body[--len] = '\0';
@@ -593,6 +632,7 @@ static void handle_status(ohttp_request *req, app_state *app) {
             __atomic_load_n(&model->relay_total, __ATOMIC_RELAXED));
     }
     snprintf(body + len, sizeof body - len, "}}");
+    free(ovr_esc);
     ohttp_force_close(req);
     ohttp_respond_str(req, 200, "application/json", body);
 }
@@ -629,6 +669,7 @@ static void handle_models(ohttp_request *req, const app_state *app) {
                                     "tts", "proxy");
     if (app->stt_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_STT_MODEL", "upstream-stt"),
                                     "stt", "proxy");
+    if (app->music_upstream) ADD_MODEL("m-a-p/YuE2-3B", "music", "proxy-capacity-aware");
     if (app->forecast_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_FORECAST_MODEL", "amazon/chronos-2"),
                                          "forecast", "proxy");
     if (app->embedding_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_EMBEDDING_MODEL", "upstream-embedding"),
@@ -795,8 +836,9 @@ static void reload_embedded_models_after_background(void) {
         if (parallel_contexts < 1) parallel_contexts = 1;
         if (parallel_contexts > slots) parallel_contexts = slots;
         fprintf(stderr, "exclusive background window: reloading LLM %s\n", gguf);
-        if (!ollm_init(gguf, resolve_llm_ngl(gguf, ngl, 999), ctx ? atoi(ctx) : 8192,
-                       parallel_contexts)) {
+        if (!ollm_init(gguf, resolve_llm_ngl(gguf, ngl, 999, ctx ? atoi(ctx) : 8192,
+                                            parallel_contexts),
+                       ctx ? atoi(ctx) : 8192, parallel_contexts)) {
             fprintf(stderr, "exclusive background window: LLM reload failed\n");
         }
         ollm_placement placement;
@@ -894,8 +936,8 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
     oproxy_result result;
     const char *upstream_path = path_override ? path_override : req->path;
     size_t upstream_path_len = path_override ? strlen(path_override) : req->path_len;
-    int upstream_timeout_ms = local == app->h3_upstream
-        ? app->h3_timeout_ms : app->upstream_timeout_ms;
+    int upstream_timeout_ms = local == app->music_upstream ? app->music_timeout_ms :
+        (local == app->h3_upstream ? app->h3_timeout_ms : app->upstream_timeout_ms);
     bool ok = oproxy_target_relay(
         upstream,
         req->method, req->method_len,
@@ -1037,6 +1079,154 @@ static int parse_stop_values(const char *js, const oj_tok *toks, int n, int root
     return count;
 }
 
+static void guard_request_id(const ohttp_request *req, char *dst, size_t cap) {
+    size_t len = 0;
+    const char *v = ohttp_req_header(req, "X-Request-ID", &len);
+    if (!v || !len || cap == 0) {
+        if (cap > 0) snprintf(dst, cap, "-");
+        return;
+    }
+    if (len > cap - 1) len = cap - 1;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)v[i];
+        dst[i] = (c >= 0x20 && c < 0x7f && c != ' ') ? (char)c : '_';
+    }
+    dst[len] = 0;
+}
+
+static long guard_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)(ts.tv_sec * 1000000L + ts.tv_nsec / 1000L);
+}
+
+#define GUARD_PART_CAP 16384
+
+static void guard_append(char *dst, size_t *len, const char *s) {
+    if (!dst || !s) return;
+    if (*len > 0 && *len < GUARD_PART_CAP) dst[(*len)++] = '\n';
+    size_t n = strlen(s);
+    if (*len + n > GUARD_PART_CAP) n = GUARD_PART_CAP - *len;
+    memcpy(dst + *len, s, n);
+    *len += n;
+    dst[*len] = 0;
+}
+
+static void guard_collect_chat(const ochat_msg *msgs, int msg_n, char **system_out,
+                               const char **user_out, char **ctx_out) {
+    char *sys = malloc(GUARD_PART_CAP + 1);
+    char *ctx = malloc(GUARD_PART_CAP + 1);
+    size_t sys_len = 0, ctx_len = 0;
+    if (sys) sys[0] = 0;
+    if (ctx) ctx[0] = 0;
+    int last_user = -1;
+    for (int i = 0; i < msg_n; i++)
+        if (strcmp(msgs[i].role, "user") == 0) last_user = i;
+    *user_out = last_user >= 0 ? msgs[last_user].content : "";
+    int ctx_items = 0;
+    for (int i = 0; i < msg_n; i++) {
+        if (i == last_user) continue;
+        if (strcmp(msgs[i].role, "system") == 0) {
+            guard_append(sys, &sys_len, msgs[i].content);
+        } else if (i >= msg_n - 7 && ctx_items < 6) {
+            guard_append(ctx, &ctx_len, msgs[i].content);
+            ctx_items++;
+        }
+    }
+    *system_out = sys;
+    *ctx_out = ctx;
+}
+
+static void guard_block_log(const ohttp_request *req, oguard_category category,
+                            const char *rule, const char *sys, const char *user,
+                            const char *ctx, long elapsed_us) {
+    char req_id[64];
+    char hash[65];
+    guard_request_id(req, req_id, sizeof req_id);
+    oguard_text_hash(sys, user, ctx, hash);
+    oguard_record_block(category);
+    fprintf(stderr, "guard block category=%s rule=%.63s req=%.60s hash=%s latency_us=%ld\n",
+            oguard_category_name(category), rule ? rule : "-", req_id, hash, elapsed_us);
+}
+
+static bool guard_embed_ready(void) {
+    return oembed_ready();
+}
+
+static bool guard_embed_text(const char *text, size_t len, float **values, int *dim) {
+    oembed_result r;
+    if (!oembed_text(text, len, 0, &r)) return false;
+    *values = r.values;
+    *dim = r.dimensions;
+    return true;
+}
+
+static void guard_embed_free(float *values) {
+    oembed_result r;
+    memset(&r, 0, sizeof r);
+    r.values = values;
+    oembed_result_free(&r);
+}
+
+static bool guard_judge_ready(void) {
+    return ojudge_ready();
+}
+
+static bool guard_judge_score(const char *prompt, size_t len, double *pyes, double *ms) {
+    return ojudge_score(prompt, len, pyes, ms);
+}
+
+static bool guard_judge_multi(const char **prompts, const size_t *lens, int n,
+                              double *pyes, double *ms) {
+    return ojudge_score_multi(prompts, lens, n, pyes, ms);
+}
+
+#define OGUARD_REFUSAL "I can't help with that."
+
+static void guard_refuse_chat(ohttp_request *req, bool stream, oguard_category category) {
+    char hdr[96];
+    snprintf(hdr, sizeof hdr, "X-Content-Policy: blocked:%s", oguard_category_name(category));
+    if (stream) {
+        ohttp_stream_begin_h(req, 200, "text/event-stream", hdr);
+        char chunk[1024];
+        int n = snprintf(chunk, sizeof chunk,
+            "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,"
+            "\"delta\":{\"role\":\"assistant\",\"content\":\"%s\"},"
+            "\"finish_reason\":\"content_filter\"}],\"usage\":{\"prompt_tokens\":0,"
+            "\"completion_tokens\":0}}\n\ndata: [DONE]\n\n", OGUARD_REFUSAL);
+        if (n > 0) ohttp_stream_write(req, chunk, (size_t)n);
+        ohttp_stream_end(req);
+        return;
+    }
+    char body[1024];
+    int n = snprintf(body, sizeof body,
+        "{\"id\":\"chatcmpl-guard\",\"object\":\"chat.completion\",\"created\":%ld,"
+        "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+        "\"content\":\"%s\"},\"finish_reason\":\"content_filter\"}],"
+        "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}",
+        time(NULL), ollm_model_name(), OGUARD_REFUSAL);
+    ohttp_respond_h(req, 200, "application/json", body, n > 0 ? (size_t)n : 0, hdr);
+}
+
+static void guard_refuse_completion(ohttp_request *req, bool legacy, oguard_category category) {
+    char hdr[96];
+    snprintf(hdr, sizeof hdr, "X-Content-Policy: blocked:%s", oguard_category_name(category));
+    char body[1024];
+    int n;
+    if (legacy) {
+        n = snprintf(body, sizeof body,
+            "[{\"generated_text\":\"%s\",\"stop_reason\":\"content_filter\","
+            "\"thinking_content\":null}]", OGUARD_REFUSAL);
+    } else {
+        n = snprintf(body, sizeof body,
+            "{\"id\":\"cmpl-guard\",\"object\":\"text_completion\",\"choices\":[{\"index\":0,"
+            "\"text\":\"%s\",\"finish_reason\":\"content_filter\"}],\"model\":\"%s\","
+            "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}",
+            OGUARD_REFUSAL, ollm_model_name());
+    }
+    ohttp_respond_h(req, 200, "application/json", body, n > 0 ? (size_t)n : 0, hdr);
+}
+
 static void handle_chat(ohttp_request *req, app_state *app) {
     if (!ollm_ready()) {
         respond_error(req, 503, "no LLM model loaded; start with OMNISERVE_NATIVE_LLM_GGUF");
@@ -1089,9 +1279,35 @@ static void handle_chat(ohttp_request *req, app_state *app) {
         return;
     }
 
+    bool guard_stream = false;
+    int stream_tok = oj_obj_get(req->body, toks, n, 0, "stream");
+    if (stream_tok >= 0) guard_stream = oj_bool(req->body, &toks[stream_tok], false);
+    if (oguard_enabled()) {
+        char *gsys = NULL;
+        char *gctx = NULL;
+        const char *guser = "";
+        guard_collect_chat(msgs, msg_n, &gsys, &guser, &gctx);
+        long guard_t0 = guard_now_us();
+        oguard_verdict gv = oguard_classify(gsys, guser, gctx);
+        long guard_elapsed = guard_now_us() - guard_t0;
+        if (gv.category != OGUARD_NONE) {
+            guard_block_log(req, gv.category, gv.matched_rule, gsys, guser, gctx, guard_elapsed);
+            guard_refuse_chat(req, guard_stream, gv.category);
+            free(gsys);
+            free(gctx);
+            for (int i = 0; i < owned_n; i++) free(owned[i]);
+            free(toks);
+            return;
+        }
+        free(gsys);
+        free(gctx);
+    }
+
+    bool thinking_default = ollm_thinking_default();
     ochat_req creq = { .messages = msgs, .message_count = msg_n, .max_tokens = 512,
                        .temperature = 0.8f, .top_p = 0.92f, .top_k = 40,
-                       .repetition_penalty = 1.0f, .seed = -1, .enable_thinking = true };
+                       .repetition_penalty = 1.0f, .seed = -1,
+                       .enable_thinking = thinking_default };
     int t = oj_obj_get(req->body, toks, n, 0, "max_tokens");
     if (t >= 0) creq.max_tokens = (int)oj_number(req->body, &toks[t], 512);
     t = oj_obj_get(req->body, toks, n, 0, "temperature");
@@ -1109,7 +1325,7 @@ static void handle_chat(ohttp_request *req, app_state *app) {
     t = oj_obj_get(req->body, toks, n, 0, "seed");
     if (t >= 0) creq.seed = (int64_t)oj_number(req->body, &toks[t], -1);
     t = oj_obj_get(req->body, toks, n, 0, "enable_thinking");
-    if (t >= 0) creq.enable_thinking = oj_bool(req->body, &toks[t], true);
+    if (t >= 0) creq.enable_thinking = oj_bool(req->body, &toks[t], thinking_default);
     const char *stop_values[16];
     creq.stop_count = parse_stop_values(req->body, toks, n, 0, "stop", stop_values,
                                         owned, &owned_n, MAX_MSGS * 2 + 16);
@@ -1279,7 +1495,8 @@ static void handle_completion(ohttp_request *req, app_state *app, bool legacy, b
         .raw_prompt = system_owned ? NULL : prompt, .completion_prefix = prompt,
         .max_tokens = 100,
         .temperature = 0.7f, .top_p = 0.9f, .top_k = 40,
-        .repetition_penalty = 1.0f, .seed = -1, .enable_thinking = false,
+        .repetition_penalty = 1.0f, .seed = -1,
+        .enable_thinking = ollm_thinking_default(),
     };
     if (autocomplete) {
         creq.max_tokens = 32;
@@ -1311,6 +1528,20 @@ static void handle_completion(ohttp_request *req, app_state *app, bool legacy, b
     int echo_tok = oj_obj_get(req->body, toks, n, 0, "echo");
     if (echo_tok >= 0) echo = oj_bool(req->body, &toks[echo_tok], false);
     free(toks);
+
+    if (oguard_enabled()) {
+        long guard_t0 = guard_now_us();
+        oguard_verdict gv = oguard_classify(system_owned, prompt, NULL);
+        long guard_elapsed = guard_now_us() - guard_t0;
+        if (gv.category != OGUARD_NONE) {
+            guard_block_log(req, gv.category, gv.matched_rule, system_owned, prompt, NULL, guard_elapsed);
+            guard_refuse_completion(req, legacy, gv.category);
+            free(system_owned);
+            free(prompt);
+            for (int i = 0; i < stop_owned_n; i++) free(stop_owned[i]);
+            return;
+        }
+    }
 
     otier tier = request_tier(req);
     int permits = tier == TIER_BACKGROUND ? osched_capacity(app->sched) : app->llm_permits;
@@ -2009,6 +2240,9 @@ static void handle_host_memory(ohttp_request *req) {
 typedef struct {
     char path[PATH_MAX];
     char ngl[32];
+    char tensor_override[512];
+    char moe_cpu_experts[32];
+    char spec_mtp_gguf[PATH_MAX];
     int ctx;
     int contexts;
 } llm_admin_config;
@@ -2021,6 +2255,17 @@ static bool parse_llm_admin_config(const ohttp_request *req, llm_admin_config *o
     const char *default_ngl = g_llm_active_ngl[0]
         ? g_llm_active_ngl : getenv("OMNISERVE_NATIVE_NGL");
     if (default_ngl) snprintf(out->ngl, sizeof out->ngl, "%s", default_ngl);
+    const char *default_tensor = g_llm_active_placement_set
+        ? g_llm_active_tensor_override : getenv("OMNISERVE_NATIVE_TENSOR_OVERRIDE");
+    if (default_tensor) {
+        snprintf(out->tensor_override, sizeof out->tensor_override, "%s", default_tensor);
+    }
+    const char *default_moe = g_llm_active_placement_set
+        ? g_llm_active_moe_cpu_experts : getenv("OMNISERVE_NATIVE_MOE_CPU_EXPERTS");
+    if (default_moe) snprintf(out->moe_cpu_experts, sizeof out->moe_cpu_experts, "%s", default_moe);
+    const char *default_mtp = g_llm_active_placement_set
+        ? g_llm_active_spec_mtp : getenv("OMNISERVE_NATIVE_SPEC_MTP_GGUF");
+    if (default_mtp) snprintf(out->spec_mtp_gguf, sizeof out->spec_mtp_gguf, "%s", default_mtp);
     out->ctx = g_llm_active_ctx > 0 ? g_llm_active_ctx : 8192;
     out->contexts = g_llm_active_contexts > 0 ? g_llm_active_contexts : 1;
 
@@ -2049,6 +2294,36 @@ static bool parse_llm_admin_config(const ohttp_request *req, llm_admin_config *o
             return false;
         }
     }
+    int tensor_tok = oj_obj_get(req->body, toks, n, 0, "tensor_override");
+    if (tensor_tok >= 0) {
+        if (toks[tensor_tok].type != OJ_STRING) {
+            free(toks);
+            return false;
+        }
+        out->tensor_override[0] = 0;
+        (void)oj_unescape(req->body, &toks[tensor_tok],
+                          out->tensor_override, sizeof out->tensor_override);
+    }
+    int moe_tok = oj_obj_get(req->body, toks, n, 0, "moe_cpu_experts");
+    if (moe_tok >= 0) {
+        if (toks[moe_tok].type != OJ_STRING) {
+            free(toks);
+            return false;
+        }
+        out->moe_cpu_experts[0] = 0;
+        (void)oj_unescape(req->body, &toks[moe_tok],
+                          out->moe_cpu_experts, sizeof out->moe_cpu_experts);
+    }
+    int mtp_tok = oj_obj_get(req->body, toks, n, 0, "spec_mtp_gguf");
+    if (mtp_tok >= 0) {
+        if (toks[mtp_tok].type != OJ_STRING) {
+            free(toks);
+            return false;
+        }
+        out->spec_mtp_gguf[0] = 0;
+        (void)oj_unescape(req->body, &toks[mtp_tok],
+                          out->spec_mtp_gguf, sizeof out->spec_mtp_gguf);
+    }
     int ctx_tok = oj_obj_get(req->body, toks, n, 0, "ctx");
     if (ctx_tok >= 0) out->ctx = (int)oj_number(req->body, &toks[ctx_tok], out->ctx);
     int contexts_tok = oj_obj_get(req->body, toks, n, 0, "contexts");
@@ -2064,33 +2339,67 @@ static void llm_admin_response(ohttp_request *req, bool ok, int status, const ch
     ollm_placement_snapshot(&placement);
     double free_gib = -1.0;
     (void)ogpu_memory_gib(&free_gib, NULL);
-    char body[768];
+    char *ovr = NULL;
+    size_t ovr_len = 0, ovr_cap = 0;
+    (void)oj_escape_append(&ovr, &ovr_len, &ovr_cap,
+                           placement.tensor_override, strlen(placement.tensor_override));
+    char body[2048];
     snprintf(body, sizeof body,
              "{\"ok\":%s,\"action\":\"%s\",\"loaded\":%s,"
              "\"model\":\"%.240s\",\"placement\":\"%s\","
+             "\"gpu_expert_layers\":%d,\"cpu_expert_layers\":%d,"
+             "\"tensor_override\":\"%s\",\"est_gpu_bytes\":%llu,"
              "\"gpu_free_gib\":%.2f}",
              ok ? "true" : "false", action, ollm_ready() ? "true" : "false",
              ollm_model_name(), placement.on_gpu ? "gpu" : "cpu",
+             placement.gpu_expert_layers, placement.cpu_expert_layers,
+             ovr ? ovr : "", placement.est_gpu_bytes,
              free_gib);
+    free(ovr);
     ohttp_respond_str(req, status, "application/json", body);
 }
 
 static bool llm_admin_load(const llm_admin_config *config) {
     char resolved[PATH_MAX];
-    if (!llm_swap_path(config->path, resolved, sizeof resolved)) return false;
+    if (!llm_swap_path(config->path, resolved, sizeof resolved)) {
+        const char *root = getenv("OMNISERVE_NATIVE_LLM_SWAP_DIR");
+        fprintf(stderr, "admin LLM load rejected: '%s' is not a regular file under %s='%s'\n",
+                config->path, "OMNISERVE_NATIVE_LLM_SWAP_DIR", root ? root : "(unset)");
+        return false;
+    }
     int contexts = config->contexts > 0 ? config->contexts : 1;
     const char *slots_env = getenv("OMNISERVE_NATIVE_SLOTS");
     int slots = slots_env ? atoi(slots_env) : contexts;
     if (slots < 1) slots = 1;
     if (contexts > slots) contexts = slots;
+    char mtp_resolved[PATH_MAX] = "";
+    if (config->spec_mtp_gguf[0] &&
+        !llm_swap_path(config->spec_mtp_gguf, mtp_resolved, sizeof mtp_resolved)) {
+        const char *root = getenv("OMNISERVE_NATIVE_LLM_SWAP_DIR");
+        fprintf(stderr, "admin LLM load rejected: spec_mtp_gguf '%s' is not a regular file under %s='%s'\n",
+                config->spec_mtp_gguf, "OMNISERVE_NATIVE_LLM_SWAP_DIR", root ? root : "(unset)");
+        return false;
+    }
     const char *ngl = config->ngl[0] ? config->ngl : "auto";
-    int layers = resolve_llm_ngl(resolved, ngl, 999);
-    fprintf(stderr, "admin LLM load: path=%s ngl=%s ctx=%d contexts=%d\n",
-            resolved, ngl, config->ctx, contexts);
-    if (!ollm_init(resolved, layers, config->ctx > 0 ? config->ctx : 8192, contexts)) return false;
+    if (setenv("OMNISERVE_NATIVE_TENSOR_OVERRIDE", config->tensor_override, 1) != 0) return false;
+    if (setenv("OMNISERVE_NATIVE_MOE_CPU_EXPERTS", config->moe_cpu_experts, 1) != 0) return false;
+    if (setenv("OMNISERVE_NATIVE_SPEC_MTP_GGUF", mtp_resolved, 1) != 0) return false;
+    int ctx = config->ctx > 0 ? config->ctx : 8192;
+    int layers = resolve_llm_ngl(resolved, ngl, 999, ctx, contexts);
+    fprintf(stderr, "admin LLM load: path=%s ngl=%s ctx=%d contexts=%d tensor_override=%s moe_cpu_experts=%s spec_mtp=%s\n",
+            resolved, ngl, config->ctx, contexts,
+            config->tensor_override, config->moe_cpu_experts,
+            mtp_resolved[0] ? mtp_resolved : "(off)");
+    if (!ollm_init(resolved, layers, ctx, contexts)) return false;
     snprintf(g_llm_active_path, sizeof g_llm_active_path, "%s", resolved);
     snprintf(g_llm_active_ngl, sizeof g_llm_active_ngl, "%s", ngl);
-    g_llm_active_ctx = config->ctx > 0 ? config->ctx : 8192;
+    snprintf(g_llm_active_tensor_override, sizeof g_llm_active_tensor_override,
+             "%s", config->tensor_override);
+    snprintf(g_llm_active_moe_cpu_experts, sizeof g_llm_active_moe_cpu_experts,
+             "%s", config->moe_cpu_experts);
+    snprintf(g_llm_active_spec_mtp, sizeof g_llm_active_spec_mtp, "%s", mtp_resolved);
+    g_llm_active_placement_set = true;
+    g_llm_active_ctx = ctx;
     g_llm_active_contexts = contexts;
     return true;
 }
@@ -2130,6 +2439,12 @@ static void handle_llm_swap(ohttp_request *req) {
     llm_admin_config previous = {0};
     snprintf(previous.path, sizeof previous.path, "%s", g_llm_active_path);
     snprintf(previous.ngl, sizeof previous.ngl, "%s", g_llm_active_ngl);
+    snprintf(previous.tensor_override, sizeof previous.tensor_override,
+             "%s", g_llm_active_tensor_override);
+    snprintf(previous.moe_cpu_experts, sizeof previous.moe_cpu_experts,
+             "%s", g_llm_active_moe_cpu_experts);
+    snprintf(previous.spec_mtp_gguf, sizeof previous.spec_mtp_gguf,
+             "%s", g_llm_active_spec_mtp);
     previous.ctx = g_llm_active_ctx;
     previous.contexts = g_llm_active_contexts;
     ollm_shutdown();
@@ -2258,6 +2573,44 @@ static void handle_vram_renew(ohttp_request *req, app_state *app) {
                       renewed ? "{\"renewed\":true}" : "{\"renewed\":false}");
 }
 
+static void handle_guard_classify(ohttp_request *req, app_state *app) {
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+    if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+    char *sys = NULL;
+    char *user = NULL;
+    char *ctx = NULL;
+    oj_tok *toks = malloc(sizeof(oj_tok) * 32);
+    if (!toks) { respond_error(req, 500, "out of memory"); return; }
+    int n = oj_parse(req->body, req->body_len, toks, 32);
+    if (n <= 0 || toks[0].type != OJ_OBJECT) {
+        free(toks);
+        respond_error(req, 400, "body must be a JSON object");
+        return;
+    }
+    int st = oj_obj_get(req->body, toks, n, 0, "system");
+    int ut = oj_obj_get(req->body, toks, n, 0, "user");
+    int ct = oj_obj_get(req->body, toks, n, 0, "context");
+    if (st >= 0) sys = oj_strdup(req->body, &toks[st]);
+    if (ut >= 0) user = oj_strdup(req->body, &toks[ut]);
+    if (ct >= 0) ctx = oj_strdup(req->body, &toks[ct]);
+    free(toks);
+    long t0 = guard_now_us();
+    oguard_full f = oguard_classify_diagnose(sys, user, ctx);
+    long dt = guard_now_us() - t0;
+    oguard_classify_note((double)dt / 1000.0);
+    free(sys);
+    free(user);
+    free(ctx);
+    char body[256];
+    snprintf(body, sizeof body,
+             "{\"blocked\":%s,\"category\":\"%s\",\"rule\":\"%.63s\",\"stage\":\"%s\",\"score\":%.4f}",
+             f.final.category != OGUARD_NONE ? "true" : "false",
+             oguard_category_name(f.final.category), f.final.matched_rule,
+             oguard_stage_name(&f), f.final.score);
+    ohttp_respond_str(req, 200, "application/json", body);
+}
+
 static void route(ohttp_request *req, void *user) {
     app_state *app = user;
     if (ohttp_method_is(req, "OPTIONS")) {
@@ -2277,6 +2630,7 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/v1/gpu/lease")) { handle_vram_lease(req, app); return; }
     if (ohttp_path_is(req, "/v1/gpu/renew")) { handle_vram_renew(req, app); return; }
     if (ohttp_path_is(req, "/v1/gpu/release")) { handle_vram_release(req, app); return; }
+    if (ohttp_path_is(req, "/v1/guard/classify")) { handle_guard_classify(req, app); return; }
     if (ohttp_path_is(req, "/admin/llm/unload") || ohttp_path_is(req, "/admin/unload")) {
         handle_llm_unload(req); return;
     }
@@ -2582,6 +2936,12 @@ static void route(ohttp_request *req, void *user) {
         handle_proxy_as(req, app, app->threed_upstream, 1, NULL, mapped_path);
         return;
     }
+    if (ohttp_path_is(req, "/v1/music/generations")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_proxy(req, app, app->music_upstream, 0, "application/json");
+        return;
+    }
     if (ohttp_path_is(req, "/v1/audio/speech") ||
         ohttp_path_is(req, "/api/v1/generate_speech")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
@@ -2823,6 +3183,7 @@ int main(int argc, char **argv) {
     const char *birefnet_upstream = getenv("OMNISERVE_NATIVE_BIREFNET_UPSTREAM");
     const char *tts_upstream = getenv("OMNISERVE_NATIVE_TTS_UPSTREAM");
     const char *stt_upstream = getenv("OMNISERVE_NATIVE_STT_UPSTREAM");
+    const char *music_upstream = getenv("OMNISERVE_NATIVE_MUSIC_UPSTREAM");
     const char *forecast_upstream = getenv("OMNISERVE_NATIVE_FORECAST_UPSTREAM");
     const char *training_upstream = getenv("OMNISERVE_NATIVE_TRAINING_UPSTREAM");
     const char *embedding_upstream = getenv("OMNISERVE_NATIVE_EMBEDDING_UPSTREAM");
@@ -2859,6 +3220,7 @@ int main(int argc, char **argv) {
     CREATE_UPSTREAM(birefnet_upstream, birefnet_upstream, "birefnet");
     CREATE_UPSTREAM(tts_upstream, tts_upstream, "TTS");
     CREATE_UPSTREAM(stt_upstream, stt_upstream, "STT");
+    CREATE_UPSTREAM(music_upstream, music_upstream, "music");
     CREATE_UPSTREAM(forecast_upstream, forecast_upstream, "forecast");
     CREATE_UPSTREAM(training_upstream, training_upstream, "training");
     CREATE_UPSTREAM(embedding_upstream, embedding_upstream, "embedding");
@@ -2931,6 +3293,7 @@ int main(int argc, char **argv) {
     }
     const char *upstream_timeout = getenv("OMNISERVE_NATIVE_UPSTREAM_TIMEOUT_MS");
     app.upstream_timeout_ms = upstream_timeout ? atoi(upstream_timeout) : 600000;
+    app.music_timeout_ms = 1530000;
     const char *h3_timeout = getenv("OMNISERVE_NATIVE_H3_TIMEOUT_MS");
     app.h3_timeout_ms = h3_timeout ? atoi(h3_timeout) : 1800000;
     /* The image overflow is reached by a metered cog that has to cold start a
@@ -2955,11 +3318,22 @@ int main(int argc, char **argv) {
             snprintf(g_llm_active_path, sizeof g_llm_active_path, "%s", gguf);
         }
         snprintf(g_llm_active_ngl, sizeof g_llm_active_ngl, "%s", ngl ? ngl : "auto");
+        const char *startup_tensor = getenv("OMNISERVE_NATIVE_TENSOR_OVERRIDE");
+        const char *startup_moe = getenv("OMNISERVE_NATIVE_MOE_CPU_EXPERTS");
+        snprintf(g_llm_active_tensor_override, sizeof g_llm_active_tensor_override,
+                 "%s", startup_tensor ? startup_tensor : "");
+        snprintf(g_llm_active_moe_cpu_experts, sizeof g_llm_active_moe_cpu_experts,
+                 "%s", startup_moe ? startup_moe : "");
+        const char *startup_mtp = getenv("OMNISERVE_NATIVE_SPEC_MTP_GGUF");
+        snprintf(g_llm_active_spec_mtp, sizeof g_llm_active_spec_mtp,
+                 "%s", startup_mtp ? startup_mtp : "");
+        g_llm_active_placement_set = true;
         g_llm_active_ctx = ctx ? atoi(ctx) : 8192;
         if (g_llm_active_ctx < 1) g_llm_active_ctx = 8192;
         g_llm_active_contexts = parallel_contexts;
-        if (!ollm_init(gguf, resolve_llm_ngl(gguf, ngl, 999), ctx ? atoi(ctx) : 8192,
-                       parallel_contexts)) {
+        if (!ollm_init(gguf, resolve_llm_ngl(gguf, ngl, 999, ctx ? atoi(ctx) : 8192,
+                                            parallel_contexts),
+                       ctx ? atoi(ctx) : 8192, parallel_contexts)) {
             fprintf(stderr, "llm load failed\n");
         }
         ollm_placement placement;
@@ -2991,6 +3365,15 @@ int main(int argc, char **argv) {
                          embed_threads ? atoi(embed_threads) : 8)) {
             fprintf(stderr, "embedding model load failed\n");
         }
+    }
+    if (env_flag("OMNISERVE_NATIVE_GUARD_JUDGE", 1)) {
+        const char *judge_gguf = getenv("OMNISERVE_NATIVE_GUARD_JUDGE_GGUF");
+        if (!judge_gguf || !judge_gguf[0])
+            judge_gguf = "/nvme0n1-disk/models/omniserve-native/shieldgemma-2b-q4_k_m.gguf";
+        const char *judge_threads = getenv("OMNISERVE_NATIVE_GUARD_JUDGE_THREADS");
+        fprintf(stderr, "loading guard judge %s\n", judge_gguf);
+        if (!ojudge_init(judge_gguf, 4096, judge_threads ? atoi(judge_threads) : 24))
+            fprintf(stderr, "guard judge load failed, stages 1+2 only\n");
     }
     const char *sd = getenv("OMNISERVE_NATIVE_SD_MODEL");
     if (!sd || !sd[0]) sd = getenv("OMNISERVE_NATIVE_SD_DIFFUSION_MODEL");
@@ -3030,6 +3413,12 @@ int main(int argc, char **argv) {
     olog_set_internal_fn(request_is_internal);
     olog_init();
     if (olog_enabled()) fprintf(stderr, "access log: %s\n", olog_path());
+    oguard_init();
+    oguard_set_embed_backend(guard_embed_ready, guard_embed_text, guard_embed_free);
+    oguard_embed_warmup();
+    oguard_set_judge_backend(guard_judge_ready, guard_judge_score);
+    oguard_set_judge_multi_backend(guard_judge_multi);
+    oguard_judge_warmup();
 
     const char *reactors_env = getenv("OMNISERVE_NATIVE_REACTORS");
     ohttp_config cfg = {
@@ -3059,6 +3448,7 @@ int main(int argc, char **argv) {
     oproxy_target_destroy(app.birefnet_upstream);
     oproxy_target_destroy(app.tts_upstream);
     oproxy_target_destroy(app.stt_upstream);
+    oproxy_target_destroy(app.music_upstream);
     oproxy_target_destroy(app.forecast_upstream);
     oproxy_target_destroy(app.training_upstream);
     oproxy_target_destroy(app.embedding_upstream);

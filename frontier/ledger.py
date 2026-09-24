@@ -10,9 +10,23 @@ import urllib.request
 from pathlib import Path
 
 DEFAULT_DB = "/nvme0n1-disk/data/omniserve-frontier/ledger.db"
-GPU_USD_PER_H = {"H200": 5.94, "H100": 4.80, "L40S": 1.76, "RTX6000Ada": 1.76, "A40": 1.63, "A6000": 1.63,
-                 "RTX4090": 1.10, "POOL24": 0.70, "B200": 8.65, "RTX5090-local": 0.10}
-ENDPOINT_USD_PER_H = {"tlofa06vj7iab7": 0.74, "tmozxvnm9fuuud": 1.10, "akgefm0nzzr4jo": 1.10, "wl0am3ahax9mi9": 0.74}
+# RunPod serverless flex $/h per GPU, measured from /v1/billing/endpoints?grouping=gpuTypeId
+# (amount / timeBilledMs, 2026-09-18..23); H100/H200/B200 are list prices.
+GPU_USD_PER_H = {"H200": 5.94, "H100": 4.80, "B200": 8.65, "RTXPRO6000": 3.50, "RTXPRO6000-MIG2g": 1.76,
+                 "RTXPRO6000-MIG1g": 0.70, "L40S": 1.75, "L40": 1.75, "RTX6000Ada": 1.75, "A40": 1.23, "A6000": 1.23,
+                 "RTX5090": 1.58, "RTX4090": 1.11, "A5000": 0.70, "L4": 0.70, "RTX3090": 0.69, "POOL24": 0.70,
+                 "RTX5090-local": 0.10}
+ENDPOINT_USD_PER_H = {"tlofa06vj7iab7": 0.74, "tmozxvnm9fuuud": 1.11, "akgefm0nzzr4jo": 1.11, "wl0am3ahax9mi9": 0.74,
+                      "d6opzplchn2w3a": 1.11}
+GPU_NAMES = {"NVIDIA GeForce RTX 4090": "RTX4090", "NVIDIA GeForce RTX 5090": "RTX5090", "NVIDIA L40S": "L40S",
+             "NVIDIA L40": "L40", "NVIDIA RTX 6000 Ada Generation": "RTX6000Ada", "NVIDIA RTX A6000": "A6000",
+             "NVIDIA A40": "A40", "NVIDIA RTX A5000": "A5000", "NVIDIA L4": "L4", "NVIDIA GeForce RTX 3090": "RTX3090",
+             "NVIDIA RTX PRO 6000 Blackwell Server Edition": "RTXPRO6000",
+             "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": "RTXPRO6000",
+             "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb": "RTXPRO6000-MIG1g",
+             "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb": "RTXPRO6000-MIG2g",
+             "NVIDIA H100 80GB HBM3": "H100", "NVIDIA H100 PCIe": "H100", "NVIDIA H100 NVL": "H100",
+             "NVIDIA H200": "H200", "NVIDIA B200": "B200"}
 COLD_DELAY_MS = 3000.0
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY, ts REAL NOT NULL, workload TEXT NOT NULL, backend TEXT NOT NULL,
@@ -45,6 +59,42 @@ def rates() -> tuple[dict, dict]:
     return gpu, endpoint
 
 
+def gpu_key(name: str | None) -> str | None:
+    if not name:
+        return None
+    name = str(name).strip()
+    if name in GPU_USD_PER_H:
+        return name
+    return GPU_NAMES.get(name) or name.replace("NVIDIA ", "").replace("GeForce ", "").replace(" ", "")
+
+
+_WORKER_GPU: dict = {}
+
+
+def runpod_worker_gpu(worker_id: str | None, api_key: str, fetch=None) -> str | None:
+    """GPU class of a serverless worker (GraphQL pod.machine), cached; works after the worker exited."""
+    if not worker_id or not api_key:
+        return None
+    if worker_id in _WORKER_GPU:
+        return _WORKER_GPU[worker_id]
+    query = {"query": 'query { pod(input:{podId:"%s"}) { machine { gpuTypeId } } }' % worker_id.replace('"', "")}
+    try:
+        if fetch is None:
+            request = urllib.request.Request("https://api.runpod.io/graphql", data=json.dumps(query).encode(),
+                                             headers={"Content-Type": "application/json", "Authorization": "Bearer " + api_key,
+                                                      "User-Agent": "omniserve-frontier/1"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                data = json.load(response)
+        else:
+            data = fetch(query)
+        gpu = gpu_key((((data.get("data") or {}).get("pod") or {}).get("machine") or {}).get("gpuTypeId"))
+    except (OSError, ValueError, AttributeError):
+        return None
+    if gpu:
+        _WORKER_GPU[worker_id] = gpu
+    return gpu
+
+
 def estimate_usd(backend: str, *, exec_ms: float = 0, queue_ms: float = 0, endpoint: str | None = None,
                  gpu: str | None = None, saturated: bool = False, cache_hit: bool = False) -> tuple[float, bool]:
     if cache_hit:
@@ -57,7 +107,7 @@ def estimate_usd(backend: str, *, exec_ms: float = 0, queue_ms: float = 0, endpo
         return usd, False
     if backend == "runpod":
         gpu_rates, endpoint_rates = rates()
-        rate = endpoint_rates.get(endpoint or "") or gpu_rates.get(gpu or "") or gpu_rates["RTX4090"]
+        rate = gpu_rates.get(gpu_key(gpu) or "") or endpoint_rates.get(endpoint or "") or gpu_rates["RTX4090"]
         cold = (queue_ms or 0) > COLD_DELAY_MS
         billed_ms = (exec_ms or 0) + ((queue_ms or 0) if cold else 0)
         return rate * billed_ms / 3.6e6, cold
@@ -92,6 +142,8 @@ class Ledger:
         if row.get("ts") is None:
             row["ts"] = time.time()
         saturated = bool(row.pop("saturated", False))
+        if row.get("gpu"):
+            row["gpu"] = gpu_key(row["gpu"])
         if row.get("est_usd") is None:
             usd, cold = estimate_usd(row.get("backend", ""), exec_ms=row.get("exec_ms") or 0,
                                      queue_ms=row.get("queue_ms") or 0, endpoint=row.get("endpoint"),
@@ -233,6 +285,41 @@ class Ledger:
         self.set_meta("last_reconcile", str(time.time()))
         return out
 
+    def backfill_gpu(self, api_key: str, hours: float = 6, status_fetch=None, gql_fetch=None) -> int:
+        """Fill gpu (and re-price) for RunPod rows written without one: job status -> workerId -> machine.
+        RunPod keeps /status for finished async jobs ~30 min, so this runs every frontier cycle."""
+        conn = self.conn()
+        rows = conn.execute("SELECT id, endpoint, job_id, queue_ms, exec_ms, detail FROM jobs WHERE backend='runpod' "
+                            "AND (gpu IS NULL OR gpu='') AND job_id IS NOT NULL AND ts>=?",
+                            (time.time() - hours * 3600,)).fetchall()
+        done = 0
+        for row_id, endpoint, job_id, queue_ms, exec_ms, detail in rows:
+            worker = None
+            try:
+                worker = (json.loads(detail or "{}") or {}).get("worker")
+            except (ValueError, AttributeError):
+                pass
+            if not worker:
+                try:
+                    if status_fetch is None:
+                        request = urllib.request.Request(f"https://api.runpod.ai/v2/{endpoint}/status/{job_id}",
+                                                         headers={"Authorization": "Bearer " + api_key,
+                                                                  "User-Agent": "omniserve-frontier/1"})
+                        with urllib.request.urlopen(request, timeout=15) as response:
+                            state = json.load(response)
+                    else:
+                        state = status_fetch(endpoint, job_id)
+                    worker = state.get("workerId")
+                except (OSError, ValueError):
+                    continue
+            gpu = runpod_worker_gpu(worker, api_key, gql_fetch)
+            if not gpu:
+                continue
+            usd, _ = estimate_usd("runpod", exec_ms=exec_ms or 0, queue_ms=queue_ms or 0, endpoint=endpoint, gpu=gpu)
+            conn.execute("UPDATE jobs SET gpu=?, est_usd=? WHERE id=?", (gpu, usd, row_id))
+            done += 1
+        return done
+
     def billing_factor(self, endpoint: str, days: int = 14) -> float:
         rows = self.conn().execute(
             "SELECT factor FROM billing WHERE endpoint=? AND factor IS NOT NULL AND jobs>=3 ORDER BY day DESC LIMIT ?",
@@ -273,9 +360,26 @@ class Ledger:
                 g["p50_ms"] = percentile(walls, 50)
                 g["p95_ms"] = percentile(walls, 95)
                 g["usd"] = round(g["usd"], 6)
+        by_gpu: dict = {}
+        for workload, gpu, wall, exec_ms, usd in self.conn().execute(
+                "SELECT workload, COALESCE(gpu,'unknown'), wall_ms, exec_ms, est_usd FROM jobs WHERE ts>=? AND backend='runpod'"
+                " AND cache_hit=0", (since,)):
+            g = by_gpu.setdefault(workload, {}).setdefault(gpu, {"jobs": 0, "usd": 0.0, "wall": [], "exec": []})
+            g["jobs"] += 1
+            g["usd"] += usd or 0
+            if wall:
+                g["wall"].append(wall)
+            if exec_ms:
+                g["exec"].append(exec_ms)
+        for gpus in by_gpu.values():
+            for g in gpus.values():
+                g["wall_p50_ms"] = percentile(g.pop("wall"), 50)
+                g["exec_p50_ms"] = percentile(g.pop("exec"), 50)
+                g["usd"] = round(g["usd"], 6)
         billing = [dict(zip(("day", "endpoint", "amount", "est_usd", "jobs", "factor"), r)) for r in self.conn().execute(
             "SELECT day, endpoint, amount, est_usd, jobs, factor FROM billing ORDER BY day DESC, endpoint LIMIT 30")]
-        return {"window_hours": hours, "generated_at": time.time(), "workloads": groups, "billing": billing,
+        return {"window_hours": hours, "generated_at": time.time(), "workloads": groups, "runpod_by_gpu": by_gpu,
+                "billing": billing,
                 "dropped": self.dropped}
 
     def prometheus(self, hours: float = 24) -> str:

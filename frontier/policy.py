@@ -56,20 +56,30 @@ def measured(ledger, workload: str, candidate: dict, since: float) -> dict | Non
         return None
     rows = [r for r in ledger.samples(workload, since) if not r["cache_hit"]
             and str(r["status"] or "") in ("200", "ok", "COMPLETED")]
+    extra = {}
     if candidate["kind"] == "local":
         rows = [r for r in rows if r["backend"] == "local"]
         walls = [r["exec_ms"] for r in rows if r["exec_ms"]]
     else:
         rows = [r for r in rows if r["backend"] == "runpod" and r["endpoint"] == candidate.get("endpoint")]
         walls = [r["wall_ms"] for r in rows if r["wall_ms"]]
+        by_gpu: dict = {}
+        for r in rows:
+            by_gpu.setdefault(r["gpu"] or "unknown", []).append(r)
+        if by_gpu:
+            extra["by_gpu"] = {gpu: {"n": len(rs), "wall_p50_ms": percentile([r["wall_ms"] for r in rs if r["wall_ms"]], 50),
+                                     "exec_p50_ms": percentile([r["exec_ms"] for r in rs if r["exec_ms"]], 50),
+                                     "cold_fraction": round(sum(1 for r in rs if r["cold"]) / len(rs), 3),
+                                     "usd_per_job": sum(r["est_usd"] or 0 for r in rs) / len(rs)}
+                               for gpu, rs in sorted(by_gpu.items())}
     if len(walls) < MIN_SAMPLES:
-        return None
+        return extra or None
     usd = sum(r["est_usd"] or 0 for r in rows) / len(rows)
     cold = sum(1 for r in rows if r["cold"]) / len(rows)
     if candidate["kind"] == "runpod":
         usd *= ledger.billing_factor(candidate["endpoint"])
     return {"p50_ms": percentile(walls, 50), "p95_ms": percentile(walls, 95), "usd_per_job": usd,
-            "n": len(walls), "cold_fraction": cold, "source": "ledger"}
+            "n": len(walls), "cold_fraction": cold, "source": "ledger", **extra}
 
 
 def build_routing(seeds: dict, ledger=None, days: float = 7, now: float | None = None) -> dict:

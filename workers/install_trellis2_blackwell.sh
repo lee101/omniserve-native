@@ -26,8 +26,8 @@ uv pip install --python "$venv/bin/python" \
 uv pip install --python "$venv/bin/python" \
   setuptools wheel ninja packaging \
   imageio imageio-ffmpeg tqdm easydict opencv-python-headless \
-  transformers gradio==6.0.1 tensorboard pandas lpips zstandard \
-  pillow kornia timm trimesh pygltflib plyfile \
+  transformers==4.57.3 gradio==6.0.1 tensorboard pandas lpips zstandard \
+  pillow kornia timm trimesh pygltflib plyfile einops \
   git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
 
 mkdir -p "$extension_root"
@@ -54,7 +54,7 @@ uv pip install --python "$venv/bin/python" --no-build-isolation "$extension_root
 uv pip install --python "$venv/bin/python" --no-build-isolation --no-deps \
   "$repo/o-voxel"
 
-ATTN_BACKEND=xformers "$venv/bin/python" - <<'PY'
+PYTHONPATH="$repo" ATTN_BACKEND=xformers "$venv/bin/python" - <<'PY'
 import torch
 import xformers
 import cumesh

@@ -108,6 +108,77 @@ class RequestValidationTests(unittest.TestCase):
         self.assertIn("private", body["error"])
 
 
+class LocalOverrideTests(unittest.TestCase):
+    def test_loopback_url_requires_opt_in(self) -> None:
+        url = "http://127.0.0.1:9/a.png"
+        with mock.patch.dict(worker.os.environ, {"OMNISERVE_3D_ALLOW_LOOPBACK_URLS": ""}):
+            with self.assertRaises(ValueError):
+                worker.validate_public_url(url)
+        with mock.patch.dict(worker.os.environ, {"OMNISERVE_3D_ALLOW_LOOPBACK_URLS": "1"}):
+            self.assertEqual(worker.validate_public_url(url), url)
+            with self.assertRaises(ValueError):
+                worker.validate_public_url("http://10.0.0.1/a.png")
+
+    def test_dinov3_repo_override_is_checked(self) -> None:
+        mirror = "camenduru/dinov3-vitl16-pretrain-lvd1689m"
+        with (
+            mock.patch.dict(worker.os.environ, {"OMNISERVE_3D_DINOV3_REPO": mirror}),
+            mock.patch.object(worker, "cached_hf_model", side_effect=lambda repo: repo == mirror) as cached,
+        ):
+            self.assertIsNone(worker.model_dependency_issue(worker.MODEL_TRELLIS))
+        cached.assert_called_once_with(mirror)
+        with (
+            mock.patch.dict(worker.os.environ, {"OMNISERVE_3D_DINOV3_REPO": ""}),
+            mock.patch.object(worker, "cached_hf_model", return_value=False),
+        ):
+            issue = worker.model_dependency_issue(worker.MODEL_TRELLIS)
+        self.assertEqual(issue["dependency"], worker.DINO_TRELLIS)
+
+
+class RunnerOverrideTests(unittest.TestCase):
+    def test_runner_rewrites_gated_model_names(self) -> None:
+        import sys
+        import types
+
+        seen: list[str] = []
+
+        class Dino:
+            def __init__(self, model_name, image_size=512):
+                seen.append(model_name)
+
+        class BiRefNet:
+            def __init__(self, model_name="ZhengPeng7/BiRefNet"):
+                seen.append(model_name)
+
+        extractor = types.ModuleType("trellis2.modules.image_feature_extractor")
+        extractor.DinoV3FeatureExtractor = Dino
+        rembg = types.ModuleType("trellis2.pipelines.rembg")
+        rembg.BiRefNet = BiRefNet
+        modules = {
+            "trellis2": types.ModuleType("trellis2"),
+            "trellis2.modules": types.ModuleType("trellis2.modules"),
+            "trellis2.modules.image_feature_extractor": extractor,
+            "trellis2.pipelines": types.ModuleType("trellis2.pipelines"),
+            "trellis2.pipelines.rembg": rembg,
+        }
+        modules["trellis2.modules"].image_feature_extractor = extractor
+        modules["trellis2.pipelines"].rembg = rembg
+        spec = importlib.util.spec_from_file_location("run_trellis2", WORKER_PATH.with_name("run_trellis2.py"))
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.dict(
+                worker.os.environ,
+                {"OMNISERVE_3D_DINOV3_REPO": "mirror/dino", "OMNISERVE_3D_REMBG_REPO": "ZhengPeng7/BiRefNet"},
+            ),
+        ):
+            runner.override_model_names()
+            Dino(model_name="facebook/dinov3-vitl16-pretrain-lvd1689m")
+            BiRefNet(model_name="briaai/RMBG-2.0")
+        self.assertEqual(seen, ["mirror/dino", "ZhengPeng7/BiRefNet"])
+
+
 class GPUCoordinatorTests(unittest.TestCase):
     def test_holds_wrap_job_and_release_in_reverse_order(self) -> None:
         calls: list[tuple[str, str]] = []

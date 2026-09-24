@@ -34,10 +34,6 @@ static int decode_digit(unsigned char value) {
 
 static void webp_lib_load(void);
 static bool webp_lib_loaded;
-typedef unsigned char *(*fn_webp_decode_rgb)(const unsigned char *, size_t, int *, int *);
-typedef void (*fn_webp_free)(void *);
-static fn_webp_decode_rgb p_webp_decode_rgb;
-static fn_webp_free p_webp_free;
 /* libwebp is resolved lazily by name, and the reference-image path below uses
  * these before the encoder does, so both the types and the pointers are
  * declared here rather than with the rest of the function table. */
