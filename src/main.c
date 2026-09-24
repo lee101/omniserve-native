@@ -195,8 +195,71 @@ static bool query_secret_matches(const ohttp_request *req, const char *secret, s
     return false;
 }
 
+/* Per-caller tiers: OMNISERVE_NATIVE_KEY_TIERS="key=sub,key2=paid". A mapped
+ * key authenticates like the shared secret and names the caller's default
+ * tier, which is also its ceiling: a keyed caller may send X-Omniserve-Tier to
+ * lower a request (a free user of a subscription site) but never raise it.
+ * This is how relayed callers (tunnel, other hosts) get a non-free tier. */
+#define KEY_TIER_MAX 64
+typedef struct { char key[160]; size_t len; otier tier; } key_tier;
+static key_tier g_key_tiers[KEY_TIER_MAX];
+static int g_key_tier_n;
+static pthread_once_t g_key_tiers_once = PTHREAD_ONCE_INIT;
+
+static void key_tiers_load(void) {
+    const char *env = getenv("OMNISERVE_NATIVE_KEY_TIERS");
+    if (!env) return;
+    const char *p = env;
+    while (*p && g_key_tier_n < KEY_TIER_MAX) {
+        const char *end = strchr(p, ',');
+        if (!end) end = p + strlen(p);
+        const char *eq = memchr(p, '=', (size_t)(end - p));
+        if (eq && eq > p && (size_t)(eq - p) < sizeof g_key_tiers[0].key) {
+            const char *t = eq + 1;
+            int tlen = (int)(end - t);
+            otier tier = otier_parse(t, tlen);
+            bool named = tier != TIER_FREE || (tlen == 4 && strncasecmp(t, "free", 4) == 0);
+            if (named) {
+                key_tier *k = &g_key_tiers[g_key_tier_n++];
+                k->len = (size_t)(eq - p);
+                memcpy(k->key, p, k->len);
+                k->key[k->len] = 0;
+                k->tier = tier;
+            } else {
+                fprintf(stderr, "OMNISERVE_NATIVE_KEY_TIERS: ignoring entry with unknown tier\n");
+            }
+        }
+        p = *end ? end + 1 : end;
+    }
+    fprintf(stderr, "key tiers: %d caller keys mapped\n", g_key_tier_n);
+}
+
+static bool credential_matches(const ohttp_request *req, const char *key, size_t klen) {
+    size_t len = 0;
+    const char *v = ohttp_req_header(req, "secret", &len);
+    if (v && len == klen && memcmp(v, key, klen) == 0) return true;
+    v = ohttp_req_header(req, "Authorization", &len);
+    if (v && len > 7 && strncasecmp(v, "Bearer ", 7) == 0 &&
+        len - 7 == klen && memcmp(v + 7, key, klen) == 0) return true;
+    v = ohttp_req_header(req, "X-API-Key", &len);
+    if (v && len == klen && memcmp(v, key, klen) == 0) return true;
+    v = ohttp_req_header(req, "X-Rapid-API-Key", &len);
+    if (v && len == klen && memcmp(v, key, klen) == 0) return true;
+    return query_secret_matches(req, key, klen);
+}
+
+/* The mapped tier of the caller's credential, or -1 when it presents none. */
+static int request_key_tier(const ohttp_request *req) {
+    pthread_once(&g_key_tiers_once, key_tiers_load);
+    for (int i = 0; i < g_key_tier_n; i++)
+        if (credential_matches(req, g_key_tiers[i].key, g_key_tiers[i].len))
+            return (int)g_key_tiers[i].tier;
+    return -1;
+}
+
 static bool authorized(const app_state *app, const ohttp_request *req) {
     if (!app->secret || !app->secret[0]) return true;
+    if (request_key_tier(req) >= 0) return true;
     size_t len = 0;
     const char *v = ohttp_req_header(req, "secret", &len);
     size_t slen = strlen(app->secret);
@@ -240,9 +303,16 @@ static bool request_is_internal(const ohttp_request *req) {
 static otier request_tier(const ohttp_request *req) {
     /* Priority is a privilege too: a public caller must not be able to claim
      * the paid lane, so an untrusted X-Omniserve-Tier falls back to default. */
-    if (!request_is_internal(req)) return otier_parse_public(NULL, 0);
+    int keyed = request_key_tier(req);
+    bool internal = request_is_internal(req);
+    if (!internal && keyed < 0) return otier_parse_public(NULL, 0);
     size_t len = 0;
     const char *v = ohttp_req_header(req, "X-Omniserve-Tier", &len);
+    if (keyed >= 0 && !(internal && v && len)) {
+        if (!v || !len) return (otier)keyed;
+        otier asked = otier_parse(v, (int)len);
+        return (int)asked < keyed ? (otier)keyed : asked;
+    }
     /* Internal callers are the only callers allowed to request the true
      * background lane.  otier_parse_public deliberately collapses background
      * to free, which would let a batch image occupy ordinary serving capacity
