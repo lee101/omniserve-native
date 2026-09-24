@@ -100,6 +100,10 @@ int ovram_lease_wait(ovram *v, const char *owner, int pid, int mb, int min_mb, o
 typedef int (*ovram_pressure_fn)(void *ctx, otier waiter_tier, int deficit_mb);
 void ovram_set_pressure_hook(ovram *v, ovram_pressure_fn fn, void *ctx, int after_ms);
 
+/* A queued higher tier blocks lower tiers for at most this long (default 15 s,
+ * 0 = no limit), and only while its need is coverable once live leases end. */
+void ovram_set_block_max_s(ovram *v, double s);
+
 /* Current headroom for a tier, and queued waiters for a tier. */
 int ovram_headroom(ovram *v, otier tier);
 int ovram_waiting(ovram *v, otier tier);

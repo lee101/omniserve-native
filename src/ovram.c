@@ -13,6 +13,7 @@
 #define OVRAM_MAX_PROCS 64
 #define OVRAM_OWNER_CAP 32
 #define OVRAM_ID_CAP 40
+#define OVRAM_MAX_WAITERS 64
 
 typedef struct {
     char owner[OVRAM_OWNER_CAP];
@@ -54,6 +55,8 @@ struct ovram {
     int nprocs;
     bool procs_valid;
     int waiting[4];
+    struct { bool used; otier tier; int need; double since; } waiters[OVRAM_MAX_WAITERS];
+    double block_max_s;
     ovram_pressure_fn pressure;
     void *pressure_ctx;
     int pressure_after_ms;
@@ -251,6 +254,7 @@ ovram *ovram_create(int keep_free_mb, double default_ttl_s) {
     v->keep_free_mb = keep_free_mb > 0 ? keep_free_mb : 0;
     v->default_ttl_s = default_ttl_s > 0.0 ? default_ttl_s : 120.0;
     v->pressure_after_ms = 1000;
+    v->block_max_s = 15.0;
     v->next_id = 1;
     return v;
 }
@@ -268,6 +272,13 @@ void ovram_set_pressure_hook(ovram *v, ovram_pressure_fn fn, void *ctx, int afte
     v->pressure = fn;
     v->pressure_ctx = ctx;
     v->pressure_after_ms = after_ms >= 0 ? after_ms : 0;
+    pthread_mutex_unlock(&v->lock);
+}
+
+void ovram_set_block_max_s(ovram *v, double s) {
+    if (!v) return;
+    pthread_mutex_lock(&v->lock);
+    v->block_max_s = s;
     pthread_mutex_unlock(&v->lock);
 }
 
@@ -312,9 +323,24 @@ bool ovram_reserve(ovram *v, const char *owner, int mb) {
     return true;
 }
 
-static bool higher_tier_waiting_locked(const ovram *v, otier tier) {
-    for (int t = TIER_PAID; t < (int)tier; t++) {
-        if (v->waiting[t] > 0) return true;
+/*
+ * A queued higher tier holds back lower tiers only while holding back helps:
+ * its need must be coverable by current headroom plus what live leases will
+ * hand back, and it must not have been blocking for longer than block_max_s.
+ * Otherwise a paid job that cannot fit until a resident is evicted would
+ * starve every lower tier (head-of-line blocking) for its whole wait.
+ */
+static bool higher_tier_waiting_locked(const ovram *v, otier tier, double now_s, int device_free_mb) {
+    int leased_total = 0;
+    for (int i = 0; i < OVRAM_MAX_LEASES; i++) {
+        if (v->leases[i].active) leased_total += v->leases[i].mb;
+    }
+    for (int i = 0; i < OVRAM_MAX_WAITERS; i++) {
+        if (!v->waiters[i].used || v->waiters[i].tier >= tier) continue;
+        if (v->block_max_s > 0 && now_s - v->waiters[i].since > v->block_max_s) continue;
+        if (device_free_mb >= 0 &&
+            v->waiters[i].need > headroom_locked(v, v->waiters[i].tier, device_free_mb) + leased_total) continue;
+        return true;
     }
     return false;
 }
@@ -367,7 +393,7 @@ int ovram_lease_pid_at(ovram *v, const char *owner, int pid, int mb, int min_mb,
     pthread_mutex_lock(&v->lock);
     expire_locked(v, now_s);
     /* A lower tier may not take headroom a queued higher tier is waiting for. */
-    int granted = higher_tier_waiting_locked(v, tier) ? 0
+    int granted = higher_tier_waiting_locked(v, tier, now_s, device_free_mb) ? 0
         : grant_locked(v, owner, pid, mb, min_mb, tier, ttl_s, now_s, device_free_mb, id_out, id_cap);
     if (granted <= 0) {
         v->denials++;
@@ -405,6 +431,7 @@ int ovram_lease_wait(ovram *v, const char *owner, int pid, int mb, int min_mb, o
     double deadline = started + (wait_ms > 0 ? wait_ms / 1000.0 : 0.0);
     double next_pressure = started + v->pressure_after_ms / 1000.0;
     bool registered = false;
+    int wslot = -1;
     int granted = 0;
 
     for (;;) {
@@ -413,7 +440,7 @@ int ovram_lease_wait(ovram *v, const char *owner, int pid, int mb, int min_mb, o
         double now = monotonic_s();
         pthread_mutex_lock(&v->lock);
         expire_locked(v, now);
-        if (!higher_tier_waiting_locked(v, tier)) {
+        if (!higher_tier_waiting_locked(v, tier, now, device_free)) {
             granted = grant_locked(v, name, pid, mb, min_mb, tier, ttl_s, now, device_free,
                                    id_out, id_cap);
         }
@@ -422,6 +449,7 @@ int ovram_lease_wait(ovram *v, const char *owner, int pid, int mb, int min_mb, o
             double waited = (now - started) * 1000.0;
             if (registered) {
                 v->waiting[tier]--;
+                if (wslot >= 0) v->waiters[wslot].used = false;
                 o->waits++;
                 o->wait_ms_total += waited;
                 if (waited > o->wait_ms_max) o->wait_ms_max = waited;
@@ -440,6 +468,15 @@ int ovram_lease_wait(ovram *v, const char *owner, int pid, int mb, int min_mb, o
         if (!registered) {
             registered = true;
             v->waiting[tier]++;
+            for (int i = 0; i < OVRAM_MAX_WAITERS; i++) {
+                if (v->waiters[i].used) continue;
+                v->waiters[i].used = true;
+                v->waiters[i].tier = tier;
+                v->waiters[i].need = min_mb > 0 ? min_mb : mb;
+                v->waiters[i].since = now;
+                wslot = i;
+                break;
+            }
             v->waits++;
         }
         int need = min_mb > 0 ? min_mb : mb;

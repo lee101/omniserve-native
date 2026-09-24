@@ -1623,6 +1623,7 @@ typedef struct {
     unsigned long long judge_admits, judge_evictions;
     int wait_ms[4];
     int sd_lease_mb, sd_edit_lease_mb;
+    bool lease_scale_by_pixels;
     unsigned long long image_waits, image_wait_denials, broker_unreachable;
 } gpu_sched_state;
 
@@ -2535,6 +2536,17 @@ static void handle_images(ohttp_request *req, app_state *app) {
     char image_lease_id[40] = {0};
     bool image_lease_remote = false;
     int required_headroom_mb = img2img ? g_gs.sd_edit_lease_mb : g_gs.sd_lease_mb;
+    /* Lease figures are for 1024x1024. Activation memory scales with pixels
+     * on top of a fixed part (weights streamed per layer, text encoder):
+     * measured Qwen 2.1 growth ~7.7 GB at 768^2 vs ~10.3 GB at 1024^2. */
+    if (g_gs.lease_scale_by_pixels && required_headroom_mb > 0) {
+        double mpx = (double)image_request.generation.width * image_request.generation.height /
+                     (1024.0 * 1024.0);
+        if (mpx > 0.0) {
+            double scaled = required_headroom_mb * (0.45 + 0.55 * mpx);
+            required_headroom_mb = (int)(scaled < 256.0 ? 256.0 : scaled);
+        }
+    }
     int image_waited_ms = 0;
     if (required_headroom_mb > 0 &&
         image_gpu_lease(app, required_headroom_mb, tier, image_lease_id, sizeof image_lease_id,
@@ -3990,6 +4002,8 @@ int main(int argc, char **argv) {
         }
         g_gs.sd_lease_mb = env_int("OMNISERVE_NATIVE_SD_LEASE_MB", oimage_gpu_headroom_mb());
         g_gs.sd_edit_lease_mb = env_int("OMNISERVE_NATIVE_SD_EDIT_LEASE_MB", g_gs.sd_lease_mb);
+        g_gs.lease_scale_by_pixels = env_flag("OMNISERVE_NATIVE_SD_LEASE_SCALE_PIXELS", 0);
+        if (app.vram) ovram_set_block_max_s(app.vram, env_int("OMNISERVE_NATIVE_VRAM_BLOCK_MAX_S", 15));
         g_gs.llm_idle_s = env_int("OMNISERVE_NATIVE_EVICT_LLM_IDLE_S", 0);
         const char *evict_tier = getenv("OMNISERVE_NATIVE_EVICT_LLM_MAX_TIER");
         g_gs.llm_evict_max_tier = evict_tier && evict_tier[0]

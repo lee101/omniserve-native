@@ -1941,36 +1941,51 @@ typedef struct { ovram *v; int got; } vram_waiter_arg;
 static void *vram_paid_waiter(void *p) {
     vram_waiter_arg *a = p;
     char id[40];
-    /* Can never fit, so it stays queued for its whole wait. */
-    a->got = ovram_lease_wait(a->v, "paid-waiter", 0, 100000000, 100000000, TIER_PAID, 60.0, 400,
+    a->got = ovram_lease_wait(a->v, "paid-waiter", 0, 1024, 1024, TIER_PAID, 60.0, 400,
                               id, sizeof id, NULL);
     return NULL;
 }
 
-/* A queued higher tier blocks lower tiers from taking headroom it waits for. */
+static double test_mono_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* A queued higher tier blocks lower tiers while its need is coverable once
+ * live leases end, and only for a bounded time. */
 static void test_vram_priority(void) {
     ovram *v = ovram_create(1024, 60.0);
     CHECK(v != NULL);
+    char hold[40], id[40];
+    /* A paid holder larger than any real device keeps the waiter queued. */
+    CHECK(ovram_lease_at(v, "holder", 400000, 400000, TIER_PAID, 1e9, 1.0, 500000,
+                         hold, sizeof hold) == 400000);
     vram_waiter_arg a = {v, -1};
     pthread_t t;
     CHECK(pthread_create(&t, NULL, vram_paid_waiter, &a) == 0);
     for (int i = 0; i < 100 && ovram_waiting(v, TIER_PAID) == 0; i++) usleep(5000);
     CHECK(ovram_waiting(v, TIER_PAID) == 1);
-    char id[40];
-    CHECK(ovram_lease_at(v, "free-tenant", 1024, 1024, TIER_FREE, 60.0, 1.0, 8192, id, sizeof id) == 0);
-    /* Same or higher tier is not blocked by a paid waiter. */
-    CHECK(ovram_lease_at(v, "paid-tenant", 1024, 1024, TIER_PAID, 60.0, 1.0, 8192, id, sizeof id) == 1024);
+    double now = test_mono_s();
+    /* Feasible (the holder will hand back 400000) and young: free tier waits. */
+    CHECK(ovram_lease_at(v, "free-tenant", 512, 512, TIER_FREE, 60.0, now, 8192, id, sizeof id) == 0);
+    /* Past the blocking bound the lower tier may proceed. */
+    ovram_set_block_max_s(v, 0.05);
+    usleep(100000);
+    now = test_mono_s();
+    CHECK(ovram_lease_at(v, "free-tenant", 512, 512, TIER_FREE, 60.0, now, 8192 + 400000, id, sizeof id) == 512);
     CHECK(ovram_release(v, id));
+    ovram_set_block_max_s(v, 15.0);
     pthread_join(t, NULL);
     CHECK(a.got == 0);
     CHECK(ovram_waiting(v, TIER_PAID) == 0);
-    CHECK(ovram_lease_at(v, "free-tenant", 1024, 1024, TIER_FREE, 60.0, 2.0, 8192, id, sizeof id) == 1024);
-    CHECK(ovram_release(v, id));
+    CHECK(ovram_release(v, hold));
     char ledger[16384];
     CHECK(ovram_ledger_json(v, ledger, sizeof ledger) > 0);
     CHECK(strstr(ledger, "\"wait_timeouts\":1") != NULL);
     CHECK(strstr(ledger, "\"owner\":\"paid-waiter\"") != NULL);
     ovram_destroy(v);
+
 }
 
 static void test_host_prefetch_policy(void) {
