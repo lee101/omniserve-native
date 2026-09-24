@@ -16,6 +16,7 @@
 
 #include <math.h>
 #include <limits.h>
+#include <stdint.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -326,12 +327,147 @@ static bool request_is_internal(const ohttp_request *req) {
     return ohttp_req_peer_is_loopback(req) && !request_via_proxy(req);
 }
 
+/* Public auth gate. OMNISERVE_NATIVE_AUTH_MODE=off|shadow|enforce and
+ * OMNISERVE_NATIVE_AUTH_SCOPE=relayed|all. In scope, a request must carry a
+ * mapped service key (KEY_TIERS or the shared secret) or an end-user
+ * credential the subscriber verifier (OMNISERVE_NATIVE_AUTH_VERIFY_URL)
+ * vouches for. Verdicts are cached per credential so the verifier sees at
+ * most one call per credential per TTL; a verifier outage keeps a recently
+ * verified subscriber serving from the stale entry. */
+typedef enum { AUTH_OFF, AUTH_SHADOW, AUTH_ENFORCE } auth_mode;
+#define SUBCACHE_N 4096
+#define SUBCRED_MAX 256
+typedef struct {
+    char cred[SUBCRED_MAX];
+    size_t len;
+    int verdict; /* >=0 subscriber tier, -401 unknown, -402 not subscribed */
+    time_t fresh_until, stale_until;
+} subcache_ent;
+static subcache_ent g_subcache[SUBCACHE_N];
+static pthread_mutex_t g_subcache_lock = PTHREAD_MUTEX_INITIALIZER;
+static auth_mode g_auth_mode;
+static bool g_auth_scope_all;
+static oproxy_target *g_auth_verify;
+static char g_auth_verify_path[256];
+static const char *g_auth_verify_secret;
+static int g_auth_ok_ttl = 300, g_auth_deny_ttl = 60, g_auth_stale_ttl = 3600;
+static unsigned long long g_auth_counts[6]; /* service, subscriber, internal, 401, 402, verify_err */
+
+static uint64_t cred_hash(const char *s, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+/* The end-user credential, in the order callers of this API send it. */
+static const char *request_credential(const ohttp_request *req, size_t *len) {
+    size_t n = 0;
+    const char *v = ohttp_req_header(req, "Authorization", &n);
+    if (v && n > 7 && strncasecmp(v, "Bearer ", 7) == 0) { *len = n - 7; return v + 7; }
+    static const char *names[] = { "secret", "X-API-Key", "X-Rapid-API-Key" };
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        v = ohttp_req_header(req, names[i], &n);
+        if (v && n) { *len = n; return v; }
+    }
+    const char *p = req->query, *end = p ? p + req->query_len : NULL;
+    while (p && p < end) {
+        const char *amp = memchr(p, '&', (size_t)(end - p));
+        const char *fe = amp ? amp : end;
+        if (fe - p > 7 && strncmp(p, "secret=", 7) == 0) { *len = (size_t)(fe - p - 7); return p + 7; }
+        p = amp ? amp + 1 : end;
+    }
+    *len = 0;
+    return NULL;
+}
+
+/* 1 hit (fresh), 2 stale-positive usable only on verifier failure, 0 miss. */
+static int subcache_get(const char *cred, size_t len, int *verdict, bool allow_stale) {
+    if (len >= SUBCRED_MAX) return 0;
+    time_t now = time(NULL);
+    subcache_ent *e = &g_subcache[cred_hash(cred, len) % SUBCACHE_N];
+    int rc = 0;
+    pthread_mutex_lock(&g_subcache_lock);
+    if (e->len == len && memcmp(e->cred, cred, len) == 0) {
+        if (now < e->fresh_until) { *verdict = e->verdict; rc = 1; }
+        else if (allow_stale && e->verdict >= 0 && now < e->stale_until) { *verdict = e->verdict; rc = 2; }
+    }
+    pthread_mutex_unlock(&g_subcache_lock);
+    return rc;
+}
+
+static void subcache_put(const char *cred, size_t len, int verdict) {
+    if (len >= SUBCRED_MAX) return;
+    time_t now = time(NULL);
+    subcache_ent *e = &g_subcache[cred_hash(cred, len) % SUBCACHE_N];
+    pthread_mutex_lock(&g_subcache_lock);
+    memcpy(e->cred, cred, len);
+    e->len = len;
+    e->verdict = verdict;
+    e->fresh_until = now + (verdict >= 0 ? g_auth_ok_ttl : g_auth_deny_ttl);
+    e->stale_until = verdict >= 0 ? now + g_auth_stale_ttl : 0;
+    pthread_mutex_unlock(&g_subcache_lock);
+}
+
+typedef struct { char buf[4096]; size_t n; } verify_sink_buf;
+static bool verify_sink(const void *data, size_t len, void *user) {
+    verify_sink_buf *b = user;
+    size_t room = sizeof b->buf - 1 - b->n;
+    if (len > room) len = room;
+    memcpy(b->buf + b->n, data, len);
+    b->n += len;
+    b->buf[b->n] = 0;
+    return true;
+}
+
+/* Asks the verifier about one credential. Returns the verdict, or INT_MIN when
+ * the verifier could not answer. */
+static int subscriber_verify_remote(const char *cred, size_t len) {
+    if (!g_auth_verify) return -401;
+    oproxy_header h[2] = {
+        { .name = "X-Subscriber-Credential", .name_len = sizeof "X-Subscriber-Credential" - 1,
+          .value = cred, .value_len = len },
+        { .name = "X-Verify-Secret", .name_len = sizeof "X-Verify-Secret" - 1,
+          .value = g_auth_verify_secret ? g_auth_verify_secret : "",
+          .value_len = g_auth_verify_secret ? strlen(g_auth_verify_secret) : 0 },
+    };
+    verify_sink_buf b = { .n = 0 };
+    oproxy_result res = {0};
+    char err[256];
+    bool ok = oproxy_target_relay(g_auth_verify, "GET", 3, g_auth_verify_path, strlen(g_auth_verify_path),
+                                  NULL, 0, NULL, 0, NULL, 0, h, 2, 5000,
+                                  verify_sink, &b, &res, err, sizeof err);
+    if (!ok || res.status == 0 || res.status >= 500) return INT_MIN;
+    if (res.status == 401) return -401;
+    if (res.status == 402 || res.status == 403) return -402;
+    if (res.status != 200) return INT_MIN;
+    const char *t = strstr(b.buf, "\"tier\"");
+    otier tier = TIER_SUB;
+    if (t && (t = strchr(t + 6, '"'))) {
+        const char *e = strchr(t + 1, '"');
+        if (e) tier = otier_parse_public(t + 1, (int)(e - t - 1));
+    }
+    return (int)tier;
+}
+
+/* Cached subscriber tier for this request's credential, or -1. */
+static int request_subscriber_tier(const ohttp_request *req) {
+    if (g_auth_mode == AUTH_OFF) return -1;
+    size_t len = 0;
+    const char *cred = request_credential(req, &len);
+    int verdict;
+    if (!cred || !len || !subcache_get(cred, len, &verdict, true) || verdict < 0) return -1;
+    return verdict;
+}
+
 static otier request_tier(const ohttp_request *req) {
     /* Priority is a privilege too: a public caller must not be able to claim
      * the paid lane, so an untrusted X-Omniserve-Tier falls back to default. */
     int keyed = request_key_tier(req);
     bool internal = request_is_internal(req);
-    if (!internal && keyed < 0) return otier_parse_public(NULL, 0);
+    if (!internal && keyed < 0) {
+        keyed = request_subscriber_tier(req);
+        if (keyed < 0) return otier_parse_public(NULL, 0);
+    }
     size_t len = 0;
     const char *v = ohttp_req_header(req, "X-Omniserve-Tier", &len);
     if (keyed >= 0 && !(internal && v && len)) {
@@ -350,6 +486,156 @@ static void respond_error(ohttp_request *req, int status, const char *msg) {
     char body[512];
     snprintf(body, sizeof body, "{\"error\":{\"message\":\"%s\",\"type\":\"invalid_request_error\"}}", msg);
     ohttp_respond_str(req, status, "application/json", body);
+}
+
+#define SUBSCRIBE_URL "https://text-generator.io/subscribe"
+
+static void respond_subscription_required(ohttp_request *req, int status) {
+    const char *msg = status == 401
+        ? "An API key from a paid or subscribed account is required. Send it as Authorization: Bearer <key> or a secret header."
+        : "This API is available to paid and subscribed accounts. Subscribe to continue.";
+    char body[512];
+    int n = snprintf(body, sizeof body,
+        "{\"error\":{\"code\":\"subscription_required\",\"message\":\"%s\",\"subscribe_url\":\"" SUBSCRIBE_URL "\"}}",
+        msg);
+    ohttp_respond_h(req, status, "application/json", body, n > 0 ? (size_t)n : 0,
+                    "X-Subscribe-URL: " SUBSCRIBE_URL);
+}
+
+static bool auth_path_exempt(const ohttp_request *req) {
+    static const char *open_paths[] = {
+        "/health", "/healthz", "/liveness_check", "/readyz", "/readiness_check",
+        "/status", "/", "/docs", "/openapi.json", "/v1/models", "/api/v1/speech/catalog",
+    };
+    for (size_t i = 0; i < sizeof open_paths / sizeof open_paths[0]; i++)
+        if (ohttp_path_is(req, open_paths[i])) return true;
+    return false;
+}
+
+static void auth_gate_log(const ohttp_request *req, const char *verdict, const char *cred, size_t len) {
+    char path[160];
+    size_t pn = req->path_len < sizeof path - 1 ? req->path_len : sizeof path - 1;
+    memcpy(path, req->path, pn);
+    path[pn] = 0;
+    for (size_t i = 0; i < pn; i++) if (path[i] == '"' || path[i] < 0x20) path[i] = '_';
+    fprintf(stderr, "auth_gate mode=%s verdict=%s cred=%08x path=\"%s\"\n",
+            g_auth_mode == AUTH_SHADOW ? "shadow" : "enforce", verdict,
+            cred && len ? (unsigned)(cred_hash(cred, len) >> 32) : 0u, path);
+}
+
+static auth_mode auth_mode_parse(const char *m) {
+    if (!m || !m[0] || strncasecmp(m, "off", 3) == 0 || m[0] == '0') return AUTH_OFF;
+    return strncasecmp(m, "shadow", 6) == 0 ? AUTH_SHADOW : AUTH_ENFORCE;
+}
+
+/* OMNISERVE_NATIVE_AUTH_MODE_FILE, when set, overrides the mode and is re-read
+ * every few seconds, so rollout and rollback need no gateway restart. A
+ * missing or unreadable file keeps the last mode. */
+static const char *g_auth_mode_file;
+static time_t g_auth_mode_checked;
+static void auth_mode_refresh(void) {
+    if (!g_auth_mode_file) return;
+    time_t now = time(NULL);
+    time_t last = __atomic_load_n(&g_auth_mode_checked, __ATOMIC_RELAXED);
+    if (now - last < 3 ||
+        !__atomic_compare_exchange_n(&g_auth_mode_checked, &last, now, false,
+                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        return;
+    FILE *f = fopen(g_auth_mode_file, "r");
+    if (!f) return;
+    char buf[32] = {0};
+    if (fgets(buf, sizeof buf, f)) {
+        auth_mode m = auth_mode_parse(buf);
+        if (m != g_auth_mode) {
+            fprintf(stderr, "auth gate: mode %d -> %d from %s\n", (int)g_auth_mode, (int)m, g_auth_mode_file);
+            __atomic_store_n(&g_auth_mode, m, __ATOMIC_RELAXED);
+        }
+    }
+    fclose(f);
+}
+
+/* True when the request may proceed; otherwise the response has been sent. */
+static bool auth_gate(ohttp_request *req, const app_state *app) {
+    auth_mode_refresh();
+    if (g_auth_mode == AUTH_OFF) return true;
+    if (!g_auth_scope_all && request_is_internal(req)) {
+        __atomic_add_fetch(&g_auth_counts[2], 1, __ATOMIC_RELAXED);
+        return true;
+    }
+    if (auth_path_exempt(req)) return true;
+    size_t len = 0;
+    const char *cred = request_credential(req, &len);
+    if (request_key_tier(req) >= 0 ||
+        (app->secret && app->secret[0] && cred && len == strlen(app->secret) &&
+         memcmp(cred, app->secret, len) == 0)) {
+        __atomic_add_fetch(&g_auth_counts[0], 1, __ATOMIC_RELAXED);
+        return true;
+    }
+    int verdict = -401;
+    if (cred && len && len < SUBCRED_MAX) {
+        if (!subcache_get(cred, len, &verdict, false)) {
+            int v = subscriber_verify_remote(cred, len);
+            if (v == INT_MIN) {
+                __atomic_add_fetch(&g_auth_counts[5], 1, __ATOMIC_RELAXED);
+                if (subcache_get(cred, len, &verdict, true) != 2) {
+                    auth_gate_log(req, "verify_error", cred, len);
+                    if (g_auth_mode == AUTH_SHADOW) return true;
+                    ohttp_respond_h(req, 503, "application/json",
+                        "{\"error\":{\"code\":\"auth_unavailable\",\"message\":\"subscription check unavailable; retry\"}}",
+                        sizeof "{\"error\":{\"code\":\"auth_unavailable\",\"message\":\"subscription check unavailable; retry\"}}" - 1,
+                        "Retry-After: 5");
+                    return false;
+                }
+            } else {
+                verdict = v;
+                subcache_put(cred, len, verdict);
+            }
+        }
+    }
+    if (verdict >= 0) {
+        __atomic_add_fetch(&g_auth_counts[1], 1, __ATOMIC_RELAXED);
+        return true;
+    }
+    int status = verdict == -402 ? 402 : 401;
+    __atomic_add_fetch(&g_auth_counts[status == 401 ? 3 : 4], 1, __ATOMIC_RELAXED);
+    auth_gate_log(req, status == 401 ? "deny_401" : "deny_402", cred, len);
+    if (g_auth_mode == AUTH_SHADOW) return true;
+    respond_subscription_required(req, status);
+    return false;
+}
+
+static void auth_gate_init(void) {
+    g_auth_mode = auth_mode_parse(getenv("OMNISERVE_NATIVE_AUTH_MODE"));
+    g_auth_mode_file = getenv("OMNISERVE_NATIVE_AUTH_MODE_FILE");
+    if (g_auth_mode_file && !g_auth_mode_file[0]) g_auth_mode_file = NULL;
+    auth_mode_refresh();
+    const char *s = getenv("OMNISERVE_NATIVE_AUTH_SCOPE");
+    g_auth_scope_all = s && strcasecmp(s, "all") == 0;
+    const char *v;
+    if ((v = getenv("OMNISERVE_NATIVE_AUTH_OK_TTL_S")) && atoi(v) > 0) g_auth_ok_ttl = atoi(v);
+    if ((v = getenv("OMNISERVE_NATIVE_AUTH_DENY_TTL_S")) && atoi(v) > 0) g_auth_deny_ttl = atoi(v);
+    if ((v = getenv("OMNISERVE_NATIVE_AUTH_STALE_TTL_S")) && atoi(v) >= 0) g_auth_stale_ttl = atoi(v);
+    g_auth_verify_secret = getenv("OMNISERVE_NATIVE_AUTH_VERIFY_SECRET");
+    const char *url = getenv("OMNISERVE_NATIVE_AUTH_VERIFY_URL");
+    if (url && url[0]) {
+        const char *host = strstr(url, "://");
+        const char *slash = host ? strchr(host + 3, '/') : NULL;
+        char base[256];
+        size_t bn = slash ? (size_t)(slash - url) : strlen(url);
+        if (bn < sizeof base) {
+            memcpy(base, url, bn);
+            base[bn] = 0;
+            snprintf(g_auth_verify_path, sizeof g_auth_verify_path, "%s", slash ? slash : "/");
+            char err[256];
+            g_auth_verify = oproxy_target_create(base, 4, err, sizeof err);
+            if (!g_auth_verify) fprintf(stderr, "auth gate: verifier %s unusable: %s\n", base, err);
+        }
+    }
+    pthread_once(&g_key_tiers_once, key_tiers_load);
+    if (g_auth_mode != AUTH_OFF || g_auth_mode_file)
+        fprintf(stderr, "auth gate: mode=%s scope=%s verifier=%s\n",
+                g_auth_mode == AUTH_OFF ? "off" : g_auth_mode == AUTH_SHADOW ? "shadow" : "enforce",
+                g_auth_scope_all ? "all" : "relayed", g_auth_verify ? "on" : "off");
 }
 
 /* An embedded model that fell back to CPU still answers, so it cannot be
@@ -2850,6 +3136,7 @@ static void route(ohttp_request *req, void *user) {
         ohttp_respond_str(req, 204, "text/plain", "");
         return;
     }
+    if (!auth_gate(req, app)) return;
     if (ohttp_path_is(req, "/health") || ohttp_path_is(req, "/healthz") ||
         ohttp_path_is(req, "/liveness_check")) { handle_health(req); return; }
     if (ohttp_path_is(req, "/readyz") || ohttp_path_is(req, "/readiness_check")) {
@@ -3401,6 +3688,7 @@ int main(int argc, char **argv) {
         if (paths[0]) ohost_prefetch_start(paths, keep_pct);
     }
     app.secret = getenv("OMNISERVE_NATIVE_SECRET");
+    auth_gate_init();
     app.h3_api_key = getenv("OMNISERVE_NATIVE_H3_API_KEY");
     app.h3_tier_mask = parse_tier_mask(getenv("OMNISERVE_NATIVE_H3_TIERS"));
     app.prefer_embedded_image = env_flag("OMNISERVE_NATIVE_IMAGE_PREFER_EMBEDDED", 0);

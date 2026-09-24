@@ -227,6 +227,12 @@ if(Python3_Interpreter_FOUND)
     set_tests_properties(key_tiers PROPERTIES
         ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
     add_test(
+        NAME auth_gate
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_auth_gate.py"
+    )
+    set_tests_properties(auth_gate PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    add_test(
         NAME multimodal_routing
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_multimodal_routing.py"
     )
