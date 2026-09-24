@@ -1,0 +1,15 @@
+{
+  "name": "omniserve-yue2-quality",
+  "endpoint_id": "tmozxvnm9fuuud",
+  "template_id": "k2im0m20rr",
+  "image": "ghcr.io/lee101/yue-cog@sha256:33d2154e8399e3919a874279614319e53ca885a9132abaec3b3354e171dc321e",
+  "workersMin": 0,
+  "workersMax": 1,
+  "idleTimeout": 20,
+  "gpuTypeIds": [
+    "NVIDIA GeForce RTX 4090"
+  ],
+  "benchmark_exit_code": 0,
+  "date": "2026-09-20",
+  "template_env_optimization": "YUE_HF_HOME=/runpod-volume/huggingface-cache/hub"
+}

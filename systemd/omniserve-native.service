@@ -23,7 +23,7 @@ Environment=OMNISERVE_NATIVE_LLM_SWAP_DIR=/nvme0n1-disk/models/omniserve-native
 # than the VAE decoder's scratch requirement once Z-Image and the search
 # tenants are resident, causing generation to finish denoising and then return
 # HTTP 500 during decode. Hybrid splits exceed this GGUF's split-input limit.
-Environment=OMNISERVE_NATIVE_NGL=0
+Environment=OMNISERVE_NATIVE_NGL=1
 Environment=OMNISERVE_NATIVE_CTX=4096
 # One context per admitted request. LLM_PERMITS below is 1, so a second
 # context could never be scheduled while it cost a full KV + compute buffer

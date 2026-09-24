@@ -7,8 +7,8 @@
   },
   "gpu": {
     "device_present": true,
-    "requested": false,
-    "placement": "cpu",
+    "requested": true,
+    "placement": "gpu",
     "device": "NVIDIA GeForce RTX 5090",
     "kv_type": "q8_0",
     "flash_attn": true,
@@ -16,73 +16,95 @@
   },
   "checks": [
     {
+      "check": "gateway.health",
+      "ok": true,
+      "detail": "status=ok"
+    },
+    {
+      "check": "gateway.gpu_placement",
+      "ok": true,
+      "detail": "placement=gpu device=NVIDIA GeForce RTX 5090 kv=q8_0 flash_attn=True"
+    },
+    {
+      "check": "gateway.vram_readable",
+      "ok": true,
+      "detail": "free=29.43 GiB"
+    },
+    {
+      "check": "gateway.models_listed",
+      "ok": true,
+      "detail": "text-generator/auto, text-generator/auto-fast, text-generator/auto-cheap, text-generator/auto-code, text-generator/auto-reasoning, text-generator/auto-vision"
+    },
+    {
       "check": "llm.reachable",
       "ok": true,
-      "detail": "http=200 13865ms"
+      "detail": "skipped: auth required",
+      "skipped": true
     },
     {
-      "check": "llm.cold_determinism",
+      "check": "embedding.reachable",
       "ok": true,
-      "detail": "identical"
+      "detail": "http=200 dims=768 36ms"
     },
     {
-      "check": "llm.prefix_cache_agreement",
+      "check": "embedding.determinism",
       "ok": true,
-      "detail": "diverges at char 17/17",
+      "detail": "self_cosine=1.000000"
+    },
+    {
+      "check": "embedding.batch_shape",
+      "ok": true,
+      "detail": "returned=2"
+    },
+    {
+      "check": "embedding.batch_matches_single",
+      "ok": true,
+      "detail": "cosine=1.000000"
+    },
+    {
+      "check": "embedding.legacy_num_features",
+      "ok": true,
+      "detail": "http=200 len=128"
+    },
+    {
+      "check": "embedding.sts_margin",
+      "ok": true,
+      "detail": "pos=0.831 neg=0.608",
+      "score": 0.22290402211974925
+    },
+    {
+      "check": "embedding.sts_ranking_accuracy",
+      "ok": true,
+      "detail": "25/25 pairs ordered",
       "score": 1.0
     },
     {
-      "check": "llm.prefix_cache_not_corrupt",
+      "check": "embedding.drift_cosine",
       "ok": true,
-      "detail": "agreement=1.000"
+      "detail": "worst of 3 reference texts",
+      "score": 0.999999999999976
     },
     {
-      "check": "llm.prefix_cache_active",
+      "check": "image.reachable",
       "ok": true,
-      "detail": "cached_prompt_tokens=35 cold=24410ms warm=15971ms (cold reported 19)"
+      "detail": "http=200 13957ms"
     },
     {
-      "check": "llm.prefix_cache_speedup",
+      "check": "image.envelope",
       "ok": true,
-      "detail": "24410ms -> 15971ms",
-      "score": 1.528406645897607
+      "detail": "keys=['b64_json', 'format', 'inference_time_ms', 'seed']"
     },
     {
-      "check": "llm.max_tokens_honored",
+      "check": "audio.tts_reachable",
       "ok": true,
-      "detail": "completion_tokens=16"
-    },
-    {
-      "check": "llm.stop_sequence_honored",
-      "ok": true,
-      "detail": "text='Count: one two '"
-    },
-    {
-      "check": "llm.legacy_generate",
-      "ok": true,
-      "detail": "http=200 11890ms text='Hi I am bored so looking for something'"
-    },
-    {
-      "check": "llm.max_sentences_honored",
-      "ok": true,
-      "detail": "terminators=0"
-    },
-    {
-      "check": "llm.no_reasoning_leak",
-      "ok": true,
-      "detail": "text='Hi I am bored so looking for something'"
-    },
-    {
-      "check": "llm.task_accuracy",
-      "ok": true,
-      "detail": "7/8; missed How many letters are in the ->'10'",
-      "score": 0.875
+      "detail": "skipped: auth required",
+      "skipped": true
     }
   ],
   "metrics": {
-    "llm.prefix_cache_agreement": 1.0,
-    "llm.prefix_cache_speedup": 1.528407,
-    "llm.task_accuracy": 0.875
+    "embedding.sts_margin": 0.222904,
+    "embedding.sts_ranking_accuracy": 1.0,
+    "embedding.drift_cosine": 1.0
   },
   "failures": [],
   "regressions": []

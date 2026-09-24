@@ -21,6 +21,13 @@ matte/libomatte.so
 # Training data, checkpoints, and generated model artifacts never belong in
 # the source repository. Publish reviewed artifacts to a dedicated model repo.
 data/
+# The content-guard name list and test corpus are source, not artifacts.
+!data/
+data/*
+!data/guard/
+!tests/data/
+tests/data/*
+!tests/data/guard-corpus.json
 training-state/
 checkpoints/
 artifacts/
