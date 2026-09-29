@@ -1289,6 +1289,8 @@ static void spec_mtp_init_locked(int n_gpu_layers, const struct llama_context_pa
     }
     if (fail) {
         spec_mtp_free_locked();
+        for (int i = 0; i < g_slot_count; i++) ollama_set_nextn(g_slots[i].ctx, false, false);
+        llama_model_free(head);
         g_spec_mtp_cfg.draft_max = 0;
         return;
     }
