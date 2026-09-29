@@ -1629,7 +1629,13 @@ static const char *overflow_path_label(void) {
 static bool env_flag(const char *name, int fallback) {
     const char *value = getenv(name);
     if (!value || !value[0]) return fallback != 0;
-    return value[0] == '1' || value[0] == 't' || value[0] == 'T' || value[0] == 'y' || value[0] == 'Y';
+    static const char *const yes[] = {"1", "t", "true", "y", "yes", "on", NULL};
+    static const char *const no[] = {"0", "f", "false", "n", "no", "off", NULL};
+    for (int i = 0; yes[i]; ++i) if (strcasecmp(value, yes[i]) == 0) return true;
+    for (int i = 0; no[i]; ++i) if (strcasecmp(value, no[i]) == 0) return false;
+    fprintf(stderr, "ignoring %s=%s (not a boolean), using %s\n", name, value,
+            fallback ? "true" : "false");
+    return fallback != 0;
 }
 
 /* The credential this gateway presents at a destination, or NULL when the

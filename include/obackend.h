@@ -131,6 +131,9 @@ typedef struct {
     int image_height;
     float strength;
     bool cache;
+    uint64_t image_hash; /* keyed hash and length of image_base64, set by osd_prepare_image when cache is on */
+    size_t image_len;
+    bool image_hash_valid;
 } oimg_req;
 
 typedef struct {

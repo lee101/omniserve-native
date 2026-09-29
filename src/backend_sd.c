@@ -23,54 +23,137 @@
 #define STBI_MAX_DIMENSIONS 4096
 #include "stb_image.h"
 
-static int decode_digit(unsigned char value) {
-    if (value >= 'A' && value <= 'Z') return value - 'A';
-    if (value >= 'a' && value <= 'z') return value - 'a' + 26;
-    if (value >= '0' && value <= '9') return value - '0' + 52;
-    if (value == '+') return 62;
-    if (value == '/') return 63;
-    return -1;
+static signed char b64_lut[256];
+static pthread_once_t b64_once = PTHREAD_ONCE_INIT;
+
+static void b64_lut_init(void) {
+    memset(b64_lut, -1, sizeof b64_lut);
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (int i = 0; i < 64; ++i) b64_lut[(unsigned char)alphabet[i]] = (signed char)i;
 }
 
-static void webp_lib_load(void);
-static bool webp_lib_loaded;
-typedef unsigned char *(*fn_webp_decode_rgb)(const unsigned char *, size_t, int *, int *);
 typedef void (*fn_webp_free)(void *);
-static fn_webp_decode_rgb p_webp_decode_rgb;
+typedef size_t (*fn_webp_encode_rgb)(const unsigned char *, int, int, int, float,
+                                     unsigned char **);
+typedef size_t (*fn_webp_encode_rgba)(const unsigned char *, int, int, int, float,
+                                      unsigned char **);
+typedef int (*fn_webp_get_info)(const unsigned char *, size_t, int *, int *);
+typedef unsigned char *(*fn_webp_decode_rgb_into)(const unsigned char *, size_t,
+                                                  unsigned char *, size_t, int);
+
 static fn_webp_free p_webp_free;
-/* libwebp is resolved lazily by name, and the reference-image path below uses
- * these before the encoder does, so both the types and the pointers are
- * declared here rather than with the rest of the function table. */
-typedef void (*fn_webp_free)(void *);
-typedef unsigned char *(*fn_webp_decode_rgb)(const unsigned char *, size_t, int *, int *);
-static fn_webp_free p_webp_free;
-static fn_webp_decode_rgb p_webp_decode_rgb; /* reference/init images may arrive as WebP; stb_image cannot decode it */
+static fn_webp_encode_rgb p_webp_encode_rgb;
+static fn_webp_encode_rgba p_webp_encode_rgba; /* Qwen Image 2.1 decodes RGBA (layered/transparent output) */
+static fn_webp_get_info p_webp_get_info;
+static fn_webp_decode_rgb_into p_webp_decode_rgb_into; /* reference/init images may arrive as WebP; stb_image cannot decode it */
+static pthread_once_t webp_once = PTHREAD_ONCE_INIT;
+
+static void webp_lib_load_once(void) {
+    static const char *const candidates[] = {
+        "libwebp.so.7", "libwebp.so.6", "libwebp.so", NULL,
+    };
+    for (int i = 0; candidates[i]; ++i) {
+        void *lib = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
+        if (!lib) continue;
+        fn_webp_encode_rgb encode_rgb = (fn_webp_encode_rgb)dlsym(lib, "WebPEncodeRGB");
+        fn_webp_free free_fn = (fn_webp_free)dlsym(lib, "WebPFree");
+        if (!encode_rgb || !free_fn) {
+            dlclose(lib);
+            continue;
+        }
+        p_webp_encode_rgb = encode_rgb;
+        p_webp_free = free_fn;
+        p_webp_encode_rgba = (fn_webp_encode_rgba)dlsym(lib, "WebPEncodeRGBA");
+        p_webp_get_info = (fn_webp_get_info)dlsym(lib, "WebPGetInfo");
+        p_webp_decode_rgb_into = (fn_webp_decode_rgb_into)dlsym(lib, "WebPDecodeRGBInto");
+        return;
+    }
+}
+
+static void webp_lib_load(void) { pthread_once(&webp_once, webp_lib_load_once); }
+
+/* Keyed hash so a client cannot craft two reference images that collide in the
+ * result cache. Per-process random key, never persisted. */
+static uint64_t g_hash_key[2];
+static pthread_once_t hash_key_once = PTHREAD_ONCE_INIT;
+
+static void hash_key_init(void) {
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f || fread(g_hash_key, sizeof g_hash_key, 1, f) != 1) {
+        g_hash_key[0] = (uint64_t)time(NULL) * 0x9e3779b97f4a7c15ULL;
+        g_hash_key[1] = (uint64_t)(uintptr_t)&g_hash_key ^ 0xd1b54a32d192ed03ULL;
+    }
+    if (f) fclose(f);
+}
+
+#define ROTL64(x, b) (uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
+#define SIPROUND do { \
+    v0 += v1; v1 = ROTL64(v1, 13); v1 ^= v0; v0 = ROTL64(v0, 32); \
+    v2 += v3; v3 = ROTL64(v3, 16); v3 ^= v2; \
+    v0 += v3; v3 = ROTL64(v3, 21); v3 ^= v0; \
+    v2 += v1; v1 = ROTL64(v1, 17); v1 ^= v2; v2 = ROTL64(v2, 32); \
+} while (0)
+
+static uint64_t keyed_hash(const void *data, size_t len) {
+    pthread_once(&hash_key_once, hash_key_init);
+    const unsigned char *in = data;
+    uint64_t v0 = 0x736f6d6570736575ULL ^ g_hash_key[0];
+    uint64_t v1 = 0x646f72616e646f6dULL ^ g_hash_key[1];
+    uint64_t v2 = 0x6c7967656e657261ULL ^ g_hash_key[0];
+    uint64_t v3 = 0x7465646279746573ULL ^ g_hash_key[1];
+    uint64_t tail = (uint64_t)len << 56;
+    const unsigned char *end = in + (len & ~(size_t)7);
+    for (; in != end; in += 8) {
+        uint64_t m;
+        memcpy(&m, in, 8);
+        v3 ^= m; SIPROUND; SIPROUND; v0 ^= m;
+    }
+    for (size_t i = 0; i < (len & 7); ++i) tail |= (uint64_t)in[i] << (8 * i);
+    v3 ^= tail; SIPROUND; SIPROUND; v0 ^= tail;
+    v2 ^= 0xff; SIPROUND; SIPROUND; SIPROUND; SIPROUND;
+    return v0 ^ v1 ^ v2 ^ v3;
+}
 
 bool osd_prepare_image(oimg_req *req) {
     if (!req->image_base64) return true;
     const char *src = req->image_base64;
     size_t len = strlen(src);
     if (!len || len > (8u << 20) || len % 4) return false;
+    pthread_once(&b64_once, b64_lut_init);
     unsigned char *bytes = malloc(len / 4 * 3);
     if (!bytes) return false;
     size_t used = 0;
     bool valid = true;
-    for (size_t i = 0; i < len; i += 4) {
-        int a = decode_digit((unsigned char)src[i]);
-        int b = decode_digit((unsigned char)src[i + 1]);
-        bool pad_c = src[i + 2] == '=';
-        bool pad_d = src[i + 3] == '=';
-        int c = pad_c ? 0 : decode_digit((unsigned char)src[i + 2]);
-        int d = pad_d ? 0 : decode_digit((unsigned char)src[i + 3]);
-        if (a < 0 || b < 0 || c < 0 || d < 0 ||
-            (pad_c && !pad_d) || ((pad_c || pad_d) && i + 4 != len) ||
-            (pad_c && (b & 15)) || (pad_d && !pad_c && (c & 3))) {
+    size_t last = len - 4;
+    for (size_t i = 0; i < last; i += 4) {
+        int a = b64_lut[(unsigned char)src[i]];
+        int b = b64_lut[(unsigned char)src[i + 1]];
+        int c = b64_lut[(unsigned char)src[i + 2]];
+        int d = b64_lut[(unsigned char)src[i + 3]];
+        if ((a | b | c | d) < 0) {
             valid = false;
             break;
         }
         bytes[used++] = (unsigned char)((a << 2) | (b >> 4));
-        if (!pad_c) bytes[used++] = (unsigned char)((b << 4) | (c >> 2));
-        if (!pad_d) bytes[used++] = (unsigned char)((c << 6) | d);
+        bytes[used++] = (unsigned char)((b << 4) | (c >> 2));
+        bytes[used++] = (unsigned char)((c << 6) | d);
+    }
+    if (valid) {
+        int a = b64_lut[(unsigned char)src[last]];
+        int b = b64_lut[(unsigned char)src[last + 1]];
+        bool pad_c = src[last + 2] == '=';
+        bool pad_d = src[last + 3] == '=';
+        int c = pad_c ? 0 : b64_lut[(unsigned char)src[last + 2]];
+        int d = pad_d ? 0 : b64_lut[(unsigned char)src[last + 3]];
+        if (a < 0 || b < 0 || c < 0 || d < 0 || (pad_c && !pad_d) ||
+            (pad_c && (b & 15)) || (pad_d && !pad_c && (c & 3))) {
+            valid = false;
+        } else {
+            bytes[used++] = (unsigned char)((a << 2) | (b >> 4));
+            if (!pad_c) bytes[used++] = (unsigned char)((b << 4) | (c >> 2));
+            if (!pad_d) bytes[used++] = (unsigned char)((c << 6) | d);
+        }
     }
     int width = 0, height = 0, channels = 0;
     if (valid && stbi_info_from_memory(bytes, (int)used, &width, &height, &channels) &&
@@ -78,20 +161,31 @@ bool osd_prepare_image(oimg_req *req) {
         req->image_pixels = stbi_load_from_memory(bytes, (int)used,
             &req->image_width, &req->image_height, &channels, 3);
     } else if (valid && used > 12 && memcmp(bytes, "RIFF", 4) == 0 && memcmp(bytes + 8, "WEBP", 4) == 0) {
-        if (!webp_lib_loaded) { webp_lib_load(); webp_lib_loaded = true; }
-        if (p_webp_decode_rgb) {
-            int w = 0, h = 0;
-            unsigned char *rgb = p_webp_decode_rgb(bytes, used, &w, &h);
-            if (rgb && w > 0 && h > 0 && w <= 4096 && h <= 4096) {
-                /* stbi_image_free is free(); WebP buffers must go through WebPFree, so copy. */
-                size_t n = (size_t)w * (size_t)h * 3;
-                req->image_pixels = malloc(n);
-                if (req->image_pixels) { memcpy(req->image_pixels, rgb, n); req->image_width = w; req->image_height = h; }
+        webp_lib_load();
+        int w = 0, h = 0;
+        /* Dimensions are checked before decoding: WebPDecodeRGB would allocate up to
+         * 16383x16383x3 first. Decoding straight into our own malloc also avoids a copy
+         * (stbi_image_free is free(); WebP-owned buffers must go through WebPFree). */
+        if (p_webp_get_info && p_webp_decode_rgb_into &&
+            p_webp_get_info(bytes, used, &w, &h) &&
+            w > 0 && h > 0 && w <= 4096 && h <= 4096) {
+            size_t n = (size_t)w * (size_t)h * 3;
+            unsigned char *rgb = malloc(n);
+            if (rgb && p_webp_decode_rgb_into(bytes, used, rgb, n, w * 3)) {
+                req->image_pixels = rgb;
+                req->image_width = w;
+                req->image_height = h;
+            } else {
+                free(rgb);
             }
-            if (rgb && p_webp_free) p_webp_free(rgb);
         }
     }
     free(bytes);
+    if (req->image_pixels && req->cache) {
+        req->image_hash = keyed_hash(src, len);
+        req->image_len = len;
+        req->image_hash_valid = true;
+    }
     return req->image_pixels != NULL;
 }
 
@@ -117,10 +211,6 @@ typedef void (*fn_latent_params_init)(sd_latent_replay_params_t *);
 typedef bool (*fn_generate_image_with_latent)(sd_ctx_t *, const sd_img_gen_params_t *,
                                               sd_latent_replay_params_t *, sd_image_t **, int *);
 typedef void (*fn_free_latent)(sd_latent_t *);
-typedef size_t (*fn_webp_encode_rgb)(const unsigned char *, int, int, int, float,
-                                     unsigned char **);
-typedef size_t (*fn_webp_encode_rgba)(const unsigned char *, int, int, int, float,
-                                      unsigned char **);
 
 static fn_ctx_params_init p_ctx_params_init;
 static fn_new_sd_ctx p_new_sd_ctx;
@@ -130,28 +220,8 @@ static fn_free_images p_free_images;
 static fn_latent_params_init p_latent_params_init;
 static fn_generate_image_with_latent p_generate_image_with_latent;
 static fn_free_latent p_free_latent;
-static fn_webp_encode_rgb p_webp_encode_rgb;
-static fn_webp_encode_rgba p_webp_encode_rgba; /* Qwen Image 2.1 decodes RGBA (layered/transparent output) */
 static bool g_webp_enabled = true;
 static float g_webp_quality = 85.0f;
-
-static void webp_lib_load(void) {
-    static const char *const candidates[] = {
-        "libwebp.so.7", "libwebp.so.6", "libwebp.so", NULL,
-    };
-    for (int i = 0; candidates[i]; ++i) {
-        void *lib = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
-        if (!lib) continue;
-        p_webp_encode_rgb = (fn_webp_encode_rgb)dlsym(lib, "WebPEncodeRGB");
-        p_webp_free = (fn_webp_free)dlsym(lib, "WebPFree");
-        p_webp_encode_rgba = (fn_webp_encode_rgba)dlsym(lib, "WebPEncodeRGBA");
-        p_webp_decode_rgb = (fn_webp_decode_rgb)dlsym(lib, "WebPDecodeRGB");
-        if (p_webp_encode_rgb && p_webp_free) return;
-        p_webp_encode_rgb = NULL;
-        p_webp_free = NULL;
-        dlclose(lib);
-    }
-}
 
 static bool sd_lib_load(void) {
     const char *path = getenv("OMNISERVE_NATIVE_SD_LIB");
@@ -180,6 +250,9 @@ static bool sd_lib_load(void) {
 
 static sd_ctx_t *g_sd;
 static pthread_mutex_t g_sd_lock = PTHREAD_MUTEX_INITIALIZER;
+/* g_sd_lock serializes generation and every cache insert/evict; g_cache_lock only
+ * guards lookups against those. A cache_entry pointer found under g_sd_lock stays
+ * valid for as long as g_sd_lock is held. */
 static pthread_mutex_t g_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_sd_name[256];
 static bool g_reference_edit;
@@ -189,7 +262,8 @@ bool osd_reference_edit_ready(void) { return g_sd && g_reference_edit; }
 typedef struct {
     char *prompt;
     char *negative_prompt;
-    char *image_base64;
+    uint64_t image_hash;
+    size_t image_len;
     float strength;
     int width;
     int height;
@@ -208,6 +282,7 @@ typedef struct {
 static latent_cache_entry *g_latent_cache;
 static int g_latent_cache_size;
 static unsigned long long g_latent_cache_tick;
+static size_t g_cache_bytes;
 
 static double now_ms(void) {
     struct timespec ts;
@@ -218,8 +293,13 @@ static double now_ms(void) {
 static bool sd_env_flag(const char *name, bool fallback) {
     const char *value = getenv(name);
     if (!value || !value[0]) return fallback;
-    return value[0] == '1' || value[0] == 't' || value[0] == 'T' ||
-           value[0] == 'y' || value[0] == 'Y';
+    static const char *const yes[] = {"1", "t", "true", "y", "yes", "on", NULL};
+    static const char *const no[] = {"0", "f", "false", "n", "no", "off", NULL};
+    for (int i = 0; yes[i]; ++i) if (strcasecmp(value, yes[i]) == 0) return true;
+    for (int i = 0; no[i]; ++i) if (strcasecmp(value, no[i]) == 0) return false;
+    fprintf(stderr, "sd: ignoring %s=%s (not a boolean), using %s\n", name, value,
+            fallback ? "true" : "false");
+    return fallback;
 }
 
 static int sd_env_int(const char *name, int fallback, int minimum, int maximum) {
@@ -227,7 +307,11 @@ static int sd_env_int(const char *name, int fallback, int minimum, int maximum) 
     if (!value || !value[0]) return fallback;
     char *end = NULL;
     long parsed = strtol(value, &end, 10);
-    if (!end || *end || parsed < minimum || parsed > maximum) return fallback;
+    if (!end || end == value || *end || parsed < minimum || parsed > maximum) {
+        fprintf(stderr, "sd: ignoring %s=%s (want integer %d..%d), using %d\n",
+                name, value, minimum, maximum, fallback);
+        return fallback;
+    }
     return (int)parsed;
 }
 
@@ -237,14 +321,77 @@ static float sd_env_float(const char *name, float fallback, float minimum, float
     char *end = NULL;
     float parsed = strtof(value, &end);
     if (!end || end == value || *end || !isfinite(parsed) ||
-        parsed < minimum || parsed > maximum) return fallback;
+        parsed < minimum || parsed > maximum) {
+        fprintf(stderr, "sd: ignoring %s=%s (want number %g..%g), using %g\n",
+                name, value, (double)minimum, (double)maximum, (double)fallback);
+        return fallback;
+    }
     return parsed;
+}
+
+/* Per-request tunables, parsed once in osd_init so the hot path never touches the
+ * environment and a bad value is reported once at startup. */
+static struct {
+    float zero_guidance;
+    int vae_tiling; /* -1: keep the library default */
+    int tile_x, tile_y;
+    float tile_overlap;
+    float flow_shift;
+    const char *cache_mode; /* NULL: off; otherwise a static string */
+    float easycache_threshold;
+    float cache_start, cache_end;
+    int taylor_derivatives, taylor_skip;
+    int spectrum_warmup;
+    float spectrum_stop, residual_diff;
+    int teleport_start; /* -1: steps - 1 */
+    size_t cache_bytes_max;
+} g_cfg;
+
+static void sd_cfg_load(void) {
+    g_cfg.zero_guidance = sd_env_float("OMNISERVE_NATIVE_SD_ZERO_GUIDANCE", 1.0f, 0.0f, 30.0f);
+    const char *tiling = getenv("OMNISERVE_NATIVE_SD_VAE_TILING");
+    g_cfg.vae_tiling = tiling && tiling[0] ? (int)sd_env_flag("OMNISERVE_NATIVE_SD_VAE_TILING", false) : -1;
+    g_cfg.tile_x = sd_env_int("OMNISERVE_NATIVE_SD_VAE_TILE_X", 32, 32, 4096);
+    g_cfg.tile_y = sd_env_int("OMNISERVE_NATIVE_SD_VAE_TILE_Y", 32, 32, 4096);
+    g_cfg.tile_overlap = sd_env_float("OMNISERVE_NATIVE_SD_VAE_TILE_OVERLAP", 0.5f, 0.0f, 0.95f);
+    g_cfg.flow_shift = sd_env_float("OMNISERVE_NATIVE_SD_FLOW_SHIFT", 3.0f, 0.1f, 20.0f);
+    g_cfg.easycache_threshold = sd_env_float("OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD", 0.0f, 0.0f, 1.0f);
+    g_cfg.cache_start = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_START", 0.15f, 0.0f, 1.0f);
+    g_cfg.cache_end = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_END", 0.95f, 0.0f, 1.0f);
+    g_cfg.taylor_derivatives = sd_env_int("OMNISERVE_NATIVE_SD_TAYLORSEER_DERIVATIVES", 1, 1, 4);
+    g_cfg.taylor_skip = sd_env_int("OMNISERVE_NATIVE_SD_TAYLORSEER_SKIP_INTERVAL", 2, 1, 8);
+    g_cfg.spectrum_warmup = sd_env_int("OMNISERVE_NATIVE_SD_SPECTRUM_WARMUP", 4, 1, 64);
+    g_cfg.spectrum_stop = sd_env_float("OMNISERVE_NATIVE_SD_SPECTRUM_STOP", 0.9f, 0.0f, 1.0f);
+    g_cfg.residual_diff = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_RESIDUAL_DIFF", 0.08f, 0.0f, 10.0f);
+    g_cfg.teleport_start = sd_env_int("OMNISERVE_NATIVE_SD_TELEPORT_START_STEP", -1, 1, 99);
+    g_cfg.cache_bytes_max = (size_t)sd_env_int("OMNISERVE_NATIVE_SD_CACHE_MAX_MB", 1024, 0, 1 << 20) << 20;
+    /* OMNISERVE_NATIVE_SD_CACHE_MODE selects the stable-diffusion.cpp denoiser
+     * cache: easycache | taylorseer | spectrum | cache-dit | dbcache | ucache.
+     * The legacy OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD alone still means easycache. */
+    static const char *const modes[] = {"easycache", "ucache", "taylorseer", "spectrum",
+                                        "cache-dit", "dbcache", NULL};
+    const char *mode = getenv("OMNISERVE_NATIVE_SD_CACHE_MODE");
+    g_cfg.cache_mode = NULL;
+    if ((!mode || !mode[0]) && g_cfg.easycache_threshold > 0.0f) mode = "easycache";
+    if (mode && mode[0] && strcmp(mode, "off") != 0 && strcmp(mode, "none") != 0) {
+        for (int i = 0; modes[i]; ++i) if (strcmp(mode, modes[i]) == 0) g_cfg.cache_mode = modes[i];
+        if (!g_cfg.cache_mode) fprintf(stderr, "sd: unknown OMNISERVE_NATIVE_SD_CACHE_MODE=%s, denoiser cache off\n", mode);
+    }
 }
 
 static bool latent_api_ready(void) {
     return p_latent_params_init && p_generate_image_with_latent && p_free_latent &&
            g_latent_cache && g_latent_cache_size > 0;
 }
+
+/* Everything in a request that selects a cache entry and is not a plain scalar.
+ * Built once per request: the LoRA key is a heap string and the image hash is
+ * O(image size) when it was not memoized by osd_prepare_image. */
+typedef struct {
+    char *lora;
+    uint64_t image_hash;
+    size_t image_len;
+} cache_key;
 
 static char *lora_cache_key(const oimg_req *req) {
     size_t needed = 1;
@@ -269,69 +416,95 @@ static char *lora_cache_key(const oimg_req *req) {
     return key;
 }
 
+static bool cache_key_make(const oimg_req *req, cache_key *key) {
+    key->lora = lora_cache_key(req);
+    if (req->image_hash_valid) {
+        key->image_len = req->image_len;
+        key->image_hash = req->image_hash;
+    } else {
+        key->image_len = req->image_base64 ? strlen(req->image_base64) : 0;
+        key->image_hash = key->image_len ? keyed_hash(req->image_base64, key->image_len) : 0;
+    }
+    return key->lora != NULL;
+}
+
+static void cache_key_free(cache_key *key) {
+    free(key->lora);
+    key->lora = NULL;
+}
+
 static bool cache_key_equal(const latent_cache_entry *entry, const oimg_req *req,
-                            int resume_step, const char *lora_key) {
+                            int resume_step, const cache_key *key) {
     const char *negative = req->negative_prompt ? req->negative_prompt : "";
     return entry->prompt && entry->width == req->width && entry->height == req->height &&
            entry->steps == req->steps && entry->guidance_scale == req->guidance_scale &&
            entry->seed == req->seed && entry->resume_step == resume_step &&
-           strcmp(entry->lora_key ? entry->lora_key : "", lora_key) == 0 &&
-           strcmp(entry->prompt, req->prompt) == 0 &&
-           strcmp(entry->negative_prompt, negative) == 0 &&
+           entry->image_len == key->image_len && entry->image_hash == key->image_hash &&
            entry->strength == req->strength &&
-           strcmp(entry->image_base64 ? entry->image_base64 : "",
-                  req->image_base64 ? req->image_base64 : "") == 0;
+           strcmp(entry->lora_key ? entry->lora_key : "", key->lora) == 0 &&
+           strcmp(entry->prompt, req->prompt) == 0 &&
+           strcmp(entry->negative_prompt, negative) == 0;
 }
 
-static latent_cache_entry *cache_find(const oimg_req *req, int resume_step) {
-    char *lora_key = lora_cache_key(req);
-    if (!lora_key) return NULL;
+static latent_cache_entry *cache_find(const oimg_req *req, int resume_step, const cache_key *key) {
     for (int i = 0; i < g_latent_cache_size; i++) {
-        if (cache_key_equal(&g_latent_cache[i], req, resume_step, lora_key)) {
+        if (cache_key_equal(&g_latent_cache[i], req, resume_step, key)) {
             g_latent_cache[i].tick = ++g_latent_cache_tick;
-            free(lora_key);
             return &g_latent_cache[i];
         }
     }
-    free(lora_key);
     return NULL;
 }
 
 static void cache_entry_clear(latent_cache_entry *entry) {
     if (entry->latent && p_free_latent) p_free_latent(entry->latent);
+    g_cache_bytes -= entry->encoded_image_len;
     free(entry->prompt);
     free(entry->negative_prompt);
-    free(entry->image_base64);
     free(entry->lora_key);
     free(entry->encoded_image);
     memset(entry, 0, sizeof *entry);
 }
 
-static bool cache_insert(const oimg_req *req, int resume_step, sd_latent_t *latent) {
+/* Callers hold g_sd_lock and g_cache_lock. An entry already holding this key is
+ * reused, so two identical concurrent requests do not occupy two slots. */
+static latent_cache_entry *cache_insert(const oimg_req *req, int resume_step,
+                                        const cache_key *key, sd_latent_t *latent) {
     latent_cache_entry *slot = NULL;
     for (int i = 0; i < g_latent_cache_size; i++) {
-        if (!g_latent_cache[i].prompt) {
+        if (cache_key_equal(&g_latent_cache[i], req, resume_step, key)) {
             slot = &g_latent_cache[i];
+            if (!latent) {
+                slot->tick = ++g_latent_cache_tick;
+                return slot;
+            }
             break;
         }
-        if (!slot || g_latent_cache[i].tick < slot->tick) slot = &g_latent_cache[i];
     }
-    if (!slot) return false;
+    if (!slot) {
+        for (int i = 0; i < g_latent_cache_size; i++) {
+            if (!g_latent_cache[i].prompt) {
+                slot = &g_latent_cache[i];
+                break;
+            }
+            if (!slot || g_latent_cache[i].tick < slot->tick) slot = &g_latent_cache[i];
+        }
+    }
+    if (!slot) return NULL;
     char *prompt = strdup(req->prompt);
     char *negative = strdup(req->negative_prompt ? req->negative_prompt : "");
-    char *lora_key = lora_cache_key(req);
-    char *image_base64 = req->image_base64 ? strdup(req->image_base64) : NULL;
-    if (!prompt || !negative || !lora_key || (req->image_base64 && !image_base64)) {
+    char *lora_key = strdup(key->lora);
+    if (!prompt || !negative || !lora_key) {
         free(prompt);
         free(negative);
         free(lora_key);
-        free(image_base64);
-        return false;
+        return NULL;
     }
     cache_entry_clear(slot);
     slot->prompt = prompt;
     slot->negative_prompt = negative;
-    slot->image_base64 = image_base64;
+    slot->image_hash = key->image_hash;
+    slot->image_len = key->image_len;
     slot->strength = req->strength;
     slot->width = req->width;
     slot->height = req->height;
@@ -342,7 +515,7 @@ static bool cache_insert(const oimg_req *req, int resume_step, sd_latent_t *late
     slot->lora_key = lora_key;
     slot->latent = latent;
     slot->tick = ++g_latent_cache_tick;
-    return true;
+    return slot;
 }
 
 static bool cache_copy_encoded_result(const latent_cache_entry *entry, oimg_result *out) {
@@ -373,33 +546,57 @@ bool osd_try_cached_result(const oimg_req *req, oimg_result *out) {
     if (!g_sd || !req->cache || req->teleport || req->seed < 0 || req->batch_count > 1) return false;
     memset(out, 0, sizeof *out);
     double started = now_ms();
+    cache_key key;
+    if (!cache_key_make(req, &key)) return false;
     pthread_mutex_lock(&g_cache_lock);
-    latent_cache_entry *entry = cache_find(req, 0);
+    latent_cache_entry *entry = cache_find(req, 0, &key);
     bool found = entry && cache_copy_encoded_result(entry, out);
     pthread_mutex_unlock(&g_cache_lock);
+    cache_key_free(&key);
     if (found) {
         out->cache_requested = out->cache_hit = true;
-        out->denoiser_cache_threshold = sd_env_float(
-            "OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD", 0.0f, 0.0f, 1.0f);
+        out->denoiser_cache_threshold = g_cfg.easycache_threshold;
         out->elapsed_ms = now_ms() - started;
     }
     return found;
 }
 
+/* Callers hold g_sd_lock. Evicts least recently used encoded images, never
+ * `keep`, until the new image fits the byte budget. */
 static void cache_store_encoded_result(latent_cache_entry *entry, const oimg_result *out) {
     if (!entry || out->image_count != 1 || !out->images || !out->image_lens ||
-        !out->images[0] || !out->image_lens[0] || out->image_lens[0] > (64u << 20)) return;
-    unsigned char *copy = malloc(out->image_lens[0]);
+        !out->images[0] || !out->image_lens[0] || out->image_lens[0] > (64u << 20) ||
+        out->image_lens[0] > g_cfg.cache_bytes_max) return;
+    size_t len = out->image_lens[0];
+    unsigned char *copy = malloc(len);
     if (!copy) return;
-    memcpy(copy, out->images[0], out->image_lens[0]);
+    memcpy(copy, out->images[0], len);
+    pthread_mutex_lock(&g_cache_lock);
+    g_cache_bytes -= entry->encoded_image_len;
     free(entry->encoded_image);
+    entry->encoded_image = NULL;
+    entry->encoded_image_len = 0;
+    while (g_cache_bytes + len > g_cfg.cache_bytes_max) {
+        latent_cache_entry *victim = NULL;
+        for (int i = 0; i < g_latent_cache_size; i++) {
+            latent_cache_entry *e = &g_latent_cache[i];
+            if (e == entry || !e->encoded_image) continue;
+            if (!victim || e->tick < victim->tick) victim = e;
+        }
+        if (!victim) break;
+        cache_entry_clear(victim);
+    }
     entry->encoded_image = copy;
-    entry->encoded_image_len = out->image_lens[0];
+    entry->encoded_image_len = len;
+    g_cache_bytes += len;
     entry->encoded_image_is_webp = out->format && strcmp(out->format, "webp") == 0;
+    pthread_mutex_unlock(&g_cache_lock);
 }
 
 bool osd_init(const char *model_path) {
+    if (g_sd) return true;
     if (!sd_lib_load()) return false;
+    sd_cfg_load();
     sd_ctx_params_t params;
     p_ctx_params_init(&params);
     const char *diffusion = getenv("OMNISERVE_NATIVE_SD_DIFFUSION_MODEL");
@@ -437,6 +634,7 @@ bool osd_init(const char *model_path) {
     if (!g_sd) return false;
     g_reference_edit = sd_env_flag("OMNISERVE_NATIVE_SD_REFERENCE_EDIT", false);
     const char *named_path = diffusion && diffusion[0] ? diffusion : model_path;
+    if (!named_path) named_path = "";
     const char *slash = strrchr(named_path, '/');
     snprintf(g_sd_name, sizeof g_sd_name, "%s", slash ? slash + 1 : named_path);
     char *dot = strrchr(g_sd_name, '.');
@@ -509,17 +707,13 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
      * zero guidance maps there unless OMNISERVE_NATIVE_SD_ZERO_GUIDANCE
      * overrides it. */
     params.sample_params.guidance.txt_cfg = req->guidance_scale == 0.0f
-        ? sd_env_float("OMNISERVE_NATIVE_SD_ZERO_GUIDANCE", 1.0f, 0.0f, 30.0f)
+        ? g_cfg.zero_guidance
         : req->guidance_scale;
-    params.vae_tiling_params.enabled = sd_env_flag(
-        "OMNISERVE_NATIVE_SD_VAE_TILING", params.vae_tiling_params.enabled);
+    if (g_cfg.vae_tiling >= 0) params.vae_tiling_params.enabled = g_cfg.vae_tiling;
     if (params.vae_tiling_params.enabled) {
-        params.vae_tiling_params.tile_size_x = sd_env_int(
-            "OMNISERVE_NATIVE_SD_VAE_TILE_X", 32, 32, 4096);
-        params.vae_tiling_params.tile_size_y = sd_env_int(
-            "OMNISERVE_NATIVE_SD_VAE_TILE_Y", 32, 32, 4096);
-        params.vae_tiling_params.target_overlap = sd_env_float(
-            "OMNISERVE_NATIVE_SD_VAE_TILE_OVERLAP", 0.5f, 0.0f, 0.95f);
+        params.vae_tiling_params.tile_size_x = g_cfg.tile_x;
+        params.vae_tiling_params.tile_size_y = g_cfg.tile_y;
+        params.vae_tiling_params.target_overlap = g_cfg.tile_overlap;
     }
     params.seed = req->seed;
     sd_image_t source_image = {0};
@@ -532,8 +726,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         if (g_reference_edit) {
             params.ref_images = &source_image;
             params.ref_images_count = 1;
-            params.sample_params.flow_shift = sd_env_float(
-                "OMNISERVE_NATIVE_SD_FLOW_SHIFT", 3.0f, 0.1f, 20.0f);
+            params.sample_params.flow_shift = g_cfg.flow_shift;
         } else {
             params.init_image = source_image;
             params.strength = req->strength;
@@ -556,73 +749,69 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     out->cache_requested = req->cache;
     /* Static per-process setting: result-cache entries never cross profiles.
      * Latent replay requires a dense trajectory, so it cannot use EasyCache. */
-    if (!req->teleport) {
-        /* OMNISERVE_NATIVE_SD_CACHE_MODE selects the stable-diffusion.cpp denoiser
-         * cache: easycache | taylorseer | spectrum | cache-dit | dbcache | ucache.
-         * The legacy OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD alone still means easycache. */
-        const char *mode = getenv("OMNISERVE_NATIVE_SD_CACHE_MODE");
-        float threshold = sd_env_float("OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD", 0.0f, 0.0f, 1.0f);
-        if ((!mode || !mode[0]) && threshold > 0.0f) mode = "easycache";
-        if (mode && mode[0] && strcmp(mode, "off") != 0 && strcmp(mode, "none") != 0) {
-            params.cache.start_percent = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_START", 0.15f, 0.0f, 1.0f);
-            params.cache.end_percent = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_END", 0.95f, 0.0f, 1.0f);
-            if (strcmp(mode, "easycache") == 0 || strcmp(mode, "ucache") == 0) {
-                params.cache.mode = strcmp(mode, "ucache") == 0 ? SD_CACHE_UCACHE : SD_CACHE_EASYCACHE;
-                params.cache.reuse_threshold = threshold > 0.0f ? threshold : 0.2f;
-                out->denoiser_cache_threshold = params.cache.reuse_threshold;
-            } else if (strcmp(mode, "taylorseer") == 0) {
-                params.cache.mode = SD_CACHE_TAYLORSEER;
-                params.cache.taylorseer_n_derivatives = sd_env_int("OMNISERVE_NATIVE_SD_TAYLORSEER_DERIVATIVES", 1, 1, 4);
-                params.cache.taylorseer_skip_interval = sd_env_int("OMNISERVE_NATIVE_SD_TAYLORSEER_SKIP_INTERVAL", 2, 1, 8);
-                out->denoiser_cache_threshold = (float)params.cache.taylorseer_skip_interval;
-            } else if (strcmp(mode, "spectrum") == 0) {
-                params.cache.mode = SD_CACHE_SPECTRUM;
-                params.cache.spectrum_warmup_steps = sd_env_int("OMNISERVE_NATIVE_SD_SPECTRUM_WARMUP", 4, 1, 64);
-                params.cache.spectrum_stop_percent = sd_env_float("OMNISERVE_NATIVE_SD_SPECTRUM_STOP", 0.9f, 0.0f, 1.0f);
-                out->denoiser_cache_threshold = params.cache.spectrum_stop_percent;
-            } else if (strcmp(mode, "cache-dit") == 0 || strcmp(mode, "dbcache") == 0) {
-                params.cache.mode = strcmp(mode, "dbcache") == 0 ? SD_CACHE_DBCACHE : SD_CACHE_CACHE_DIT;
-                params.cache.residual_diff_threshold = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_RESIDUAL_DIFF", 0.08f, 0.0f, 10.0f);
-                out->denoiser_cache_threshold = params.cache.residual_diff_threshold;
-            } else {
-                mode = NULL;
-            }
-            out->denoiser_cache_mode = mode;
+    if (!req->teleport && g_cfg.cache_mode) {
+        const char *mode = g_cfg.cache_mode;
+        params.cache.start_percent = g_cfg.cache_start;
+        params.cache.end_percent = g_cfg.cache_end;
+        if (strcmp(mode, "easycache") == 0 || strcmp(mode, "ucache") == 0) {
+            params.cache.mode = strcmp(mode, "ucache") == 0 ? SD_CACHE_UCACHE : SD_CACHE_EASYCACHE;
+            params.cache.reuse_threshold = g_cfg.easycache_threshold > 0.0f ? g_cfg.easycache_threshold : 0.2f;
+            out->denoiser_cache_threshold = params.cache.reuse_threshold;
+        } else if (strcmp(mode, "taylorseer") == 0) {
+            params.cache.mode = SD_CACHE_TAYLORSEER;
+            params.cache.taylorseer_n_derivatives = g_cfg.taylor_derivatives;
+            params.cache.taylorseer_skip_interval = g_cfg.taylor_skip;
+            out->denoiser_cache_threshold = (float)params.cache.taylorseer_skip_interval;
+        } else if (strcmp(mode, "spectrum") == 0) {
+            params.cache.mode = SD_CACHE_SPECTRUM;
+            params.cache.spectrum_warmup_steps = g_cfg.spectrum_warmup;
+            params.cache.spectrum_stop_percent = g_cfg.spectrum_stop;
+            out->denoiser_cache_threshold = params.cache.spectrum_stop_percent;
+        } else {
+            params.cache.mode = strcmp(mode, "dbcache") == 0 ? SD_CACHE_DBCACHE : SD_CACHE_CACHE_DIT;
+            params.cache.residual_diff_threshold = g_cfg.residual_diff;
+            out->denoiser_cache_threshold = params.cache.residual_diff_threshold;
         }
+        out->denoiser_cache_mode = mode;
     }
     out->teleport_capture_step = -1;
     out->teleport_resume_step = 0;
 
+    bool result_cache = req->cache && !req->teleport && req->seed >= 0 && params.batch_count == 1;
+    bool teleport_cache = req->teleport && !req->image_pixels && params.batch_count == 1 &&
+                          req->steps > 1 && latent_api_ready();
+    cache_key key = {0};
+    if ((result_cache || teleport_cache) && !cache_key_make(req, &key)) {
+        result_cache = teleport_cache = false;
+    }
     pthread_mutex_lock(&g_sd_lock);
     double started = now_ms();
     sd_image_t *images = NULL;
     int image_count = 0;
     int cache_resume_step = 0;
     bool ok = false;
-    bool result_cache = req->cache && !req->teleport && req->seed >= 0 && params.batch_count == 1;
     if (result_cache) {
         pthread_mutex_lock(&g_cache_lock);
-        latent_cache_entry *cached = cache_find(req, 0);
+        latent_cache_entry *cached = cache_find(req, 0, &key);
         bool hit = cached && cache_copy_encoded_result(cached, out);
         pthread_mutex_unlock(&g_cache_lock);
         if (hit) {
             out->cache_hit = true;
             out->elapsed_ms = now_ms() - started;
             pthread_mutex_unlock(&g_sd_lock);
+            cache_key_free(&key);
             free(loras);
             return true;
         }
     }
-    if (req->teleport && !req->image_pixels && params.batch_count == 1 &&
-        req->steps > 1 && latent_api_ready()) {
-        int default_resume = sd_env_int(
-            "OMNISERVE_NATIVE_SD_TELEPORT_START_STEP", req->steps - 1, 1, 99);
+    if (teleport_cache) {
+        int default_resume = g_cfg.teleport_start > 0 ? g_cfg.teleport_start : req->steps - 1;
         int resume_step = req->teleport_start_step > 0
             ? req->teleport_start_step : default_resume;
         if (resume_step >= req->steps) resume_step = req->steps - 1;
         cache_resume_step = resume_step;
         pthread_mutex_lock(&g_cache_lock);
-        latent_cache_entry *cached = cache_find(req, resume_step);
+        latent_cache_entry *cached = cache_find(req, resume_step, &key);
         bool hit = cached && cache_copy_encoded_result(cached, out);
         pthread_mutex_unlock(&g_cache_lock);
         if (hit) {
@@ -633,6 +822,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
             out->teleport_resume_step = resume_step;
             out->elapsed_ms = now_ms() - started;
             pthread_mutex_unlock(&g_sd_lock);
+            cache_key_free(&key);
             free(loras);
             return true;
         }
@@ -653,7 +843,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
             out->teleport_resume_step = replay.resume_step;
             if (captured) {
                 pthread_mutex_lock(&g_cache_lock);
-                bool inserted = cache_insert(req, resume_step, captured);
+                bool inserted = cache_insert(req, resume_step, &key, captured) != NULL;
                 pthread_mutex_unlock(&g_cache_lock);
                 if (!inserted) {
                     fprintf(stderr, "diffusion teleport latent cache insert failed\n");
@@ -683,6 +873,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
 
     if (!ok || image_count <= 0 || !images) {
         if (images) p_free_images(images, image_count);
+        cache_key_free(&key);
         return false;
     }
     out->images = calloc((size_t)image_count, sizeof *out->images);
@@ -693,6 +884,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         free(out->image_lens);
         out->images = NULL;
         out->image_lens = NULL;
+        cache_key_free(&key);
         return false;
     }
     bool use_webp = g_webp_enabled && p_webp_encode_rgb && p_webp_free;
@@ -726,6 +918,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
                 p_free_images(images, image_count);
                 out->image_count = (size_t)i;
                 osd_result_free(out);
+                cache_key_free(&key);
                 return false;
             }
             out->images[i] = sink.data;
@@ -740,18 +933,20 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     if (result_cache) {
         pthread_mutex_lock(&g_sd_lock);
         pthread_mutex_lock(&g_cache_lock);
-        if (cache_insert(req, 0, NULL)) cache_store_encoded_result(cache_find(req, 0), out);
+        latent_cache_entry *entry = cache_insert(req, 0, &key, NULL);
         pthread_mutex_unlock(&g_cache_lock);
+        if (entry) cache_store_encoded_result(entry, out);
         pthread_mutex_unlock(&g_sd_lock);
     }
     if (out->teleport_used && cache_resume_step > 0 && out->image_count == 1) {
         pthread_mutex_lock(&g_sd_lock);
         pthread_mutex_lock(&g_cache_lock);
-        latent_cache_entry *entry = cache_find(req, cache_resume_step);
-        if (entry) cache_store_encoded_result(entry, out);
+        latent_cache_entry *entry = cache_find(req, cache_resume_step, &key);
         pthread_mutex_unlock(&g_cache_lock);
+        if (entry) cache_store_encoded_result(entry, out);
         pthread_mutex_unlock(&g_sd_lock);
     }
+    cache_key_free(&key);
     return true;
 }
 
