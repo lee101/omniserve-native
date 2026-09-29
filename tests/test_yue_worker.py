@@ -137,6 +137,7 @@ class YueTests(unittest.TestCase):
             with patch.dict(os.environ, {"YUE_WORKER_SECRET": "test-key"}), patch.object(worker, "generate", return_value=self.output) as generate:
                 url = f"http://127.0.0.1:{server.server_port}/v1/music/generations"
                 for token, payload, expected in (("wrong", self.request, 401),
+                                                 ("caf\xe9", self.request, 401),
                                                  ("test-key", {}, 400),
                                                  ("test-key", self.request, 200)):
                     request = urllib.request.Request(url, data=json.dumps(payload).encode(),

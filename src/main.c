@@ -200,6 +200,14 @@ static int resolve_llm_ngl(const char *model_path, const char *value, int fallba
     return fits ? 999 : 0;
 }
 
+static bool ct_eq(const void *a, const void *b, size_t n) {
+    const volatile unsigned char *x = a;
+    const volatile unsigned char *y = b;
+    unsigned char d = 0;
+    for (size_t i = 0; i < n; i++) d |= (unsigned char)(x[i] ^ y[i]);
+    return d == 0;
+}
+
 static bool query_secret_matches(const ohttp_request *req, const char *secret, size_t secret_len) {
     const char *p = req->query;
     const char *end = p ? p + req->query_len : NULL;
@@ -209,7 +217,7 @@ static bool query_secret_matches(const ohttp_request *req, const char *secret, s
         const char *eq = memchr(p, '=', (size_t)(field_end - p));
         if (eq && (size_t)(eq - p) == 6 && memcmp(p, "secret", 6) == 0 &&
             (size_t)(field_end - eq - 1) == secret_len &&
-            memcmp(eq + 1, secret, secret_len) == 0) {
+            ct_eq(eq + 1, secret, secret_len)) {
             return true;
         }
         p = amp ? amp + 1 : end;
@@ -259,14 +267,14 @@ static void key_tiers_load(void) {
 static bool credential_matches(const ohttp_request *req, const char *key, size_t klen) {
     size_t len = 0;
     const char *v = ohttp_req_header(req, "secret", &len);
-    if (v && len == klen && memcmp(v, key, klen) == 0) return true;
+    if (v && len == klen && ct_eq(v, key, klen)) return true;
     v = ohttp_req_header(req, "Authorization", &len);
     if (v && len > 7 && strncasecmp(v, "Bearer ", 7) == 0 &&
-        len - 7 == klen && memcmp(v + 7, key, klen) == 0) return true;
+        len - 7 == klen && ct_eq(v + 7, key, klen)) return true;
     v = ohttp_req_header(req, "X-API-Key", &len);
-    if (v && len == klen && memcmp(v, key, klen) == 0) return true;
+    if (v && len == klen && ct_eq(v, key, klen)) return true;
     v = ohttp_req_header(req, "X-Rapid-API-Key", &len);
-    if (v && len == klen && memcmp(v, key, klen) == 0) return true;
+    if (v && len == klen && ct_eq(v, key, klen)) return true;
     return query_secret_matches(req, key, klen);
 }
 
@@ -285,14 +293,14 @@ static bool authorized(const app_state *app, const ohttp_request *req) {
     size_t len = 0;
     const char *v = ohttp_req_header(req, "secret", &len);
     size_t slen = strlen(app->secret);
-    if (v && len == slen && memcmp(v, app->secret, slen) == 0) return true;
+    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
     v = ohttp_req_header(req, "Authorization", &len);
     if (v && len > 7 && strncasecmp(v, "Bearer ", 7) == 0 &&
-        len - 7 == slen && memcmp(v + 7, app->secret, slen) == 0) return true;
+        len - 7 == slen && ct_eq(v + 7, app->secret, slen)) return true;
     v = ohttp_req_header(req, "X-API-Key", &len);
-    if (v && len == slen && memcmp(v, app->secret, slen) == 0) return true;
+    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
     v = ohttp_req_header(req, "X-Rapid-API-Key", &len);
-    if (v && len == slen && memcmp(v, app->secret, slen) == 0) return true;
+    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
     if (query_secret_matches(req, app->secret, slen)) return true;
     return false;
 }
