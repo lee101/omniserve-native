@@ -776,6 +776,14 @@ static void test_proxy_breaker(void) {
     oproxy_stats st;
     oproxy_target_snapshot(t, &st);
     CHECK(st.open_ms_left > 40 && st.breaker_opens == 1 && st.breaker_rejects >= 2);
+    for (int i = 0; i < 3; i++) oproxy_target_record(t, false);
+    oproxy_target_snapshot(t, &st);
+    CHECK(st.open_ms_left <= 80);
+    usleep(90 * 1000);
+    CHECK(oproxy_target_allow(t));
+    oproxy_target_record(t, false);
+    oproxy_target_snapshot(t, &st);
+    CHECK(st.open_ms_left > 80);
     oproxy_target_record(t, true);
     CHECK(oproxy_target_open_ms(t) == 0);
     CHECK(oproxy_target_allow(t));

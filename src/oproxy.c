@@ -80,6 +80,7 @@ struct oproxy_target {
     atomic_uint consecutive_failures;
     atomic_llong open_until_ms;
     atomic_int cooldown_ms;
+    atomic_bool probing;
     atomic_ullong breaker_opens;
     atomic_ullong breaker_rejects;
     unsigned failure_limit;
@@ -162,8 +163,10 @@ bool oproxy_target_allow(oproxy_target *target) {
      * wedge the target shut and concurrent callers do not stampede it. */
     if (now >= until &&
         atomic_compare_exchange_strong(&target->open_until_ms, &until,
-                                       now + atomic_load(&target->cooldown_ms)))
+                                       now + atomic_load(&target->cooldown_ms))) {
+        atomic_store(&target->probing, true);
         return true;
+    }
     atomic_fetch_add_explicit(&target->breaker_rejects, 1, memory_order_relaxed);
     return false;
 }
@@ -173,6 +176,7 @@ void oproxy_target_record(oproxy_target *target, bool ok) {
     if (ok) {
         atomic_store(&target->consecutive_failures, 0);
         atomic_store(&target->open_until_ms, 0);
+        atomic_store(&target->probing, false);
         atomic_store(&target->cooldown_ms, target->base_cooldown_ms);
         return;
     }
@@ -181,8 +185,10 @@ void oproxy_target_record(oproxy_target *target, bool ok) {
     if (target->failure_limit == 0 || n < target->failure_limit) return;
     long long now = monotonic_ms();
     bool was_open = atomic_load(&target->open_until_ms) != 0;
+    bool probe_failed = atomic_exchange(&target->probing, false);
     int cooldown = atomic_load(&target->cooldown_ms);
-    if (was_open) {
+    if (was_open && !probe_failed) return;
+    if (probe_failed) {
         long long next = (long long)cooldown * 2;
         cooldown = next > target->max_cooldown_ms ? target->max_cooldown_ms : (int)next;
         atomic_store(&target->cooldown_ms, cooldown);
