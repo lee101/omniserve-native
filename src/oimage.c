@@ -109,7 +109,15 @@ static bool resolve_cached_lora_file(const char *directory, const char *filename
 }
 
 static char *default_lora_registry_path(const char *directory) {
-    const char *slash = strrchr(directory, '/');
+    size_t directory_len = strlen(directory);
+    while (directory_len > 1 && directory[directory_len - 1] == '/') directory_len--;
+    const char *slash = NULL;
+    for (size_t i = directory_len; i-- > 0;) {
+        if (directory[i] == '/') {
+            slash = directory + i;
+            break;
+        }
+    }
     if (!slash || slash == directory) return NULL;
     size_t parent_len = (size_t)(slash - directory);
     const char suffix[] = "/lora_registry.json";
@@ -163,7 +171,8 @@ static char *registry_lora_filename(const char *directory, const char *id) {
     free(fallback);
     if (!json) return NULL;
 
-    int token_cap = 65536;
+    /* A token needs at least one byte of JSON, so json_len bounds the token count. */
+    int token_cap = json_len + 2 < 65536 ? (int)json_len + 2 : 65536;
     oj_tok *tokens = calloc((size_t)token_cap, sizeof *tokens);
     if (!tokens) {
         free(json);
@@ -333,7 +342,7 @@ static bool token_int64(const char *json, const oj_tok *token, int64_t *value) {
     char *end = NULL;
     errno = 0;
     long long parsed = strtoll(bounded, &end, 10);
-    if (errno || end != bounded + len || parsed < INT64_MIN || parsed > INT64_MAX) return false;
+    if (errno || end != bounded + len) return false;
     *value = (int64_t)parsed;
     return true;
 }
@@ -719,7 +728,14 @@ bool oimage_openai_response(const oimg_result *result, const char *model, long l
         if (!image || !image_len || !encoded_len || encoded_total > SIZE_MAX - encoded_len) return false;
         encoded_total += encoded_len;
     }
-    const char *safe_model = model && model[0] ? model : "diffusion";
+    char safe_model[128];
+    const char *model_name = model && model[0] ? model : "diffusion";
+    size_t model_len = 0;
+    for (; *model_name && model_len + 1 < sizeof safe_model; ++model_name) {
+        unsigned char c = (unsigned char)*model_name;
+        safe_model[model_len++] = c < 32 || c == '"' || c == '\\' || c >= 127 ? '_' : (char)c;
+    }
+    safe_model[model_len] = 0;
     const char *format = result->format ? result->format : "png";
     if (encoded_total > SIZE_MAX - 4096 - count * 384) return false;
     size_t capacity = encoded_total + 4096 + count * 384;
@@ -738,6 +754,7 @@ bool oimage_openai_response(const oimg_result *result, const char *model, long l
             "%s{\"b64_json\":\"", i ? "," : "");
         if (wrote < 0 || (size_t)wrote >= capacity - used) { free(json); return false; }
         used += (size_t)wrote;
+        if (encoded_len >= capacity - used) { free(json); return false; }
         base64_encode(image, image_len, json + used);
         used += encoded_len;
         wrote = snprintf(json + used, capacity - used,
