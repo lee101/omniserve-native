@@ -2493,9 +2493,7 @@ static bool llm_admin_load(const llm_admin_config *config) {
         return false;
     }
     const char *ngl = config->ngl[0] ? config->ngl : "auto";
-    if (setenv("OMNISERVE_NATIVE_TENSOR_OVERRIDE", config->tensor_override, 1) != 0) return false;
-    if (setenv("OMNISERVE_NATIVE_MOE_CPU_EXPERTS", config->moe_cpu_experts, 1) != 0) return false;
-    if (setenv("OMNISERVE_NATIVE_SPEC_MTP_GGUF", mtp_resolved, 1) != 0) return false;
+    ollm_set_load_overrides(config->tensor_override, config->moe_cpu_experts, mtp_resolved);
     int ctx = config->ctx > 0 ? config->ctx : 8192;
     int layers = resolve_llm_ngl(resolved, ngl, 999, ctx, contexts);
     fprintf(stderr, "admin LLM load: path=%s ngl=%s ctx=%d contexts=%d tensor_override=%s moe_cpu_experts=%s spec_mtp=%s\n",

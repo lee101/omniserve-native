@@ -129,6 +129,8 @@ bool ollm_moe_last_active(void);
 unsigned long long ollm_moe_last_free_bytes(void);
 unsigned long long ollm_moe_last_est_bytes(void);
 
+void ollm_set_load_overrides(const char *tensor_override, const char *moe_cpu_experts,
+                             const char *spec_mtp_gguf);
 bool ollm_init(const char *model_path, int n_gpu_layers, int ctx_len, int parallel_contexts);
 bool ollm_ready(void);
 void ollm_placement_snapshot(ollm_placement *out);
