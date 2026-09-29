@@ -753,13 +753,17 @@ static bool collect_relay(const void *data, size_t len, void *user) {
     return true;
 }
 
+static int g_port_a = 18791;
+
 static void test_proxy_relay(void) {
+    char url_a_slash[64];
+    snprintf(url_a_slash, sizeof url_a_slash, "http://127.0.0.1:%d/", g_port_a);
     relay_sink sink = {0};
     oproxy_result result;
     char error[256];
     const char *body = "{\"proxied\":true}";
     bool ok = oproxy_relay(
-        "http://127.0.0.1:18791/",
+        url_a_slash,
         "POST", 4,
         "/echo", 5,
         "source=test", 11,
@@ -859,43 +863,46 @@ static void test_proxy_service_credentials(void) {
 
 static void test_http_server(void) {
     char target_error[256];
+    char url_a[64], url_b[64];
+    snprintf(url_a, sizeof url_a, "http://127.0.0.1:%d", g_port_a);
+    snprintf(url_b, sizeof url_b, "http://127.0.0.1:%d", g_port_a + 1);
     echo_context context = {
-        .target = oproxy_target_create("http://127.0.0.1:18791", 4,
+        .target = oproxy_target_create(url_a, 4,
                                        target_error, sizeof target_error),
-        .bare_target = oproxy_target_create("http://127.0.0.1:18792", 1,
+        .bare_target = oproxy_target_create(url_b, 1,
                                             target_error, sizeof target_error),
     };
     CHECK(context.target != NULL);
     CHECK(context.bare_target != NULL);
-    ohttp_config cfg = { .port = 18791, .reactor_threads = 1, .worker_threads = 4,
+    ohttp_config cfg = { .port = g_port_a, .reactor_threads = 1, .worker_threads = 4,
                          .handler = echo_handler, .user = &context };
     ohttp_server *srv = ohttp_start(&cfg);
     CHECK(srv != NULL);
     usleep(100000);
 
-    char *r = http_roundtrip(18791, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"a\":\"b\\n\"}", NULL);
+    char *r = http_roundtrip(g_port_a, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"a\":\"b\\n\"}", NULL);
     CHECK(r && strstr(r, "200 OK") && strstr(r, "{\"a\":\"b\\n\"}"));
     CHECK(r && strstr(r, "Access-Control-Allow-Origin: *"));
     free(r);
 
-    r = http_roundtrip(18791, "GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
+    r = http_roundtrip(g_port_a, "GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
     CHECK(r && strstr(r, "Transfer-Encoding: chunked") && strstr(r, "one") && strstr(r, "two"));
     free(r);
 
-    r = http_roundtrip(18791, "GET /hdr HTTP/1.1\r\nHost: x\r\nX-Test: abc\r\nConnection: close\r\n\r\n", NULL);
+    r = http_roundtrip(g_port_a, "GET /hdr HTTP/1.1\r\nHost: x\r\nX-Test: abc\r\nConnection: close\r\n\r\n", NULL);
     CHECK(r && strstr(r, "header-ok"));
     free(r);
 
-    r = http_roundtrip(18791, "GET /missing HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
+    r = http_roundtrip(g_port_a, "GET /missing HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
     CHECK(r && strstr(r, "404"));
     free(r);
 
-    r = http_roundtrip(18791, "POST /relay?source=gateway HTTP/1.1\r\nHost: x\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"relay\":true}", NULL);
+    r = http_roundtrip(g_port_a, "POST /relay?source=gateway HTTP/1.1\r\nHost: x\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"relay\":true}", NULL);
     CHECK(r && strstr(r, "HTTP/1.1 200 OK") && strstr(r, "{\"relay\":true}"));
     free(r);
 
     raw_http_context raw_context = {
-        .port = 18792,
+        .port = g_port_a + 1,
         .response = "HTTP/1.1 401 Unauthorized\r\n"
                     "Content-Type: application/json\r\n"
                     "Content-Length: 20\r\n"
@@ -906,7 +913,7 @@ static void test_http_server(void) {
     pthread_create(&raw_thread, NULL, raw_http_server, &raw_context);
     while (!atomic_load(&raw_context.ready)) usleep(1000);
     CHECK(!atomic_load(&raw_context.failed));
-    r = http_roundtrip(18791, "POST /relay-bare HTTP/1.1\r\nHost: x\r\nOrigin: https://text-generator.io\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}", NULL);
+    r = http_roundtrip(g_port_a, "POST /relay-bare HTTP/1.1\r\nHost: x\r\nOrigin: https://text-generator.io\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}", NULL);
     pthread_join(raw_thread, NULL);
     CHECK(r && strstr(r, "HTTP/1.1 401 Unauthorized"));
     CHECK(r && strstr(r, "Access-Control-Allow-Origin: *"));
@@ -914,7 +921,7 @@ static void test_http_server(void) {
     CHECK(r && strstr(r, "{\"detail\":\"invalid\"}"));
     free(r);
 
-    r = http_roundtrip(18791, "GET /relay-stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
+    r = http_roundtrip(g_port_a, "GET /relay-stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
     CHECK(r && strstr(r, "Transfer-Encoding: chunked") && strstr(r, "one") && strstr(r, "two"));
     free(r);
 
@@ -927,7 +934,7 @@ static void test_http_server(void) {
     test_proxy_relay();
     test_proxy_breaker();
 
-    int fd = connect_local(18791);
+    int fd = connect_local(g_port_a);
     CHECK(fd >= 0);
     const char *req1 = "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi";
     CHECK(test_write_all(fd, req1, strlen(req1)));
@@ -941,7 +948,7 @@ static void test_http_server(void) {
     CHECK(n > 0);
     close(fd);
 
-    fd = connect_local(18791);
+    fd = connect_local(g_port_a);
     CHECK(fd >= 0);
     const char *close_req =
         "GET /close HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -959,12 +966,12 @@ static void test_http_server(void) {
     const char *pipelined =
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\none"
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntwo";
-    r = http_roundtrip(18791, pipelined, NULL);
+    r = http_roundtrip(g_port_a, pipelined, NULL);
     CHECK(r && count_text(r, "HTTP/1.1 200 OK") == 2);
     CHECK(r && strstr(r, "one") && strstr(r, "two"));
     free(r);
 
-    fd = connect_local(18791);
+    fd = connect_local(g_port_a);
     CHECK(fd >= 0);
     const char *expect_headers =
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n"
@@ -986,7 +993,7 @@ static void test_http_server(void) {
     close(fd);
 
     r = http_roundtrip(
-        18791,
+        g_port_a,
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n"
         "Content-Length: 2\r\nConnection: close\r\n\r\nx",
         NULL);
@@ -994,7 +1001,7 @@ static void test_http_server(void) {
     free(r);
 
     r = http_roundtrip(
-        18791,
+        g_port_a,
         "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
         "Connection: close\r\n\r\n1\r\nx\r\n0\r\n\r\n",
         NULL);
@@ -2137,6 +2144,8 @@ static void test_tensor_overrides(void) {
 }
 
 int main(void) {
+    const char *port_env = getenv("ONATIVE_TEST_PORT");
+    if (port_env && atoi(port_env) > 1024 && atoi(port_env) < 65000) g_port_a = atoi(port_env);
     test_tensor_overrides();
     test_sched_try_acquire();
     test_spec_draft();
