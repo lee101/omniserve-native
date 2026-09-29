@@ -1,0 +1,39 @@
+{
+  "comparisons": [
+    {
+      "bytes": 929457,
+      "candidate": "../app-site/public/static/cogs/h3/accel-sweep/sol-balanced.webm",
+      "decoded_audio_exact": null,
+      "decoded_audio_sha256": null,
+      "decoded_video_exact": false,
+      "decoded_video_sha256": "728ac7faeb937a5c22f05aeaa2700372e9e0e91d314d65ba1e8775af5a39ecab",
+      "file_sha256": "43d1a529a55bb592deb1cece480dfa8e85431d99bed29436b68ecaac62936867",
+      "psnr": 22.721451,
+      "ssim": 0.783956
+    },
+    {
+      "bytes": 929060,
+      "candidate": "../app-site/public/static/cogs/h3/accel-sweep/balanced.webm",
+      "decoded_audio_exact": null,
+      "decoded_audio_sha256": null,
+      "decoded_video_exact": false,
+      "decoded_video_sha256": "30e89570419bf7677f76adc4567de0da4f847001db1c6df77b79d2ecd7fd00f8",
+      "file_sha256": "b3ec3abe28a4b0b5df3dbf1bcd9918882bccc5ba9ed663e93830636053aa8dac",
+      "psnr": 34.973096,
+      "ssim": 0.967884
+    },
+    {
+      "bytes": 944396,
+      "candidate": "../app-site/public/static/cogs/h3/accel-sweep/stack-balanced.webm",
+      "decoded_audio_exact": null,
+      "decoded_audio_sha256": null,
+      "decoded_video_exact": false,
+      "decoded_video_sha256": "71a5925672698f9906f526057f39fad7eb40f13a09080c13bd882ae883422ca6",
+      "file_sha256": "75f59039df11c127f317daa5cb275de563ddc9e179d13852ed8977239301884e",
+      "psnr": 22.954348,
+      "ssim": 0.78919
+    }
+  ],
+  "reference": "../app-site/public/static/cogs/h3/accel-sweep/off.webm",
+  "reference_file_sha256": "849326438f84710cc016c11052f0d4e11a682434a04f61d0ba6b264c6d553e3b"
+}

@@ -25,6 +25,37 @@
 #define OPROXY_INITIAL_HEADER (8u << 10)
 #define OPROXY_MAX_HEADER (64u << 10)
 
+bool oproxy_is_caller_credential(const char *name, size_t name_len) {
+    /* The same four headers this gateway accepts as a caller's own credential:
+     * if a name authenticates a client here, it must not be replayed to a
+     * backend that authenticates us instead. */
+    static const char *credentials[] = {
+        "Authorization", "X-API-Key", "X-Rapid-API-Key", "secret",
+    };
+    if (!name) return false;
+    for (size_t i = 0; i < sizeof credentials / sizeof credentials[0]; i++) {
+        size_t n = strlen(credentials[i]);
+        if (name_len == n && strncasecmp(name, credentials[i], n) == 0) return true;
+    }
+    return false;
+}
+
+bool oproxy_service_bearer(oproxy_header *out, char *buffer, size_t capacity,
+                           const char *key) {
+    if (!out || !buffer || capacity == 0) return false;
+    if (!key || !key[0]) return false;
+    int written = snprintf(buffer, capacity, "Bearer %s", key);
+    /* 7 is the length of "Bearer " with nothing after it: a key that renders
+     * only that is a misconfiguration, and forwarding it would turn our own
+     * 401 into the backend's. */
+    if (written <= 7 || (size_t)written >= capacity) return false;
+    out->name = "Authorization";
+    out->name_len = sizeof "Authorization" - 1;
+    out->value = buffer;
+    out->value_len = (size_t)written;
+    return true;
+}
+
 typedef struct {
     struct sockaddr_storage addr;
     socklen_t addr_len;

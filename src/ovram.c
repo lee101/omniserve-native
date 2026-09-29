@@ -16,6 +16,7 @@ typedef struct {
     int mb;
     double expires_s;
     char id[OVRAM_ID_CAP];
+    otier tier;
     bool active;
 } ovram_lease_slot;
 
@@ -97,6 +98,15 @@ static int leased_mb_locked(const ovram *v) {
     return total;
 }
 
+static int leased_mb_for_tier_locked(const ovram *v, otier tier) {
+    int total = 0;
+    for (int i = 0; i < OVRAM_MAX_LEASES; i++) {
+        if (!v->leases[i].active) continue;
+        if (v->leases[i].tier <= tier) total += v->leases[i].mb;
+    }
+    return total;
+}
+
 static int reserved_mb_locked(const ovram *v) {
     int total = 0;
     for (int i = 0; i < OVRAM_MAX_RESERVATIONS; i++) {
@@ -108,7 +118,7 @@ static int reserved_mb_locked(const ovram *v) {
 static int headroom_locked(const ovram *v, otier tier, int device_free_mb) {
     if (device_free_mb < 0) return 0;
     int available = device_free_mb - floor_for_tier(v->keep_free_mb, tier)
-                    - reserved_mb_locked(v) - leased_mb_locked(v);
+                    - reserved_mb_locked(v) - leased_mb_for_tier_locked(v, tier);
     return available > 0 ? available : 0;
 }
 
@@ -189,6 +199,7 @@ int ovram_lease_at(ovram *v, const char *owner, int mb, int min_mb, otier tier,
     lease->mb = granted;
     lease->expires_s = now_s + (ttl_s > 0.0 ? ttl_s : v->default_ttl_s);
     snprintf(lease->id, sizeof lease->id, "lv%llu", v->next_id++);
+    lease->tier = tier;
     lease->active = true;
 
     v->grants++;
@@ -221,6 +232,24 @@ bool ovram_release(ovram *v, const char *id) {
     }
     pthread_mutex_unlock(&v->lock);
     return false;
+}
+
+bool ovram_renew_at(ovram *v, const char *id, double ttl_s, double now_s) {
+    if (!v || !id || !id[0]) return false;
+    pthread_mutex_lock(&v->lock);
+    expire_locked(v, now_s);
+    for (int i = 0; i < OVRAM_MAX_LEASES; i++) {
+        if (!v->leases[i].active || strcmp(v->leases[i].id, id) != 0) continue;
+        v->leases[i].expires_s = now_s + (ttl_s > 0.0 ? ttl_s : v->default_ttl_s);
+        pthread_mutex_unlock(&v->lock);
+        return true;
+    }
+    pthread_mutex_unlock(&v->lock);
+    return false;
+}
+
+bool ovram_renew(ovram *v, const char *id, double ttl_s) {
+    return ovram_renew_at(v, id, ttl_s, monotonic_s());
 }
 
 int ovram_expire_at(ovram *v, double now_s) {

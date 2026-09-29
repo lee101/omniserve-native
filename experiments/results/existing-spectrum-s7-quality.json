@@ -1,0 +1,28 @@
+{
+  "comparisons": [
+    {
+      "bytes": 860512,
+      "candidate": "../app-site/public/static/cogs/h3/spectrum-sweep/t2v-spectrum-sol-s7.webm",
+      "decoded_audio_exact": false,
+      "decoded_audio_sha256": "91a7817baf069a9bb61e6053d3b5bbf91ed544bb94ad4ef140b5069a78d3a8de",
+      "decoded_video_exact": false,
+      "decoded_video_sha256": "21fd06dc574cf6cf2c47a5ef3dc9dd71879e0f366057350754ff4539cdf74ea0",
+      "file_sha256": "14a0b8e9a33f6cda85b33a9af275a8eaa9e31d748f83cc831bb7a440ba6b2d3f",
+      "psnr": 19.77267,
+      "ssim": 0.760391
+    },
+    {
+      "bytes": 1037974,
+      "candidate": "../app-site/public/static/cogs/h3/spectrum-sweep/t2v-stack-balanced-s7.webm",
+      "decoded_audio_exact": false,
+      "decoded_audio_sha256": "71f7ee2532bee769a03680c94d56aee49befc067f872fc2d61aca907ae6fc1a2",
+      "decoded_video_exact": false,
+      "decoded_video_sha256": "57b0d297b1e01f4d030e5c7910efe85f7164c2861563f49d896a5f50892f4247",
+      "file_sha256": "500928ced01015997feddcfa30caa46144d27ac1787881e16ffc4c8b7924d7eb",
+      "psnr": 22.897064,
+      "ssim": 0.785265
+    }
+  ],
+  "reference": "../app-site/public/static/cogs/h3/spectrum-sweep/t2v-off-s7.webm",
+  "reference_file_sha256": "bfc2568c45a3d63df899312dc161b6aed0fdd2f6b07027e1524a3ec5c4d6c538"
+}

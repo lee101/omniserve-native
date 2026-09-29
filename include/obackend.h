@@ -107,24 +107,60 @@ void oembed_result_free(oembed_result *r);
 void oembed_shutdown(void);
 
 typedef struct {
+    const char *path;
+    float scale;
+} oimg_lora;
+
+typedef struct {
     const char *prompt;
     const char *negative_prompt;
     int width;
     int height;
     int steps;
-    long seed;
+    int batch_count;
+    float guidance_scale;
+    int64_t seed;
+    bool teleport;
+    int teleport_start_step;
+    const oimg_lora *loras;
+    size_t lora_count;
+    /* Owned by oimage_request; decoded RGB is prepared before GPU admission. */
+    char *image_base64;
+    unsigned char *image_pixels;
+    int image_width;
+    int image_height;
+    float strength;
+    bool cache;
 } oimg_req;
 
 typedef struct {
     unsigned char *png;
     size_t png_len;
+    unsigned char **images;
+    size_t *image_lens;
+    size_t image_count;
+    const char *format;
+    bool images_malloc_owned;
     double elapsed_ms;
+    bool teleport_requested;
+    bool cache_requested;
+    bool cache_hit;
+    float denoiser_cache_threshold; /* zero disables approximate EasyCache */
+    const char *denoiser_cache_mode; /* static string: easycache|taylorseer|spectrum|cache-dit|dbcache|ucache */
+    bool teleport_used;
+    bool teleport_cache_hit;
+    bool teleport_result_cache_hit;
+    int teleport_capture_step;
+    int teleport_resume_step;
 } oimg_result;
 
 bool osd_init(const char *model_path);
 bool osd_ready(void);
 const char *osd_model_name(void);
 bool osd_generate(const oimg_req *req, oimg_result *out);
+bool osd_try_cached_result(const oimg_req *req, oimg_result *out);
+bool osd_prepare_image(oimg_req *req);
+bool osd_reference_edit_ready(void);
 void osd_result_free(oimg_result *r);
 
 #ifdef __cplusplus

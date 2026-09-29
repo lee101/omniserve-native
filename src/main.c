@@ -2,6 +2,7 @@
 #include "obackend.h"
 #include "ocapacity.h"
 #include "ohttp.h"
+#include "oimage.h"
 #include "ojson.h"
 #include "olog.h"
 #include "oproxy.h"
@@ -12,25 +13,39 @@
 #include "ovram.h"
 
 #include <math.h>
+#include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #define MAX_TOKS 4096
 #define MAX_MSGS 128
+#define MAX_IMAGE_MODEL_UPSTREAMS 16
+
+typedef struct {
+    char model[64];
+    oproxy_target *target;
+    unsigned long long relay_total;
+} image_model_upstream;
 
 typedef struct {
     osched *sched;
     const char *secret;
     oproxy_target *llm_upstream;
     oproxy_target *image_upstream;
+    oproxy_target *h3_upstream;
+    oproxy_target *image_worker_upstream;
+    oproxy_target *image_editor_upstream;
     oproxy_target *art_upstream;
     oproxy_target *birefnet_upstream;
     oproxy_target *depth_upstream;
     oproxy_target *tts_upstream;
     oproxy_target *stt_upstream;
+    oproxy_target *forecast_upstream;
     oproxy_target *training_upstream;
     oproxy_target *embedding_upstream;
     oproxy_target *multimodal_upstream;
@@ -39,13 +54,16 @@ typedef struct {
     oproxy_target *threed_upstream;
     oproxy_target *aux_upstream;
     int upstream_timeout_ms;
+    int h3_timeout_ms;
     int llm_permits;
     int image_permits;
+    int h3_permits;
     int art_permits;
     int birefnet_permits;
     int depth_permits;
     int tts_permits;
     int stt_permits;
+    int forecast_permits;
     int training_permits;
     int embedding_permits;
     int multimodal_permits;
@@ -53,6 +71,9 @@ typedef struct {
     int liveportrait_permits;
     int threed_permits;
     int aux_permits;
+    bool prefer_embedded_image;
+    const char *h3_api_key;
+    unsigned h3_tier_mask;
     oscale *scale;
     ocapacity *capacity;
     ovram *vram;
@@ -64,6 +85,14 @@ typedef struct {
     oproxy_target *depth_overflow;
     oproxy_target *stt_overflow;
     oproxy_target *tts_overflow;
+    /* Credential and time budget for the image lane's remote. The key is what
+     * makes the relay strip the caller's own: without one, nothing proves this
+     * gateway is the one paying, so the pass-through stays as it was. */
+    const char *image_overflow_api_key;
+    int image_overflow_timeout_ms;
+    image_model_upstream image_model_upstreams[MAX_IMAGE_MODEL_UPSTREAMS];
+    int image_model_upstream_count;
+    const char *image_model_upstream_secret;
     unsigned overflow_tier_mask;
     unsigned long long overflow_saturated;
     unsigned long long overflow_failover;
@@ -73,6 +102,82 @@ extern const char *DOCS_HTML;
 extern const char *OPENAPI_JSON;
 
 static bool env_flag(const char *name, int fallback);
+static const char *configured_path(const char *name, const char *fallback);
+static bool overflow_path_passthrough(void);
+static const char *overflow_path_label(void);
+/* Relays are built from these wherever a lane can send work to a standing
+ * remote, so they are declared here rather than beside their definitions. */
+static const char *service_key_for(const app_state *app, const oproxy_target *target);
+static int build_relay_headers(const app_state *app, const ohttp_request *req,
+                               const oproxy_target *target, int tier_override,
+                               oproxy_header *forwarded, int capacity,
+                               char *auth, size_t auth_cap);
+
+/* The native LLM is an embedded backend, so the Python scheduler cannot evict
+ * it unless the gateway exposes the same lifecycle it exposes for a proxy
+ * worker. Keep the active configuration here so a failed replacement can
+ * restore the previous model. The swap root is an explicit allow-list; an
+ * internal HTTP caller must not turn this control endpoint into an arbitrary
+ * file loader. */
+static pthread_mutex_t g_llm_swap_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_llm_active_path[PATH_MAX];
+static char g_llm_active_ngl[32];
+static int g_llm_active_ctx;
+static int g_llm_active_contexts;
+
+static bool path_is_under(const char *path, const char *root) {
+    size_t n = strlen(root);
+    return strncmp(path, root, n) == 0 && (path[n] == '\0' || path[n] == '/');
+}
+
+static bool llm_swap_path(const char *requested, char *resolved, size_t resolved_cap) {
+    if (!requested || !requested[0] || !resolved || resolved_cap == 0) return false;
+    char path[PATH_MAX];
+    char root[PATH_MAX];
+    if (!realpath(requested, path)) return false;
+    const char *root_env = getenv("OMNISERVE_NATIVE_LLM_SWAP_DIR");
+    if (!root_env || !root_env[0] || !realpath(root_env, root)) return false;
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || !path_is_under(path, root)) return false;
+    snprintf(resolved, resolved_cap, "%s", path);
+    return true;
+}
+
+/* A large GGUF can be perfectly valid while still being too large for the
+ * currently available slice of a shared GPU. `auto` is intentionally
+ * conservative: it only requests full offload when the file itself plus a
+ * configurable runtime margin fits in the driver's current free memory. A
+ * caller that wants a partial split can continue to pass an explicit layer
+ * count. */
+static int resolve_llm_ngl(const char *model_path, const char *value, int fallback) {
+    if (!value || !value[0] || strcasecmp(value, "auto") != 0) {
+        return value && value[0] ? atoi(value) : fallback;
+    }
+
+    struct stat st;
+    double free_gib = -1.0;
+    bool have_vram = ogpu_memory_gib(&free_gib, NULL);
+    long long keep_mb = 2048;
+    const char *keep_env = getenv("OMNISERVE_NATIVE_NGL_AUTO_KEEP_FREE_MB");
+    if (keep_env && keep_env[0]) keep_mb = atoll(keep_env);
+    if (keep_mb < 0) keep_mb = 0;
+
+    unsigned long long model_bytes = 0;
+    if (stat(model_path, &st) == 0 && st.st_size > 0) {
+        model_bytes = (unsigned long long)st.st_size;
+    }
+    unsigned long long margin_bytes = (unsigned long long)keep_mb * 1024ULL * 1024ULL;
+    unsigned long long required_bytes = model_bytes + margin_bytes;
+    unsigned long long free_bytes = have_vram && free_gib > 0.0
+        ? (unsigned long long)(free_gib * 1024.0 * 1024.0 * 1024.0) : 0;
+    bool fits = have_vram && model_bytes > 0 && free_bytes >= required_bytes;
+
+    fprintf(stderr,
+            "llm NGL=auto: model=%llu MiB free=%llu MiB keep_free=%lld MiB -> %s\n",
+            model_bytes / (1024ULL * 1024ULL), free_bytes / (1024ULL * 1024ULL),
+            keep_mb, fits ? "full GPU offload" : "CPU placement");
+    return fits ? 999 : 0;
+}
 
 static bool query_secret_matches(const ohttp_request *req, const char *secret, size_t secret_len) {
     const char *p = req->query;
@@ -139,7 +244,11 @@ static otier request_tier(const ohttp_request *req) {
     if (!request_is_internal(req)) return otier_parse_public(NULL, 0);
     size_t len = 0;
     const char *v = ohttp_req_header(req, "X-Omniserve-Tier", &len);
-    return otier_parse_public(v, (int)len);
+    /* Internal callers are the only callers allowed to request the true
+     * background lane.  otier_parse_public deliberately collapses background
+     * to free, which would let a batch image occupy ordinary serving capacity
+     * instead of waiting for an otherwise-idle GPU. */
+    return otier_parse(v, (int)len);
 }
 
 static void respond_error(ohttp_request *req, int status, const char *msg) {
@@ -188,7 +297,7 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
     double vram_free = -1.0, vram_total = -1.0;
     bool vram_ok = ogpu_memory_gib(&vram_free, &vram_total);
 
-    char body[4096];
+    char body[8192];
     size_t len = (size_t)snprintf(body, sizeof body,
         "# HELP omniserve_responses_total HTTP responses by status class.\n"
         "# TYPE omniserve_responses_total counter\n"
@@ -290,6 +399,12 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
             "omniserve_overflow_total{cause=\"local_failed\"} %llu\n",
             app->overflow_saturated, app->overflow_failover);
     }
+    for (int i = 0; i < app->image_model_upstream_count && len < sizeof body; i++) {
+        image_model_upstream *model = &app->image_model_upstreams[i];
+        len += (size_t)snprintf(body + len, sizeof body - len,
+            "omniserve_image_model_relay_total{model=\"%s\"} %llu\n",
+            model->model, __atomic_load_n(&model->relay_total, __ATOMIC_RELAXED));
+    }
     ohttp_respond(req, 200, "text/plain; version=0.0.4", body, len);
 }
 
@@ -333,13 +448,17 @@ static void handle_readyz(ohttp_request *req) {
 static void handle_status(ohttp_request *req, app_state *app) {
     osched_stats stats;
     osched_snapshot(app->sched, &stats);
-    oproxy_stats llm_proxy, image_proxy, birefnet_proxy, tts_proxy, stt_proxy;
+    oproxy_stats llm_proxy, image_proxy, image_worker_proxy, h3_proxy, birefnet_proxy, tts_proxy;
+    oproxy_stats stt_proxy, forecast_proxy;
     oproxy_stats embedding_proxy, multimodal_proxy, animation_proxy, threed_proxy, aux_proxy;
     oproxy_target_snapshot(app->llm_upstream, &llm_proxy);
     oproxy_target_snapshot(app->image_upstream, &image_proxy);
+    oproxy_target_snapshot(app->image_worker_upstream, &image_worker_proxy);
+    oproxy_target_snapshot(app->h3_upstream, &h3_proxy);
     oproxy_target_snapshot(app->birefnet_upstream, &birefnet_proxy);
     oproxy_target_snapshot(app->tts_upstream, &tts_proxy);
     oproxy_target_snapshot(app->stt_upstream, &stt_proxy);
+    oproxy_target_snapshot(app->forecast_upstream, &forecast_proxy);
     oproxy_target_snapshot(app->embedding_upstream, &embedding_proxy);
     oproxy_target_snapshot(app->multimodal_upstream, &multimodal_proxy);
     oproxy_target_snapshot(app->animation_upstream, &animation_proxy);
@@ -359,19 +478,22 @@ static void handle_status(ohttp_request *req, app_state *app) {
              "\"device\":\"%.80s\",\"kv_type\":\"%s\",\"flash_attn\":%s,\"degraded\":%s},"
              "\"llm\":{\"ready\":%s,\"model\":\"%s\"},"
              "\"embedding\":{\"ready\":%s,\"model\":\"%s\"},"
-             "\"diffusion\":{\"ready\":%s,\"model\":\"%s\"},"
+             "\"diffusion\":{\"ready\":%s,\"model\":\"%s\",\"reference_edit\":%s},"
              /* Key order must track the argument order below, which matches the
               * permits object: llm, image, birefnet, tts, stt, ... */
-             "\"upstreams\":{\"llm\":%s,\"image\":%s,\"art\":%s,\"birefnet\":%s,\"tts\":%s,\"stt\":%s,"
+             "\"upstreams\":{\"llm\":%s,\"image\":%s,\"image_worker\":%s,\"h3\":%s,\"art\":%s,\"birefnet\":%s,\"tts\":%s,\"stt\":%s,\"forecast\":%s,"
              "\"embedding\":%s,\"multimodal\":%s,\"animation\":%s,\"threed\":%s,\"aux\":%s},"
-             "\"permits\":{\"llm\":%d,\"image\":%d,\"art\":%d,\"birefnet\":%d,\"tts\":%d,\"stt\":%d,"
+             "\"permits\":{\"llm\":%d,\"image\":%d,\"h3\":%d,\"art\":%d,\"birefnet\":%d,\"tts\":%d,\"stt\":%d,\"forecast\":%d,"
              "\"embedding\":%d,\"multimodal\":%d,\"animation\":%d,\"threed\":%d,\"aux\":%d},"
              "\"proxy_pool\":{"
              "\"llm\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"image\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
+             "\"image_worker\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
+             "\"h3\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"birefnet\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"tts\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"stt\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
+             "\"forecast\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"embedding\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"multimodal\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
              "\"animation\":{\"idle\":%zu,\"opened\":%llu,\"reused\":%llu,\"failures\":%llu},"
@@ -391,28 +513,38 @@ static void handle_status(ohttp_request *req, app_state *app) {
              ollm_ready() ? "true" : "false", ollm_model_name(),
              oembed_ready() ? "true" : "false", oembed_model_name(),
              osd_ready() ? "true" : "false", osd_model_name(),
+             osd_reference_edit_ready() ? "true" : "false",
              app->llm_upstream ? "true" : "false", app->image_upstream ? "true" : "false",
+             app->image_worker_upstream ? "true" : "false",
+             app->h3_upstream ? "true" : "false",
              app->art_upstream ? "true" : "false",
              app->birefnet_upstream ? "true" : "false",
              app->tts_upstream ? "true" : "false", app->stt_upstream ? "true" : "false",
+             app->forecast_upstream ? "true" : "false",
              app->embedding_upstream ? "true" : "false",
              app->multimodal_upstream ? "true" : "false",
              app->animation_upstream ? "true" : "false",
              app->threed_upstream ? "true" : "false", app->aux_upstream ? "true" : "false",
-             app->llm_permits, app->image_permits, app->art_permits, app->birefnet_permits,
-             app->tts_permits, app->stt_permits,
+             app->llm_permits, app->image_permits, app->h3_permits, app->art_permits, app->birefnet_permits,
+             app->tts_permits, app->stt_permits, app->forecast_permits,
              app->embedding_permits, app->multimodal_permits, app->animation_permits,
              app->threed_permits, app->aux_permits,
              llm_proxy.idle_connections, llm_proxy.connections_opened,
              llm_proxy.connections_reused, llm_proxy.failures,
              image_proxy.idle_connections, image_proxy.connections_opened,
              image_proxy.connections_reused, image_proxy.failures,
+             image_worker_proxy.idle_connections, image_worker_proxy.connections_opened,
+             image_worker_proxy.connections_reused, image_worker_proxy.failures,
+             h3_proxy.idle_connections, h3_proxy.connections_opened,
+             h3_proxy.connections_reused, h3_proxy.failures,
              birefnet_proxy.idle_connections, birefnet_proxy.connections_opened,
              birefnet_proxy.connections_reused, birefnet_proxy.failures,
              tts_proxy.idle_connections, tts_proxy.connections_opened,
              tts_proxy.connections_reused, tts_proxy.failures,
              stt_proxy.idle_connections, stt_proxy.connections_opened,
              stt_proxy.connections_reused, stt_proxy.failures,
+             forecast_proxy.idle_connections, forecast_proxy.connections_opened,
+             forecast_proxy.connections_reused, forecast_proxy.failures,
              embedding_proxy.idle_connections, embedding_proxy.connections_opened,
              embedding_proxy.connections_reused, embedding_proxy.failures,
              multimodal_proxy.idle_connections, multimodal_proxy.connections_opened,
@@ -444,14 +576,35 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  ",\"tune\":{\"class\":\"%s\",\"n_batch\":%d,\"n_ubatch\":%d},"
                  "\"speculation\":{\"draft_max\":%d,\"rounds\":%llu,\"drafted\":%llu,"
                  "\"accepted\":%llu,\"acceptance\":%.3f,\"calls_saved\":%llu},"
+                 "\"overflow\":{\"image\":%s,\"image_path\":\"%s\",\"tiers\":%u,"
+                 "\"saturated\":%llu,\"local_failed\":%llu},"
                  "\"capacity\":%s}",
                  placement.tune_class, placement.n_batch, placement.n_ubatch,
                  placement.spec_draft_max, placement.spec_rounds, placement.spec_drafted,
                  placement.spec_accepted, acceptance, placement.spec_saved_calls,
+                 app->image_overflow ? "true" : "false",
+                 overflow_path_label(),
+                 app->overflow_tier_mask,
+                 app->overflow_saturated, app->overflow_failover,
                  capacity_json);
     }
+    len = strlen(body);
+    if (len > 0 && body[len - 1] == '}') body[--len] = '\0';
+    len += (size_t)snprintf(body + len, sizeof body - len, ",\"image_model_upstreams\":{");
+    for (int i = 0; i < app->image_model_upstream_count; i++) {
+        image_model_upstream *model = &app->image_model_upstreams[i];
+        len += (size_t)snprintf(body + len, sizeof body - len,
+            "%s\"%s\":{\"relay_total\":%llu}", i ? "," : "", model->model,
+            __atomic_load_n(&model->relay_total, __ATOMIC_RELAXED));
+    }
+    snprintf(body + len, sizeof body - len, "}}");
     ohttp_force_close(req);
     ohttp_respond_str(req, 200, "application/json", body);
+}
+
+static const char *env_or(const char *name, const char *fallback) {
+    const char *value = getenv(name);
+    return value && value[0] ? value : fallback;
 }
 
 static void handle_models(ohttp_request *req, const app_state *app) {
@@ -467,32 +620,36 @@ static void handle_models(ohttp_request *req, const app_state *app) {
     if (ollm_ready()) ADD_MODEL(ollm_model_name(), "llm", "llama.cpp");
     if (oembed_ready()) ADD_MODEL(oembed_model_name(), "embedding", "llama.cpp");
     if (osd_ready()) ADD_MODEL(osd_model_name(), "diffusion", "stable-diffusion.cpp");
-    if (app->llm_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_LLM_MODEL") ?:
-                                    "upstream-llm", "llm", "proxy");
-    if (app->image_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_IMAGE_MODEL") ?:
-                                      "upstream-image", "diffusion", "proxy");
-    if (app->art_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_ART_MODEL") ?:
-                                    "Tongyi-MAI/Z-Image-Turbo", "background-art", "proxy-background");
-    if (app->birefnet_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_BIREFNET_MODEL") ?:
-                                         "ZhengPeng7/BiRefNet", "background-removal", "proxy-c-hot-path");
-    if (app->birefnet_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_HAIR_MODEL") ?:
-                                         "facebook/sam2.1-hiera-tiny", "hair-layers", "proxy-c-hot-path");
-    if (app->depth_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_DEPTH_MODEL") ?:
-                                      "depth-anything/Depth-Anything-V2-Small-hf", "depth-estimation", "proxy-c-hot-path");
-    if (app->tts_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_TTS_MODEL") ?:
-                                    "upstream-tts", "tts", "proxy");
-    if (app->stt_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_STT_MODEL") ?:
-                                    "upstream-stt", "stt", "proxy");
-    if (app->embedding_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_EMBEDDING_MODEL") ?:
-                                          "upstream-embedding", "embedding", "proxy");
-    if (app->multimodal_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_MULTIMODAL_MODEL") ?:
-                                           "upstream-multimodal", "multimodal", "proxy");
-    if (app->animation_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_ANIMATION_MODEL") ?:
-                                          "nvidia-ace-animation", "animation", "proxy-background");
-    if (app->liveportrait_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_LIVEPORTRAIT_MODEL") ?:
-                                             "KwaiVGI/LivePortrait", "portrait-animation", "proxy-background");
-    if (app->threed_upstream) ADD_MODEL(getenv("OMNISERVE_NATIVE_3D_MODEL") ?:
-                                       "microsoft/TRELLIS.2-4B", "image-to-3d", "proxy-background");
+    if (app->llm_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_LLM_MODEL", "upstream-llm"),
+                                    "llm", "proxy");
+    if (app->image_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_IMAGE_MODEL", "upstream-image"),
+                                      "diffusion", "proxy");
+    if (app->h3_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_H3_MODEL", "h3"),
+                                   "video", "proxy-cost-aware");
+    if (app->art_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_ART_MODEL", "Tongyi-MAI/Z-Image-Turbo"),
+                                    "background-art", "proxy-background");
+    if (app->birefnet_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_BIREFNET_MODEL", "ZhengPeng7/BiRefNet"),
+                                         "background-removal", "proxy-c-hot-path");
+    if (app->birefnet_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_HAIR_MODEL", "facebook/sam2.1-hiera-tiny"),
+                                         "hair-layers", "proxy-c-hot-path");
+    if (app->depth_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_DEPTH_MODEL", "depth-anything/Depth-Anything-V2-Small-hf"),
+                                      "depth-estimation", "proxy-c-hot-path");
+    if (app->tts_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_TTS_MODEL", "upstream-tts"),
+                                    "tts", "proxy");
+    if (app->stt_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_STT_MODEL", "upstream-stt"),
+                                    "stt", "proxy");
+    if (app->forecast_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_FORECAST_MODEL", "amazon/chronos-2"),
+                                         "forecast", "proxy");
+    if (app->embedding_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_EMBEDDING_MODEL", "upstream-embedding"),
+                                          "embedding", "proxy");
+    if (app->multimodal_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_MULTIMODAL_MODEL", "upstream-multimodal"),
+                                           "multimodal", "proxy");
+    if (app->animation_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_ANIMATION_MODEL", "nvidia-ace-animation"),
+                                          "animation", "proxy-background");
+    if (app->liveportrait_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_LIVEPORTRAIT_MODEL", "KwaiVGI/LivePortrait"),
+                                             "portrait-animation", "proxy-background");
+    if (app->threed_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_3D_MODEL", "microsoft/TRELLIS.2-4B"),
+                                       "image-to-3d", "proxy-background");
 #undef ADD_MODEL
     snprintf(body + len, sizeof body - len, "]}");
     ohttp_respond_str(req, 200, "application/json", body);
@@ -649,7 +806,7 @@ static void reload_embedded_models_after_background(void) {
         if (parallel_contexts < 1) parallel_contexts = 1;
         if (parallel_contexts > slots) parallel_contexts = slots;
         fprintf(stderr, "exclusive background window: reloading LLM %s\n", gguf);
-        if (!ollm_init(gguf, ngl ? atoi(ngl) : 999, ctx ? atoi(ctx) : 8192,
+        if (!ollm_init(gguf, resolve_llm_ngl(gguf, ngl, 999), ctx ? atoi(ctx) : 8192,
                        parallel_contexts)) {
             fprintf(stderr, "exclusive background window: LLM reload failed\n");
         }
@@ -695,13 +852,14 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
         return;
     }
     otier tier = tier_override >= 0 ? (otier)tier_override : request_tier(req);
-    int permits = tier == TIER_BACKGROUND ? osched_capacity(app->sched) : modality_permits;
+    int permits = modality_permits;
+    bool admit = permits > 0;
 
     /* With a remote available, queueing locally is the wrong default: the wait
      * buys nothing the remote would not have already delivered. Without one,
      * behaviour is unchanged and the blocking acquire still applies. */
     oproxy_target *local = upstream;
-    oproxy_target *overflow = overflow_for(app, local, tier);
+    oproxy_target *overflow = admit ? overflow_for(app, local, tier) : NULL;
     bool on_overflow = false;
     if (overflow) {
         if (!osched_try_acquire_n(app->sched, tier, permits)) {
@@ -713,7 +871,7 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
             permits = 0;
         }
     }
-    if (!on_overflow && !osched_acquire_n(app->sched, tier, permits)) {
+    if (admit && !on_overflow && !osched_acquire_n(app->sched, tier, permits)) {
         respond_error(req, 503, "admission timeout; retry");
         return;
     }
@@ -728,31 +886,14 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
           env_flag("OMNISERVE_NATIVE_TRAINING_SWAP_EMBEDDED_MODELS", 1)));
     if (swap_embedded_models) unload_embedded_models_for_background();
 
-    oproxy_header forwarded[16];
-    int forwarded_n = 0;
-    int forwarded_limit = tier_override >= 0 ? 13 : 16;
-    for (int i = 0; i < req->header_count && forwarded_n < forwarded_limit; i++) {
-        if (!proxy_header_allowed(&req->headers[i])) continue;
-        forwarded[forwarded_n++] = (oproxy_header){
-            .name = req->headers[i].name,
-            .name_len = req->headers[i].name_len,
-            .value = req->headers[i].value,
-            .value_len = req->headers[i].value_len,
-        };
-    }
-    if (tier_override >= 0) {
-        forwarded[forwarded_n++] = (oproxy_header){
-            .name = "X-Omniserve-Tier", .name_len = sizeof "X-Omniserve-Tier" - 1,
-            .value = "background", .value_len = sizeof "background" - 1,
-        };
-        forwarded[forwarded_n++] = (oproxy_header){
-            .name = "X-Animation-Publish", .name_len = sizeof "X-Animation-Publish" - 1,
-            .value = "r2-searchable", .value_len = sizeof "r2-searchable" - 1,
-        };
-        forwarded[forwarded_n++] = (oproxy_header){
-            .name = "X-3D-Publish", .name_len = sizeof "X-3D-Publish" - 1,
-            .value = "r2-searchable", .value_len = sizeof "r2-searchable" - 1,
-        };
+    char service_auth[1024];
+    oproxy_header forwarded[17];
+    int forwarded_n = build_relay_headers(app, req, upstream, tier_override,
+                                          forwarded, 17, service_auth, sizeof service_auth);
+    if (forwarded_n < 0) {
+        osched_release_n(app->sched, tier, permits);
+        respond_error(req, 500, "service credential is invalid");
+        return;
     }
     size_t content_type_len = 0;
     const char *content_type = ohttp_req_header(req, "Content-Type", &content_type_len);
@@ -765,6 +906,8 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
     oproxy_result result;
     const char *upstream_path = path_override ? path_override : req->path;
     size_t upstream_path_len = path_override ? strlen(path_override) : req->path_len;
+    int upstream_timeout_ms = local == app->h3_upstream
+        ? app->h3_timeout_ms : app->upstream_timeout_ms;
     bool ok = oproxy_target_relay(
         upstream,
         req->method, req->method_len,
@@ -773,7 +916,7 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
         req->body, req->body_len,
         content_type, content_type_len,
         forwarded, forwarded_n,
-        app->upstream_timeout_ms,
+        upstream_timeout_ms,
         proxy_sink_raw, req,
         &result, error, sizeof error);
     if (swap_embedded_models) reload_embedded_models_after_background();
@@ -788,6 +931,17 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
         permits = 0;
         app->overflow_failover++;
         fprintf(stderr, "local upstream failed (%s); retrying on overflow\n", error);
+        /* The destination changed, so the credential must too: the remote is
+         * billed for this request and must not be handed the caller's key. */
+        char overflow_auth[1024];
+        oproxy_header overflow_headers[17];
+        int overflow_n = build_relay_headers(app, req, overflow, tier_override,
+                                             overflow_headers, 17,
+                                             overflow_auth, sizeof overflow_auth);
+        if (overflow_n < 0) {
+            respond_error(req, 500, "overflow service credential is invalid");
+            return;
+        }
         ok = oproxy_target_relay(
             overflow,
             req->method, req->method_len,
@@ -795,8 +949,8 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
             req->query, req->query_len,
             req->body, req->body_len,
             content_type, content_type_len,
-            forwarded, forwarded_n,
-            app->upstream_timeout_ms,
+            overflow_headers, overflow_n,
+            upstream_timeout_ms,
             proxy_sink_raw, req,
             &result, error, sizeof error);
     }
@@ -1253,66 +1407,210 @@ static void handle_completion(ohttp_request *req, app_state *app, bool legacy, b
     free(body);
 }
 
+/* Defined with the other relay helpers below; the embedded image lane needs
+ * both before that. */
+static oproxy_target *image_overflow_for(const app_state *app, otier tier);
+static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_target *overflow);
+
+/* Inspect only routing metadata: sibling bodies need not satisfy Z-Image's
+ * parser, and source images must not be decoded by this gateway. */
+static bool relay_image_model(ohttp_request *req, app_state *app) {
+    if (!app->image_model_upstream_count || !req->body) return false;
+    oj_tok tokens[MAX_TOKS];
+    int count = oj_parse(req->body, req->body_len, tokens, MAX_TOKS);
+    if (count <= 0 || tokens[0].type != OJ_OBJECT) return false;
+    int token = oj_obj_get(req->body, tokens, count, 0, "model");
+    if (token < 0 || tokens[token].type != OJ_STRING) return false;
+    char name[64];
+    size_t length = oj_unescape(req->body, &tokens[token], name, sizeof name);
+    if (!length || length >= sizeof name || strlen(name) != length) return false;
+    if (!strcasecmp(name, "z-image") || !strcasecmp(name, "zimage") ||
+        !strcasecmp(name, "local")) return false;
+    image_model_upstream *model = NULL;
+    for (int i = 0; i < app->image_model_upstream_count; i++) {
+        if (!strcasecmp(name, app->image_model_upstreams[i].model)) {
+            model = &app->image_model_upstreams[i];
+            break;
+        }
+    }
+    if (!model) return false;
+    otier tier = request_tier(req);
+    /* This sibling uses the same GPU, so it must queue. The standing remote
+     * overflow is not an alternative backend for this selected model. */
+    if (!osched_acquire_n(app->sched, tier, app->image_permits)) {
+        respond_error(req, 503, "admission timeout; retry");
+        return true;
+    }
+    char auth[1024];
+    oproxy_header forwarded[20];
+    int n = build_relay_headers(app, req, model->target, -1, forwarded, 17,
+                                auth, sizeof auth);
+    /* The sibling authenticates this gateway, never the original caller.
+     * No proxy-origin headers are allowlisted, so loopback trust is retained. */
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        if (!oproxy_is_caller_credential(forwarded[i].name, forwarded[i].name_len))
+            forwarded[kept++] = forwarded[i];
+    }
+    n = kept;
+    const char *secret = app->image_model_upstream_secret;
+    if (secret && secret[0]) forwarded[n++] = (oproxy_header){
+        "X-API-Key", sizeof "X-API-Key" - 1, secret, strlen(secret)};
+    const char *tier_name = otier_name(tier);
+    forwarded[n++] = (oproxy_header){
+        "X-Omniserve-Tier", sizeof "X-Omniserve-Tier" - 1, tier_name, strlen(tier_name)};
+    size_t content_type_len = 0;
+    const char *content_type = ohttp_req_header(req, "Content-Type", &content_type_len);
+    if (!content_type) {
+        content_type = "application/json";
+        content_type_len = strlen(content_type);
+    }
+    char error[256];
+    oproxy_result result;
+    __atomic_fetch_add(&model->relay_total, 1, __ATOMIC_RELAXED);
+    bool ok = oproxy_target_relay(model->target,
+        req->method, req->method_len, req->path, req->path_len,
+        NULL, 0, req->body, req->body_len, content_type, content_type_len,
+        forwarded, n, app->upstream_timeout_ms, proxy_sink_raw, req,
+        &result, error, sizeof error);
+    osched_release_n(app->sched, tier, app->image_permits);
+    if (!ok) {
+        fprintf(stderr, "image model %s relay failed: %s\n", model->model, error);
+        if (!result.response_started) respond_error(req, 502, "image model backend unavailable");
+        else ohttp_force_close(req);
+    } else if (result.downstream_close) ohttp_force_close(req);
+    return true;
+}
+
 static void handle_images(ohttp_request *req, app_state *app) {
+    otier tier = request_tier(req);
+    /* Resolved before admission, so a saturated or unavailable local lane can
+     * be answered by the remote instead of a queue wait or a 503. */
+    oproxy_target *overflow = image_overflow_for(app, tier);
     if (!osd_ready()) {
+        if (overflow) {
+            app->overflow_failover++;
+            fprintf(stderr, "no diffusion model loaded; relaying to the image overflow\n");
+            relay_image_overflow(req, app, overflow);
+            return;
+        }
         respond_error(req, 503, "no diffusion model loaded; start with OMNISERVE_NATIVE_SD_MODEL");
         return;
     }
-    oj_tok *toks = malloc(sizeof(oj_tok) * MAX_TOKS);
-    if (!toks) { respond_error(req, 500, "allocation failed"); return; }
-    int n = oj_parse(req->body, req->body_len, toks, MAX_TOKS);
-    if (n <= 0 || toks[0].type != OJ_OBJECT) { free(toks); respond_error(req, 400, "invalid JSON body"); return; }
-    int p = oj_obj_get(req->body, toks, n, 0, "prompt");
-    if (p < 0 || toks[p].type != OJ_STRING) { free(toks); respond_error(req, 400, "prompt required"); return; }
-    char *prompt = oj_strdup(req->body, &toks[p]);
-    if (!prompt) { free(toks); respond_error(req, 500, "allocation failed"); return; }
-
-    char *negative_prompt = NULL;
-    int negative = oj_obj_get(req->body, toks, n, 0, "negative_prompt");
-    if (negative >= 0) {
-        if (toks[negative].type != OJ_STRING || !(negative_prompt = oj_strdup(req->body, &toks[negative]))) {
-            free(prompt);
-            free(toks);
-            respond_error(req, 400, "negative_prompt must be a string");
-            return;
-        }
-    }
-
-    oimg_req ireq = { .prompt = prompt, .negative_prompt = negative_prompt, .width = 768, .height = 768, .steps = 4, .seed = -1 };
-    int t = oj_obj_get(req->body, toks, n, 0, "width");
-    if (t >= 0) ireq.width = (int)oj_number(req->body, &toks[t], 768);
-    t = oj_obj_get(req->body, toks, n, 0, "height");
-    if (t >= 0) ireq.height = (int)oj_number(req->body, &toks[t], 768);
-    t = oj_obj_get(req->body, toks, n, 0, "steps");
-    if (t >= 0) ireq.steps = (int)oj_number(req->body, &toks[t], 4);
-    t = oj_obj_get(req->body, toks, n, 0, "seed");
-    if (t >= 0) ireq.seed = (int64_t)oj_number(req->body, &toks[t], -1);
-
-    if (ireq.seed < -1 || ireq.seed > 2147483647L) {
-        free(negative_prompt);
-        free(prompt);
-        free(toks);
-        respond_error(req, 400, "seed must be between -1 and 2147483647");
+    oimage_request image_request;
+    char parse_error[160];
+    if (!oimage_request_parse(req->body, req->body_len, &image_request,
+                              parse_error, sizeof parse_error)) {
+        respond_error(req, 400, parse_error);
         return;
     }
-
-    free(toks);
-    otier tier = request_tier(req);
-    int permits = tier == TIER_BACKGROUND ? osched_capacity(app->sched) : app->image_permits;
-    if (!osched_acquire_n(app->sched, tier, permits)) {
-        free(negative_prompt);
-        free(prompt);
-        respond_error(req, 503, "admission timeout; retry");
+    if (image_request.direct_lora_paths && !request_is_internal(req)) {
+        oimage_request_free(&image_request);
+        respond_error(req, 403, "public image requests must use a cache-validated lora_id");
+        return;
+    }
+    bool img2img = ohttp_path_is(req, "/v1/images/img2img") ||
+                  ohttp_path_is(req, "/v1/images/edits");
+    if (img2img != (image_request.generation.image_base64 != NULL) ||
+        !osd_prepare_image(&image_request.generation)) {
+        oimage_request_free(&image_request);
+        respond_error(req, 400, "img2img requires image_base64: a PNG or JPEG up to 4096x4096; generations does not accept source images");
         return;
     }
     oimg_result result;
-    bool ok = osd_generate(&ireq, &result);
+    bool ok = osd_try_cached_result(&image_request.generation, &result);
+    if (ok) goto encode_image;
+    int permits = app->image_permits;
+    /* With a remote available, queueing locally is the wrong default: the wait
+     * buys nothing the remote would not have already delivered. Try-acquire
+     * refuses while anyone is queued, so a caller with somewhere else to go
+     * cannot jump ahead of one that has already paid the latency. */
+    if (overflow) {
+        if (!osched_try_acquire_n(app->sched, tier, permits)) {
+            app->overflow_saturated++;
+            oimage_request_free(&image_request);
+            relay_image_overflow(req, app, overflow);
+            return;
+        }
+    } else if (!osched_acquire_n(app->sched, tier, permits)) {
+        oimage_request_free(&image_request);
+        respond_error(req, 503, "admission timeout; retry");
+        return;
+    }
+    /* Keep the scratch budget visible to every broker-aware GPU tenant until
+     * generation finishes.  A point-in-time cudaMemGetInfo check alone still
+     * lets another tenant claim the same bytes between admission and a late
+     * denoising cache allocation. */
+    char image_lease_id[40] = {0};
+    int required_headroom_mb = oimage_gpu_headroom_mb();
+    if (app->vram && required_headroom_mb > 0 &&
+        ovram_lease(app->vram, "embedded-zimage", required_headroom_mb,
+                    required_headroom_mb, tier, 0.0,
+                    image_lease_id, sizeof image_lease_id) != required_headroom_mb) {
+        char lease_error[160];
+        snprintf(lease_error, sizeof lease_error,
+                 "image generation needs at least %d MB free GPU memory; "
+                 "managed GPU capacity is busy",
+                 required_headroom_mb);
+        osched_release_n(app->sched, tier, permits);
+        oimage_request_free(&image_request);
+        /* A device that cannot take this request is a capacity refusal, not a
+         * backend fault: it is the same answer as a taken permit, and the remote
+         * can serve it. */
+        if (overflow) {
+            app->overflow_saturated++;
+            relay_image_overflow(req, app, overflow);
+            return;
+        }
+        respond_error(req, 503, lease_error);
+        return;
+    }
+    double free_gib = -1.0;
+    double total_gib = -1.0;
+    char headroom_error[160];
+    if (ogpu_memory_gib(&free_gib, &total_gib) &&
+        !oimage_gpu_headroom_ok(free_gib, headroom_error, sizeof headroom_error)) {
+        if (image_lease_id[0]) ovram_release(app->vram, image_lease_id);
+        osched_release_n(app->sched, tier, permits);
+        oimage_request_free(&image_request);
+        if (overflow) {
+            app->overflow_saturated++;
+            relay_image_overflow(req, app, overflow);
+            return;
+        }
+        respond_error(req, 503, headroom_error);
+        return;
+    }
+    ok = osd_generate(&image_request.generation, &result);
+    if (image_lease_id[0]) ovram_release(app->vram, image_lease_id);
     osched_release_n(app->sched, tier, permits);
-    free(negative_prompt);
-    free(prompt);
-    if (!ok) { respond_error(req, 500, "image generation failed"); return; }
-    ohttp_respond(req, 200, "image/png", (const char *)result.png, result.png_len);
+    if (!ok) {
+        oimage_request_free(&image_request);
+        /* Nothing has been written to the caller yet, so this is still a safe
+         * place to spend a remote on. */
+        if (overflow) {
+            app->overflow_failover++;
+            fprintf(stderr, "local image generation failed; relaying to the image overflow\n");
+            relay_image_overflow(req, app, overflow);
+            return;
+        }
+        respond_error(req, 500, "image generation failed");
+        return;
+    }
+encode_image:;
+    char *json = NULL;
+    size_t json_len = 0;
+    ok = oimage_openai_response(&result, osd_model_name(),
+                                image_request.generation.seed,
+                                &json, &json_len);
     osd_result_free(&result);
+    oimage_request_free(&image_request);
+    if (!ok) {
+        respond_error(req, 500, "image response encoding failed");
+        return;
+    }
+    ohttp_respond(req, 200, "application/json", json, json_len);
+    free(json);
 }
 
 static bool path_starts_with(const ohttp_request *req, const char *prefix) {
@@ -1330,10 +1628,140 @@ static const char *configured_path(const char *name, const char *fallback) {
     return path && path[0] == '/' ? path : fallback;
 }
 
+static bool overflow_path_passthrough(void) {
+    const char *raw = getenv("OMNISERVE_NATIVE_IMAGE_OVERFLOW_PATH");
+    return raw && strcmp(raw, "passthrough") == 0;
+}
+
+static const char *overflow_path_label(void) {
+    return overflow_path_passthrough() ? "passthrough"
+         : configured_path("OMNISERVE_NATIVE_IMAGE_OVERFLOW_PATH", "/predict-sync");
+}
+
 static bool env_flag(const char *name, int fallback) {
     const char *value = getenv(name);
     if (!value || !value[0]) return fallback != 0;
     return value[0] == '1' || value[0] == 't' || value[0] == 'T' || value[0] == 'y' || value[0] == 'Y';
+}
+
+/* The credential this gateway presents at a destination, or NULL when the
+ * destination carries none of its own. */
+static const char *service_key_for(const app_state *app, const oproxy_target *target) {
+    if (target == app->h3_upstream) return app->h3_api_key;
+    if (target == app->image_overflow) return app->image_overflow_api_key;
+    return NULL;
+}
+
+/* Builds the forwarded header set for one relay: the caller's allowlisted
+ * headers, minus the credential headers this destination must not receive, plus
+ * the service credential it must. Returns the header count, or -1 when a
+ * configured credential cannot be rendered — the caller refuses the relay
+ * rather than forwarding the caller's key to a backend that bills us.
+ *
+ * Rebuilt per destination rather than once per request, because a failover
+ * changes which credential is correct. */
+static int build_relay_headers(const app_state *app, const ohttp_request *req,
+                               const oproxy_target *target, int tier_override,
+                               oproxy_header *forwarded, int capacity,
+                               char *auth, size_t auth_cap) {
+    const char *service_key = service_key_for(app, target);
+    int reserve = 1 + (service_key ? 1 : 0) + (tier_override >= 0 ? 3 : 0);
+    int limit = capacity - reserve;
+    if (limit < 0) limit = 0;
+    int count = 0;
+    for (int i = 0; i < req->header_count && count < limit; i++) {
+        if (!proxy_header_allowed(&req->headers[i])) continue;
+        if (service_key &&
+            oproxy_is_caller_credential(req->headers[i].name, req->headers[i].name_len))
+            continue;
+        forwarded[count++] = (oproxy_header){
+            .name = req->headers[i].name,
+            .name_len = req->headers[i].name_len,
+            .value = req->headers[i].value,
+            .value_len = req->headers[i].value_len,
+        };
+    }
+    if (service_key) {
+        oproxy_header header;
+        if (count >= capacity || !oproxy_service_bearer(&header, auth, auth_cap, service_key))
+            return -1;
+        forwarded[count++] = header;
+    }
+    if (tier_override >= 0) {
+        forwarded[count++] = (oproxy_header){
+            .name = "X-Omniserve-Tier", .name_len = sizeof "X-Omniserve-Tier" - 1,
+            .value = "background", .value_len = sizeof "background" - 1,
+        };
+        forwarded[count++] = (oproxy_header){
+            .name = "X-Animation-Publish", .name_len = sizeof "X-Animation-Publish" - 1,
+            .value = "r2-searchable", .value_len = sizeof "r2-searchable" - 1,
+        };
+        forwarded[count++] = (oproxy_header){
+            .name = "X-3D-Publish", .name_len = sizeof "X-3D-Publish" - 1,
+            .value = "r2-searchable", .value_len = sizeof "r2-searchable" - 1,
+        };
+    }
+    return count;
+}
+
+/* The standing remote for the embedded image lane. The lanes that proxy have a
+ * local target to key off; this one's local backend is the SD context inside
+ * this process, so the lane is named directly. NULL when the lane has no remote
+ * or this tier may not spend: free and background traffic must never reach a
+ * metered endpoint. */
+static oproxy_target *image_overflow_for(const app_state *app, otier tier) {
+    if (!app->image_overflow) return NULL;
+    if (!(app->overflow_tier_mask & (1u << (unsigned)tier))) return NULL;
+    return app->image_overflow;
+}
+
+/* Relays one image request to the standing remote, streaming its response back
+ * as the caller's own. The body goes across unchanged: the remote is handed
+ * exactly the JSON this gateway parses, which is what lets the app.nz cog seam
+ * be addressed like any other upstream. */
+static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_target *overflow) {
+    char auth[1024];
+    oproxy_header forwarded[17];
+    int forwarded_n = build_relay_headers(app, req, overflow, -1, forwarded, 17,
+                                          auth, sizeof auth);
+    if (forwarded_n < 0) {
+        respond_error(req, 500, "image overflow credential is invalid");
+        return;
+    }
+    const char *path = configured_path("OMNISERVE_NATIVE_IMAGE_OVERFLOW_PATH", "/predict-sync");
+    size_t path_len = strlen(path);
+    /* "passthrough" chains to another omniserve gateway: generations and edits
+     * keep their own routes instead of collapsing onto one worker path. */
+    if (overflow_path_passthrough()) {
+        path = req->path;
+        path_len = req->path_len;
+    }
+    size_t content_type_len = 0;
+    const char *content_type = ohttp_req_header(req, "Content-Type", &content_type_len);
+    if (!content_type) {
+        content_type = "application/json";
+        content_type_len = sizeof "application/json" - 1;
+    }
+    char error[256];
+    oproxy_result result;
+    bool ok = oproxy_target_relay(
+        overflow,
+        req->method, req->method_len,
+        path, path_len,
+        req->query, req->query_len,
+        req->body, req->body_len,
+        content_type, content_type_len,
+        forwarded, forwarded_n,
+        app->image_overflow_timeout_ms,
+        proxy_sink_raw, req,
+        &result, error, sizeof error);
+    if (!ok) {
+        fprintf(stderr, "image overflow request failed: %s\n", error);
+        if (!result.response_started) respond_error(req, 502, "overflow backend unavailable");
+        else ohttp_force_close(req);
+    } else if (result.downstream_close) {
+        ohttp_force_close(req);
+    }
 }
 
 static bool request_forces_local_model(const ohttp_request *req) {
@@ -1341,6 +1769,38 @@ static bool request_forces_local_model(const ohttp_request *req) {
     size_t value_len = 0;
     const char *value = ohttp_req_header(req, "X-Omniserve-Internal", &value_len);
     return value && value_len == 5 && strncasecmp(value, "local", 5) == 0;
+}
+
+static bool request_has_structured_chat_content(const ohttp_request *req) {
+    /* Embedded llama.cpp currently accepts string message content only. OpenAI
+     * image/audio messages encode content as an array of typed parts, so detect
+     * that shape before entering the local parser and send it to the configured
+     * Gemma multimodal worker instead. Text-only typed arrays follow the same
+     * path, preserving the OpenAI contract rather than dropping the message. */
+    oj_tok *toks = malloc(sizeof(oj_tok) * MAX_TOKS);
+    if (!toks) return false;
+    int n = oj_parse(req->body, req->body_len, toks, MAX_TOKS);
+    if (n <= 0 || toks[0].type != OJ_OBJECT) {
+        free(toks);
+        return false;
+    }
+    int messages = oj_obj_get(req->body, toks, n, 0, "messages");
+    if (messages < 0 || toks[messages].type != OJ_ARRAY) {
+        free(toks);
+        return false;
+    }
+    bool structured = false;
+    for (int i = 0; i < toks[messages].size; i++) {
+        int message = oj_arr_at(toks, n, messages, i);
+        if (message < 0 || toks[message].type != OJ_OBJECT) continue;
+        int content = oj_obj_get(req->body, toks, n, message, "content");
+        if (content >= 0 && toks[content].type == OJ_ARRAY) {
+            structured = true;
+            break;
+        }
+    }
+    free(toks);
+    return structured;
 }
 
 static void handle_embedding(ohttp_request *req, bool openai_shape) {
@@ -1558,6 +2018,142 @@ static void handle_host_memory(ohttp_request *req) {
     ohttp_respond_str(req, 200, "application/json", body);
 }
 
+typedef struct {
+    char path[PATH_MAX];
+    char ngl[32];
+    int ctx;
+    int contexts;
+} llm_admin_config;
+
+static bool parse_llm_admin_config(const ohttp_request *req, llm_admin_config *out) {
+    memset(out, 0, sizeof *out);
+    const char *default_path = g_llm_active_path[0]
+        ? g_llm_active_path : getenv("OMNISERVE_NATIVE_LLM_GGUF");
+    if (default_path) snprintf(out->path, sizeof out->path, "%s", default_path);
+    const char *default_ngl = g_llm_active_ngl[0]
+        ? g_llm_active_ngl : getenv("OMNISERVE_NATIVE_NGL");
+    if (default_ngl) snprintf(out->ngl, sizeof out->ngl, "%s", default_ngl);
+    out->ctx = g_llm_active_ctx > 0 ? g_llm_active_ctx : 8192;
+    out->contexts = g_llm_active_contexts > 0 ? g_llm_active_contexts : 1;
+
+    if (req->body_len == 0) return out->path[0] != 0;
+    oj_tok *toks = malloc(sizeof *toks * 64);
+    if (!toks) return false;
+    int n = oj_parse(req->body, req->body_len, toks, 64);
+    if (n <= 0 || toks[0].type != OJ_OBJECT) {
+        free(toks);
+        return false;
+    }
+    int path_tok = oj_obj_get(req->body, toks, n, 0, "path");
+    if (path_tok < 0) path_tok = oj_obj_get(req->body, toks, n, 0, "model_path");
+    if (path_tok >= 0) {
+        if (toks[path_tok].type != OJ_STRING ||
+            !oj_unescape(req->body, &toks[path_tok], out->path, sizeof out->path)) {
+            free(toks);
+            return false;
+        }
+    }
+    int ngl_tok = oj_obj_get(req->body, toks, n, 0, "ngl");
+    if (ngl_tok >= 0) {
+        if (toks[ngl_tok].type != OJ_STRING ||
+            !oj_unescape(req->body, &toks[ngl_tok], out->ngl, sizeof out->ngl)) {
+            free(toks);
+            return false;
+        }
+    }
+    int ctx_tok = oj_obj_get(req->body, toks, n, 0, "ctx");
+    if (ctx_tok >= 0) out->ctx = (int)oj_number(req->body, &toks[ctx_tok], out->ctx);
+    int contexts_tok = oj_obj_get(req->body, toks, n, 0, "contexts");
+    if (contexts_tok >= 0) {
+        out->contexts = (int)oj_number(req->body, &toks[contexts_tok], out->contexts);
+    }
+    free(toks);
+    return out->path[0] != 0;
+}
+
+static void llm_admin_response(ohttp_request *req, bool ok, int status, const char *action) {
+    ollm_placement placement;
+    ollm_placement_snapshot(&placement);
+    double free_gib = -1.0;
+    (void)ogpu_memory_gib(&free_gib, NULL);
+    char body[768];
+    snprintf(body, sizeof body,
+             "{\"ok\":%s,\"action\":\"%s\",\"loaded\":%s,"
+             "\"model\":\"%.240s\",\"placement\":\"%s\","
+             "\"gpu_free_gib\":%.2f}",
+             ok ? "true" : "false", action, ollm_ready() ? "true" : "false",
+             ollm_model_name(), placement.on_gpu ? "gpu" : "cpu",
+             free_gib);
+    ohttp_respond_str(req, status, "application/json", body);
+}
+
+static bool llm_admin_load(const llm_admin_config *config) {
+    char resolved[PATH_MAX];
+    if (!llm_swap_path(config->path, resolved, sizeof resolved)) return false;
+    int contexts = config->contexts > 0 ? config->contexts : 1;
+    const char *slots_env = getenv("OMNISERVE_NATIVE_SLOTS");
+    int slots = slots_env ? atoi(slots_env) : contexts;
+    if (slots < 1) slots = 1;
+    if (contexts > slots) contexts = slots;
+    const char *ngl = config->ngl[0] ? config->ngl : "auto";
+    int layers = resolve_llm_ngl(resolved, ngl, 999);
+    fprintf(stderr, "admin LLM load: path=%s ngl=%s ctx=%d contexts=%d\n",
+            resolved, ngl, config->ctx, contexts);
+    if (!ollm_init(resolved, layers, config->ctx > 0 ? config->ctx : 8192, contexts)) return false;
+    snprintf(g_llm_active_path, sizeof g_llm_active_path, "%s", resolved);
+    snprintf(g_llm_active_ngl, sizeof g_llm_active_ngl, "%s", ngl);
+    g_llm_active_ctx = config->ctx > 0 ? config->ctx : 8192;
+    g_llm_active_contexts = contexts;
+    return true;
+}
+
+static void handle_llm_unload(ohttp_request *req) {
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+    pthread_mutex_lock(&g_llm_swap_lock);
+    ollm_shutdown();
+    pthread_mutex_unlock(&g_llm_swap_lock);
+    llm_admin_response(req, true, 200, "unload");
+}
+
+static void handle_llm_load(ohttp_request *req) {
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+    llm_admin_config config;
+    if (!parse_llm_admin_config(req, &config)) {
+        respond_error(req, 400, "path must name a model under OMNISERVE_NATIVE_LLM_SWAP_DIR");
+        return;
+    }
+    pthread_mutex_lock(&g_llm_swap_lock);
+    bool ok = !ollm_ready() && llm_admin_load(&config);
+    pthread_mutex_unlock(&g_llm_swap_lock);
+    llm_admin_response(req, ok, ok ? 200 : 503, "load");
+}
+
+static void handle_llm_swap(ohttp_request *req) {
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+    llm_admin_config next;
+    if (!parse_llm_admin_config(req, &next)) {
+        respond_error(req, 400, "path must name a model under OMNISERVE_NATIVE_LLM_SWAP_DIR");
+        return;
+    }
+    pthread_mutex_lock(&g_llm_swap_lock);
+    llm_admin_config previous = {0};
+    snprintf(previous.path, sizeof previous.path, "%s", g_llm_active_path);
+    snprintf(previous.ngl, sizeof previous.ngl, "%s", g_llm_active_ngl);
+    previous.ctx = g_llm_active_ctx;
+    previous.contexts = g_llm_active_contexts;
+    ollm_shutdown();
+    bool ok = llm_admin_load(&next);
+    if (!ok && previous.path[0]) {
+        fprintf(stderr, "admin LLM swap failed; restoring %s\n", previous.path);
+        (void)llm_admin_load(&previous);
+    }
+    pthread_mutex_unlock(&g_llm_swap_lock);
+    llm_admin_response(req, ok, ok ? 200 : 503, "swap");
+}
+
 static void handle_vram_status(ohttp_request *req, app_state *app) {
     if (!app->vram) { respond_error(req, 503, "vram broker is not enabled"); return; }
     char body[512];
@@ -1652,6 +2248,28 @@ static void handle_vram_release(ohttp_request *req, app_state *app) {
     ohttp_respond_str(req, 200, "application/json", "{\"released\":true}");
 }
 
+static void handle_vram_renew(ohttp_request *req, app_state *app) {
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    if (!app->vram) { respond_error(req, 503, "vram broker is not enabled"); return; }
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+
+    oj_tok *toks = malloc(sizeof(oj_tok) * 32);
+    if (!toks) { respond_error(req, 500, "out of memory"); return; }
+    int n = oj_parse(req->body, req->body_len, toks, 32);
+    char id[40] = {0};
+    double ttl_s = 0.0;
+    if (n > 0 && toks[0].type == OJ_OBJECT) {
+        int id_tok = oj_obj_get(req->body, toks, n, 0, "lease_id");
+        if (id_tok >= 0) oj_unescape(req->body, &toks[id_tok], id, sizeof id);
+        int ttl_tok = oj_obj_get(req->body, toks, n, 0, "ttl_s");
+        if (ttl_tok >= 0) ttl_s = oj_number(req->body, &toks[ttl_tok], 0);
+    }
+    free(toks);
+    bool renewed = ovram_renew(app->vram, id, ttl_s);
+    ohttp_respond_str(req, renewed ? 200 : 404, "application/json",
+                      renewed ? "{\"renewed\":true}" : "{\"renewed\":false}");
+}
+
 static void route(ohttp_request *req, void *user) {
     app_state *app = user;
     if (ohttp_method_is(req, "OPTIONS")) {
@@ -1669,7 +2287,17 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/v1/gpu/vram")) { handle_vram_status(req, app); return; }
     if (ohttp_path_is(req, "/v1/host/memory")) { handle_host_memory(req); return; }
     if (ohttp_path_is(req, "/v1/gpu/lease")) { handle_vram_lease(req, app); return; }
+    if (ohttp_path_is(req, "/v1/gpu/renew")) { handle_vram_renew(req, app); return; }
     if (ohttp_path_is(req, "/v1/gpu/release")) { handle_vram_release(req, app); return; }
+    if (ohttp_path_is(req, "/admin/llm/unload") || ohttp_path_is(req, "/admin/unload")) {
+        handle_llm_unload(req); return;
+    }
+    if (ohttp_path_is(req, "/admin/llm/load") || ohttp_path_is(req, "/admin/load")) {
+        handle_llm_load(req); return;
+    }
+    if (ohttp_path_is(req, "/admin/llm/swap") || ohttp_path_is(req, "/admin/swap")) {
+        handle_llm_swap(req); return;
+    }
     if (ohttp_path_is(req, "/v1/models")) {
         if (!ohttp_method_is(req, "GET")) { respond_error(req, 405, "GET required"); return; }
         if (app->aux_upstream && env_flag("OMNISERVE_NATIVE_MODELS_COMPAT_PROXY", 0))
@@ -1689,7 +2317,10 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/v1/chat/completions")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
-        if (app->aux_upstream && env_flag("OMNISERVE_NATIVE_CHAT_COMPAT_PROXY", 0) &&
+        if (request_has_structured_chat_content(req)) {
+            oproxy_target *target = app->multimodal_upstream ? app->multimodal_upstream : app->aux_upstream;
+            handle_proxy(req, app, target, app->multimodal_permits, "application/json");
+        } else if (app->aux_upstream && env_flag("OMNISERVE_NATIVE_CHAT_COMPAT_PROXY", 0) &&
             !request_forces_local_model(req)) {
             handle_proxy(req, app, app->aux_upstream, app->llm_permits, "application/json");
         } else if (app->llm_upstream) {
@@ -1749,16 +2380,104 @@ static void route(ohttp_request *req, void *user) {
         }
         return;
     }
+    if (app->image_model_upstream_count &&
+        (ohttp_path_is(req, "/v1/images/generations") ||
+         ohttp_path_is(req, "/v1/images/edits") ||
+         ohttp_path_is(req, "/v1/images/img2img"))) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        if (relay_image_model(req, app)) return;
+    }
     if (ohttp_path_is(req, "/v1/images/generations")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
-        if (app->image_upstream) {
+        if (app->image_upstream &&
+            !(app->prefer_embedded_image && osd_ready())) {
             handle_proxy_as(req, app, app->image_upstream, app->image_permits,
                             "application/json",
                             configured_path("OMNISERVE_NATIVE_IMAGE_GENERATE_PATH",
                                             "/v1/images/generations"));
         }
         else handle_images(req, app);
+        return;
+    }
+    if (ohttp_path_is(req, "/v1/images/img2img")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_images(req, app);
+        return;
+    }
+    if (ohttp_path_is(req, "/v1/images/edits") && osd_reference_edit_ready()) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_images(req, app);
+        return;
+    }
+    /* Precise masks and masked edits are handled by a scale-to-zero GPU pool.
+     * They have their own target so SAM2 / inpainting cold starts cannot steal
+     * the resident Z-Image or BiRefNet lanes on the shared local GPU. */
+    if (ohttp_path_is(req, "/v1/images/segmentations") ||
+        ohttp_path_is(req, "/v1/images/text-layers") ||
+        ohttp_path_is(req, "/v1/images/edits")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        if (!app->image_editor_upstream) {
+            respond_error(req, 503, "image editor worker is not configured");
+            return;
+        }
+        handle_proxy_as(req, app, app->image_editor_upstream, 1, "application/json", NULL);
+        return;
+    }
+    /* OmniServe's vision/video control-plane surface is part of the public
+     * native gateway too. Keep one upstream and preserve the exact path so
+     * models, LoRAs, validation and capacity decisions stay centralized. */
+    if (ohttp_path_is(req, "/v1/images/captions") ||
+        ohttp_path_is(req, "/v1/images/classifications") ||
+        ohttp_path_is(req, "/v1/classifications")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_proxy_as(req, app, app->image_upstream, app->image_permits,
+                        "application/json", NULL);
+        return;
+    }
+    if (ohttp_path_is(req, "/v1/video/generations")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        if (app->h3_upstream) {
+            otier tier = request_tier(req);
+            if (!(app->h3_tier_mask & OSCALE_TIER_BIT(tier))) {
+                respond_error(req, 402, "video generation requires a billable tier");
+                return;
+            }
+            handle_proxy_as(req, app, app->h3_upstream, app->h3_permits,
+                            "application/json",
+                            configured_path("OMNISERVE_NATIVE_H3_PATH", "/predict-sync"));
+        } else {
+            /* Legacy image backends retain the idle-only batch policy. */
+            handle_proxy_as_tier(req, app, app->image_upstream, app->image_permits,
+                                 "application/json", NULL, TIER_BACKGROUND);
+        }
+        return;
+    }
+    if (ohttp_path_is(req, "/loras")) {
+        if (!ohttp_method_is(req, "GET")) { respond_error(req, 405, "GET required"); return; }
+        handle_proxy_as(req, app, app->image_upstream, 0, NULL, NULL);
+        return;
+    }
+    /* Style transfer over an existing backdrop, same lane and same tier as the
+     * art above. The cutout worker uses this to restyle the backdrop it solved
+     * for rather than inventing an unrelated one, so the replacement inherits
+     * the original's lighting. GET, because that is the upstream's shape. */
+    if (ohttp_path_is(req, "/v1/images/backgrounds/style")) {
+        if (!ohttp_method_is(req, "GET") && !ohttp_method_is(req, "POST")) {
+            respond_error(req, 405, "GET or POST required");
+            return;
+        }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_proxy_as_tier(
+            req, app, app->art_upstream, app->art_permits, NULL,
+            configured_path("OMNISERVE_NATIVE_ART_STYLE_PATH", "/style_transfer_and_upload_image"),
+            TIER_BACKGROUND);
         return;
     }
     if (ohttp_path_is(req, "/v1/images/backgrounds") ||
@@ -1794,6 +2513,42 @@ static void route(ohttp_request *req, void *user) {
         }
         handle_proxy_as_tier(req, app, app->birefnet_upstream, 1,
                              is_post ? "application/json" : NULL, mapped_path, -1);
+        return;
+    }
+    if (path_starts_with(req, "/v1/images/foreground-generations/jobs")) {
+        const bool is_post = ohttp_method_is(req, "POST");
+        if (!is_post && !ohttp_method_is(req, "GET")) {
+            respond_error(req, 405, "GET or POST required");
+            return;
+        }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        char mapped_path[1024];
+        int mapped_len = snprintf(mapped_path, sizeof mapped_path, "%.*s",
+                                  (int)req->path_len, req->path);
+        if (mapped_len <= 0 || mapped_len >= (int)sizeof mapped_path) {
+            respond_error(req, 414, "path too long");
+            return;
+        }
+        handle_proxy_as_tier(req, app, app->birefnet_upstream, 1,
+                             is_post ? "application/json" : NULL, mapped_path, -1);
+        return;
+    }
+    if (path_starts_with(req, "/v1/videos/background-removals/jobs")) {
+        const bool is_post = ohttp_method_is(req, "POST");
+        if (!is_post && !ohttp_method_is(req, "GET")) {
+            respond_error(req, 405, "GET or POST required");
+            return;
+        }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        char mapped_path[1024];
+        int mapped_len = snprintf(mapped_path, sizeof mapped_path, "%.*s",
+                                  (int)req->path_len, req->path);
+        if (mapped_len <= 0 || mapped_len >= (int)sizeof mapped_path) {
+            respond_error(req, 414, "path too long");
+            return;
+        }
+        handle_proxy_as_tier(req, app, app->birefnet_upstream, 1,
+                             is_post ? "application/json" : NULL, mapped_path, TIER_BACKGROUND);
         return;
     }
     if (ohttp_path_is(req, "/v1/images/background-removals") ||
@@ -1880,7 +2635,7 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/api/v1/speech/catalog")) {
         if (!ohttp_method_is(req, "GET")) { respond_error(req, 405, "GET required"); return; }
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
-        handle_proxy(req, app, app->tts_upstream, app->tts_permits, NULL);
+        handle_proxy(req, app, app->tts_upstream, 0, NULL);
         return;
     }
     if (ohttp_path_is(req, "/v1/audio/transcriptions") ||
@@ -1903,7 +2658,7 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/v1/training/status") ||
         ohttp_path_is(req, "/v1/training/jobs")) {
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
-        handle_proxy(req, app, app->training_upstream, 1, "application/json");
+        handle_proxy(req, app, app->training_upstream, 0, "application/json");
         return;
     }
     if (ohttp_path_is(req, "/v1/training/jobs/run")) {
@@ -1938,7 +2693,9 @@ static void route(ohttp_request *req, void *user) {
         ohttp_path_is(req, "/aesthetic_score");
     if (image_worker_path) {
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
-        handle_proxy(req, app, app->image_upstream, app->image_permits, NULL);
+        oproxy_target *target = app->image_worker_upstream
+            ? app->image_worker_upstream : app->image_upstream;
+        handle_proxy(req, app, target, app->image_permits, NULL);
         return;
     }
     if (ohttp_path_is(req, "/synthesize")) {
@@ -1949,6 +2706,16 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/transcribe") || ohttp_path_is(req, "/transcribe_file")) {
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
         handle_proxy(req, app, app->stt_upstream, app->stt_permits, NULL);
+        return;
+    }
+    if (ohttp_path_is(req, "/forecast") || ohttp_path_is(req, "/forecast_batch") ||
+        ohttp_path_is(req, "/v1/forecasts")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        const char *mapped_path = ohttp_path_is(req, "/v1/forecasts")
+            ? configured_path("OMNISERVE_NATIVE_FORECAST_PATH", "/forecast") : NULL;
+        handle_proxy_as(req, app, app->forecast_upstream, app->forecast_permits,
+                        "application/json", mapped_path);
         return;
     }
     if (ohttp_path_is(req, "/api/v1/generate-bulk") ||
@@ -1995,9 +2762,12 @@ int main(int argc, char **argv) {
             puts("usage: omniserve-native [--port PORT]\n"
                  "environment: OMNISERVE_NATIVE_LLM_GGUF, _EMBEDDING_GGUF, _SD_MODEL,\n"
                  "             _SECRET, _SLOTS, _LLM_UPSTREAM, _IMAGE_UPSTREAM,\n"
+                 "             _H3_UPSTREAM, _H3_PATH, _H3_API_KEY, _H3_TIERS, _H3_TIMEOUT_MS,\n"
+                 "             _IMAGE_WORKER_UPSTREAM,\n"
                  "             _ART_UPSTREAM, _ART_PATH, _ART_PERMITS,\n"
                  "             _BIREFNET_UPSTREAM, _DEPTH_UPSTREAM, _DEPTH_PATH, _DEPTH_PERMITS,\n"
                  "             _TTS_UPSTREAM, _STT_UPSTREAM,\n"
+                 "             _FORECAST_UPSTREAM, _FORECAST_PERMITS,\n"
                  "             _EMBEDDING_UPSTREAM, _BIREFNET_PERMITS,\n"
                  "             _MULTIMODAL_UPSTREAM, _ANIMATION_UPSTREAM, _LIVEPORTRAIT_UPSTREAM,\n"
                  "             _AUX_UPSTREAM");
@@ -2013,11 +2783,17 @@ int main(int argc, char **argv) {
     if (slots > 64) slots = 64;
     app.llm_permits = configured_permits("OMNISERVE_NATIVE_LLM_PERMITS", 1, slots);
     app.image_permits = configured_permits("OMNISERVE_NATIVE_IMAGE_PERMITS", slots, slots);
+    /* app.nz owns H3's local/remote admission. Zero means this long-lived
+     * relay must not pin an OmniServe GPU slot while RunPod is executing. */
+    app.h3_permits = env_int("OMNISERVE_NATIVE_H3_PERMITS", 0);
+    if (app.h3_permits < 0) app.h3_permits = 0;
+    if (app.h3_permits > slots) app.h3_permits = slots;
     app.art_permits = configured_permits("OMNISERVE_NATIVE_ART_PERMITS", slots, slots);
     app.birefnet_permits = configured_permits("OMNISERVE_NATIVE_BIREFNET_PERMITS", 1, slots);
     app.depth_permits = configured_permits("OMNISERVE_NATIVE_DEPTH_PERMITS", 1, slots);
     app.tts_permits = configured_permits("OMNISERVE_NATIVE_TTS_PERMITS", 1, slots);
     app.stt_permits = configured_permits("OMNISERVE_NATIVE_STT_PERMITS", 1, slots);
+    app.forecast_permits = configured_permits("OMNISERVE_NATIVE_FORECAST_PERMITS", 1, slots);
     app.training_permits = configured_permits("OMNISERVE_NATIVE_TRAINING_PERMITS", slots, slots);
     app.embedding_permits = configured_permits("OMNISERVE_NATIVE_EMBEDDING_PERMITS", 1, slots);
     app.multimodal_permits = configured_permits("OMNISERVE_NATIVE_MULTIMODAL_PERMITS", 1, slots);
@@ -2069,6 +2845,9 @@ int main(int argc, char **argv) {
         if (paths[0]) ohost_prefetch_start(paths, keep_pct);
     }
     app.secret = getenv("OMNISERVE_NATIVE_SECRET");
+    app.h3_api_key = getenv("OMNISERVE_NATIVE_H3_API_KEY");
+    app.h3_tier_mask = parse_tier_mask(getenv("OMNISERVE_NATIVE_H3_TIERS"));
+    app.prefer_embedded_image = env_flag("OMNISERVE_NATIVE_IMAGE_PREFER_EMBEDDED", 0);
     const char *workers_env = getenv("OMNISERVE_NATIVE_WORKERS");
     int workers = workers_env ? atoi(workers_env) : 32;
     if (workers < 1) workers = 1;
@@ -2080,11 +2859,15 @@ int main(int argc, char **argv) {
     const char *unified_upstream = getenv("OMNISERVE_NATIVE_UPSTREAM");
     const char *llm_upstream = getenv("OMNISERVE_NATIVE_LLM_UPSTREAM");
     const char *image_upstream = getenv("OMNISERVE_NATIVE_IMAGE_UPSTREAM");
+    const char *h3_upstream = getenv("OMNISERVE_NATIVE_H3_UPSTREAM");
+    const char *image_worker_upstream = getenv("OMNISERVE_NATIVE_IMAGE_WORKER_UPSTREAM");
+    const char *image_editor_upstream = getenv("OMNISERVE_NATIVE_IMAGE_EDITOR_UPSTREAM");
     const char *art_upstream = getenv("OMNISERVE_NATIVE_ART_UPSTREAM");
     const char *birefnet_upstream = getenv("OMNISERVE_NATIVE_BIREFNET_UPSTREAM");
     const char *depth_upstream = getenv("OMNISERVE_NATIVE_DEPTH_UPSTREAM");
     const char *tts_upstream = getenv("OMNISERVE_NATIVE_TTS_UPSTREAM");
     const char *stt_upstream = getenv("OMNISERVE_NATIVE_STT_UPSTREAM");
+    const char *forecast_upstream = getenv("OMNISERVE_NATIVE_FORECAST_UPSTREAM");
     const char *training_upstream = getenv("OMNISERVE_NATIVE_TRAINING_UPSTREAM");
     const char *embedding_upstream = getenv("OMNISERVE_NATIVE_EMBEDDING_UPSTREAM");
     const char *multimodal_upstream = getenv("OMNISERVE_NATIVE_MULTIMODAL_UPSTREAM");
@@ -2098,6 +2881,7 @@ int main(int argc, char **argv) {
     if (!birefnet_upstream) birefnet_upstream = unified_upstream;
     if (!tts_upstream) tts_upstream = unified_upstream;
     if (!stt_upstream) stt_upstream = unified_upstream;
+    if (!forecast_upstream) forecast_upstream = unified_upstream;
     if (!aux_upstream) aux_upstream = unified_upstream;
     if (!embedding_upstream) embedding_upstream = aux_upstream;
     if (!multimodal_upstream) multimodal_upstream = aux_upstream ? aux_upstream : image_upstream;
@@ -2113,11 +2897,15 @@ int main(int argc, char **argv) {
 } while (0)
     CREATE_UPSTREAM(llm_upstream, llm_upstream, "LLM");
     CREATE_UPSTREAM(image_upstream, image_upstream, "image");
+    CREATE_UPSTREAM(h3_upstream, h3_upstream, "H3");
+    CREATE_UPSTREAM(image_worker_upstream, image_worker_upstream, "image worker");
+    CREATE_UPSTREAM(image_editor_upstream, image_editor_upstream, "image editor");
     CREATE_UPSTREAM(art_upstream, art_upstream, "background art");
     CREATE_UPSTREAM(birefnet_upstream, birefnet_upstream, "birefnet");
     CREATE_UPSTREAM(depth_upstream, depth_upstream, "depth");
     CREATE_UPSTREAM(tts_upstream, tts_upstream, "TTS");
     CREATE_UPSTREAM(stt_upstream, stt_upstream, "STT");
+    CREATE_UPSTREAM(forecast_upstream, forecast_upstream, "forecast");
     CREATE_UPSTREAM(training_upstream, training_upstream, "training");
     CREATE_UPSTREAM(embedding_upstream, embedding_upstream, "embedding");
     CREATE_UPSTREAM(multimodal_upstream, multimodal_upstream, "multimodal");
@@ -2136,6 +2924,43 @@ int main(int argc, char **argv) {
     CREATE_UPSTREAM(depth_overflow, depth_overflow_url, "depth overflow");
     CREATE_UPSTREAM(stt_overflow, stt_overflow_url, "STT overflow");
     CREATE_UPSTREAM(tts_overflow, tts_overflow_url, "TTS overflow");
+    const char *model_upstreams = getenv("OMNISERVE_NATIVE_IMAGE_MODEL_UPSTREAMS");
+    if (model_upstreams && model_upstreams[0]) {
+        char *entries = strdup(model_upstreams);
+        if (!entries) return 1;
+        for (char *save = NULL, *entry = strtok_r(entries, ",", &save); entry;
+             entry = strtok_r(NULL, ",", &save)) {
+            char *eq = strchr(entry, '=');
+            size_t len = eq ? (size_t)(eq - entry) : 0;
+            if (!len || len >= sizeof app.image_model_upstreams[0].model ||
+                strspn(entry, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.") != len ||
+                app.image_model_upstream_count == MAX_IMAGE_MODEL_UPSTREAMS) {
+                fprintf(stderr, "invalid image model upstream mapping\n");
+                free(entries);
+                return 1;
+            }
+            *eq++ = 0;
+            image_model_upstream *model = &app.image_model_upstreams[app.image_model_upstream_count];
+            for (size_t j = 0; j < len; j++)
+                model->model[j] = entry[j] >= 'A' && entry[j] <= 'Z' ? entry[j] + ('a' - 'A') : entry[j];
+            for (int j = 0; j < app.image_model_upstream_count; j++) {
+                if (!strcmp(model->model, app.image_model_upstreams[j].model)) {
+                    fprintf(stderr, "duplicate image model upstream: %s\n", model->model);
+                    free(entries);
+                    return 1;
+                }
+            }
+            model->target = oproxy_target_create(eq, upstream_idle, upstream_error, sizeof upstream_error);
+            if (!model->target) {
+                fprintf(stderr, "invalid image model upstream: %s\n", upstream_error);
+                free(entries);
+                return 1;
+            }
+            app.image_model_upstream_count++;
+        }
+        free(entries);
+    }
+    app.image_model_upstream_secret = getenv("OMNISERVE_NATIVE_IMAGE_MODEL_UPSTREAM_SECRET");
 #undef CREATE_UPSTREAM
     /* Defaults to paid only. Widening this is a decision to let cheaper
      * traffic reach a metered endpoint, so it must be written down, not
@@ -2155,6 +2980,13 @@ int main(int argc, char **argv) {
     }
     const char *upstream_timeout = getenv("OMNISERVE_NATIVE_UPSTREAM_TIMEOUT_MS");
     app.upstream_timeout_ms = upstream_timeout ? atoi(upstream_timeout) : 600000;
+    const char *h3_timeout = getenv("OMNISERVE_NATIVE_H3_TIMEOUT_MS");
+    app.h3_timeout_ms = h3_timeout ? atoi(h3_timeout) : 1800000;
+    /* The image overflow is reached by a metered cog that has to cold start a
+     * worker and load ~11 GB of weights before it samples, so the default is
+     * generous: a timeout here is a paid request thrown away. */
+    app.image_overflow_api_key = getenv("OMNISERVE_NATIVE_IMAGE_OVERFLOW_API_KEY");
+    app.image_overflow_timeout_ms = env_int("OMNISERVE_NATIVE_IMAGE_OVERFLOW_TIMEOUT_MS", 600000);
 
     const char *gguf = getenv("OMNISERVE_NATIVE_LLM_GGUF");
     if (gguf && gguf[0]) {
@@ -2165,7 +2997,17 @@ int main(int argc, char **argv) {
         int parallel_contexts = contexts ? atoi(contexts) : slots;
         if (parallel_contexts < 1) parallel_contexts = 1;
         if (parallel_contexts > slots) parallel_contexts = slots;
-        if (!ollm_init(gguf, ngl ? atoi(ngl) : 999, ctx ? atoi(ctx) : 8192,
+        char resolved_gguf[PATH_MAX];
+        if (realpath(gguf, resolved_gguf)) {
+            snprintf(g_llm_active_path, sizeof g_llm_active_path, "%s", resolved_gguf);
+        } else {
+            snprintf(g_llm_active_path, sizeof g_llm_active_path, "%s", gguf);
+        }
+        snprintf(g_llm_active_ngl, sizeof g_llm_active_ngl, "%s", ngl ? ngl : "auto");
+        g_llm_active_ctx = ctx ? atoi(ctx) : 8192;
+        if (g_llm_active_ctx < 1) g_llm_active_ctx = 8192;
+        g_llm_active_contexts = parallel_contexts;
+        if (!ollm_init(gguf, resolve_llm_ngl(gguf, ngl, 999), ctx ? atoi(ctx) : 8192,
                        parallel_contexts)) {
             fprintf(stderr, "llm load failed\n");
         }
@@ -2200,6 +3042,7 @@ int main(int argc, char **argv) {
         }
     }
     const char *sd = getenv("OMNISERVE_NATIVE_SD_MODEL");
+    if (!sd || !sd[0]) sd = getenv("OMNISERVE_NATIVE_SD_DIFFUSION_MODEL");
     if (sd && sd[0]) {
         fprintf(stderr, "loading diffusion %s\n", sd);
         if (!osd_init(sd)) fprintf(stderr, "diffusion load failed\n");
@@ -2258,11 +3101,15 @@ int main(int argc, char **argv) {
     olog_shutdown();
     oproxy_target_destroy(app.llm_upstream);
     oproxy_target_destroy(app.image_upstream);
+    oproxy_target_destroy(app.h3_upstream);
+    oproxy_target_destroy(app.image_worker_upstream);
+    oproxy_target_destroy(app.image_editor_upstream);
     oproxy_target_destroy(app.art_upstream);
     oproxy_target_destroy(app.birefnet_upstream);
     oproxy_target_destroy(app.depth_upstream);
     oproxy_target_destroy(app.tts_upstream);
     oproxy_target_destroy(app.stt_upstream);
+    oproxy_target_destroy(app.forecast_upstream);
     oproxy_target_destroy(app.training_upstream);
     oproxy_target_destroy(app.embedding_upstream);
     oproxy_target_destroy(app.multimodal_upstream);
@@ -2270,6 +3117,8 @@ int main(int argc, char **argv) {
     oproxy_target_destroy(app.liveportrait_upstream);
     oproxy_target_destroy(app.threed_upstream);
     oproxy_target_destroy(app.aux_upstream);
+    for (int i = 0; i < app.image_model_upstream_count; i++)
+        oproxy_target_destroy(app.image_model_upstreams[i].target);
     oproxy_target_destroy(app.image_overflow);
     oproxy_target_destroy(app.depth_overflow);
     oproxy_target_destroy(app.stt_overflow);

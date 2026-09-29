@@ -75,15 +75,17 @@ DRIFT_TEXTS = [
 
 
 class Bench:
-    def __init__(self, base: str, secret: str | None, timeout: float):
+    def __init__(self, base: str, secret: str | None, timeout: float,
+                 force_local: bool = False):
         self.base = base.rstrip("/")
         self.secret = secret
         self.timeout = timeout
+        self.force_local = force_local
         self.results: list[dict] = []
         self.metrics: dict[str, float] = {}
 
     # --- transport ---------------------------------------------------------
-    def call(self, path: str, payload=None, method=None, raw=False):
+    def call(self, path: str, payload=None, method=None, raw=False, extra_headers=None):
         url = f"{self.base}{path}"
         data = None
         headers = {"Accept": "application/json"}
@@ -92,6 +94,8 @@ class Bench:
             headers["Content-Type"] = "application/json"
         if self.secret:
             headers["X-API-Key"] = self.secret
+        if extra_headers:
+            headers.update(extra_headers)
         req = urllib.request.Request(url, data=data, headers=headers,
                                      method=method or ("POST" if data else "GET"))
         started = time.monotonic()
@@ -118,7 +122,9 @@ class Bench:
         payload = {"messages": [{"role": "user", "content": content}],
                    "max_tokens": kw.pop("max_tokens", 64), "temperature": kw.pop("temperature", 0.0)}
         payload.update(kw)
-        status, body, ms = self.call("/v1/chat/completions", payload)
+        headers = {"X-Omniserve-Internal": "local"} if self.force_local else None
+        status, body, ms = self.call("/v1/chat/completions", payload,
+                                     extra_headers=headers)
         text = ""
         usage = {}
         if isinstance(body, dict):
@@ -440,6 +446,8 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=int(os.environ.get("OMNISERVE_NATIVE_PORT", 8791)))
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--secret", default=os.environ.get("OMNISERVE_NATIVE_SECRET"))
+    ap.add_argument("--force-local", action="store_true",
+                    help="grade the embedded LLM instead of a configured compatibility proxy")
     ap.add_argument("--timeout", type=float, default=180.0)
     ap.add_argument("--suite", action="append",
                     choices=["gateway", "llm", "embedding", "image", "audio"],
@@ -457,7 +465,7 @@ def main() -> int:
         with open(args.baseline) as fh:
             baseline = json.load(fh)
 
-    b = Bench(base, args.secret, args.timeout)
+    b = Bench(base, args.secret, args.timeout, force_local=args.force_local)
     code, status_doc, _ = b.call("/status")
     if code != 200 or not isinstance(status_doc, dict):
         print(f"cannot reach {base}/status: {status_doc}", file=sys.stderr)

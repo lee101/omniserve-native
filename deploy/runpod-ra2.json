@@ -1,0 +1,20 @@
+{
+  "name": "omniserve-native-ra2",
+  "workersMin": 0,
+  "workersMax": 2,
+  "idleTimeout": 5,
+  "flashboot": true,
+  "scalerType": "REQUEST_COUNT",
+  "scalerValue": 1,
+  "executionTimeoutMs": 900000,
+  "allowedCudaVersions": ["12.8"],
+  "minCudaVersion": "12.8",
+  "gpuTypeIds": [
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA L40S",
+    "NVIDIA L40",
+    "NVIDIA RTX A6000",
+    "NVIDIA GeForce RTX 3090"
+  ],
+  "notes": "Qwen Image 2.1 (ra2) overflow worker: Dockerfile.runpod-sdcpp, CUDA 12.8 build of stable-diffusion.cpp, weights on the shared network volume. workersMin 0 and idleTimeout 5 keep an unused lane at zero spend; app.nz promotes to a pod only when sustained traffic makes continuous billing cheaper."
+}

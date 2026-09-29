@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "ocapacity.h"
 #include "ohttp.h"
+#include "oimage.h"
 #include "ojson.h"
 #include "olog.h"
 #include "oproxy.h"
@@ -69,6 +70,233 @@ static void test_json(void) {
     free(buf);
 }
 
+static void test_image_contract(void) {
+    char headroom_error[160] = {0};
+    unsetenv("OMNISERVE_NATIVE_SD_MIN_FREE_MB");
+    CHECK(oimage_gpu_headroom_mb() == 4096);
+    CHECK(oimage_gpu_headroom_ok(4.0, headroom_error, sizeof headroom_error));
+    CHECK(!oimage_gpu_headroom_ok(2.0, headroom_error, sizeof headroom_error));
+    CHECK(strstr(headroom_error, "4096 MB") != NULL);
+    CHECK(strstr(headroom_error, "2048 MB") != NULL);
+    setenv("OMNISERVE_NATIVE_SD_MIN_FREE_MB", "0", 1);
+    CHECK(oimage_gpu_headroom_mb() == 0);
+    CHECK(oimage_gpu_headroom_ok(0.1, headroom_error, sizeof headroom_error));
+    setenv("OMNISERVE_NATIVE_SD_MIN_FREE_MB", "8192", 1);
+    CHECK(oimage_gpu_headroom_mb() == 8192);
+    CHECK(!oimage_gpu_headroom_ok(7.99, headroom_error, sizeof headroom_error));
+    unsetenv("OMNISERVE_NATIVE_SD_MIN_FREE_MB");
+
+    const char *body = "{\"prompt\":\"red cube\",\"negative_prompt\":\"blur\","
+                       "\"size\":\"768x512\",\"width\":1024,\"steps\":8,"
+                       "\"guidance_scale\":1.5,\"seed\":42,\"n\":1}";
+    oimage_request request;
+    char error[160];
+    const char *edit = "{\"prompt\":\"watercolor\",\"image_base64\":\"YWJj\",\"strength\":0.4}";
+    CHECK(oimage_request_parse(edit, strlen(edit), &request, error, sizeof error));
+    CHECK(request.generation.image_base64 && strcmp(request.generation.image_base64, "YWJj") == 0);
+    CHECK(fabsf(request.generation.strength - 0.4f) < 0.0001f);
+    oimage_request_free(&request);
+    const char *bad_edits[] = {
+        "{\"prompt\":\"p\",\"image_base64\":\"\"}",
+        "{\"prompt\":\"p\",\"image_base64\":true}",
+        "{\"prompt\":\"p\",\"strength\":0.4}",
+        "{\"prompt\":\"p\",\"image_base64\":\"YWJj\",\"strength\":0}",
+        "{\"prompt\":\"p\",\"image_base64\":\"YWJj\",\"strength\":1.1}",
+        "{\"prompt\":\"p\",\"image_base64\":\"YWJj\",\"teleport\":true}",
+    };
+    for (size_t i = 0; i < sizeof bad_edits / sizeof bad_edits[0]; ++i) {
+        CHECK(!oimage_request_parse(bad_edits[i], strlen(bad_edits[i]),
+                                   &request, error, sizeof error));
+    }
+    CHECK(oimage_request_parse(body, strlen(body), &request, error, sizeof error));
+    CHECK(request.generation.prompt && strcmp(request.generation.prompt, "red cube") == 0);
+    CHECK(request.generation.negative_prompt && strcmp(request.generation.negative_prompt, "blur") == 0);
+    CHECK(request.generation.width == 1024 && request.generation.height == 512);
+    CHECK(request.generation.steps == 8);
+    CHECK(fabsf(request.generation.guidance_scale - 1.5f) < 0.0001f);
+    CHECK(request.generation.seed == 42);
+    CHECK(request.generation.lora_count == 0);
+    oimage_request_free(&request);
+
+    const char *loras = "{\"prompt\":\"cat\",\"loras\":["
+                        "{\"path\":\"/models/a.safetensors\",\"scale\":0.75},"
+                        "\"/models/b.safetensors\"]}";
+    CHECK(oimage_request_parse(loras, strlen(loras), &request, error, sizeof error));
+    CHECK(request.direct_lora_paths);
+    CHECK(request.generation.lora_count == 2);
+    CHECK(strcmp(request.generation.loras[0].path, "/models/a.safetensors") == 0);
+    CHECK(fabsf(request.generation.loras[0].scale - 0.75f) < 0.0001f);
+    CHECK(strcmp(request.generation.loras[1].path, "/models/b.safetensors") == 0);
+    CHECK(request.generation.loras[1].scale == 1.0f);
+    oimage_request_free(&request);
+
+    char lora_dir[] = "/tmp/omniserve-lora-XXXXXX";
+    CHECK(mkdtemp(lora_dir) != NULL);
+    char lora_path[512];
+    snprintf(lora_path, sizeof lora_path, "%s/pixel_art.safetensors", lora_dir);
+    FILE *lora_file = fopen(lora_path, "wb");
+    CHECK(lora_file != NULL);
+    if (lora_file) fclose(lora_file);
+    setenv("OMNISERVE_NATIVE_LORA_DIR", lora_dir, 1);
+    const char *lora_id = "{\"prompt\":\"cat\",\"lora_id\":\"pixel_art\",\"lora_scale\":0.8}";
+    CHECK(oimage_request_parse(lora_id, strlen(lora_id), &request, error, sizeof error));
+    CHECK(!request.direct_lora_paths);
+    CHECK(request.generation.lora_count == 1);
+    CHECK(strcmp(request.generation.loras[0].path, lora_path) == 0);
+    CHECK(fabsf(request.generation.loras[0].scale - 0.8f) < 0.0001f);
+    oimage_request_free(&request);
+    char named_lora_path[512];
+    snprintf(named_lora_path, sizeof named_lora_path, "%s/Z Image.safetensors", lora_dir);
+    lora_file = fopen(named_lora_path, "wb");
+    CHECK(lora_file != NULL);
+    if (lora_file) fclose(lora_file);
+    const char *named_lora = "{\"prompt\":\"cat\",\"lora_id\":\"z_style\","
+                             "\"lora_filename\":\"Z Image.safetensors\"}";
+    CHECK(oimage_request_parse(named_lora, strlen(named_lora), &request, error, sizeof error));
+    CHECK(request.generation.lora_count == 1);
+    CHECK(strcmp(request.generation.loras[0].path, named_lora_path) == 0);
+    oimage_request_free(&request);
+    char registry_lora_path[512];
+    snprintf(registry_lora_path, sizeof registry_lora_path, "%s/Z-Image_360.safetensors", lora_dir);
+    lora_file = fopen(registry_lora_path, "wb");
+    CHECK(lora_file != NULL);
+    if (lora_file) fclose(lora_file);
+    char registry_path[512];
+    snprintf(registry_path, sizeof registry_path, "%s/lora_registry.json", lora_dir);
+    FILE *registry_file = fopen(registry_path, "wb");
+    CHECK(registry_file != NULL);
+    if (registry_file) {
+        fprintf(registry_file,
+                "[{\"id\":\"zimage_360\",\"path\":\"%s/Z-Image_360.safetensors\"}]",
+                lora_dir);
+        fclose(registry_file);
+    }
+    setenv("OMNISERVE_NATIVE_LORA_REGISTRY", registry_path, 1);
+    const char *registry_lora = "{\"prompt\":\"cat\",\"lora_id\":\"zimage_360\"}";
+    CHECK(oimage_request_parse(registry_lora, strlen(registry_lora),
+                               &request, error, sizeof error));
+    CHECK(request.generation.lora_count == 1);
+    CHECK(strcmp(request.generation.loras[0].path, registry_lora_path) == 0);
+    oimage_request_free(&request);
+    const char *unsafe_filename = "{\"prompt\":\"cat\",\"lora_id\":\"z_style\","
+                                  "\"lora_filename\":\"../secret.safetensors\"}";
+    CHECK(!oimage_request_parse(unsafe_filename, strlen(unsafe_filename),
+                                &request, error, sizeof error));
+    char escaped_lora_path[512];
+    snprintf(escaped_lora_path, sizeof escaped_lora_path, "%s/escape.safetensors", lora_dir);
+    CHECK(symlink("/etc/passwd", escaped_lora_path) == 0);
+    const char *escaped_lora = "{\"prompt\":\"cat\",\"lora_id\":\"z_style\","
+                               "\"lora_filename\":\"escape.safetensors\"}";
+    CHECK(!oimage_request_parse(escaped_lora, strlen(escaped_lora),
+                                &request, error, sizeof error));
+    const char *unsafe_lora_id = "{\"prompt\":\"cat\",\"lora_id\":\"../secret\"}";
+    CHECK(!oimage_request_parse(unsafe_lora_id, strlen(unsafe_lora_id),
+                                &request, error, sizeof error));
+    unsetenv("OMNISERVE_NATIVE_LORA_REGISTRY");
+    unsetenv("OMNISERVE_NATIVE_LORA_DIR");
+    unlink(escaped_lora_path);
+    unlink(registry_path);
+    unlink(registry_lora_path);
+    unlink(named_lora_path);
+    unlink(lora_path);
+    rmdir(lora_dir);
+
+    const char *exact_seed = "{\"prompt\":\"cat\",\"guidance_scale\":0,"
+                             "\"seed\":9007199254740993}";
+    CHECK(oimage_request_parse(exact_seed, strlen(exact_seed), &request, error, sizeof error));
+    CHECK(request.generation.guidance_scale == 0.0f);
+    CHECK(request.generation.seed == INT64_C(9007199254740993));
+    oimage_request_free(&request);
+
+    const char *aliases = "{\"prompt\":\"cat\",\"num_inference_steps\":7}";
+    CHECK(oimage_request_parse(aliases, strlen(aliases), &request, error, sizeof error));
+    CHECK(request.generation.width == 1024 && request.generation.height == 1024);
+    CHECK(request.generation.steps == 7 && request.generation.seed == 0);
+    oimage_request_free(&request);
+
+    const char *bad_size = "{\"prompt\":\"cat\",\"size\":\"513x512\"}";
+    CHECK(!oimage_request_parse(bad_size, strlen(bad_size), &request, error, sizeof error));
+    CHECK(strstr(error, "64-pixel") != NULL);
+    const char *bad_batch = "{\"prompt\":\"cat\",\"n\":2}";
+    CHECK(!oimage_request_parse(bad_batch, strlen(bad_batch), &request, error, sizeof error));
+    setenv("OMNISERVE_NATIVE_SD_MAX_BATCH", "4", 1);
+    CHECK(oimage_request_parse(bad_batch, strlen(bad_batch), &request, error, sizeof error));
+    CHECK(request.count == 2 && request.generation.batch_count == 2);
+    oimage_request_free(&request);
+    unsetenv("OMNISERVE_NATIVE_SD_MAX_BATCH");
+    const char *bad_guidance = "{\"prompt\":\"cat\",\"guidance_scale\":NaN}";
+    CHECK(!oimage_request_parse(bad_guidance, strlen(bad_guidance), &request, error, sizeof error));
+    const char *bad_seed = "{\"prompt\":\"cat\",\"seed\":9223372036854775808}";
+    CHECK(!oimage_request_parse(bad_seed, strlen(bad_seed), &request, error, sizeof error));
+    const char *bad_negative = "{\"prompt\":\"cat\",\"negative_prompt\":42}";
+    CHECK(!oimage_request_parse(bad_negative, strlen(bad_negative), &request, error, sizeof error));
+    const char *bad_teleport = "{\"prompt\":\"cat\",\"teleport\":\"true\"}";
+    CHECK(!oimage_request_parse(bad_teleport, strlen(bad_teleport), &request, error, sizeof error));
+    const char *bad_teleport_step =
+        "{\"prompt\":\"cat\",\"steps\":9,\"teleport_start_step\":0}";
+    CHECK(!oimage_request_parse(bad_teleport_step, strlen(bad_teleport_step),
+                                &request, error, sizeof error));
+
+    const char *teleport = "{\"prompt\":\"cat\",\"steps\":9,\"teleport\":true,\"teleport_start_step\":7}";
+    CHECK(oimage_request_parse(teleport, strlen(teleport), &request, error, sizeof error));
+    CHECK(request.generation.teleport && request.generation.teleport_start_step == 7);
+    oimage_request_free(&request);
+
+    const unsigned char image[] = {'a', 'b', 'c'};
+    oimg_result image_result = {
+        .png = (unsigned char *)image,
+        .png_len = sizeof image,
+        .elapsed_ms = 12.6,
+        .teleport_requested = true,
+        .teleport_used = true,
+        .teleport_cache_hit = true,
+        .teleport_result_cache_hit = true,
+        .teleport_capture_step = 6,
+        .teleport_resume_step = 7,
+    };
+    char *json = NULL;
+    size_t json_len = 0;
+    CHECK(oimage_openai_response(&image_result, "z-image", 42,
+                                 &json, &json_len));
+    if (json == NULL) {
+        CHECK(json != NULL);
+        return;
+    }
+    CHECK(json_len == strlen(json));
+    CHECK(strstr(json, "\"b64_json\":\"YWJj\"") != NULL);
+    CHECK(strstr(json, "\"seed\":42") != NULL);
+    CHECK(strstr(json, "\"inference_time_ms\":13") != NULL);
+    CHECK(strstr(json, "\"cache_hit\":true") != NULL);
+    CHECK(strstr(json, "\"method\":\"exact_prompt_result_cache\"") != NULL);
+    CHECK(strstr(json, "\"resume_step\":7") != NULL);
+    oj_tok response_tokens[32];
+    CHECK(oj_parse(json, json_len, response_tokens, 32) > 0);
+    free(json);
+
+    image_result.teleport_requested = false;
+    image_result.denoiser_cache_threshold = 0.1f;
+    CHECK(oimage_openai_response(&image_result, "qwen-edit", 42, &json, &json_len));
+    CHECK(strstr(json, "\"requested\":\"easycache\"") != NULL);
+    CHECK(strstr(json, "\"approximate\":true") != NULL);
+    CHECK(strstr(json, "\"threshold\":0.100000") != NULL);
+    free(json);
+
+    unsigned char *batch_images[] = {(unsigned char *)image, (unsigned char *)image};
+    size_t batch_lens[] = {sizeof image, sizeof image};
+    oimg_result batch_result = {
+        .images = batch_images,
+        .image_lens = batch_lens,
+        .image_count = 2,
+        .format = "webp",
+        .elapsed_ms = 10.0,
+    };
+    CHECK(oimage_openai_response(&batch_result, "z-image", 7, &json, &json_len));
+    CHECK(strstr(json, "\"format\":\"webp\"") != NULL);
+    CHECK(strstr(json, "\"seed\":7") != NULL);
+    CHECK(strstr(json, "\"seed\":8") != NULL);
+    free(json);
+}
+
 static void test_tier_parse(void) {
     CHECK(otier_parse("paid", 4) == TIER_PAID);
     CHECK(otier_parse("SUB", 3) == TIER_SUB);
@@ -106,8 +334,13 @@ static void test_openapi(void) {
         "/v1/animations/generations", "/v1/3d/generations",
         "/v1/expression-pack",
         "/v1/images/backgrounds",
+        "/v1/images/segmentations", "/v1/images/text-layers", "/v1/images/edits",
+        "/v1/images/foreground-generations/jobs",
+        "/v1/images/foreground-generations/jobs/{job_id}",
         "/v1/images/background-removals/jobs",
         "/v1/images/background-removals",
+        "/v1/images/captions", "/v1/images/classifications",
+        "/v1/classifications", "/v1/video/generations", "/loras",
         "/v1/3d/assets/{job}/{file}",
         "/v1/engines/{engine_name}/completions",
     };
@@ -168,6 +401,90 @@ static void test_sched_priority(void) {
     osched_destroy(s);
 }
 
+/* Saturation is the case the queue exists for, so it is the case worth testing.
+ * Many more threads than slots, mixed tiers, every one of them hammering the
+ * admission path: the cap must hold exactly, and nobody may be lost - a handoff
+ * that signals the wrong waiter shows up here as a thread that never wakes. */
+typedef struct {
+    osched *s;
+    otier tier;
+    int rounds;
+    _Atomic int *inflight;
+    _Atomic int *peak;
+    _Atomic int *admitted;
+} sched_stress_job;
+
+static void *sched_stress_worker(void *arg) {
+    sched_stress_job *j = arg;
+    for (int i = 0; i < j->rounds; i++) {
+        if (!osched_acquire_n(j->s, j->tier, 1)) continue;
+        int now = atomic_fetch_add(j->inflight, 1) + 1;
+        int seen = atomic_load(j->peak);
+        while (now > seen && !atomic_compare_exchange_weak(j->peak, &seen, now)) {
+        }
+        atomic_fetch_add(j->admitted, 1);
+        atomic_fetch_sub(j->inflight, 1);
+        osched_release_n(j->s, j->tier, 1);
+    }
+    return NULL;
+}
+
+static void test_sched_saturation(void) {
+    enum { THREADS = 48, SLOTS = 4, ROUNDS = 200 };
+    osched *s = osched_create(SLOTS, 30);
+    _Atomic int inflight = 0, peak = 0, admitted = 0;
+    static const otier tiers[3] = {TIER_PAID, TIER_SUB, TIER_FREE};
+
+    pthread_t workers[THREADS];
+    sched_stress_job jobs[THREADS];
+    for (int i = 0; i < THREADS; i++) {
+        jobs[i] = (sched_stress_job){ .s = s, .tier = tiers[i % 3], .rounds = ROUNDS,
+                                      .inflight = &inflight, .peak = &peak,
+                                      .admitted = &admitted };
+        CHECK(pthread_create(&workers[i], NULL, sched_stress_worker, &jobs[i]) == 0);
+    }
+    for (int i = 0; i < THREADS; i++) pthread_join(workers[i], NULL);
+
+    CHECK(atomic_load(&admitted) == THREADS * ROUNDS);
+    CHECK(atomic_load(&peak) <= SLOTS);
+    CHECK(atomic_load(&inflight) == 0);
+    CHECK(osched_active(s) == 0);
+
+    osched_stats st;
+    osched_snapshot(s, &st);
+    CHECK(st.used_slots == 0);
+    CHECK(st.waiting[TIER_PAID] == 0 && st.waiting[TIER_FREE] == 0);
+    CHECK(st.served[TIER_PAID] + st.served[TIER_SUB] + st.served[TIER_FREE] ==
+          (long)THREADS * ROUNDS);
+    CHECK(st.timed_out[TIER_PAID] == 0 && st.timed_out[TIER_FREE] == 0);
+    osched_destroy(s);
+}
+
+/* A waiter that gives up must not take the slot it was queued for with it, and
+ * must leave the queue in a state where the next one still gets promoted. */
+static void test_sched_timeout_releases_the_queue(void) {
+    osched *s = osched_create(1, 0.05);
+    CHECK(osched_acquire(s, TIER_FREE));
+
+    atomic_int order = 0;
+    sched_job late = { .s = s, .tier = TIER_FREE, .order = &order, .hold_us = 0 };
+    pthread_t thread;
+    pthread_create(&thread, NULL, sched_worker, &late);
+    pthread_join(thread, NULL);
+    CHECK(late.got == -1);  /* timed out while the slot was held */
+
+    osched_stats st;
+    osched_snapshot(s, &st);
+    CHECK(st.timed_out[TIER_FREE] == 1);
+    CHECK(st.waiting[TIER_FREE] == 0);
+    CHECK(st.used_slots == 1);  /* still exactly the one live holder */
+
+    osched_release(s, TIER_FREE);
+    CHECK(osched_acquire(s, TIER_PAID));
+    osched_release(s, TIER_PAID);
+    osched_destroy(s);
+}
+
 static void test_sched_timeout(void) {
     osched *s = osched_create(1, 1);
     CHECK(osched_acquire(s, TIER_FREE));
@@ -221,10 +538,80 @@ static bool relay_to_http_client(const void *data, size_t len, void *user) {
 
 typedef struct {
     oproxy_target *target;
+    oproxy_target *bare_target;
 } echo_context;
+
+typedef struct {
+    uint16_t port;
+    const char *response;
+    atomic_bool ready;
+    atomic_bool failed;
+} raw_http_context;
+
+static void *raw_http_server(void *arg) {
+    raw_http_context *context = arg;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        atomic_store(&context->failed, true);
+        atomic_store(&context->ready, true);
+        return NULL;
+    }
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(context->port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(fd, 1) != 0) {
+        close(fd);
+        atomic_store(&context->failed, true);
+        atomic_store(&context->ready, true);
+        return NULL;
+    }
+    atomic_store(&context->ready, true);
+    int client = accept(fd, NULL, NULL);
+    if (client >= 0) {
+        char buf[1024];
+        ssize_t ignored = read(client, buf, sizeof buf);
+        (void)ignored;
+        const char *p = context->response;
+        size_t remaining = strlen(context->response);
+        while (remaining) {
+            ssize_t n = write(client, p, remaining);
+            if (n <= 0) break;
+            p += n;
+            remaining -= (size_t)n;
+        }
+        close(client);
+    } else {
+        atomic_store(&context->failed, true);
+    }
+    close(fd);
+    return NULL;
+}
 
 static void echo_handler(ohttp_request *req, void *user) {
     echo_context *context = user;
+    if (ohttp_path_is(req, "/relay-bare")) {
+        oproxy_result result;
+        char error[128];
+        bool ok = oproxy_target_relay(
+            context->bare_target,
+            req->method, req->method_len,
+            "/bare", 5,
+            req->query, req->query_len,
+            req->body, req->body_len,
+            "application/json", 16,
+            NULL, 0, 2000,
+            relay_to_http_client, req,
+            &result, error, sizeof error);
+        if (!ok && !result.response_started) {
+            ohttp_respond_str(req, 502, "text/plain", error);
+        } else if (!ok || result.downstream_close) {
+            ohttp_force_close(req);
+        }
+        return;
+    }
     if (ohttp_path_is(req, "/relay") || ohttp_path_is(req, "/relay-stream")) {
         const char *target = ohttp_path_is(req, "/relay-stream") ? "/stream" : "/echo";
         oproxy_result result;
@@ -365,13 +752,56 @@ static void test_proxy_relay(void) {
     free(sink.data);
 }
 
+static void test_proxy_service_credentials(void) {
+    /* Every header this gateway accepts as a caller credential must be
+     * recognised, or a metered backend would receive the caller's key. */
+    CHECK(oproxy_is_caller_credential("Authorization", sizeof "Authorization" - 1));
+    CHECK(oproxy_is_caller_credential("authorization", sizeof "authorization" - 1));
+    CHECK(oproxy_is_caller_credential("X-API-Key", sizeof "X-API-Key" - 1));
+    CHECK(oproxy_is_caller_credential("x-api-key", sizeof "x-api-key" - 1));
+    CHECK(oproxy_is_caller_credential("X-Rapid-API-Key", sizeof "X-Rapid-API-Key" - 1));
+    CHECK(oproxy_is_caller_credential("secret", sizeof "secret" - 1));
+    /* Content negotiation and tracing still pass through untouched. */
+    CHECK(!oproxy_is_caller_credential("Accept", sizeof "Accept" - 1));
+    CHECK(!oproxy_is_caller_credential("Content-Type", sizeof "Content-Type" - 1));
+    /* A prefix is not a match: "Authorization-Extra" is a different header. */
+    CHECK(!oproxy_is_caller_credential("Authorization-Extra", sizeof "Authorization-Extra" - 1));
+    CHECK(!oproxy_is_caller_credential("X-API-Key2", sizeof "X-API-Key2" - 1));
+    CHECK(!oproxy_is_caller_credential("secre", sizeof "secre" - 1));
+    CHECK(!oproxy_is_caller_credential(NULL, 0));
+
+    /* The injected credential is what the backend bills against. */
+    char buffer[64];
+    oproxy_header header;
+    CHECK(oproxy_service_bearer(&header, buffer, sizeof buffer, "appnz-service-key"));
+    CHECK(header.name_len == sizeof "Authorization" - 1);
+    CHECK(strncmp(header.name, "Authorization", header.name_len) == 0);
+    CHECK(header.value_len == strlen("Bearer appnz-service-key"));
+    CHECK(strncmp(header.value, "Bearer appnz-service-key", header.value_len) == 0);
+
+    /* Refusals: no key, empty key, and a key that cannot be rendered. Missing
+     * them would relay a request with the caller's credential still attached. */
+    CHECK(!oproxy_service_bearer(&header, buffer, sizeof buffer, NULL));
+    CHECK(!oproxy_service_bearer(&header, buffer, sizeof buffer, ""));
+    char tight[16];
+    CHECK(!oproxy_service_bearer(&header, tight, sizeof tight, "appnz-service-key"));
+    CHECK(!oproxy_service_bearer(&header, buffer, 0, "appnz-service-key"));
+    /* Exactly the separator and nothing after it is a misconfiguration, not a
+     * credential worth forwarding. */
+    char separator[16];
+    CHECK(!oproxy_service_bearer(&header, separator, sizeof separator, ""));
+}
+
 static void test_http_server(void) {
     char target_error[256];
     echo_context context = {
         .target = oproxy_target_create("http://127.0.0.1:18791", 4,
                                        target_error, sizeof target_error),
+        .bare_target = oproxy_target_create("http://127.0.0.1:18792", 1,
+                                            target_error, sizeof target_error),
     };
     CHECK(context.target != NULL);
+    CHECK(context.bare_target != NULL);
     ohttp_config cfg = { .port = 18791, .reactor_threads = 1, .worker_threads = 4,
                          .handler = echo_handler, .user = &context };
     ohttp_server *srv = ohttp_start(&cfg);
@@ -397,6 +827,26 @@ static void test_http_server(void) {
 
     r = http_roundtrip(18791, "POST /relay?source=gateway HTTP/1.1\r\nHost: x\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"relay\":true}", NULL);
     CHECK(r && strstr(r, "HTTP/1.1 200 OK") && strstr(r, "{\"relay\":true}"));
+    free(r);
+
+    raw_http_context raw_context = {
+        .port = 18792,
+        .response = "HTTP/1.1 401 Unauthorized\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: 20\r\n"
+                    "Connection: close\r\n\r\n"
+                    "{\"detail\":\"invalid\"}",
+    };
+    pthread_t raw_thread;
+    pthread_create(&raw_thread, NULL, raw_http_server, &raw_context);
+    while (!atomic_load(&raw_context.ready)) usleep(1000);
+    CHECK(!atomic_load(&raw_context.failed));
+    r = http_roundtrip(18791, "POST /relay-bare HTTP/1.1\r\nHost: x\r\nOrigin: https://text-generator.io\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}", NULL);
+    pthread_join(raw_thread, NULL);
+    CHECK(r && strstr(r, "HTTP/1.1 401 Unauthorized"));
+    CHECK(r && strstr(r, "Access-Control-Allow-Origin: *"));
+    CHECK(r && strstr(r, "Content-Type: application/json\r\n"));
+    CHECK(r && strstr(r, "{\"detail\":\"invalid\"}"));
     free(r);
 
     r = http_roundtrip(18791, "GET /relay-stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
@@ -488,6 +938,7 @@ static void test_http_server(void) {
     ohttp_stop(srv);
     CHECK(ohttp_join(srv) == 0);
     oproxy_target_destroy(context.target);
+    oproxy_target_destroy(context.bare_target);
 }
 
 /* A lane that is already justified and under pressure, so each test can turn
@@ -635,6 +1086,7 @@ static void test_scale_caps_and_cooldown(void) {
     oscale_policy policy;
     oscale_observation obs;
     saturated_paid_lane(&policy, &obs);
+    obs.backlog_reqs = 2000.0; /* Enough uncovered demand for both instances. */
     policy.max_instances = 2;
     policy.max_usd_hr = 1.0; /* room for two $0.34 instances */
     oscale *s = oscale_create();
@@ -670,6 +1122,37 @@ static void test_scale_caps_and_cooldown(void) {
     CHECK(oscale_decide(lane, &obs, 1400.0, &reason) == OSCALE_HOLD);
     CHECK(reason == OSCALE_REASON_INSTANCE_CAP);
     CHECK(oscale_lane_spend_rate_usd_hr(lane) > 0.67);
+    oscale_destroy(s);
+}
+
+static void test_scale_marginal_demand(void) {
+    oscale_policy policy;
+    oscale_observation obs;
+    saturated_paid_lane(&policy, &obs);
+    oscale *s = oscale_create();
+    CHECK(oscale_add_lane(s, &policy) == 0);
+    oscale_lane *lane = oscale_lane_at(s, 0);
+    oscale_reason reason = OSCALE_REASON_NONE;
+    CHECK(oscale_decide(lane, &obs, 1000.0, &reason) == OSCALE_UP);
+    int slot = oscale_begin_instance(lane, 1000.0);
+    oscale_instance_touch(lane, slot, 1130.0);
+
+    /* 200 requests fit in the first instance's 720 req/hour capacity.
+     * Neither warming nor ready capacity can justify a duplicate rental. */
+    for (int ready = 0; ready < 2; ready++) {
+        lane->instances[slot].ready = ready != 0;
+        obs.backlog_reqs = 200.0;
+        CHECK(oscale_decide(lane, &obs, 1130.0, &reason) == OSCALE_HOLD);
+        CHECK(reason == OSCALE_REASON_NOT_WORTH_IT);
+        obs.backlog_reqs = 723.0; /* Three marginal requests do not pay rent. */
+        CHECK(oscale_decide(lane, &obs, 1130.0, &reason) == OSCALE_HOLD);
+        CHECK(reason == OSCALE_REASON_NOT_WORTH_IT);
+        obs.backlog_reqs = 920.0;
+        CHECK(oscale_decide(lane, &obs, 1130.0, &reason) == OSCALE_UP);
+    }
+    oscale_release_instance(lane, slot, 1130.0, OSCALE_REASON_IDLE);
+    obs.backlog_reqs = 200.0;
+    CHECK(oscale_decide(lane, &obs, 1260.0, &reason) == OSCALE_UP);
     oscale_destroy(s);
 }
 
@@ -1020,6 +1503,23 @@ static int log_files_present(const char *dir) {
     return present;
 }
 
+static int unused_loopback_port(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    socklen_t len = sizeof addr;
+    int port = 0;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) == 0 &&
+        getsockname(fd, (struct sockaddr *)&addr, &len) == 0) {
+        port = ntohs(addr.sin_port);
+    }
+    close(fd);
+    return port;
+}
+
 /* The access log is the one place a credential could leak to disk by accident,
  * so the redaction is pinned here rather than left to review. */
 static void test_access_log(void) {
@@ -1036,13 +1536,15 @@ static void test_access_log(void) {
     CHECK(olog_enabled());
 
     echo_context context = { .target = NULL };
-    ohttp_config cfg = { .port = 18793, .reactor_threads = 1, .worker_threads = 2,
+    int port = unused_loopback_port();
+    CHECK(port > 0);
+    ohttp_config cfg = { .port = port, .reactor_threads = 1, .worker_threads = 2,
                          .handler = echo_handler, .user = &context };
     ohttp_server *srv = ohttp_start(&cfg);
     CHECK(srv != NULL);
     usleep(100000);
 
-    char *r = http_roundtrip(18793,
+    char *r = http_roundtrip(port,
         "POST /echo?token=querysecret789 HTTP/1.1\r\nHost: x\r\n"
         "Authorization: Bearer supersecret123\r\nX-API-Key: topsecretkey456\r\n"
         "X-Forwarded-For: 8.8.8.8\r\nX-Omniserve-Tier: paid\r\n"
@@ -1052,7 +1554,7 @@ static void test_access_log(void) {
 
     /* A bare CR, a quote and a control byte in the path: one request must stay
      * one line no matter what the client puts in the request target. */
-    r = http_roundtrip(18793,
+    r = http_roundtrip(port,
         "GET /inject\"\rmarker\x01x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
     free(r);
 
@@ -1086,7 +1588,7 @@ static void test_access_log(void) {
         char raw[256];
         snprintf(raw, sizeof raw,
                  "GET /rotate/%d HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", i);
-        free(http_roundtrip(18793, raw, NULL));
+        free(http_roundtrip(port, raw, NULL));
     }
     olog_flush();
     usleep(50000);
@@ -1278,12 +1780,27 @@ static void test_vram_arbitration(void) {
     /* 8192 free, 1024 floor for background: 7168 grantable. */
     CHECK(ovram_headroom_at(v, TIER_BACKGROUND, 100.0, 8192) == 7168);
 
+    /* The embedded image lane leases its whole scratch floor, not a partial
+     * best effort.  While it is active no second background tenant can size
+     * itself against those same physical bytes. */
+    char image_id[40], competing_id[40];
+    CHECK(ovram_lease_at(v, "embedded-zimage", 4096, 4096,
+                         TIER_BACKGROUND, 60.0, 90.0, 8192,
+                         image_id, sizeof image_id) == 4096);
+    CHECK(ovram_lease_at(v, "competing-gpu-tenant", 4096, 4096,
+                         TIER_BACKGROUND, 60.0, 90.0, 8192,
+                         competing_id, sizeof competing_id) == 0);
+    CHECK(competing_id[0] == '\0');
+    CHECK(ovram_release(v, image_id));
+
     /* The whole point: a granted lease is subtracted from what the next caller
      * sees, so two tenants cannot size against the same free bytes. */
     int a = ovram_lease_at(v, "zimage", 4096, 1024, TIER_BACKGROUND, 60.0, 100.0, 8192,
                            id_a, sizeof id_a);
     CHECK(a == 4096);
     CHECK(ovram_headroom_at(v, TIER_BACKGROUND, 100.0, 8192) == 3072);
+    CHECK(ovram_renew_at(v, id_a, 120.0, 110.0));
+    CHECK(!ovram_renew_at(v, "missing", 120.0, 110.0));
 
     /* Asking beyond headroom yields a partial grant when min_mb still fits. */
     int b = ovram_lease_at(v, "other", 8192, 1024, TIER_BACKGROUND, 60.0, 100.0, 8192,
@@ -1297,9 +1814,11 @@ static void test_vram_arbitration(void) {
                          id_c, sizeof id_c) == 0);
     CHECK(id_c[0] == '\0');
 
-    /* Paid dips further into the floor than background may, so interactive
-     * traffic is not starved by batch work holding every lease. */
-    CHECK(ovram_headroom_at(v, TIER_PAID, 100.0, 8192) > 0);
+    /* Higher-priority traffic is not starved by background leases. Those
+     * leases still protect background tenants from each other, but normal
+     * interactive work sizes from the real device headroom and its own floor. */
+    CHECK(ovram_headroom_at(v, TIER_FREE, 100.0, 8192) == 7424);
+    CHECK(ovram_headroom_at(v, TIER_PAID, 100.0, 8192) == 7936);
 
     CHECK(ovram_release(v, id_a));
     CHECK(!ovram_release(v, id_a));
@@ -1325,8 +1844,8 @@ static void test_vram_arbitration(void) {
      * lease still held here would be reaped by it and skew the counters. */
     ovram_stats st;
     ovram_snapshot(v, &st);
-    CHECK(st.grants == 2 && st.partial_grants == 1 && st.denials == 2);
-    CHECK(st.releases == 1 && st.expirations == 1);
+    CHECK(st.grants == 3 && st.partial_grants == 1 && st.denials == 3);
+    CHECK(st.releases == 2 && st.expirations == 1);
     CHECK(st.lease_count == 0);
 
     ovram_destroy(v);
@@ -1390,22 +1909,27 @@ int main(void) {
     test_host_prefetch_policy();
     test_vram_arbitration();
     test_json();
+    test_image_contract();
     test_matte();
     test_tier_parse();
     test_completion_spacing();
     test_openapi();
     test_sched_priority();
     test_sched_timeout();
+    test_sched_timeout_releases_the_queue();
+    test_sched_saturation();
     test_sched_weighted_capacity();
     test_scale_defaults_to_zero();
     test_scale_only_for_eligible_tiers();
     test_scale_prefers_local_capacity();
     test_scale_cost_gate();
     test_scale_caps_and_cooldown();
+    test_scale_marginal_demand();
     test_scale_down_to_zero();
     test_scale_hard_ttl_beats_everything();
     test_tune_profiles();
     test_capacity_controller();
+    test_proxy_service_credentials();
     test_http_server();
     test_response_accounting();
     test_access_log();

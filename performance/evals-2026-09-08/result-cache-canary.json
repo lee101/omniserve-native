@@ -1,0 +1,374 @@
+{
+  "before": {
+    "schema_version": 1,
+    "captured_at": "2026-09-08T04:53:41.287583+00:00",
+    "cpu_count": 72,
+    "load_average": [
+      12.26904296875,
+      14.18505859375,
+      15.2841796875
+    ],
+    "memory_gib": {
+      "MemTotal": 251.75565338134766,
+      "MemAvailable": 117.99382019042969,
+      "SwapTotal": 79.99999237060547,
+      "SwapFree": 0.000934600830078125
+    },
+    "disk": {
+      "path": "/nvme0n1-disk/code/omniserve-native",
+      "free_gib": 34.41852951049805,
+      "total_gib": 1759.3501167297363,
+      "used_pct": 97.94113472490992
+    },
+    "pressure": {
+      "cpu": "some avg10=0.32 avg60=0.21 avg300=0.26 total=61791933326\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+      "memory": "some avg10=0.00 avg60=0.00 avg300=0.00 total=12171447254\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=10901847764",
+      "io": "some avg10=0.60 avg60=0.40 avg300=0.37 total=376757883222\nfull avg10=0.50 avg60=0.34 avg300=0.28 total=332790205943"
+    },
+    "gpus": [
+      {
+        "index": 0,
+        "name": "NVIDIA GeForce RTX 5090",
+        "total_gib": 31.8427734375,
+        "free_gib": 12.314453125,
+        "used_gib": 19.0439453125,
+        "utilization_pct": 0
+      }
+    ],
+    "warnings": [
+      "Disk at least 95% full; avoid conversion/download staging here",
+      "Swap nearly full; inspect PSI and swap-in/out, not swap occupancy alone"
+    ]
+  },
+  "settings": {
+    "OMNISERVE_NATIVE_SD_DIFFUSION_MODEL": "/nvme0n1-disk/models/omniserve-native/qwen-edit-2511/qwen-image-edit-2511-Q4_K_M.gguf",
+    "OMNISERVE_NATIVE_SD_LLM": "/nvme0n1-disk/models/omniserve-native/qwen-edit-2511/split_files/text_encoders/qwen_2.5_vl_7b.safetensors",
+    "OMNISERVE_NATIVE_SD_VAE": "/nvme0n1-disk/models/omniserve-native/qwen-edit-2511/split_files/vae/qwen_image_vae.safetensors",
+    "OMNISERVE_NATIVE_BIND": "127.0.0.1",
+    "OMNISERVE_NATIVE_SLOTS": "1",
+    "OMNISERVE_NATIVE_IMAGE_PERMITS": "1",
+    "OMNISERVE_NATIVE_SD_MAX_VRAM": "4",
+    "OMNISERVE_NATIVE_SD_STREAM_LAYERS": "1",
+    "OMNISERVE_NATIVE_SD_PARAMS_BACKEND": "cpu",
+    "OMNISERVE_NATIVE_SD_BACKEND": "diffusion=cuda0,te=cuda0,vae=cuda0",
+    "OMNISERVE_NATIVE_SD_THREADS": "8",
+    "OMNISERVE_NATIVE_SD_MMAP": "1",
+    "OMNISERVE_NATIVE_SD_EAGER_LOAD": "0",
+    "OMNISERVE_NATIVE_SD_IMAGE_FORMAT": "png",
+    "OMNISERVE_NATIVE_SD_MIN_FREE_MB": "2048",
+    "OMNISERVE_NATIVE_SD_REFERENCE_EDIT": "1",
+    "OMNISERVE_NATIVE_SD_MODEL_ARGS": "qwen_image_zero_cond_t=true",
+    "OMNISERVE_NATIVE_SD_TELEPORT_CACHE_SIZE": "16",
+    "OMNISERVE_NATIVE_SD_ZERO_GUIDANCE": "1",
+    "OMNISERVE_NATIVE_IMAGE_PREFER_EMBEDDED": "1",
+    "OMNISERVE_NATIVE_SD_LIB": "/nvme0n1-disk/tmp/qwen-graph-library-ul1p05g4/libstable-diffusion.so"
+  },
+  "command": [
+    ".venv/bin/python",
+    "tools/image_cache_bench.py",
+    "--source",
+    "../stable-diffusion.cpp/assets/flux/flux1-dev-q8_0.png",
+    "--output",
+    "/tmp/qwen-edit-gpu-fixed-cache-0908",
+    "--route",
+    "/v1/images/edits",
+    "--steps",
+    "12",
+    "--guidance",
+    "2.5",
+    "--limit",
+    "3",
+    "--prompt",
+    "Change the text on the sign from 'flux.cpp' to 'edit.cpp'. Keep the cat and background unchanged."
+  ],
+  "binary": "/nvme0n1-disk/code/omniserve-native/build-edit-perf/omniserve-native",
+  "complete": true,
+  "status": {
+    "vram_free_gib": 12.31,
+    "vram_total_gib": 31.84,
+    "vram_available": true,
+    "gpu": {
+      "device_present": true,
+      "requested": false,
+      "placement": "cpu",
+      "device": "NVIDIA GeForce RTX 5090",
+      "kv_type": "f16",
+      "flash_attn": false,
+      "degraded": false
+    },
+    "llm": {
+      "ready": false,
+      "model": "none"
+    },
+    "embedding": {
+      "ready": false,
+      "model": "none"
+    },
+    "diffusion": {
+      "ready": true,
+      "model": "qwen-image-edit-2511-Q4_K_M"
+    },
+    "upstreams": {
+      "llm": false,
+      "image": false,
+      "image_worker": false,
+      "h3": false,
+      "art": false,
+      "birefnet": false,
+      "tts": false,
+      "stt": false,
+      "forecast": false,
+      "embedding": false,
+      "multimodal": false,
+      "animation": false,
+      "threed": false,
+      "aux": false
+    },
+    "permits": {
+      "llm": 1,
+      "image": 1,
+      "h3": 0,
+      "art": 1,
+      "birefnet": 1,
+      "tts": 1,
+      "stt": 1,
+      "forecast": 1,
+      "embedding": 1,
+      "multimodal": 1,
+      "animation": 1,
+      "threed": 1,
+      "aux": 1
+    },
+    "proxy_pool": {
+      "llm": {
+        "idle": 0,
+        "opened": 0,
+        "reused": 0,
+        "failures": 0
+      },
+      "image": {
+        "idle": 0,
+        "opened": 0,
+        "reused": 0,
+        "failures": 0
+      },
+      "image_worker": {
+        "idle": 0,
+        "opened": 0,
+        "reused": 0,
+        "failures": 0
+      },
+      "h3": {
+        "idle": 0,
+        "opened": 0,
+        "reused": 0,
+        "failures": 0
+      },
+      "birefnet": {
+        "idle": 0,
+        "opened": 0,
+        "reused": 0,
+        "failures": 0
+      },
+      "tts": {
+        "idle": 0,
+        "opened": 0,
+        "reused": 0,
+        "failures": 0
+      },
+      "stt": {
+        "idle": 0,
+        "opened": 0,
+        "reused": 0,
+        "failures": 0
+      },
+      "forecast": {
+        "idle": 0,
+        "opened": 0,
+        "reused": 0,
+        "failures": 0
+      },
+      "embedding": {
+        "idle": 0,
+        "opened": 0,
+        "reused": 0,
+        "failures": 0
+      },
+      "multimodal": {
+        "idle": 0,
+        "opened": 0,
+        "reused": 0,
+        "failures": 0
+      },
+      "animation": {
+        "idle": 0,
+        "opened": 0,
+        "reused": 0,
+        "failures": 0
+      },
+      "threed": {
+        "idle": 0,
+        "opened": 0,
+        "reused": 0,
+        "failures": 0
+      },
+      "aux": {
+        "idle": 0,
+        "opened": 0,
+        "reused": 0,
+        "failures": 0
+      }
+    },
+    "admission": {
+      "slots": 1,
+      "used_slots": 0,
+      "active": 0,
+      "waiting": {
+        "paid": 0,
+        "sub": 0,
+        "free": 0,
+        "background": 0
+      },
+      "served": {
+        "paid": 0,
+        "sub": 0,
+        "free": 0,
+        "background": 0
+      },
+      "timed_out": {
+        "paid": 0,
+        "sub": 0,
+        "free": 0,
+        "background": 0
+      },
+      "queue_ms_max": {
+        "paid": 0.0,
+        "sub": 0.0,
+        "free": 0.0,
+        "background": 0.0
+      }
+    },
+    "tune": {
+      "class": "unknown",
+      "n_batch": 0,
+      "n_ubatch": 0
+    },
+    "speculation": {
+      "draft_max": 0,
+      "rounds": 0,
+      "drafted": 0,
+      "accepted": 0,
+      "acceptance": 0.0,
+      "calls_saved": 0
+    },
+    "capacity": {
+      "warm_failures": 0,
+      "lanes": [
+        {
+          "name": "tts",
+          "enabled": false,
+          "hardware": "gpu-rtx4090",
+          "instances": 0,
+          "ready": 0,
+          "price_usd_hr": 0.34,
+          "spend_rate_usd_hr": 0.0,
+          "spend_usd": 0.0,
+          "instance_seconds": 0,
+          "scale_ups": 0,
+          "scale_downs": 0,
+          "ttl_kills": 0,
+          "last_reason": "none"
+        },
+        {
+          "name": "stt",
+          "enabled": false,
+          "hardware": "gpu-rtx4090",
+          "instances": 0,
+          "ready": 0,
+          "price_usd_hr": 0.34,
+          "spend_rate_usd_hr": 0.0,
+          "spend_usd": 0.0,
+          "instance_seconds": 0,
+          "scale_ups": 0,
+          "scale_downs": 0,
+          "ttl_kills": 0,
+          "last_reason": "none"
+        },
+        {
+          "name": "image",
+          "enabled": false,
+          "hardware": "gpu-rtx4090",
+          "instances": 0,
+          "ready": 0,
+          "price_usd_hr": 0.34,
+          "spend_rate_usd_hr": 0.0,
+          "spend_usd": 0.0,
+          "instance_seconds": 0,
+          "scale_ups": 0,
+          "scale_downs": 0,
+          "ttl_kills": 0,
+          "last_reason": "none"
+        },
+        {
+          "name": "multimodal",
+          "enabled": false,
+          "hardware": "gpu-rtx4090",
+          "instances": 0,
+          "ready": 0,
+          "price_usd_hr": 0.34,
+          "spend_rate_usd_hr": 0.0,
+          "spend_usd": 0.0,
+          "instance_seconds": 0,
+          "scale_ups": 0,
+          "scale_downs": 0,
+          "ttl_kills": 0,
+          "last_reason": "none"
+        }
+      ]
+    }
+  },
+  "load_seconds": 1.0201423969119787,
+  "returncode": 0,
+  "after": {
+    "schema_version": 1,
+    "captured_at": "2026-09-08T05:01:22.350874+00:00",
+    "cpu_count": 72,
+    "load_average": [
+      12.05908203125,
+      11.876953125,
+      13.9052734375
+    ],
+    "memory_gib": {
+      "MemTotal": 251.75565338134766,
+      "MemAvailable": 115.44103622436523,
+      "SwapTotal": 79.99999237060547,
+      "SwapFree": 3.814697265625e-06
+    },
+    "disk": {
+      "path": "/nvme0n1-disk/code/omniserve-native",
+      "free_gib": 34.271018981933594,
+      "total_gib": 1759.3501167297363,
+      "used_pct": 97.9495191008884
+    },
+    "pressure": {
+      "cpu": "some avg10=0.45 avg60=0.43 avg300=0.24 total=61794399395\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+      "memory": "some avg10=0.17 avg60=0.05 avg300=0.01 total=12171826944\nfull avg10=0.17 avg60=0.05 avg300=0.01 total=10902224919",
+      "io": "some avg10=0.11 avg60=0.36 avg300=0.35 total=376761049848\nfull avg10=0.10 avg60=0.26 avg300=0.26 total=332792878911"
+    },
+    "gpus": [
+      {
+        "index": 0,
+        "name": "NVIDIA GeForce RTX 5090",
+        "total_gib": 31.8427734375,
+        "free_gib": 12.314453125,
+        "used_gib": 19.0439453125,
+        "utilization_pct": 0
+      }
+    ],
+    "warnings": [
+      "Disk at least 95% full; avoid conversion/download staging here",
+      "Swap nearly full; inspect PSI and swap-in/out, not swap occupancy alone"
+    ]
+  },
+  "elapsed_seconds": 461.0650439178571
+}

@@ -68,7 +68,7 @@ endif()
 set(LLAMA_DIR "${CMAKE_SOURCE_DIR}/../llama.cpp" CACHE PATH "llama.cpp checkout")
 set(SD_DIR "${CMAKE_SOURCE_DIR}/../stable-diffusion.cpp" CACHE PATH "stable-diffusion.cpp checkout")
 
-set(CORE_SRC src/ocapacity.c src/ohttp.c src/ojson.c src/olog.c src/omatte.c src/oproxy.c src/osched.c
+set(CORE_SRC src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c src/omatte.c src/onsfw.c src/oproxy.c src/osched.c
              src/ohost.c src/ovram.c src/ospec.c
              src/oscale.c src/otext.c src/otune.c)
 
@@ -80,6 +80,13 @@ add_executable(omniserve-native src/main.c src/docs.c src/backend_llama.c src/ba
 target_include_directories(omniserve-native PRIVATE include)
 target_link_libraries(omniserve-native PRIVATE onative_core)
 
+# Capacity-aware local/managed ASR selection.  Keeping this relay in the same C
+# data plane removes the Python HTTP server from every transcription request;
+# model inference remains isolated in its model-specific worker.
+add_executable(omniserve-asr-router src/asr_router.c)
+target_include_directories(omniserve-asr-router PRIVATE include)
+target_link_libraries(omniserve-asr-router PRIVATE onative_core)
+
 if(WITH_LLAMA AND EXISTS "${LLAMA_DIR}/build/bin/libllama.so")
     target_compile_definitions(omniserve-native PRIVATE USE_LLAMA)
     target_include_directories(omniserve-native SYSTEM PRIVATE "${LLAMA_DIR}/include" "${LLAMA_DIR}/ggml/include")
@@ -89,23 +96,59 @@ endif()
 
 if(WITH_SD AND EXISTS "${SD_DIR}/build/bin/libstable-diffusion.so")
     target_compile_definitions(omniserve-native PRIVATE USE_SD "OMNISERVE_SD_LIB_DEFAULT=\"${SD_DIR}/build/bin/libstable-diffusion.so\"")
+    # Upstream stable-diffusion.cpp lacks the exact-prompt latent replay API carried by
+    # the production fork; detect it so backend_sd.c can fall back to dense generation.
+    file(READ "${SD_DIR}/include/stable-diffusion.h" _sd_header)
+    if(_sd_header MATCHES "stream_layers")
+        target_compile_definitions(omniserve-native PRIVATE OMNISERVE_SD_STREAM_LAYERS=1)
+    else()
+        target_compile_definitions(omniserve-native PRIVATE OMNISERVE_SD_STREAM_LAYERS=0)
+    endif()
+    if(_sd_header MATCHES "sd_latent_replay_params_t")
+        target_compile_definitions(omniserve-native PRIVATE OMNISERVE_SD_LATENT_API=1)
+    else()
+        target_compile_definitions(omniserve-native PRIVATE OMNISERVE_SD_LATENT_API=0)
+    endif()
     # SYSTEM so the vendored stb/sd headers do not trip our own strict warning
     # set; they are third-party code and are not ours to fix.
     target_include_directories(omniserve-native SYSTEM BEFORE PRIVATE "${SD_DIR}/ggml/examples")
     target_include_directories(omniserve-native SYSTEM PRIVATE "${SD_DIR}/include")
     target_include_directories(omniserve-native SYSTEM PRIVATE "${SD_DIR}/thirdparty")
+    add_executable(onative_image_decode_tests tests/test_image_decode.c src/backend_sd.c)
+    target_compile_definitions(onative_image_decode_tests PRIVATE USE_SD)
+    target_include_directories(onative_image_decode_tests SYSTEM PRIVATE
+        "${SD_DIR}/ggml/examples" "${SD_DIR}/include" "${SD_DIR}/thirdparty")
+    target_link_libraries(onative_image_decode_tests PRIVATE onative_core)
+    add_library(onative_sd_cache_stub SHARED tests/sd_cache_stub.c)
+    target_include_directories(onative_sd_cache_stub SYSTEM PRIVATE "${SD_DIR}/include")
 endif()
 
 enable_testing()
+if(TARGET onative_image_decode_tests)
+    add_test(NAME image_decode COMMAND onative_image_decode_tests)
+endif()
 add_executable(onative_tests tests/test_core.c src/backend_llama.c src/docs.c)
 target_include_directories(onative_tests PRIVATE include)
 target_link_libraries(onative_tests PRIVATE onative_core)
 add_test(NAME core COMMAND onative_tests)
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+    if(TARGET onative_sd_cache_stub)
+        add_test(NAME image_cache_concurrency COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/tests/test_image_cache_concurrency.py")
+        set_tests_properties(image_cache_concurrency PROPERTIES ENVIRONMENT
+            "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
+    endif()
     add_test(
         NAME trellis2_worker
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_trellis2_worker.py"
+    )
+    # The pod-mode entry app.nz drives over HTTP: /healthz, /predictions with
+    # {"input": ...} in and {"output": ...} out. Runs a stub workload, so it
+    # needs no GPU and no weights.
+    add_test(
+        NAME cog_pod_contract
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_cog_pod_contract.py"
     )
     add_test(
         NAME asr_training
@@ -115,6 +158,12 @@ if(Python3_Interpreter_FOUND)
         NAME asr_router
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_asr_router.py"
     )
+    add_test(
+        NAME asr_router_native
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_asr_router_native.py"
+    )
+    set_tests_properties(asr_router_native PROPERTIES
+        ENVIRONMENT "OMNISERVE_ASR_ROUTER_BIN=$<TARGET_FILE:omniserve-asr-router>")
     add_test(
         NAME birefnet_jobs
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_birefnet_jobs.py"
@@ -151,6 +200,46 @@ if(Python3_Interpreter_FOUND)
     set_tests_properties(depth_route PROPERTIES
         ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>"
     )
+    add_test(
+        NAME multimodal_routing
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_multimodal_routing.py"
+    )
+    set_tests_properties(multimodal_routing PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    add_test(
+        NAME forecast_routing
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_forecast_routing.py"
+    )
+    set_tests_properties(forecast_routing PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    add_test(
+        NAME image_worker_routing
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_image_worker_routing.py"
+    )
+    set_tests_properties(image_worker_routing PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    # Drives the real gateway with the stub diffusion backend: a saturated
+    # embedded image lane must relay to its standing remote instead of queueing.
+    if(TARGET onative_sd_cache_stub)
+        add_test(
+            NAME image_overflow_routing
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_image_overflow_routing.py"
+        )
+        add_test(
+            NAME image_model_routing
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_image_model_routing.py"
+        )
+        set_tests_properties(image_model_routing PROPERTIES
+            ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
+        set_tests_properties(image_overflow_routing PROPERTIES
+            ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
+    endif()
+    add_test(
+        NAME h3_routing
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_h3_routing.py"
+    )
+    set_tests_properties(h3_routing PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
     # Skips itself when numpy or libomatte.so is missing (CPU-only CI).
     add_test(
         NAME matte_decontamination

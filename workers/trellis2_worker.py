@@ -9,8 +9,10 @@ per request so all VRAM is returned when a background job finishes.
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -27,6 +29,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import remote_3d  # noqa: E402
 
 
 MODEL_TRELLIS = "microsoft/TRELLIS.2-4B"
@@ -242,7 +247,15 @@ def run_with_gpu_holds(job) -> tuple[int, dict]:
                 print(f"[omniserve-3d] failed to release GPU hold at {base}: {exc}", file=sys.stderr)
 
 
-def run_job(payload: dict, server_base: str) -> tuple[int, dict]:
+def pixal_remote() -> bool:
+    if not remote_3d.configured():
+        return False
+    installed = runtime_installed(MODEL_PIXAL)
+    free_mib = gpu_memory_mib()[0] if installed else None
+    return remote_3d.should_route(installed, free_mib, int(os.getenv("OMNISERVE_3D_MIN_FREE_MIB", "24576")))
+
+
+def run_job(payload: dict, server_base: str, remote: bool | None = None) -> tuple[int, dict]:
     model = str(payload.get("model") or MODEL_TRELLIS)
     if model not in ALLOWED_MODELS:
         return HTTPStatus.BAD_REQUEST, {"error": "unsupported model"}
@@ -274,6 +287,9 @@ def run_job(payload: dict, server_base: str) -> tuple[int, dict]:
     if not -(2**31) <= seed < 2**31:
         return HTTPStatus.BAD_REQUEST, {"error": "seed must be a signed 32-bit integer"}
 
+    if model == MODEL_PIXAL and (pixal_remote() if remote is None else remote):
+        return remote_3d.run(model, image_url, resolution, texture_size, decimation_target, seed,
+                             Path(os.getenv("OMNISERVE_3D_OUTPUT_DIR", "/nvme0n1-disk/models/omniserve-3d/outputs")))
     repo, python, runner = model_runtime(model)
     if not runtime_installed(model):
         return HTTPStatus.SERVICE_UNAVAILABLE, {
@@ -302,6 +318,72 @@ def run_job(payload: dict, server_base: str) -> tuple[int, dict]:
             runner,
         )
     )
+
+
+# TRELLIS.2 segments its input itself when handed an opaque image, with a
+# general-purpose salient-object model. Feeding it a BiRefNet cutout that has
+# already been colour-decontaminated is strictly better in two ways: the matte is
+# sharper on hair and thin structures, and the RGB under the soft edge is the
+# subject's own colour rather than the subject blended with whatever it was
+# photographed against. That second one matters more than it sounds - the
+# backdrop colour in the edge band gets baked into the generated texture and
+# then lit, so a green-screened figure comes back with a green rim that no
+# amount of retexturing removes.
+CUTOUT_BASE = os.getenv("OMNISERVE_3D_CUTOUT_BASE", "http://127.0.0.1:8791").rstrip("/")
+CUTOUT_PATH = os.getenv("OMNISERVE_3D_CUTOUT_PATH", "/v1/images/background-removals")
+CUTOUT_SECRET = os.getenv("OMNISERVE_3D_CUTOUT_SECRET", os.getenv("OMNISERVE_NATIVE_SECRET", ""))
+CUTOUT_TIMEOUT = int(os.getenv("OMNISERVE_3D_CUTOUT_TIMEOUT", "180"))
+CUTOUT_ENABLED = os.getenv("OMNISERVE_3D_CUTOUT", "1") == "1"
+
+
+def prepare_cutout(source_path: Path, job_dir: Path) -> Path:
+    """Replaces the source with a background-removed RGBA version.
+
+    Best effort by design: a cutout service that is down, slow or unhelpful must
+    not fail a 3D job that would have worked without it, so every failure path
+    returns the original image and logs why.
+    """
+    if not CUTOUT_ENABLED:
+        return source_path
+    try:
+        from PIL import Image
+    except ImportError:
+        return source_path
+
+    try:
+        with source_path.open("rb") as handle:
+            data = handle.read()
+        if Image.open(io.BytesIO(data)).mode in {"RGBA", "LA"}:
+            # Already cut out by the caller; segmenting it again would only
+            # erode the matte it already has.
+            return source_path
+    except Exception as error:
+        print(f"3d cutout skipped (unreadable source): {error}", flush=True)
+        return source_path
+
+    payload = json.dumps({
+        "image_url": "data:image/png;base64," + base64.b64encode(data).decode(),
+        "output_format": "png",
+        "decontaminate": True,
+    }).encode()
+    headers = {"Content-Type": "application/json", "Accept": "image/png"}
+    if CUTOUT_SECRET:
+        headers["Authorization"] = f"Bearer {CUTOUT_SECRET}"
+
+    try:
+        request = Request(f"{CUTOUT_BASE}{CUTOUT_PATH}", data=payload, headers=headers)
+        with urlopen(request, timeout=CUTOUT_TIMEOUT) as response:
+            cutout = response.read()
+        image = Image.open(io.BytesIO(cutout))
+        if image.mode != "RGBA":
+            raise ValueError(f"cutout came back as {image.mode}, not RGBA")
+    except Exception as error:
+        print(f"3d cutout skipped: {error}", flush=True)
+        return source_path
+
+    cutout_path = job_dir / "source-cutout.png"
+    image.save(cutout_path, format="PNG")
+    return cutout_path
 
 
 def run_validated_job(
@@ -342,6 +424,7 @@ def run_validated_job(
 
     try:
         download_image(image_url, source_path)
+        source_path = prepare_cutout(source_path, job_dir)
         command = [
             python,
             str(runner),
@@ -511,7 +594,8 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "JSON object required"})
             return
-        if not JOB_LOCK.acquire(blocking=False):
+        remote = payload.get("model") == MODEL_PIXAL and pixal_remote()
+        if not remote and not JOB_LOCK.acquire(blocking=False):
             self.send_json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"error": "worker_busy", "retry_after_seconds": 30},
@@ -522,10 +606,11 @@ class Handler(BaseHTTPRequestHandler):
                 "OMNISERVE_3D_PUBLIC_BASE",
                 f"http://127.0.0.1:{self.server.server_port}",
             ).rstrip("/")
-            status, response = run_job(payload, public_base)
+            status, response = run_job(payload, public_base, remote)
             self.send_json(status, response)
         finally:
-            JOB_LOCK.release()
+            if not remote:
+                JOB_LOCK.release()
 
     def log_message(self, message: str, *args: object) -> None:
         sys.stderr.write(f"[omniserve-3d] {self.address_string()} {message % args}\n")

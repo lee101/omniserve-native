@@ -49,6 +49,23 @@ bool oproxy_target_relay(oproxy_target *target,
                          char *error, size_t error_cap);
 
 /*
+ * Credential policy for a relay, kept pure so the boundary that decides whose
+ * credential reaches a metered backend is unit tested without a network or a
+ * provider account.
+ *
+ * A destination with a service credential of its own must never receive the
+ * caller's: the caller authenticated to this gateway, not to the backend, and
+ * forwarding it would put a caller's key in a service that bills us.
+ */
+bool oproxy_is_caller_credential(const char *name, size_t name_len);
+
+/* Renders ``Authorization: Bearer <key>`` into ``buffer`` and points ``out`` at
+ * it. Returns false when there is no key or it does not fit, in which case the
+ * caller must refuse the relay rather than forward the caller's credential. */
+bool oproxy_service_bearer(oproxy_header *out, char *buffer, size_t capacity,
+                           const char *key);
+
+/*
  * Convenience one-shot relay. Long-lived servers should create one
  * ``oproxy_target`` per upstream and call ``oproxy_target_relay`` so DNS and
  * established connections are reused.

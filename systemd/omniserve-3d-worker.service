@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 User=administrator
 WorkingDirectory=/nvme0n1-disk/code/omniserve-native
+EnvironmentFile=-/etc/omniserve-r2.env
 Environment=OMNISERVE_3D_BIND=127.0.0.1
 Environment=OMNISERVE_3D_PORT=9093
 Environment=OMNISERVE_3D_PUBLIC_BASE=http://127.0.0.1:8791/v1/3d

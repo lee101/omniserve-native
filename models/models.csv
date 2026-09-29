@@ -1,0 +1,5 @@
+# id,label,weights_mib,runtime_mib
+qwen2.5-7b-qlora,Qwen 2.5 7B QLoRA chat,4608,2048
+anima-gemma-qlora,Anima Gemma QLoRA (text),2048,1024
+video-matting-rvm,Video Matting RVM ResNet50,105,1695
+anima-2.9b-image,Anima 2.9B text-to-image,5570,7230

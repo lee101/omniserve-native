@@ -8,7 +8,8 @@ Type=simple
 User=administrator
 WorkingDirectory=/nvme0n1-disk/code/omniserve-native
 Environment=HF_HOME=/nvme0n1-disk/models/huggingface
-Environment=OMNISERVE_ASR_MODEL=nvidia/parakeet-ctc-0.6b
+# Selected by the checked-in WER benchmark; Parakeet emitted <unk> for this corpus.
+Environment=OMNISERVE_ASR_MODEL=openai/whisper-small.en
 Environment=OMNISERVE_ASR_DEVICE=auto
 ExecStart=/nvme0n1-disk/code/omniserve-native/.venv/bin/python -m uvicorn workers.asr_worker:app --host 127.0.0.1 --port 9097
 Restart=on-failure

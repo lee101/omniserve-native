@@ -105,6 +105,24 @@ static void record_relayed_status(ohttp_request *req, const void *data, size_t l
     record_status(req, (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0'));
 }
 
+static bool response_has_header(const char *data, size_t header_len, const char *name) {
+    size_t name_len = strlen(name);
+    const char *p = data;
+    const char *end = data + header_len;
+    while (p < end) {
+        const char *line_end = memmem(p, (size_t)(end - p), "\r\n", 2);
+        if (!line_end) line_end = end;
+        size_t line_len = (size_t)(line_end - p);
+        if (line_len > name_len && p[name_len] == ':' &&
+            strncasecmp(p, name, name_len) == 0) {
+            return true;
+        }
+        if (line_end == end) break;
+        p = line_end + 2;
+    }
+    return false;
+}
+
 void ohttp_response_snapshot(ohttp_response_stats *out) {
     if (!out) return;
     memset(out, 0, sizeof *out);
@@ -407,6 +425,23 @@ bool ohttp_raw_write(ohttp_request *req, const void *data, size_t len) {
     if (!req->conn->status_recorded) {
         req->conn->status_recorded = true;
         record_relayed_status(req, data, len);
+        const char *bytes = data;
+        const char *header_end = len >= 4 ? memmem(bytes, len, "\r\n\r\n", 4) : NULL;
+        size_t header_len = header_end ? (size_t)(header_end - bytes) : 0;
+        if (len >= 5 && memcmp(bytes, "HTTP/", 5) == 0 && header_end &&
+            !response_has_header(bytes, header_len, "Access-Control-Allow-Origin")) {
+            static const char cors_headers[] =
+                "Access-Control-Allow-Origin: *\r\n"
+                "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                "Access-Control-Allow-Headers: Authorization, Content-Type, secret, X-API-Key, X-Rapid-API-Key, X-Omniserve-Tier\r\n";
+            size_t insert_at = header_len + 2;
+            struct iovec iov[3] = {
+                { .iov_base = (void *)bytes, .iov_len = insert_at },
+                { .iov_base = (void *)cors_headers, .iov_len = sizeof cors_headers - 1 },
+                { .iov_base = (void *)(bytes + insert_at), .iov_len = len - insert_at },
+            };
+            return writev_all(req->conn->fd, iov, 3);
+        }
     }
     return write_all(req->conn->fd, data, len);
 }

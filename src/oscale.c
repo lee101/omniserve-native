@@ -264,11 +264,6 @@ oscale_action oscale_decide(const oscale_lane *lane, const oscale_observation *o
         return OSCALE_HOLD;
     }
 
-    if (!oscale_rent_is_justified(&lane->policy, obs, NULL, NULL)) {
-        if (reason_out) *reason_out = OSCALE_REASON_NOT_WORTH_IT;
-        return OSCALE_HOLD;
-    }
-
     int active = active_instances(lane);
     if (active >= lane->policy.max_instances || active >= OSCALE_MAX_INSTANCES) {
         if (reason_out) *reason_out = OSCALE_REASON_INSTANCE_CAP;
@@ -277,6 +272,18 @@ oscale_action oscale_decide(const oscale_lane *lane, const oscale_observation *o
     if (lane->policy.max_usd_hr > 0 &&
         (double)(active + 1) * lane->policy.price_usd_hr > lane->policy.max_usd_hr) {
         if (reason_out) *reason_out = OSCALE_REASON_SPEND_CAP;
+        return OSCALE_HOLD;
+    }
+    /* The next instance must pay for itself from demand not already covered
+     * by rented capacity. Include warming instances: ignoring them would rent
+     * duplicates while a model is still loading. Use the same hourly horizon
+     * and runtime fallback as the single-instance cost gate. */
+    oscale_observation marginal = *obs;
+    double seconds_per_req = lane->policy.seconds_per_req > 0
+                           ? lane->policy.seconds_per_req : 1.0;
+    marginal.backlog_reqs -= active * (3600.0 / seconds_per_req);
+    if (!oscale_rent_is_justified(&lane->policy, &marginal, NULL, NULL)) {
+        if (reason_out) *reason_out = OSCALE_REASON_NOT_WORTH_IT;
         return OSCALE_HOLD;
     }
     if (lane->policy.cooldown_s > 0 && lane->last_action_s > 0 &&
