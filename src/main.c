@@ -1108,11 +1108,10 @@ typedef struct {
     ohttp_request *req;
 } stream_ctx;
 
-static bool stream_token(const char *piece, size_t len, void *user) {
+static bool stream_slice(const char *piece, size_t len, void *user) {
     stream_ctx *sc = user;
     const char *pre = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"";
     size_t pren = strlen(pre);
-    if (len > 256) return false;
     char payload[2048];
     memcpy(payload, pre, pren);
     size_t plen = pren;
@@ -1142,6 +1141,17 @@ static bool stream_token(const char *piece, size_t len, void *user) {
     memcpy(payload + plen, post, strlen(post));
     plen += strlen(post);
     return ohttp_stream_write(sc->req, payload, plen);
+}
+
+static bool stream_token(const char *piece, size_t len, void *user) {
+    if (len == 0) return stream_slice(piece, 0, user);
+    while (len > 0) {
+        size_t n = otext_utf8_slice(piece, len, 256);
+        if (!stream_slice(piece, n, user)) return false;
+        piece += n;
+        len -= n;
+    }
+    return true;
 }
 
 static int parse_stop_values(const char *js, const oj_tok *toks, int n, int root,

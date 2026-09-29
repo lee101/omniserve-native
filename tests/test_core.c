@@ -318,6 +318,32 @@ static void test_completion_spacing(void) {
     CHECK(otext_completion_needs_space("looking", 7, "for", 3, false));
 }
 
+static void test_utf8_slice(void) {
+    char buf[1024];
+    memset(buf, 'a', sizeof buf);
+    CHECK(otext_utf8_slice(buf, 100, 256) == 100);
+    CHECK(otext_utf8_slice(buf, 256, 256) == 256);
+    CHECK(otext_utf8_slice(buf, 1000, 256) == 256);
+    memset(buf, 'a', 255);
+    memcpy(buf + 255, "\xc3\xa9", 2);
+    memset(buf + 257, 'b', 100);
+    CHECK(otext_utf8_slice(buf, 357, 256) == 255);
+    memset(buf, 0x80, sizeof buf);
+    CHECK(otext_utf8_slice(buf, 1000, 256) == 256);
+    size_t total = 0, off = 0, len = 1000;
+    memset(buf, 'x', 250);
+    for (int i = 0; i < 250; i++) memcpy(buf + 250 + i * 3, "\xe2\x82\xac", 3);
+    len = 250 + 750;
+    while (off < len) {
+        size_t n = otext_utf8_slice(buf + off, len - off, 256);
+        CHECK(n > 0 && n <= 256);
+        if (off + n < len) CHECK(((unsigned char)buf[off + n] & 0xc0u) != 0x80u);
+        off += n;
+        total += n;
+    }
+    CHECK(total == len);
+}
+
 static void test_openapi(void) {
     const int capacity = 8192;
     oj_tok *toks = malloc((size_t)capacity * sizeof *toks);
@@ -2123,6 +2149,7 @@ int main(void) {
     test_matte();
     test_tier_parse();
     test_completion_spacing();
+    test_utf8_slice();
     test_openapi();
     test_sched_priority();
     test_sched_timeout();
