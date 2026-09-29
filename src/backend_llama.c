@@ -2083,7 +2083,8 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
     struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
     struct llama_sampler *smpl = llama_sampler_chain_init(sparams);
     probability_capture sampled = { .probability = 1.0f };
-    llama_sampler_chain_add(smpl, llama_sampler_init(&probability_capture_i, &sampled));
+    if (req->min_probability > 0.0f)
+        llama_sampler_chain_add(smpl, llama_sampler_init(&probability_capture_i, &sampled));
     float repetition = req->repetition_penalty > 0 ? req->repetition_penalty : 1.0f;
     bool penalized = repetition != 1.0f;
     if (penalized) {
