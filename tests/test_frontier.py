@@ -145,6 +145,34 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(rows[2][1:], (1, 0.0))
 
 
+class LedgerPerfTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ledger = Ledger(Path(self.tmp.name) / "l.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_insert_normalizes_each_row_once(self):
+        rows = [{"workload": "image", "backend": "runpod", "endpoint": "e", "exec_ms": 100 + i} for i in range(5)]
+        with mock.patch.object(Ledger, "normalize", wraps=Ledger.normalize) as normalize:
+            self.ledger.insert(rows)
+        self.assertEqual(normalize.call_count, 5)
+        stored = self.ledger.conn().execute("SELECT ts, est_usd FROM jobs").fetchall()
+        self.assertEqual(len(stored), 5)
+        self.assertTrue(all(ts > 0 and usd > 0 for ts, usd in stored))
+
+    def test_hot_queries_use_indexes(self):
+        conn = self.ledger.conn()
+        plans = {
+            "summary": conn.execute("EXPLAIN QUERY PLAN SELECT backend FROM jobs WHERE ts>=?", (0,)).fetchall(),
+            "reconcile": conn.execute("EXPLAIN QUERY PLAN SELECT SUM(est_usd) FROM jobs WHERE backend='runpod' "
+                                      "AND endpoint=? AND ts>=? AND ts<?", ("e", 0, 1)).fetchall(),
+        }
+        self.assertIn("jobs_ts", str(plans["summary"]))
+        self.assertIn("jobs_bet", str(plans["reconcile"]))
+
+
 class RouterTests(unittest.TestCase):
     def test_hot_reload_and_decisions(self):
         with tempfile.TemporaryDirectory() as tmp:
