@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY, ts REAL NOT NULL, worklo
   endpoint TEXT, gpu TEXT, tier TEXT, queue_ms REAL, exec_ms REAL, wall_ms REAL, cold INTEGER DEFAULT 0,
   est_usd REAL DEFAULT 0, quality_tier TEXT, status TEXT, cache_hit INTEGER DEFAULT 0, job_id TEXT, source TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS jobs_wts ON jobs(workload, ts);
+CREATE INDEX IF NOT EXISTS jobs_ts ON jobs(ts);
+CREATE INDEX IF NOT EXISTS jobs_bet ON jobs(backend, endpoint, ts);
 CREATE TABLE IF NOT EXISTS billing(day TEXT, endpoint TEXT, amount REAL, billed_ms REAL, disk_gb REAL,
   est_usd REAL, jobs INTEGER, factor REAL, fetched REAL, PRIMARY KEY(day, endpoint));
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -161,7 +163,7 @@ class Ledger:
     def insert(self, rows: list[dict]) -> None:
         if not rows:
             return
-        values = [tuple(self.normalize(r)[c] for c in COLUMNS) for r in rows]
+        values = [tuple(n[c] for c in COLUMNS) for n in map(self.normalize, rows)]
         sql = f"INSERT INTO jobs({','.join(COLUMNS)}) VALUES({','.join('?' * len(COLUMNS))})"
         conn = self.conn()
         conn.execute("BEGIN")

@@ -12,4 +12,6 @@ bool otext_completion_needs_space(const char *prompt, size_t prompt_len,
                                   const char *continuation, size_t continuation_len,
                                   bool raw_completion);
 
+size_t otext_utf8_slice(const char *s, size_t len, size_t max);
+
 #endif

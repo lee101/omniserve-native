@@ -214,6 +214,14 @@ static int resolve_llm_ngl(const char *model_path, const char *value, int fallba
     return fits ? 999 : 0;
 }
 
+static bool ct_eq(const void *a, const void *b, size_t n) {
+    const volatile unsigned char *x = a;
+    const volatile unsigned char *y = b;
+    unsigned char d = 0;
+    for (size_t i = 0; i < n; i++) d |= (unsigned char)(x[i] ^ y[i]);
+    return d == 0;
+}
+
 static bool query_secret_matches(const ohttp_request *req, const char *secret, size_t secret_len) {
     const char *p = req->query;
     const char *end = p ? p + req->query_len : NULL;
@@ -223,7 +231,7 @@ static bool query_secret_matches(const ohttp_request *req, const char *secret, s
         const char *eq = memchr(p, '=', (size_t)(field_end - p));
         if (eq && (size_t)(eq - p) == 6 && memcmp(p, "secret", 6) == 0 &&
             (size_t)(field_end - eq - 1) == secret_len &&
-            memcmp(eq + 1, secret, secret_len) == 0) {
+            ct_eq(eq + 1, secret, secret_len)) {
             return true;
         }
         p = amp ? amp + 1 : end;
@@ -273,14 +281,14 @@ static void key_tiers_load(void) {
 static bool credential_matches(const ohttp_request *req, const char *key, size_t klen) {
     size_t len = 0;
     const char *v = ohttp_req_header(req, "secret", &len);
-    if (v && len == klen && memcmp(v, key, klen) == 0) return true;
+    if (v && len == klen && ct_eq(v, key, klen)) return true;
     v = ohttp_req_header(req, "Authorization", &len);
     if (v && len > 7 && strncasecmp(v, "Bearer ", 7) == 0 &&
-        len - 7 == klen && memcmp(v + 7, key, klen) == 0) return true;
+        len - 7 == klen && ct_eq(v + 7, key, klen)) return true;
     v = ohttp_req_header(req, "X-API-Key", &len);
-    if (v && len == klen && memcmp(v, key, klen) == 0) return true;
+    if (v && len == klen && ct_eq(v, key, klen)) return true;
     v = ohttp_req_header(req, "X-Rapid-API-Key", &len);
-    if (v && len == klen && memcmp(v, key, klen) == 0) return true;
+    if (v && len == klen && ct_eq(v, key, klen)) return true;
     return query_secret_matches(req, key, klen);
 }
 
@@ -299,14 +307,14 @@ static bool authorized(const app_state *app, const ohttp_request *req) {
     size_t len = 0;
     const char *v = ohttp_req_header(req, "secret", &len);
     size_t slen = strlen(app->secret);
-    if (v && len == slen && memcmp(v, app->secret, slen) == 0) return true;
+    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
     v = ohttp_req_header(req, "Authorization", &len);
     if (v && len > 7 && strncasecmp(v, "Bearer ", 7) == 0 &&
-        len - 7 == slen && memcmp(v + 7, app->secret, slen) == 0) return true;
+        len - 7 == slen && ct_eq(v + 7, app->secret, slen)) return true;
     v = ohttp_req_header(req, "X-API-Key", &len);
-    if (v && len == slen && memcmp(v, app->secret, slen) == 0) return true;
+    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
     v = ohttp_req_header(req, "X-Rapid-API-Key", &len);
-    if (v && len == slen && memcmp(v, app->secret, slen) == 0) return true;
+    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
     if (query_secret_matches(req, app->secret, slen)) return true;
     return false;
 }
@@ -1414,11 +1422,10 @@ typedef struct {
     ohttp_request *req;
 } stream_ctx;
 
-static bool stream_token(const char *piece, size_t len, void *user) {
+static bool stream_slice(const char *piece, size_t len, void *user) {
     stream_ctx *sc = user;
     const char *pre = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"";
     size_t pren = strlen(pre);
-    if (len > 256) return false;
     char payload[2048];
     memcpy(payload, pre, pren);
     size_t plen = pren;
@@ -1448,6 +1455,17 @@ static bool stream_token(const char *piece, size_t len, void *user) {
     memcpy(payload + plen, post, strlen(post));
     plen += strlen(post);
     return ohttp_stream_write(sc->req, payload, plen);
+}
+
+static bool stream_token(const char *piece, size_t len, void *user) {
+    if (len == 0) return stream_slice(piece, 0, user);
+    while (len > 0) {
+        size_t n = otext_utf8_slice(piece, len, 256);
+        if (!stream_slice(piece, n, user)) return false;
+        piece += n;
+        len -= n;
+    }
+    return true;
 }
 
 static int parse_stop_values(const char *js, const oj_tok *toks, int n, int root,
@@ -3194,9 +3212,7 @@ static bool llm_admin_load(const llm_admin_config *config) {
         return false;
     }
     const char *ngl = config->ngl[0] ? config->ngl : "auto";
-    if (setenv("OMNISERVE_NATIVE_TENSOR_OVERRIDE", config->tensor_override, 1) != 0) return false;
-    if (setenv("OMNISERVE_NATIVE_MOE_CPU_EXPERTS", config->moe_cpu_experts, 1) != 0) return false;
-    if (setenv("OMNISERVE_NATIVE_SPEC_MTP_GGUF", mtp_resolved, 1) != 0) return false;
+    ollm_set_load_overrides(config->tensor_override, config->moe_cpu_experts, mtp_resolved);
     int ctx = config->ctx > 0 ? config->ctx : 8192;
     int layers = resolve_llm_ngl(resolved, ngl, 999, ctx, contexts);
     fprintf(stderr, "admin LLM load: path=%s ngl=%s ctx=%d contexts=%d tensor_override=%s moe_cpu_experts=%s spec_mtp=%s\n",

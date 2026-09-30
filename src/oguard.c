@@ -197,8 +197,11 @@ typedef struct {
     char *padded_leet2;
 } gnorm_t;
 
+static void gnorm_free(gnorm_t *g);
+
 static bool gnorm_build(const char *joined, gnorm_t *g) {
     size_t cap = OGUARD_MAX_TEXT + 4;
+    memset(g, 0, sizeof *g);
     g->words = malloc(cap);
     g->words_leet = malloc(cap);
     g->words_leet2 = malloc(cap);
@@ -207,7 +210,10 @@ static bool gnorm_build(const char *joined, gnorm_t *g) {
     g->padded_leet = malloc(cap + 2);
     g->padded_leet2 = malloc(cap + 2);
     if (!g->words || !g->words_leet || !g->words_leet2 || !g->compact || !g->padded ||
-        !g->padded_leet || !g->padded_leet2) return false;
+        !g->padded_leet || !g->padded_leet2) {
+        gnorm_free(g);
+        return false;
+    }
     gnorm_words(joined, g->words, cap, 0);
     gnorm_words(joined, g->words_leet, cap, 1);
     gnorm_words(joined, g->words_leet2, cap, 2);
@@ -1172,14 +1178,10 @@ static int load_names(const char *path) {
         if (count >= cap) {
             int next = cap ? cap * 2 : 512;
             char **nn = realloc(names, (size_t)next * sizeof *nn);
+            if (nn) names = nn;
             char **cc = realloc(compacts, (size_t)next * sizeof *cc);
-            if (!nn || !cc) {
-                free(nn);
-                free(cc);
-                break;
-            }
-            names = nn;
-            compacts = cc;
+            if (cc) compacts = cc;
+            if (!nn || !cc) break;
             cap = next;
         }
         names[count] = strdup(norm);
@@ -1692,7 +1694,7 @@ static void *emb_worker(void *arg) {
             if (dim <= 0) {
                 dim = got;
             } else if (got != dim) {
-                g_emb_free_fn(vals);
+                if (g_emb_free_fn) g_emb_free_fn(vals);
                 continue;
             }
             emb_normalize(vals, dim);

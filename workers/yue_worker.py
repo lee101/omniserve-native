@@ -343,7 +343,7 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(404, {"error": "not found"})
             return
         secret = os.getenv("YUE_WORKER_SECRET", "")
-        if not secret or not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + secret):
+        if not secret or not hmac.compare_digest(self.headers.get("Authorization", "").encode("utf-8"), ("Bearer " + secret).encode("utf-8")):
             self.respond(401, {"error": "invalid secret"})
             return
         try:

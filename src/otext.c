@@ -28,3 +28,10 @@ bool otext_completion_needs_space(const char *prompt, size_t prompt_len,
      * unmistakable missing word boundary for natural-language autocomplete. */
     return ascii_alnum(last) && first >= 'A' && first <= 'Z';
 }
+
+size_t otext_utf8_slice(const char *s, size_t len, size_t max) {
+    if (len <= max) return len;
+    size_t end = max;
+    while (end > 0 && ((unsigned char)s[end] & 0xc0u) == 0x80u) end--;
+    return end ? end : max;
+}

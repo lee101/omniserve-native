@@ -500,6 +500,23 @@ static int g_runtime_refs;
  * cannot free a llama model while a request still holds its vocab/context. */
 static pthread_rwlock_t g_model_lifecycle_lock = PTHREAD_RWLOCK_INITIALIZER;
 
+static char g_ovr_tensor[512];
+static char g_ovr_moe[32];
+static char g_ovr_mtp[4096];
+static bool g_ovr_set;
+
+void ollm_set_load_overrides(const char *tensor_override, const char *moe_cpu_experts,
+                             const char *spec_mtp_gguf) {
+    snprintf(g_ovr_tensor, sizeof g_ovr_tensor, "%s", tensor_override ? tensor_override : "");
+    snprintf(g_ovr_moe, sizeof g_ovr_moe, "%s", moe_cpu_experts ? moe_cpu_experts : "");
+    snprintf(g_ovr_mtp, sizeof g_ovr_mtp, "%s", spec_mtp_gguf ? spec_mtp_gguf : "");
+    g_ovr_set = true;
+}
+
+static const char *ollm_cfg(const char *name, const char *ovr) {
+    return g_ovr_set ? ovr : getenv(name);
+}
+
 static void llama_runtime_acquire(void) {
     pthread_mutex_lock(&g_runtime_lock);
     if (g_runtime_refs++ == 0) llama_backend_init();
@@ -802,7 +819,7 @@ static int moe_decide_fresh(const char *model_path, int ctx_len, int contexts,
     memset(&g_moe_decision, 0, sizeof g_moe_decision);
     ollm_moe_mode mode = OLLM_MOE_OFF;
     int n = 0;
-    if (ollm_parse_moe_cpu_experts(getenv("OMNISERVE_NATIVE_MOE_CPU_EXPERTS"),
+    if (ollm_parse_moe_cpu_experts(ollm_cfg("OMNISERVE_NATIVE_MOE_CPU_EXPERTS", g_ovr_moe),
                                    &mode, &n) != 0) {
         fprintf(stderr, "OMNISERVE_NATIVE_MOE_CPU_EXPERTS: invalid value, ignoring\n");
         return 0;
@@ -945,7 +962,7 @@ static const struct llama_model_tensor_buft_override *buft_overrides_build(
     probe_buft_fns();
     ollm_tensor_override user[128];
     int user_count =
-        ollm_parse_tensor_overrides(getenv("OMNISERVE_NATIVE_TENSOR_OVERRIDE"),
+        ollm_parse_tensor_overrides(ollm_cfg("OMNISERVE_NATIVE_TENSOR_OVERRIDE", g_ovr_tensor),
                                     user, (int)(sizeof user / sizeof *user));
     if (user_count < 0) {
         fprintf(stderr, "OMNISERVE_NATIVE_TENSOR_OVERRIDE: invalid syntax, ignoring\n");
@@ -1191,7 +1208,7 @@ static void spec_mtp_init_locked(int n_gpu_layers, const struct llama_context_pa
                                  enum ggml_type kv_type) {
     spec_mtp_free_locked();
     ollm_spec_mtp_default(&g_spec_mtp_cfg);
-    const char *path = getenv("OMNISERVE_NATIVE_SPEC_MTP_GGUF");
+    const char *path = ollm_cfg("OMNISERVE_NATIVE_SPEC_MTP_GGUF", g_ovr_mtp);
     if (!path || !path[0]) return;
     if (ollm_spec_mtp_parse(&g_spec_mtp_cfg, getenv("OMNISERVE_NATIVE_SPEC_MTP_DRAFT"),
                             getenv("OMNISERVE_NATIVE_SPEC_MTP_P_MIN")) != 0) {
@@ -1289,6 +1306,8 @@ static void spec_mtp_init_locked(int n_gpu_layers, const struct llama_context_pa
     }
     if (fail) {
         spec_mtp_free_locked();
+        for (int i = 0; i < g_slot_count; i++) ollama_set_nextn(g_slots[i].ctx, false, false);
+        llama_model_free(head);
         g_spec_mtp_cfg.draft_max = 0;
         return;
     }
@@ -2064,7 +2083,8 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
     struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
     struct llama_sampler *smpl = llama_sampler_chain_init(sparams);
     probability_capture sampled = { .probability = 1.0f };
-    llama_sampler_chain_add(smpl, llama_sampler_init(&probability_capture_i, &sampled));
+    if (req->min_probability > 0.0f)
+        llama_sampler_chain_add(smpl, llama_sampler_init(&probability_capture_i, &sampled));
     float repetition = req->repetition_penalty > 0 ? req->repetition_penalty : 1.0f;
     bool penalized = repetition != 1.0f;
     if (penalized) {
@@ -2870,6 +2890,11 @@ void ojudge_shutdown(void) {
 unsigned long long ollm_cpu_offloaded_bytes(const char *model_path, int ctx_len, int contexts) {
     (void)model_path; (void)ctx_len; (void)contexts;
     return 0;
+}
+
+void ollm_set_load_overrides(const char *tensor_override, const char *moe_cpu_experts,
+                             const char *spec_mtp_gguf) {
+    (void)tensor_override; (void)moe_cpu_experts; (void)spec_mtp_gguf;
 }
 
 bool ollm_init(const char *model_path, int n_gpu_layers, int ctx_len, int parallel_contexts) {
