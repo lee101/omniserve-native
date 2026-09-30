@@ -137,7 +137,9 @@ if(WITH_SD AND EXISTS "${SD_DIR}/build/bin/libstable-diffusion.so")
         "${SD_DIR}/ggml/examples" "${SD_DIR}/include" "${SD_DIR}/thirdparty")
     target_link_libraries(onative_image_decode_tests PRIVATE onative_core)
     add_executable(onative_image_bench tests/bench_image.c src/backend_sd.c)
-    target_compile_definitions(onative_image_bench PRIVATE USE_SD)
+    target_compile_definitions(onative_image_bench PRIVATE USE_SD
+        OMNISERVE_SD_STREAM_LAYERS=${_sd_stream_layers}
+        OMNISERVE_SD_LATENT_API=${_sd_latent_api})
     target_include_directories(onative_image_bench SYSTEM PRIVATE
         "${SD_DIR}/ggml/examples" "${SD_DIR}/include" "${SD_DIR}/thirdparty")
     target_link_libraries(onative_image_bench PRIVATE onative_core)
