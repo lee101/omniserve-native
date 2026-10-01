@@ -363,9 +363,57 @@ static struct {
     float spectrum_stop, residual_diff;
     int teleport_start; /* -1: steps - 1 */
     size_t cache_bytes_max;
+    int turbo_n; /* >0: distilled few-step schedule, nodes in turbo_nodes */
+    float turbo_nodes[16];
+    char default_lora[1024]; /* applied to requests that carry no LoRA of their own */
+    float default_lora_scale;
 } g_cfg;
 
+/* Distilled few-step Qwen-Image (Viggle turbo) schedule: raw nodes pushed through the
+ * pipeline's resolution-dependent exponential time shift, then a terminal 0. */
+static void turbo_sigmas(int width, int height, float *out) {
+    double seq = (double)(width / 16) * (double)(height / 16);
+    double mu = 0.5 + (seq - 256.0) * (0.9 - 0.5) / (8192.0 - 256.0);
+    double e = exp(mu);
+    for (int i = 0; i < g_cfg.turbo_n; ++i) {
+        double t = (double)g_cfg.turbo_nodes[i];
+        out[i] = (float)(e / (e + (1.0 / t - 1.0)));
+    }
+    out[g_cfg.turbo_n] = 0.0f;
+}
+
+static void turbo_cfg_load(void) {
+    const char *lora = getenv("OMNISERVE_NATIVE_SD_DEFAULT_LORA");
+    g_cfg.default_lora[0] = 0;
+    g_cfg.default_lora_scale = sd_env_float("OMNISERVE_NATIVE_SD_DEFAULT_LORA_SCALE", 1.0f, -4.0f, 4.0f);
+    if (lora && lora[0] == '/' && strlen(lora) < sizeof g_cfg.default_lora) {
+        strcpy(g_cfg.default_lora, lora);
+        fprintf(stderr, "sd: default LoRA %s scale=%.2f\n", lora, (double)g_cfg.default_lora_scale);
+    }
+    const char *spec = getenv("OMNISERVE_NATIVE_SD_TURBO_NODES");
+    g_cfg.turbo_n = 0;
+    if (!spec || !spec[0]) return;
+    float nodes[16];
+    int n = 0;
+    const char *p = spec;
+    while (*p && n < 16) {
+        char *end = NULL;
+        float v = strtof(p, &end);
+        if (end == p || !isfinite(v) || v <= 0.0f || v > 1.0f) {
+            fprintf(stderr, "sd: ignoring OMNISERVE_NATIVE_SD_TURBO_NODES=%s\n", spec);
+            return;
+        }
+        nodes[n++] = v;
+        p = end;
+        if (*p == ',') ++p;
+    }
+    memcpy(g_cfg.turbo_nodes, nodes, sizeof nodes);
+    g_cfg.turbo_n = n;
+    fprintf(stderr, "sd: turbo schedule enabled, %d steps\n", n);
+}
+
 static void sd_cfg_load(void) {
+    turbo_cfg_load();
     g_cfg.zero_guidance = sd_env_float("OMNISERVE_NATIVE_SD_ZERO_GUIDANCE", 1.0f, 0.0f, 30.0f);
     const char *tiling = getenv("OMNISERVE_NATIVE_SD_VAE_TILING");
     g_cfg.vae_tiling = tiling && tiling[0] ? (int)sd_env_flag("OMNISERVE_NATIVE_SD_VAE_TILING", false) : -1;
@@ -733,6 +781,17 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         params.vae_tiling_params.tile_size_y = g_cfg.tile_y;
         params.vae_tiling_params.target_overlap = g_cfg.tile_overlap;
     }
+    /* Turbo only for plain text-to-image: reference edits and requests that bring their
+     * own LoRA keep the base schedule, so edit quality is untouched. */
+    bool turbo = g_cfg.turbo_n > 0 && !req->image_pixels && !req->lora_count;
+    float turbo_sig[17];
+    if (turbo) {
+        turbo_sigmas(params.width, params.height, turbo_sig);
+        params.sample_params.sample_steps = g_cfg.turbo_n;
+        params.sample_params.custom_sigmas = turbo_sig;
+        params.sample_params.custom_sigmas_count = g_cfg.turbo_n + 1;
+        params.sample_params.guidance.txt_cfg = 1.0f;
+    }
     params.seed = req->seed;
     sd_image_t source_image = {0};
     if (req->image_pixels) {
@@ -762,12 +821,19 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         params.loras = loras;
         params.lora_count = (uint32_t)req->lora_count;
     }
+    sd_lora_t default_lora = {0};
+    if (turbo && g_cfg.default_lora[0]) {
+        default_lora.path = g_cfg.default_lora;
+        default_lora.multiplier = g_cfg.default_lora_scale;
+        params.loras = &default_lora;
+        params.lora_count = 1;
+    }
 
     out->teleport_requested = req->teleport;
     out->cache_requested = req->cache;
     /* Static per-process setting: result-cache entries never cross profiles.
      * Latent replay requires a dense trajectory, so it cannot use EasyCache. */
-    if (!req->teleport && g_cfg.cache_mode) {
+    if (!req->teleport && g_cfg.cache_mode && !turbo) {
         const char *mode = g_cfg.cache_mode;
         params.cache.start_percent = g_cfg.cache_start;
         params.cache.end_percent = g_cfg.cache_end;
