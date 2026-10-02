@@ -377,6 +377,28 @@ static bool token_bool(const char *json, const oj_tok *token, bool *value) {
     return false;
 }
 
+static bool extra_args_bounded(const char *args) {
+    static const char key[] = "guidance_schedule=";
+    for (const char *p = args; (p = strstr(p, key)) != NULL; p += sizeof key - 1) {
+        if (p != args && p[-1] != ',') continue;
+        long total = 0;
+        const char *c = p + sizeof key - 1;
+        while (*c && *c != ',') {
+            const char *x = strchr(c, 'x');
+            if (!x) return false;
+            const char *d = x + 1;
+            long count = 0;
+            int digits = 0;
+            for (; *d >= '0' && *d <= '9'; ++d, ++digits) count = count * 10 + (*d - '0');
+            if (digits < 1 || digits > 3 || (*d && *d != '+' && *d != ',')) return false;
+            total += count;
+            if (total > 100) return false;
+            c = *d == '+' ? d + 1 : d;
+        }
+    }
+    return true;
+}
+
 bool oimage_request_parse(const char *json, size_t json_len, oimage_request *request,
                           char *error, size_t error_cap) {
     if (!json || !request) {
@@ -534,9 +556,10 @@ bool oimage_request_parse(const char *json, size_t json_len, oimage_request *req
         bool good = value && strlen(value) < strs[si].cap;
         for (const char *c = value; good && *c; ++c)
             good = (*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '_' || *c == '-' || *c == '=' || *c == ',' || *c == '.' || *c == '+';
+        if (good && strs[si].off == offsetof(oimg_req, extra_args)) good = extra_args_bounded(value);
         if (!good) {
             free(value);
-            set_error(error, error_cap, "sampler, scheduler and extra_sample_args must be short [a-z0-9_=,.-] strings");
+            set_error(error, error_cap, "sampler, scheduler and extra_sample_args must be short [a-z0-9_=,.-] strings with guidance_schedule counts totalling at most 100");
             oimage_request_free(request);
             return false;
         }
