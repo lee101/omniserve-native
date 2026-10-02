@@ -278,11 +278,20 @@ def build(spec: dict, values: dict) -> tuple[qi.SdImgGenParams, list]:
         params.vae_tiling_params.tile_size_y = qi.VAE_TILE
         params.vae_tiling_params.target_overlap = qi.VAE_TILE_OVERLAP
     mode = spec["cache_mode"]
+    threshold = spec["cache_threshold"]
+    # Base-model tier ("turbo": false) on a text-to-image task: the same step floor and looser EasyCache
+    # as the gateway. This worker has no turbo LoRA, so the default tier stays the base model at spec steps.
+    if spec["name"] == "ra2" and source is None and values.get("turbo") is False:
+        if params.sample_params.sample_steps < qi.MIN_STEPS:
+            params.sample_params.sample_steps = qi.MIN_STEPS
+        threshold = qi.HQ_CACHE_THRESHOLD
+    if values.get("cache_threshold") is not None:
+        threshold = float(values["cache_threshold"])
     if mode in qi.SD_CACHE_MODES:
         params.cache.mode = qi.SD_CACHE_MODES[mode]
         params.cache.start_percent = qi.CACHE_START
-        params.cache.end_percent = qi.CACHE_END
-        params.cache.reuse_threshold = spec["cache_threshold"]
+        params.cache.end_percent = float(values["cache_end"]) if values.get("cache_end") is not None else qi.CACHE_END
+        params.cache.reuse_threshold = threshold
     return params, keep
 
 
@@ -308,7 +317,8 @@ def generate(name: str, values: dict) -> dict:
     try:
         qi._state["seed"] = params.seed
         started = time.monotonic()
-        encoded = qi.encode(images, count.value, fmt)
+        notch = qi.NOTCH if values.get("notch") is None else bool(values["notch"])
+        encoded = qi.encode(images, count.value, fmt, notch)
         encode_ms = int((time.monotonic() - started) * 1000)
     finally:
         lib().lib.free_sd_images(images, count.value)
@@ -316,7 +326,7 @@ def generate(name: str, values: dict) -> dict:
     item = {"b64_json": encoded[0]["data"], "seed": params.seed, "inference_time_ms": sample_ms, "format": fmt}
     if params.cache.mode:
         item["denoiser_cache"] = {"requested": spec["cache_mode"], "approximate": True,
-                                  "threshold": spec["cache_threshold"]}
+                                  "threshold": params.cache.reuse_threshold}
     return {
         "created": int(time.time()), "model": spec["model"], "format": fmt, "data": [item],
         "outputs": encoded, "seed": params.seed,
