@@ -1,0 +1,23 @@
+{"server": "main", "tag": "base30_dense", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 36.83, "inf_ms": 36717, "cache": null}
+{"server": "main", "tag": "base20_dense", "prompt": "fox2", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 25.9, "inf_ms": 25783, "cache": null}
+{"server": "main", "tag": "base24_dense", "prompt": "fox2", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 30.72, "inf_ms": 30618, "cache": null}
+{"server": "main", "tag": "base30_ec05", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.05}, "wall": 24.31, "inf_ms": 24203, "cache": null}
+{"server": "main", "tag": "base30_ec08", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.08}, "wall": 21.11, "inf_ms": 21003, "cache": null}
+{"server": "main", "tag": "base30_ec10", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 21.12, "inf_ms": 21018, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 19.04, "inf_ms": 18913, "cache": null}
+{"server": "main", "tag": "base30_ec20", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 19.09, "inf_ms": 18936, "cache": null}
+{"server": "main", "tag": "base30_ec30", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 17.97, "inf_ms": 17843, "cache": null}
+{"server": "main", "tag": "base24_ec10", "prompt": "fox2", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 19.3, "inf_ms": 19201, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "fox2", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 17.16, "inf_ms": 17036, "cache": null}
+{"server": "main", "tag": "base24_ec20", "prompt": "fox2", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 17.2, "inf_ms": 17079, "cache": null}
+{"server": "main", "tag": "base20_ec10", "prompt": "fox2", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 18.41, "inf_ms": 18310, "cache": null}
+{"server": "main", "tag": "base20_ec15", "prompt": "fox2", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 15.87, "inf_ms": 15740, "cache": null}
+{"server": "main", "tag": "base20_ec20", "prompt": "fox2", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 15.91, "inf_ms": 15786, "cache": null}
+{"server": "main", "tag": "base16_ec15", "prompt": "fox2", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 13.51, "inf_ms": 13386, "cache": null}
+{"server": "main", "tag": "base16_ec20", "prompt": "fox2", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 13.76, "inf_ms": 13645, "cache": null}
+{"server": "main", "tag": "base30_ec15_end50", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.5}, "wall": 31.68, "inf_ms": 31577, "cache": null}
+{"server": "main", "tag": "base30_ec15_end70", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.7}, "wall": 25.59, "inf_ms": 25480, "cache": null}
+{"server": "main", "tag": "base30_ec15_end85", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.85}, "wall": 22.11, "inf_ms": 22005, "cache": null}
+{"server": "main", "tag": "base30_ec15_nonotch", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "notch": false}, "wall": 19.67, "inf_ms": 19555, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "fox2", "steps": 3, "extra": {}, "wall": 13.92, "inf_ms": 13792, "cache": null}
+{"server": "main", "tag": "turbo6_nonotch", "prompt": "fox2", "steps": 3, "extra": {"notch": false}, "wall": 12.98, "inf_ms": 12860, "cache": null}

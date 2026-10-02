@@ -53,7 +53,7 @@ The server answers WebP (q85) whatever `output_format` asks for, so a writer tha
 
 ## Acceleration sweep (2026-10-02, 3090 Ti, 1024², seed 0, 7 prompts, 36 configs)
 
-`sweep.py` (server variants + request grid, resumable), `score_sweep.py` (LPIPS/PSNR vs dense 30, CLIP, sharpness, Nyquist), `build_report.py` (HTML gallery; `embed` for a single file). Results: `out/sweep-20261002/{results.jsonl,summary.csv,summary.json}`; clean single-prompt timings (no GPU contention): `out/retime-20261002/results.jsonl`. Full images are not committed; rerun `sweep.py`.
+`sweep.py` (server variants + request grid, resumable), `score_sweep.py` (LPIPS/PSNR vs dense 30, CLIP, sharpness, Nyquist), `build_report.py` (HTML gallery; `embed` for a single file). Results: `results/sweep-20261002/{results.jsonl,summary.csv,summary.json}`; clean single-prompt timings (no GPU contention): `results/sweep-20261002/retime.jsonl`. Full images are not committed; rerun `sweep.py`.
 
 Clean timings (fox2) and mean LPIPS vs dense 30 (36.8 s):
 
