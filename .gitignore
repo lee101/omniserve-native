@@ -44,3 +44,4 @@ monitoring/
 # Matting eval harness: local venv and caches (the .npy fixtures are committed).
 matte/.venv/
 matte/__pycache__/
+qualitybench/out/

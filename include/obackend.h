@@ -131,6 +131,15 @@ typedef struct {
     int image_height;
     float strength;
     bool cache;
+    /* Per-request quality overrides; zero values mean the server default. */
+    float cache_threshold; /* EasyCache reuse threshold */
+    float cache_end;       /* fraction of steps after which caching stops */
+    bool cache_off;        /* dense sampling */
+    int notch;             /* 0 server default, 1 on, 2 off */
+    float flow_shift;      /* 0 server default */
+    char sampler[24];      /* sd.cpp sampler name, empty = default */
+    char scheduler[24];
+    char extra_args[96];   /* sd.cpp extra_sample_args, e.g. "exit_tol=0.02" */
     uint64_t image_hash; /* keyed hash and length of image_base64, set by osd_prepare_image when cache is on */
     size_t image_len;
     bool image_hash_valid;
