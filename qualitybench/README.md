@@ -42,3 +42,7 @@ Image quality bench for the Qwen "ra2" lane. Needs a server on :8792 (`qualitybe
 - `turbo` request field (`false` = base path: floored steps, `HQ_EASYCACHE_THRESHOLD`, no LoRA); `notch` applies to both paths.
 - The model card says to keep the LoRA unmerged at scale 1.0 because merging into quantized weights loses part of the update. The pre-merged v0.3 GGUFs (fp32 merge, quantized once) are better and faster than runtime LoRA on Q4: Q6_K 10.4 s, Q5_K_M 9.8 s, runtime LoRA 11.5 s (3090 Ti), and the fur and fox shape are visibly cleaner. Serving them next to the base model needs a second diffusion context (the text encoder would be loaded twice), so it is not wired into the unit yet.
 - LPIPS against dense 30 is meaningless for turbo (different distilled style; 0.14 to 0.40).
+
+## Prod canary (RTX 5090, 2026-10-02, drop-in `zzzzzzz-tiers.conf`, binary `omniserve-native-deploy/deploy-tiers-20261002`)
+
+1024², steady state through the live unit: default (turbo 6-step LoRA) 8.5 to 9.2 s, `"turbo":false` (30 steps, EasyCache 0.15) 10.3 to 11.0 s. Both tiers return notched images. The base tier costs about 2 s more on the 5090 and avoids the muddy LoRA-on-Q4 look; making it the default means deleting `OMNISERVE_NATIVE_SD_TURBO_NODES` in `zzzzzz-turbo.conf`.
