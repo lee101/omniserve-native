@@ -46,3 +46,7 @@ Image quality bench for the Qwen "ra2" lane. Needs a server on :8792 (`qualitybe
 ## Prod canary (RTX 5090, 2026-10-02, drop-in `zzzzzzz-tiers.conf`, binary `omniserve-native-deploy/deploy-tiers-20261002`)
 
 1024², steady state through the live unit: default (turbo 6-step LoRA) 8.5 to 9.2 s, `"turbo":false` (30 steps, EasyCache 0.15) 10.3 to 11.0 s. Both tiers return notched images. The base tier costs about 2 s more on the 5090 and avoids the muddy LoRA-on-Q4 look; making it the default means deleting `OMNISERVE_NATIVE_SD_TURBO_NODES` in `zzzzzz-turbo.conf`.
+
+## Image format
+
+The server answers WebP (q85) whatever `output_format` asks for, so a writer that trusts the request saves WebP bytes under `.png` (viewers other than a browser refuse those). Sweep tools now pick the extension from the bytes, and `qualitybench/fix_ext.py DIR...` renames existing files. WebP q85 is the default format everywhere (`OMNISERVE_NATIVE_SD_WEBP_QUALITY`, deploy script now 85).

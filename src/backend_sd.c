@@ -496,6 +496,13 @@ static bool latent_api_ready(void) {
            g_latent_cache && g_latent_cache_size > 0;
 }
 
+/* A teleport request only changes how the render runs when the library has the latent-replay API.
+ * Without it (upstream sd.cpp, the Qwen lanes) the flag must not switch off EasyCache or the result
+ * cache, or every caller that sends teleport:true pays for a dense run. */
+static bool teleport_effective(const oimg_req *req) {
+    return req->teleport && !req->image_pixels && req->batch_count <= 1 && req->steps > 1 && latent_api_ready();
+}
+
 /* Everything in a request that selects a cache entry and is not a plain scalar.
  * Built once per request: the LoRA key is a heap string and the image hash is
  * O(image size) when it was not memoized by osd_prepare_image. */
@@ -655,7 +662,7 @@ static bool cache_copy_encoded_result(const latent_cache_entry *entry, oimg_resu
 }
 
 bool osd_try_cached_result(const oimg_req *req, oimg_result *out) {
-    if (!g_sd || !req->cache || req->teleport || req->seed < 0 || req->batch_count > 1) return false;
+    if (!g_sd || !req->cache || teleport_effective(req) || req->seed < 0 || req->batch_count > 1) return false;
     memset(out, 0, sizeof *out);
     double started = now_ms();
     cache_key key;
@@ -892,7 +899,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     bool overridden = req->cache_threshold > 0.0f || req->cache_end > 0.0f || req->cache_off || req->notch ||
                       req->flow_shift > 0.0f || req->sampler[0] || req->scheduler[0] || req->extra_args[0] ||
                       req->turbo;
-    if (!req->teleport && g_cfg.cache_mode && !req->cache_off && !turbo) {
+    if (!teleport_effective(req) && g_cfg.cache_mode && !req->cache_off && !turbo) {
         const char *mode = g_cfg.cache_mode;
         float easycache_threshold = g_cfg.easycache_threshold;
         if (!req->image_pixels && g_cfg.hq_threshold > 0.0f) easycache_threshold = g_cfg.hq_threshold;
@@ -923,9 +930,8 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     out->teleport_capture_step = -1;
     out->teleport_resume_step = 0;
 
-    bool result_cache = req->cache && !req->teleport && !overridden && req->seed >= 0 && params.batch_count == 1;
-    bool teleport_cache = req->teleport && !req->image_pixels && params.batch_count == 1 &&
-                          req->steps > 1 && latent_api_ready();
+    bool result_cache = req->cache && !teleport_effective(req) && !overridden && req->seed >= 0 && params.batch_count == 1;
+    bool teleport_cache = teleport_effective(req) && params.batch_count == 1;
     cache_key key = {0};
     if ((result_cache || teleport_cache) && !cache_key_make(req, &key)) {
         result_cache = teleport_cache = false;
