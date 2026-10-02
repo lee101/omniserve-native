@@ -4,7 +4,7 @@ import numpy as np, torch, lpips, open_clip
 from PIL import Image
 
 out = sys.argv[1]
-prompts = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sweep_prompts.json")))
+prompts = json.load(open(os.environ.get("SWEEP_PROMPTS") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "sweep_prompts.json")))
 REF = "base30_dense"
 rows = [json.loads(l) for l in open(f"{out}/results.jsonl")]
 by = collections.defaultdict(dict)

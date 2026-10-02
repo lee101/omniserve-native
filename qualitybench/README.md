@@ -74,3 +74,17 @@ Clean timings (fox2) and mean LPIPS vs dense 30 (36.8 s):
 - `notch` off: Laplacian sharpness x1.97 (base) / x2.85 (turbo) vs the dense reference, lattice returns. Keep on.
 - Turbo: LoRA scale 1.3 oversharpens (x2.57), 0.7 is softer and closer to the base look (LPIPS 0.20 vs 0.24). 4-node schedule is fastest but weaker; 8-node is no better than 6. Pre-merged Q6/Q5 turbo cost less than runtime LoRA and have the highest CLIP delta (+0.017/+0.018); fox2 shows a different, cleaner composition.
 - Teleport was not benchmarked here (master sd.cpp lib has no latent API); unseeded teleport doubled HQ time on the 5090 (19.3 s vs 9.9 s) and is no longer sent without a seed.
+
+## Hard-prompt sweep and latent trajectories (2026-10-03, 3090 Ti, sd.cpp = prod tree 9bc7b35 rebuilt for sm_86)
+
+`sweep_prompts_hard.json`: 11 prompts (men and women duo/trio/quad, shirtless, group of five, hands, couple, witch, landscape). `sweep.py --prompts ... --tags ...`; `SWEEP_PROMPTS` env points `score_sweep.py`/`build_report.py` at the same file. The local lib now matches prod (latent replay API, VAE OOM retry, `sd_ctx_release_vram`): `/vfast/data/code/sdcpp-qwen-prefixkv/build-86` (source copied from prod `sdcpp-qwen-prefixkv`; prod tree also carries an uncommitted ggml and `SD_RESIDENCY_EVICT_MRU` diff).
+
+Visual read (88 images, 8 configs; premerged_q5 server hung at load and was not rerun, the 2026-10-02 sweep had q5 trio at LPIPS 0.35):
+- `base30_ec15` matches dense 30 on every prompt. `base24_ec15` changes hair and clothing colour on m_trio.
+- Turbo (6-step LoRA) keeps anatomy on duos, trios, hands, and group-of-five, but changes look/colour vs base (darker, more contrast) and breaks the crouching/jumping pose in m_quad; LoRA scale 0.5/0.7 keep the base composition on m_duo but tangle the crouching figure in m_quad; premerged Q6 folds a head in m_quad. Scale and premerge do not fix pose failures; the base tier does.
+- netwrck now routes multi-person prompts to the base tier at turbo price (`ra2NeedsBaseTier`, commit 9e78328d, deployed as netwrckprod177).
+- Zero HTTP 500 in the 88 images on the prod-parity lib; the master lib produced 14 VAE-decode OOMs on the same box when another process held VRAM. Not isolated whether the retry or the quiet GPU explains it.
+
+Latent trajectories (`traj.py` saves the sampler latent at every step with `sd-cli --latent-save-steps`; `traj_analyze.py` recovers x0 predictions `x0_k = z_k - sigma_k * v_k` from the Flux schedule). 5 of 11 prompts finished (capture was stopped by memory pressure):
+- x0-prediction relative error to the final decays smoothly: 0.10-0.16 at step 20, under 2% only at step 28-29 for every prompt, step-to-step change flat at 1.2-2.6% after step 8. Landscape converges slower than the character prompts, so "simple scenes stop earlier" does not show up in latent distance.
+- Conclusion: no usable plateau for a convergence cutoff or an adaptive step count; EasyCache already skips the redundant evaluations. Not tested: LPIPS of truncated runs per prompt, a cutoff learned from the first 3-5 steps.

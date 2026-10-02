@@ -5,7 +5,7 @@ from PIL import Image
 out = sys.argv[1]
 embed = len(sys.argv) > 2 and sys.argv[2] == "embed"
 dest = sys.argv[3] if len(sys.argv) > 3 else f"{out}/report"
-prompts = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sweep_prompts.json")))
+prompts = json.load(open(os.environ.get("SWEEP_PROMPTS") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "sweep_prompts.json")))
 summary = json.load(open(f"{out}/summary.json"))
 per = json.load(open(f"{out}/per_image.json"))
 os.makedirs(f"{dest}/thumbs", exist_ok=True)

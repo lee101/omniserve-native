@@ -82,6 +82,7 @@ SERVERS = [
     ("turbo_nodes8", turbo_env(N8), [("turbo8", 3, {})]),
     ("turbo_lora07", turbo_env(N6, "0.7"), [("turbo6_lora07", 3, {})]),
     ("turbo_lora13", turbo_env(N6, "1.3"), [("turbo6_lora13", 3, {})]),
+    ("turbo_lora05", turbo_env(N6, "0.5"), [("turbo6_lora05", 3, {})]),
     ("premerged_q6", premerged(Q6), [("premerged_q6_turbo6", 3, {})]),
     ("premerged_q5", premerged(Q5), [("premerged_q5_turbo6", 3, {})]),
     ("cache_ucache", {"OMNISERVE_NATIVE_SD_CACHE_MODE": "ucache"},
@@ -126,6 +127,7 @@ def main():
     ap.add_argument("--size", default="1024x1024")
     ap.add_argument("--servers", default="")
     ap.add_argument("--only", default="")
+    ap.add_argument("--tags", default="")
     ap.add_argument("--prompts", default=f"{HERE}/sweep_prompts.json")
     a = ap.parse_args()
     prompts = json.load(open(a.prompts))
@@ -145,7 +147,7 @@ def main():
     for name, env, variants in SERVERS:
         if want and name not in want:
             continue
-        todo = [(t, s, e) for t, s, e in variants if any((t, k) not in done for k in prompts)]
+        todo = [(t, s, e) for t, s, e in variants if (not a.tags or t in a.tags.split(",")) and any((t, k) not in done for k in prompts)]
         if not todo:
             continue
         full = dict(os.environ)
