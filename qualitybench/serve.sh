@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+cd "$(dirname "$0")/.."
+set -a; source /vfast/data/code/qwen-image-2.1-bench/omniserve_qwen.env; set +a
+unset OMNISERVE_NATIVE_SD_PARAMS_BACKEND
+export OMNISERVE_NATIVE_SD_NOTCH=${OMNISERVE_NATIVE_SD_NOTCH:-1}
+export OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD=${OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD_OVERRIDE:-0.15}
+export OMNISERVE_NATIVE_SD_MIN_STEPS=${OMNISERVE_NATIVE_SD_MIN_STEPS:-30}
+[ -n "$SDENV" ] && for kv in $SDENV; do export "OMNISERVE_NATIVE_SD_$kv"; done
+exec ./build-qwen/omniserve-native --port "${PORT:-8792}"

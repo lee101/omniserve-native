@@ -13,6 +13,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <stddef.h>
 #include <unistd.h>
 
 static void set_error(char *error, size_t cap, const char *message) {
@@ -490,6 +491,78 @@ bool oimage_request_parse(const char *json, size_t json_len, oimage_request *req
         oimage_request_free(request);
         return false;
     }
+    token = oj_obj_get(json, tokens, token_count, 0, "cache_threshold");
+    if (token >= 0) {
+        double value = 0.0;
+        if (!token_finite_double(json, &tokens[token], &value) || value < 0.0 || value > 1.0) {
+            set_error(error, error_cap, "cache_threshold must be between 0 and 1");
+            oimage_request_free(request);
+            return false;
+        }
+        request->generation.cache_off = value == 0.0;
+        request->generation.cache_threshold = (float)value;
+    }
+    token = oj_obj_get(json, tokens, token_count, 0, "cache_end");
+    if (token >= 0) {
+        double value = 0.0;
+        if (!token_finite_double(json, &tokens[token], &value) || value <= 0.0 || value > 1.0) {
+            set_error(error, error_cap, "cache_end must be in (0, 1]");
+            oimage_request_free(request);
+            return false;
+        }
+        request->generation.cache_end = (float)value;
+    }
+    token = oj_obj_get(json, tokens, token_count, 0, "notch");
+    if (token >= 0) {
+        bool on = false;
+        if (!token_bool(json, &tokens[token], &on)) {
+            set_error(error, error_cap, "notch must be a boolean");
+            oimage_request_free(request);
+            return false;
+        }
+        request->generation.notch = on ? 1 : 2;
+    }
+    static const struct { const char *key; size_t off; size_t cap; } strs[] = {
+        {"sampler", offsetof(oimg_req, sampler), sizeof(((oimg_req *)0)->sampler)},
+        {"scheduler", offsetof(oimg_req, scheduler), sizeof(((oimg_req *)0)->scheduler)},
+        {"extra_sample_args", offsetof(oimg_req, extra_args), sizeof(((oimg_req *)0)->extra_args)},
+    };
+    for (size_t si = 0; si < sizeof strs / sizeof *strs; ++si) {
+        token = oj_obj_get(json, tokens, token_count, 0, strs[si].key);
+        if (token < 0) continue;
+        char *value = tokens[token].type == OJ_STRING ? oj_strdup(json, &tokens[token]) : NULL;
+        bool good = value && strlen(value) < strs[si].cap;
+        for (const char *c = value; good && *c; ++c)
+            good = (*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '_' || *c == '-' || *c == '=' || *c == ',' || *c == '.' || *c == '+';
+        if (!good) {
+            free(value);
+            set_error(error, error_cap, "sampler, scheduler and extra_sample_args must be short [a-z0-9_=,.-] strings");
+            oimage_request_free(request);
+            return false;
+        }
+        memcpy((char *)&request->generation + strs[si].off, value, strlen(value) + 1);
+        free(value);
+    }
+    token = oj_obj_get(json, tokens, token_count, 0, "turbo");
+    if (token >= 0) {
+        bool on = false;
+        if (!token_bool(json, &tokens[token], &on)) {
+            set_error(error, error_cap, "turbo must be a boolean");
+            oimage_request_free(request);
+            return false;
+        }
+        request->generation.turbo = on ? 0 : 2;
+    }
+    token = oj_obj_get(json, tokens, token_count, 0, "flow_shift");
+    if (token >= 0) {
+        double value = 0.0;
+        if (!token_finite_double(json, &tokens[token], &value) || value < 0.1 || value > 20.0) {
+            set_error(error, error_cap, "flow_shift must be between 0.1 and 20");
+            oimage_request_free(request);
+            return false;
+        }
+        request->generation.flow_shift = (float)value;
+    }
     token = oj_obj_get(json, tokens, token_count, 0, "teleport");
     if (token >= 0 && (!token_bool(json, &tokens[token], &request->generation.teleport) ||
                       (request->generation.teleport && request->generation.seed < 0))) {
@@ -677,6 +750,12 @@ bool oimage_request_parse(const char *json, size_t json_len, oimage_request *req
         }
         request->generation.strength = (float)strength;
     }
+    /* Quality floor for lanes whose clients hardcode a low step count (ra2 callers send 20);
+     * reference edits keep the requested count. */
+    static int min_steps = -1;
+    if (min_steps < 0) min_steps = image_env_int("OMNISERVE_NATIVE_SD_MIN_STEPS", 0, 0, 100);
+    if (!request->generation.image_base64 && request->generation.steps < min_steps)
+        request->generation.steps = min_steps;
     return true;
 }
 

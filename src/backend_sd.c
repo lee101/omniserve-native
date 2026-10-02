@@ -216,6 +216,8 @@ static fn_ctx_params_init p_ctx_params_init;
 static fn_new_sd_ctx p_new_sd_ctx;
 static fn_img_params_init p_img_params_init;
 static fn_generate_image p_generate_image;
+static int (*p_str_to_sample_method)(const char *);
+static int (*p_str_to_scheduler)(const char *);
 static fn_free_images p_free_images;
 static fn_latent_params_init p_latent_params_init;
 static fn_generate_image_with_latent p_generate_image_with_latent;
@@ -251,6 +253,8 @@ static bool sd_lib_load(void) {
     p_new_sd_ctx = (fn_new_sd_ctx)dlsym(lib, "new_sd_ctx");
     p_img_params_init = (fn_img_params_init)dlsym(lib, "sd_img_gen_params_init");
     p_generate_image = (fn_generate_image)dlsym(lib, "generate_image");
+    *(void **)&p_str_to_sample_method = dlsym(lib, "str_to_sample_method");
+    *(void **)&p_str_to_scheduler = dlsym(lib, "str_to_scheduler");
     p_free_images = (fn_free_images)dlsym(lib, "free_sd_images");
     p_latent_params_init = (fn_latent_params_init)dlsym(lib, "sd_latent_replay_params_init");
     p_generate_image_with_latent = (fn_generate_image_with_latent)dlsym(lib, "generate_image_with_latent");
@@ -301,6 +305,44 @@ static latent_cache_entry *g_latent_cache;
 static int g_latent_cache_size;
 static unsigned long long g_latent_cache_tick;
 static size_t g_cache_bytes;
+
+/* Nyquist notch: (delta - b) along x then y with b = [-1 6 -15 20 -15 6 -1]/64,
+ * which removes the 2 px lattice the VAE leaves in fine texture and keeps DC
+ * gain 1. Separable, so two 7-tap passes; edges clamp. */
+static void notch_rgb(unsigned char *px, int w, int h, int ch) {
+    static const int k[7] = {1, -6, 15, 44, 15, -6, 1};
+    if (w < 7 || h < 7 || ch < 3) return;
+    int *tmp = malloc((size_t)w * h * 3 * sizeof *tmp);
+    if (!tmp) return;
+    for (int y = 0; y < h; ++y) {
+        const unsigned char *row = px + (size_t)y * w * ch;
+        int *out = tmp + (size_t)y * w * 3;
+        for (int x = 0; x < w; ++x) {
+            int a0 = 0, a1 = 0, a2 = 0;
+            for (int t = -3; t <= 3; ++t) {
+                int xx = x + t < 0 ? 0 : (x + t >= w ? w - 1 : x + t);
+                const unsigned char *p = row + (size_t)xx * ch;
+                a0 += k[t + 3] * p[0]; a1 += k[t + 3] * p[1]; a2 += k[t + 3] * p[2];
+            }
+            out[x * 3] = a0; out[x * 3 + 1] = a1; out[x * 3 + 2] = a2;
+        }
+    }
+    for (int y = 0; y < h; ++y) {
+        unsigned char *row = px + (size_t)y * w * ch;
+        const int *r[7];
+        for (int t = -3; t <= 3; ++t) {
+            int yy = y + t < 0 ? 0 : (y + t >= h ? h - 1 : y + t);
+            r[t + 3] = tmp + (size_t)yy * w * 3;
+        }
+        for (int i = 0; i < w * 3; ++i) {
+            int v = 0;
+            for (int t = 0; t < 7; ++t) v += k[t] * r[t][i];
+            v = (v + 2048) >> 12;
+            row[(i / 3) * ch + i % 3] = (unsigned char)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        }
+    }
+    free(tmp);
+}
 
 static double now_ms(void) {
     struct timespec ts;
@@ -367,6 +409,7 @@ static struct {
     float turbo_nodes[16];
     char default_lora[1024]; /* applied to requests that carry no LoRA of their own */
     float default_lora_scale;
+    bool notch;
 } g_cfg;
 
 /* Distilled few-step Qwen-Image (Viggle turbo) schedule: raw nodes pushed through the
@@ -429,6 +472,7 @@ static void sd_cfg_load(void) {
     g_cfg.spectrum_warmup = sd_env_int("OMNISERVE_NATIVE_SD_SPECTRUM_WARMUP", 4, 1, 64);
     g_cfg.spectrum_stop = sd_env_float("OMNISERVE_NATIVE_SD_SPECTRUM_STOP", 0.9f, 0.0f, 1.0f);
     g_cfg.residual_diff = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_RESIDUAL_DIFF", 0.08f, 0.0f, 10.0f);
+    g_cfg.notch = sd_env_flag("OMNISERVE_NATIVE_SD_NOTCH", false);
     g_cfg.teleport_start = sd_env_int("OMNISERVE_NATIVE_SD_TELEPORT_START_STEP", -1, 1, 99);
     g_cfg.cache_bytes_max = (size_t)sd_env_int("OMNISERVE_NATIVE_SD_CACHE_MAX_MB", 1024, 0, 1 << 20) << 20;
     /* OMNISERVE_NATIVE_SD_CACHE_MODE selects the stable-diffusion.cpp denoiser
@@ -783,7 +827,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     }
     /* Turbo only for plain text-to-image: reference edits and requests that bring their
      * own LoRA keep the base schedule, so edit quality is untouched. */
-    bool turbo = g_cfg.turbo_n > 0 && !req->image_pixels && !req->lora_count;
+    bool turbo = g_cfg.turbo_n > 0 && !req->image_pixels && !req->lora_count && req->turbo != 2;
     float turbo_sig[17];
     if (turbo) {
         turbo_sigmas(params.width, params.height, turbo_sig);
@@ -792,6 +836,16 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         params.sample_params.custom_sigmas_count = g_cfg.turbo_n + 1;
         params.sample_params.guidance.txt_cfg = 1.0f;
     }
+    if (req->sampler[0] && p_str_to_sample_method) {
+        int method = p_str_to_sample_method(req->sampler);
+        if (method >= 0 && method < SAMPLE_METHOD_COUNT) params.sample_params.sample_method = (enum sample_method_t)method;
+    }
+    if (req->scheduler[0] && p_str_to_scheduler) {
+        int scheduler = p_str_to_scheduler(req->scheduler);
+        if (scheduler >= 0 && scheduler < SCHEDULER_COUNT) params.sample_params.scheduler = (enum scheduler_t)scheduler;
+    }
+    if (req->flow_shift > 0.0f) params.sample_params.flow_shift = req->flow_shift;
+    if (req->extra_args[0]) params.sample_params.extra_sample_args = req->extra_args;
     params.seed = req->seed;
     sd_image_t source_image = {0};
     if (req->image_pixels) {
@@ -833,13 +887,17 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     out->cache_requested = req->cache;
     /* Static per-process setting: result-cache entries never cross profiles.
      * Latent replay requires a dense trajectory, so it cannot use EasyCache. */
-    if (!req->teleport && g_cfg.cache_mode && !turbo) {
+    bool overridden = req->cache_threshold > 0.0f || req->cache_end > 0.0f || req->cache_off || req->notch ||
+                      req->flow_shift > 0.0f || req->sampler[0] || req->scheduler[0] || req->extra_args[0] ||
+                      req->turbo;
+    if (!req->teleport && g_cfg.cache_mode && !req->cache_off && !turbo) {
         const char *mode = g_cfg.cache_mode;
+        float easycache_threshold = req->cache_threshold > 0.0f ? req->cache_threshold : g_cfg.easycache_threshold;
         params.cache.start_percent = g_cfg.cache_start;
-        params.cache.end_percent = g_cfg.cache_end;
+        params.cache.end_percent = req->cache_end > 0.0f ? req->cache_end : g_cfg.cache_end;
         if (strcmp(mode, "easycache") == 0 || strcmp(mode, "ucache") == 0) {
             params.cache.mode = strcmp(mode, "ucache") == 0 ? SD_CACHE_UCACHE : SD_CACHE_EASYCACHE;
-            params.cache.reuse_threshold = g_cfg.easycache_threshold > 0.0f ? g_cfg.easycache_threshold : 0.2f;
+            params.cache.reuse_threshold = easycache_threshold > 0.0f ? easycache_threshold : 0.2f;
             out->denoiser_cache_threshold = params.cache.reuse_threshold;
         } else if (strcmp(mode, "taylorseer") == 0) {
             params.cache.mode = SD_CACHE_TAYLORSEER;
@@ -861,7 +919,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     out->teleport_capture_step = -1;
     out->teleport_resume_step = 0;
 
-    bool result_cache = req->cache && !req->teleport && req->seed >= 0 && params.batch_count == 1;
+    bool result_cache = req->cache && !req->teleport && !overridden && req->seed >= 0 && params.batch_count == 1;
     bool teleport_cache = req->teleport && !req->image_pixels && params.batch_count == 1 &&
                           req->steps > 1 && latent_api_ready();
     cache_key key = {0};
@@ -970,6 +1028,10 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         out->image_lens = NULL;
         cache_key_free(&key);
         return false;
+    }
+    if (req->notch ? req->notch == 1 : g_cfg.notch) {
+        for (int i = 0; i < image_count; ++i)
+            notch_rgb(images[i].data, (int)images[i].width, (int)images[i].height, (int)images[i].channel);
     }
     bool use_webp = g_webp_enabled && p_webp_encode_rgb && p_webp_free;
     for (int i = 0; i < image_count; ++i) {
