@@ -410,6 +410,7 @@ static struct {
     char default_lora[1024]; /* applied to requests that carry no LoRA of their own */
     float default_lora_scale;
     bool notch;
+    float hq_threshold; /* EasyCache threshold for non-turbo text-to-image; 0 = use the global one */
 } g_cfg;
 
 /* Distilled few-step Qwen-Image (Viggle turbo) schedule: raw nodes pushed through the
@@ -473,6 +474,7 @@ static void sd_cfg_load(void) {
     g_cfg.spectrum_stop = sd_env_float("OMNISERVE_NATIVE_SD_SPECTRUM_STOP", 0.9f, 0.0f, 1.0f);
     g_cfg.residual_diff = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_RESIDUAL_DIFF", 0.08f, 0.0f, 10.0f);
     g_cfg.notch = sd_env_flag("OMNISERVE_NATIVE_SD_NOTCH", false);
+    g_cfg.hq_threshold = sd_env_float("OMNISERVE_NATIVE_SD_HQ_EASYCACHE_THRESHOLD", 0.0f, 0.0f, 1.0f);
     g_cfg.teleport_start = sd_env_int("OMNISERVE_NATIVE_SD_TELEPORT_START_STEP", -1, 1, 99);
     g_cfg.cache_bytes_max = (size_t)sd_env_int("OMNISERVE_NATIVE_SD_CACHE_MAX_MB", 1024, 0, 1 << 20) << 20;
     /* OMNISERVE_NATIVE_SD_CACHE_MODE selects the stable-diffusion.cpp denoiser
@@ -892,7 +894,9 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
                       req->turbo;
     if (!req->teleport && g_cfg.cache_mode && !req->cache_off && !turbo) {
         const char *mode = g_cfg.cache_mode;
-        float easycache_threshold = req->cache_threshold > 0.0f ? req->cache_threshold : g_cfg.easycache_threshold;
+        float easycache_threshold = g_cfg.easycache_threshold;
+        if (!req->image_pixels && g_cfg.hq_threshold > 0.0f) easycache_threshold = g_cfg.hq_threshold;
+        if (req->cache_threshold > 0.0f) easycache_threshold = req->cache_threshold;
         params.cache.start_percent = g_cfg.cache_start;
         params.cache.end_percent = req->cache_end > 0.0f ? req->cache_end : g_cfg.cache_end;
         if (strcmp(mode, "easycache") == 0 || strcmp(mode, "ucache") == 0) {

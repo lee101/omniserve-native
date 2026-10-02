@@ -35,3 +35,10 @@ Image quality bench for the Qwen "ra2" lane. Needs a server on :8792 (`qualitybe
 - Per-prompt LPIPS at 20 steps vs dense 30 is 0.06-0.10 for every prompt (trio is not an exception), so prompt-dependent step counts do not pay off.
 - Adaptive early exit on the x0-prediction delta (`early-exit-experiment.patch`, sd.cpp `sample_euler`): the relative change per step stays at 1-2% down to the last step (it grows for the multi-character prompts), so a tolerance either never fires or damages detail (fox2 LPIPS 0.027 -> 0.074 at tol 0.02). EasyCache already is the adaptive mechanism. Not shipped.
 - The server floors `steps` to `OMNISERVE_NATIVE_SD_MIN_STEPS` (30 in `serve.sh` and the prod unit); set it to 0 when sweeping steps.
+
+## Turbo lane (prod since 2026-10-01: Viggle v0.3 6-step LoRA, runtime-applied on the Q4_K_M base)
+
+- The cross-hatched, desaturated fox came from this lane: with the LoRA on the Q4_K_M base the fur is muddy, and the 2 px lattice is as strong as in the base model (Nyquist energy 6.7e-3 without the notch, 2e-5 with it).
+- `turbo` request field (`false` = base path: floored steps, `HQ_EASYCACHE_THRESHOLD`, no LoRA); `notch` applies to both paths.
+- The model card says to keep the LoRA unmerged at scale 1.0 because merging into quantized weights loses part of the update. The pre-merged v0.3 GGUFs (fp32 merge, quantized once) are better and faster than runtime LoRA on Q4: Q6_K 10.4 s, Q5_K_M 9.8 s, runtime LoRA 11.5 s (3090 Ti), and the fur and fox shape are visibly cleaner. Serving them next to the base model needs a second diffusion context (the text encoder would be loaded twice), so it is not wired into the unit yet.
+- LPIPS against dense 30 is meaningless for turbo (different distilled style; 0.14 to 0.40).
