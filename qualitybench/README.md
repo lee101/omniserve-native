@@ -50,3 +50,27 @@ Image quality bench for the Qwen "ra2" lane. Needs a server on :8792 (`qualitybe
 ## Image format
 
 The server answers WebP (q85) whatever `output_format` asks for, so a writer that trusts the request saves WebP bytes under `.png` (viewers other than a browser refuse those). Sweep tools now pick the extension from the bytes, and `qualitybench/fix_ext.py DIR...` renames existing files. WebP q85 is the default format everywhere (`OMNISERVE_NATIVE_SD_WEBP_QUALITY`, deploy script now 85).
+
+## Acceleration sweep (2026-10-02, 3090 Ti, 1024², seed 0, 7 prompts, 36 configs)
+
+`sweep.py` (server variants + request grid, resumable), `score_sweep.py` (LPIPS/PSNR vs dense 30, CLIP, sharpness, Nyquist), `build_report.py` (HTML gallery; `embed` for a single file). Results: `out/sweep-20261002/{results.jsonl,summary.csv,summary.json}`; clean single-prompt timings (no GPU contention): `out/retime-20261002/results.jsonl`. Full images are not committed; rerun `sweep.py`.
+
+Clean timings (fox2) and mean LPIPS vs dense 30 (36.8 s):
+
+| config | s | LPIPS |
+|---|---|---|
+| 16 steps, EC 0.15 | 13.5 | 0.168 |
+| 20 steps, EC 0.15 | 15.9 | 0.106 |
+| 24 steps, EC 0.15 | 17.2 | 0.078 |
+| 30 steps, EC 0.30 | 18.0 | 0.077 |
+| 30 steps, EC 0.15 (deployed) | 19.0 | 0.045 |
+| 30 steps, EC 0.08 | 21.1 | 0.031 |
+| 30 steps, EC 0.05 | 24.3 | 0.023 |
+| 30 steps, EC 0.15, cache_end 0.7 / 0.5 | 25.6 / 31.7 | 0.031 / 0.024 |
+
+- 30 steps with EasyCache 0.15 stays the knee: composition matches dense 30 (visually checked on quad, fox2). At 24/20/16 steps the composition drifts (poses, a figure changes) even where LPIPS is low-ish.
+- ucache is unsupported for this model (log: "only UNET models"), output equals dense. cache-dit, dbcache and taylorseer (skip 2/3) give identical output to each other, are slower than EasyCache and worse in LPIPS (0.044 at 25.8 s vs 0.045 at 20.8 s). spectrum 0.057 at 20.4 s. EasyCache is the only useful cache here.
+- `cache_end` (stop caching late) costs more time than it buys.
+- `notch` off: Laplacian sharpness x1.97 (base) / x2.85 (turbo) vs the dense reference, lattice returns. Keep on.
+- Turbo: LoRA scale 1.3 oversharpens (x2.57), 0.7 is softer and closer to the base look (LPIPS 0.20 vs 0.24). 4-node schedule is fastest but weaker; 8-node is no better than 6. Pre-merged Q6/Q5 turbo cost less than runtime LoRA and have the highest CLIP delta (+0.017/+0.018); fox2 shows a different, cleaner composition.
+- Teleport was not benchmarked here (master sd.cpp lib has no latent API); unseeded teleport doubled HQ time on the 5090 (19.3 s vs 9.9 s) and is no longer sent without a seed.
