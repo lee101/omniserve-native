@@ -410,6 +410,7 @@ static struct {
     char default_lora[1024]; /* applied to requests that carry no LoRA of their own */
     float default_lora_scale;
     bool notch;
+    bool teleport; /* OMNISERVE_NATIVE_SD_TELEPORT=0 ignores request teleport flags (Qwen lanes: latent capture makes a first render ~2x slower and only an exact repeat benefits) */
     float hq_threshold; /* EasyCache threshold for non-turbo text-to-image; 0 = use the global one */
 } g_cfg;
 
@@ -474,6 +475,7 @@ static void sd_cfg_load(void) {
     g_cfg.spectrum_stop = sd_env_float("OMNISERVE_NATIVE_SD_SPECTRUM_STOP", 0.9f, 0.0f, 1.0f);
     g_cfg.residual_diff = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_RESIDUAL_DIFF", 0.08f, 0.0f, 10.0f);
     g_cfg.notch = sd_env_flag("OMNISERVE_NATIVE_SD_NOTCH", false);
+    g_cfg.teleport = sd_env_flag("OMNISERVE_NATIVE_SD_TELEPORT", true);
     g_cfg.hq_threshold = sd_env_float("OMNISERVE_NATIVE_SD_HQ_EASYCACHE_THRESHOLD", 0.0f, 0.0f, 1.0f);
     g_cfg.teleport_start = sd_env_int("OMNISERVE_NATIVE_SD_TELEPORT_START_STEP", -1, 1, 99);
     g_cfg.cache_bytes_max = (size_t)sd_env_int("OMNISERVE_NATIVE_SD_CACHE_MAX_MB", 1024, 0, 1 << 20) << 20;
@@ -500,7 +502,7 @@ static bool latent_api_ready(void) {
  * Without it (upstream sd.cpp, the Qwen lanes) the flag must not switch off EasyCache or the result
  * cache, or every caller that sends teleport:true pays for a dense run. */
 static bool teleport_effective(const oimg_req *req) {
-    return req->teleport && !req->image_pixels && req->batch_count <= 1 && req->steps > 1 && latent_api_ready();
+    return g_cfg.teleport && req->teleport && !req->image_pixels && req->batch_count <= 1 && req->steps > 1 && latent_api_ready();
 }
 
 /* Everything in a request that selects a cache entry and is not a plain scalar.
