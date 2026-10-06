@@ -118,6 +118,17 @@ static void test_image_contract(void) {
     CHECK(request.generation.lora_count == 0);
     oimage_request_free(&request);
 
+    const char *turbo_on = "{\"prompt\":\"p\",\"turbo\":true}";
+    const char *turbo_off = "{\"prompt\":\"p\",\"turbo\":false}";
+    const char *turbo_bad = "{\"prompt\":\"p\",\"turbo\":3}";
+    CHECK(oimage_request_parse(turbo_on, strlen(turbo_on), &request, error, sizeof error));
+    CHECK(request.generation.turbo == 1);
+    oimage_request_free(&request);
+    CHECK(oimage_request_parse(turbo_off, strlen(turbo_off), &request, error, sizeof error));
+    CHECK(request.generation.turbo == 2);
+    oimage_request_free(&request);
+    CHECK(!oimage_request_parse(turbo_bad, strlen(turbo_bad), &request, error, sizeof error));
+
     const char *loras = "{\"prompt\":\"cat\",\"loras\":["
                         "{\"path\":\"/models/a.safetensors\",\"scale\":0.75},"
                         "\"/models/b.safetensors\"]}";

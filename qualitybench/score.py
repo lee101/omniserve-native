@@ -3,7 +3,7 @@ from PIL import Image
 ref = sys.argv[1]; out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
 net = lpips.LPIPS(net="alex", verbose=False)
 tim = collections.defaultdict(dict)
-for l in open(f"{out}/frontier.log"):
+for l in open(f"{out}/"+os.environ.get("LOG","frontier.log")):
     m = re.match(r"(\S+) (\S+) wall=([\d.]+)s", l)
     if m: tim[m[1]][m[2]] = float(m[3])
 def load(p): return torch.from_numpy(np.asarray(Image.open(p).convert("RGB"))).permute(2,0,1).float()[None]/127.5-1

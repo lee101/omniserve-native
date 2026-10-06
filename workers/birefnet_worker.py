@@ -58,6 +58,7 @@ VRAM_BROKER_URL = os.getenv(
 VRAM_BROKER_REQUIRED = os.getenv("BIREFNET_VRAM_BROKER_REQUIRED", "0") == "1"
 VRAM_LEASE_MIB = max(512, int(os.getenv("BIREFNET_VRAM_LEASE_MIB", "3584")))
 VRAM_LEASE_TTL_SECONDS = max(60, int(os.getenv("BIREFNET_VRAM_LEASE_TTL_SECONDS", "1800")))
+BATCH_SIZE = max(1, int(os.getenv("BIREFNET_BATCH", "4")))
 MAX_DOWNLOAD_BYTES = int(os.getenv("BIREFNET_MAX_DOWNLOAD_BYTES", str(64 << 20)))
 # Colour decontamination: recover the true foreground colour so the backdrop
 # (green screens especially) stops bleeding into semi-transparent edges.
@@ -102,6 +103,9 @@ BACKGROUND_ART_SECRET = os.getenv("BIREFNET_ART_SECRET", "")
 class RemoveBackgroundRequest(BaseModel):
     image_url: str = Field(min_length=1)
     output_format: str = DEFAULT_FORMAT
+    # Network resolution. Small subjects (sprites, icons) segment as well at 512
+    # as at 1024 for a quarter of the work; the alpha is resampled to the source.
+    input_size: int | None = Field(default=None, ge=256, le=2048, multiple_of=32)
     foreground_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
     decontaminate: bool | None = None
     cache: bool = True
@@ -125,7 +129,7 @@ class RemoveBackgroundRequest(BaseModel):
             "threshold": round(self.foreground_threshold, 4),
             "decontaminate": DECONTAMINATE if self.decontaminate is None else self.decontaminate,
             "model": MODEL_ID,
-            "input_size": INPUT_SIZE,
+            "input_size": self.input_size or INPUT_SIZE,
             "quality": WEBP_QUALITY if self.output_format.lower() == "webp" else 0,
             "webp_method": WEBP_METHOD if self.output_format.lower() == "webp" else 0,
             "transparent_rgb": "black" if self.output_format.lower() == "webp" else "n/a",
@@ -139,6 +143,14 @@ class RemoveBackgroundRequest(BaseModel):
     def wants_extras(self) -> bool:
         """True when the answer is more than one image, so it has to be JSON."""
         return bool(self.return_background or self.background or self.background_prompt)
+
+
+class BatchRemoveRequest(BaseModel):
+    image_urls: list[str] = Field(min_length=1, max_length=128)
+    output_format: str = DEFAULT_FORMAT
+    input_size: int | None = Field(default=None, ge=256, le=2048, multiple_of=32)
+    foreground_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
+    decontaminate: bool | None = None
 
 
 class ForegroundGenerationRequest(BaseModel):
@@ -383,10 +395,12 @@ def _unwrap_prediction(prediction):
     return prediction
 
 
-def _prepare_input(image: Image.Image):
+def _prepare_input(image: Image.Image, size: int | None = None):
+    size = size or INPUT_SIZE
     if not DEVICE.startswith("cuda"):
-        return runtime.transform(image).unsqueeze(0).to(DEVICE, dtype=runtime.dtype)
-    resized = image.convert("RGB").resize((INPUT_SIZE, INPUT_SIZE), Image.Resampling.BILINEAR)
+        resized = image.convert("RGB").resize((size, size), Image.Resampling.BILINEAR)
+        return runtime.transform(resized).unsqueeze(0).to(DEVICE, dtype=runtime.dtype)
+    resized = image.convert("RGB").resize((size, size), Image.Resampling.BILINEAR)
     # Upload three uint8 bytes per pixel, then cast/normalize on the device;
     # torchvision's ToTensor would send four float32 bytes per channel.
     array = np.array(resized, dtype=np.uint8, order="C", copy=True)
@@ -857,21 +871,12 @@ def resolve_backdrop(request: RemoveBackgroundRequest, estimated: Image.Image | 
     return backdrop, None
 
 
-@torch.inference_mode()
-def segment(image: Image.Image, threshold: float):
-    """BiRefNet alpha, left on the device it was produced on.
-
-    The matte pass that follows reads it there, so bringing it to the host only
-    to send it straight back was ~4 MB of pure round trip per cutout.
-    """
-    if runtime.model is None:
-        raise HTTPException(503, "BiRefNet is not loaded")
-    tensor = _prepare_input(image)
+def _forward(tensor):
     with _model_lock:
         try:
             with torch.autocast(device_type="cuda", dtype=runtime.dtype,
                                 enabled=DEVICE.startswith("cuda")):
-                prediction = runtime.model(tensor)
+                return runtime.model(tensor)
         except Exception as error:
             if runtime.model is runtime.eager_model or runtime.eager_model is None:
                 raise
@@ -880,9 +885,11 @@ def segment(image: Image.Image, threshold: float):
             runtime.engine = f"birefnet-{runtime.dtype}-eager-compile-fallback"
             with torch.autocast(device_type="cuda", dtype=runtime.dtype,
                                 enabled=DEVICE.startswith("cuda")):
-                prediction = runtime.model(tensor)
-    prediction = _unwrap_prediction(prediction)
-    mask = torch.sigmoid(prediction)
+                return runtime.model(tensor)
+
+
+def _finish_mask(mask, image: Image.Image, threshold: float):
+    """One (1, 1, h, w) probability map -> (device alpha, byte alpha)."""
     mask = functional.interpolate(mask, size=(image.height, image.width), mode="bilinear",
                                   align_corners=False)
     mask = mask[0, 0].float().clamp(0, 1)
@@ -898,7 +905,32 @@ def segment(image: Image.Image, threshold: float):
 
 
 @torch.inference_mode()
-def remove_background(image: Image.Image, request: RemoveBackgroundRequest) -> dict[str, bytes]:
+def segment(image: Image.Image, threshold: float, size: int | None = None):
+    """BiRefNet alpha, left on the device it was produced on.
+
+    The matte pass that follows reads it there, so bringing it to the host only
+    to send it straight back was ~4 MB of pure round trip per cutout.
+    """
+    if runtime.model is None:
+        raise HTTPException(503, "BiRefNet is not loaded")
+    prediction = _forward(_prepare_input(image, size))
+    mask = torch.sigmoid(_unwrap_prediction(prediction))
+    return _finish_mask(mask, image, threshold)
+
+
+@torch.inference_mode()
+def segment_batch(images: list[Image.Image], threshold: float, size: int | None = None):
+    """Several images through the network as one batch, at one input size."""
+    if runtime.model is None:
+        raise HTTPException(503, "BiRefNet is not loaded")
+    tensor = torch.cat([_prepare_input(image, size) for image in images], dim=0)
+    masks = torch.sigmoid(_unwrap_prediction(_forward(tensor)))
+    return [_finish_mask(masks[i:i + 1], image, threshold) for i, image in enumerate(images)]
+
+
+@torch.inference_mode()
+def remove_background(image: Image.Image, request: RemoveBackgroundRequest,
+                      segmented=None) -> dict[str, bytes]:
     """Cutout, and whatever else the request asked for.
 
     Returns a dict of artifact name -> encoded bytes. "cutout" is always
@@ -906,7 +938,8 @@ def remove_background(image: Image.Image, request: RemoveBackgroundRequest) -> d
     over a replacement one.
     """
     output_format = request.output_format.lower()
-    mask_device, mask_array = segment(image, request.foreground_threshold)
+    mask_device, mask_array = segmented or segment(image, request.foreground_threshold,
+                                                   request.input_size)
     alpha_bytes = (mask_array if mask_array.dtype == np.uint8
                    else (mask_array * 255).round().astype("uint8"))
     alpha = Image.fromarray(alpha_bytes, mode="L")
@@ -1065,7 +1098,9 @@ def background_removal(request: RemoveBackgroundRequest) -> Response:
         # what keeps a backdrop replacement from occupying an interactive slot.
         raise HTTPException(400, "background_prompt requires the /jobs endpoint")
 
+    started = time.perf_counter()
     result = produce_cutout(request)
+    compute_ms = f"{(time.perf_counter() - started) * 1000:.1f}"
     if request.wants_extras():
         return Response(content=json.dumps(artifact_payload(result)),
                         media_type="application/json")
@@ -1083,6 +1118,7 @@ def background_removal(request: RemoveBackgroundRequest) -> Response:
     headers = {
         "X-BiRefNet-Model": MODEL_ID,
         "X-Cutout-Cached": "1" if result["cached"] else "0",
+        "X-Compute-Ms": compute_ms,
     }
     if cutout.get("url"):
         headers["X-Cutout-Url"] = cutout["url"]
@@ -1090,6 +1126,43 @@ def background_removal(request: RemoveBackgroundRequest) -> Response:
         headers["X-Source-Width"] = str(result["width"])
         headers["X-Source-Height"] = str(result["height"])
     return Response(content=content, media_type=result["media_type"], headers=headers)
+
+
+@app.post("/v1/images/background-removals/batch")
+def background_removal_batch(request: BatchRemoveRequest) -> dict[str, Any]:
+    """Cut out many images in a few forward passes.
+
+    The network sees BIREFNET_BATCH images at a time at one input size, which
+    keeps the card busy instead of idling between requests; a sprite sheet of
+    hundreds of cells is the case this exists for. Results keep request order.
+    """
+    output_format = request.output_format.lower()
+    if output_format not in {"webp", "png"}:
+        raise HTTPException(400, "output_format must be webp or png")
+    started = time.perf_counter()
+    images = [read_image(url) for url in request.image_urls]
+    options = RemoveBackgroundRequest(
+        image_url="batch", output_format=output_format, input_size=request.input_size,
+        foreground_threshold=request.foreground_threshold, decontaminate=request.decontaminate,
+        cache=False)
+    results = []
+    timing = {"decode_ms": round((time.perf_counter() - started) * 1000, 1), "segment_ms": 0.0, "finish_ms": 0.0}
+    for low in range(0, len(images), BATCH_SIZE):
+        chunk = images[low:low + BATCH_SIZE]
+        mark = time.perf_counter()
+        segmented = segment_batch(chunk, request.foreground_threshold, request.input_size)
+        timing["segment_ms"] += (time.perf_counter() - mark) * 1000
+        mark = time.perf_counter()
+        for image, seg in zip(chunk, segmented):
+            cutout = remove_background(image, options, segmented=seg)["cutout"]
+            results.append({"width": image.width, "height": image.height,
+                            "cutout_base64": base64.b64encode(cutout).decode("ascii")})
+        timing["finish_ms"] += (time.perf_counter() - mark) * 1000
+    timing = {k: round(v, 1) for k, v in timing.items()}
+    return {"timing": timing, "model": MODEL_ID, "count": len(results), "batch": BATCH_SIZE,
+            "input_size": request.input_size or INPUT_SIZE,
+            "media_type": "image/webp" if output_format == "webp" else "image/png",
+            "compute_ms": round((time.perf_counter() - started) * 1000, 1), "results": results}
 
 
 def _run_job(job_id: str, request: RemoveBackgroundRequest) -> None:

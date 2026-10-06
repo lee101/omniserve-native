@@ -35,3 +35,24 @@ Image quality bench for the Qwen "ra2" lane. Needs a server on :8792 (`qualitybe
 - Per-prompt LPIPS at 20 steps vs dense 30 is 0.06-0.10 for every prompt (trio is not an exception), so prompt-dependent step counts do not pay off.
 - Adaptive early exit on the x0-prediction delta (`early-exit-experiment.patch`, sd.cpp `sample_euler`): the relative change per step stays at 1-2% down to the last step (it grows for the multi-character prompts), so a tolerance either never fires or damages detail (fox2 LPIPS 0.027 -> 0.074 at tol 0.02). EasyCache already is the adaptive mechanism. Not shipped.
 - The server floors `steps` to `OMNISERVE_NATIVE_SD_MIN_STEPS` (30 in `serve.sh` and the prod unit); set it to 0 when sweeping steps.
+
+## Lib, VAE and kernel A/B (2026-10-05, 3090 Ti shared, 1024², seed 0, fox2/trio/duo/quad, 30 steps EasyCache 0.15)
+
+`qualitybench/ab.sh TAG [ENV=VAL ...]` (`LIB=` picks the sd.cpp build) starts a private lane with the prod config, renders the four prompts, appends to `out/ab.log`; `LOG=ab.log uv run --with torch --with lpips --with pillow --with numpy python qualitybench/score.py base` scores every tag against `base`. `OMNISERVE_NATIVE_SD_LOG=1` prints sd.cpp's per-stage timings (sampling, decode) to the server log.
+
+Per-image stages: text encode 0.04 s (cached), sampling 15.1-16.3 s, VAE decode 3.7 s tiled. The decode is the only stage with slack.
+
+| variant | decode | LPIPS vs base | PSNR | note |
+|---|---:|---:|---:|---|
+| tiled 32 (old default) | 3.7 s | 0 | - | |
+| tile overlap 0.25 | 3.7 s | 0 | 96 | overlap is ignored, output bit-identical |
+| untiled, master lib | 1.6 s | 0.006 | 56 | OOM and 7 s decode when another tenant holds VRAM |
+| untiled, prod lib (`sdcpp-qwen-prefixkv`) | 1.3 s | 0.009 | 43 | its OOM retry falls back to smaller tiles (one 6.1 s decode in 8 images) |
+| tile 64, prod lib | 1.4 s | 0.008 | 56 | |
+| CUDA graphs (`GGML_CUDA_GRAPHS=ON`) | 3.8 s | 0 | 96 | bit-identical, sampling not faster (15.9 vs 15.1-16.0) |
+| `GGML_CUDA_FORCE_CUBLAS=ON` | 3.9 s | 0.041 | 31 | sampling not faster, output drifts (fp16 dequant path) |
+| turbo LoRA (runtime) | 3.7 s | 0.218 | 21 | 12.9 s; different distilled style, see the tier notes |
+
+- Shipped: `tools/start-ra2-lane.sh` prefers the prod-parity lib and runs it untiled (about 2.4 s, 13%, per 1024² image at LPIPS < 0.01, far inside the 0.03-0.045 that EasyCache 0.15 already costs). The master lib keeps tiling.
+- Rejected: CUDA graphs and cuBLAS give no sampling speedup; the sampler is bound by Q4_K/Q6_K `mul_mat_q` (62% of kernel time) and elementwise bcast/cpy/concat kernels (about 25%). The elementwise chain (modulate = repeat + mul + add) is the only fusion target left, worth under 1 s per image, and needs sd.cpp graph changes.
+- Lane warm-up: `OMNISERVE_NATIVE_SD_WARMUP=1` renders one 1024² step before listening (sd.cpp stages encoder, DiT and VAE tensors and builds each graph on the first request). Start to ready 13.7 s (was 12.5 s with a 256² probe), and the first real 1024² request drops from 22.4 s to 17.6 s.

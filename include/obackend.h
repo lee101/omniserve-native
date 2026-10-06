@@ -136,6 +136,7 @@ typedef struct {
     float cache_end;       /* fraction of steps after which caching stops */
     bool cache_off;        /* dense sampling */
     int notch;             /* 0 server default, 1 on, 2 off */
+    int turbo;             /* 0 server default, 1 on, 2 off: distilled few-step LoRA tier */
     float flow_shift;      /* 0 server default */
     char sampler[24];      /* sd.cpp sampler name, empty = default */
     char scheduler[24];

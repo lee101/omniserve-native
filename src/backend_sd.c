@@ -225,6 +225,11 @@ static fn_free_latent p_free_latent;
 static bool g_webp_enabled = true;
 static float g_webp_quality = 85.0f;
 
+static void sd_log_line(int level, const char *text, void *data) {
+    (void)data;
+    if (level >= 2) fputs(text, stderr);
+}
+
 static bool sd_lib_load(void) {
     const char *path = getenv("OMNISERVE_NATIVE_SD_LIB");
     if (!path || !path[0]) {
@@ -249,6 +254,12 @@ static bool sd_lib_load(void) {
     p_latent_params_init = (fn_latent_params_init)dlsym(lib, "sd_latent_replay_params_init");
     p_generate_image_with_latent = (fn_generate_image_with_latent)dlsym(lib, "generate_image_with_latent");
     p_free_latent = (fn_free_latent)dlsym(lib, "free_sd_latent");
+    const char *log_env = getenv("OMNISERVE_NATIVE_SD_LOG");
+    if (log_env && log_env[0] == '1') {
+        void (*set_log)(void (*)(int, const char *, void *), void *) =
+            (void (*)(void (*)(int, const char *, void *), void *))dlsym(lib, "sd_set_log_callback");
+        if (set_log) set_log(sd_log_line, NULL);
+    }
     return p_ctx_params_init && p_new_sd_ctx && p_img_params_init && p_generate_image && p_free_images;
 }
 
@@ -388,6 +399,10 @@ static struct {
     int teleport_start; /* -1: steps - 1 */
     size_t cache_bytes_max;
     bool notch;
+    char *turbo_lora;
+    bool turbo_default;
+    float turbo_nodes[16];
+    int turbo_count;
 } g_cfg;
 
 static void sd_cfg_load(void) {
@@ -407,6 +422,20 @@ static void sd_cfg_load(void) {
     g_cfg.spectrum_stop = sd_env_float("OMNISERVE_NATIVE_SD_SPECTRUM_STOP", 0.9f, 0.0f, 1.0f);
     g_cfg.residual_diff = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_RESIDUAL_DIFF", 0.08f, 0.0f, 10.0f);
     g_cfg.notch = sd_env_flag("OMNISERVE_NATIVE_SD_NOTCH", false);
+    /* Distilled few-step tier: OMNISERVE_NATIVE_SD_TURBO_LORA names the LoRA, _TURBO=1 makes it the default
+     * for text-to-image, a request's "turbo" overrides either way. Nodes are the flow-matching timesteps. */
+    const char *turbo_lora = getenv("OMNISERVE_NATIVE_SD_TURBO_LORA");
+    g_cfg.turbo_lora = turbo_lora && turbo_lora[0] ? strdup(turbo_lora) : NULL;
+    g_cfg.turbo_default = sd_env_flag("OMNISERVE_NATIVE_SD_TURBO", false);
+    const char *nodes = getenv("OMNISERVE_NATIVE_SD_TURBO_NODES");
+    if (!nodes || !nodes[0]) nodes = "1.0,0.9375,0.875,0.75,0.5,0.25";
+    for (const char *at = nodes; *at && g_cfg.turbo_count < 16;) {
+        char *end;
+        double node = strtod(at, &end);
+        if (end == at) break;
+        if (node > 0.0 && node <= 1.0) g_cfg.turbo_nodes[g_cfg.turbo_count++] = (float)node;
+        at = *end == ',' ? end + 1 : end;
+    }
     g_cfg.teleport_start = sd_env_int("OMNISERVE_NATIVE_SD_TELEPORT_START_STEP", -1, 1, 99);
     g_cfg.cache_bytes_max = (size_t)sd_env_int("OMNISERVE_NATIVE_SD_CACHE_MAX_MB", 1024, 0, 1 << 20) << 20;
     /* OMNISERVE_NATIVE_SD_CACHE_MODE selects the stable-diffusion.cpp denoiser
@@ -637,6 +666,23 @@ static void cache_store_encoded_result(latent_cache_entry *entry, const oimg_res
     pthread_mutex_unlock(&g_cache_lock);
 }
 
+/* sd.cpp stages the text encoder, DiT and VAE tensors and builds each graph on the first
+ * request; one throwaway step at the usual size here moves that cost, and the compute-buffer growth,
+ * out of the first user's request. */
+static void osd_warmup(void) {
+    oimg_req req;
+    oimg_result out;
+    memset(&req, 0, sizeof req);
+    req.prompt = "warmup";
+    req.width = req.height = sd_env_int("OMNISERVE_NATIVE_SD_WARMUP_SIZE", 1024, 64, 4096);
+    req.steps = 1;
+    req.seed = 1;
+    req.notch = 2;
+    double started = now_ms();
+    if (osd_generate(&req, &out)) osd_result_free(&out);
+    fprintf(stderr, "sd: warmup render %.1fs\n", (now_ms() - started) / 1000.0);
+}
+
 bool osd_init(const char *model_path) {
     if (g_sd) return true;
     if (!sd_lib_load()) return false;
@@ -692,6 +738,7 @@ bool osd_init(const char *model_path) {
     g_webp_enabled = !format || !format[0] || strcasecmp(format, "png") != 0;
     g_webp_quality = sd_env_float("OMNISERVE_NATIVE_SD_WEBP_QUALITY", 85.0f, 1.0f, 100.0f);
     if (g_webp_enabled) webp_lib_load();
+    if (sd_env_flag("OMNISERVE_NATIVE_SD_WARMUP", false)) osd_warmup();
     return true;
 }
 
@@ -787,6 +834,10 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         }
     }
     params.batch_count = req->batch_count > 0 ? req->batch_count : 1;
+    bool turbo = g_cfg.turbo_lora && g_cfg.turbo_count > 0 && !req->image_pixels && !req->lora_count &&
+                 !req->teleport && (req->turbo ? req->turbo == 1 : g_cfg.turbo_default);
+    float turbo_sigmas[17];
+    sd_lora_t turbo_lora = {0};
     sd_lora_t *loras = NULL;
     if (req->lora_count) {
         loras = calloc(req->lora_count, sizeof *loras);
@@ -797,6 +848,20 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         }
         params.loras = loras;
         params.lora_count = (uint32_t)req->lora_count;
+    } else if (turbo) {
+        float seq = (float)((params.width / 16) * (params.height / 16));
+        float shift = expf(0.5f + (seq - 256.0f) * (0.9f - 0.5f) / (8192.0f - 256.0f));
+        for (int i = 0; i < g_cfg.turbo_count; ++i)
+            turbo_sigmas[i] = shift / (shift + (1.0f / g_cfg.turbo_nodes[i] - 1.0f));
+        turbo_sigmas[g_cfg.turbo_count] = 0.0f;
+        turbo_lora.path = g_cfg.turbo_lora;
+        turbo_lora.multiplier = 1.0f;
+        params.loras = &turbo_lora;
+        params.lora_count = 1;
+        params.sample_params.sample_steps = g_cfg.turbo_count;
+        params.sample_params.custom_sigmas = turbo_sigmas;
+        params.sample_params.custom_sigmas_count = g_cfg.turbo_count + 1;
+        params.sample_params.guidance.txt_cfg = 1.0f;
     }
 
     out->teleport_requested = req->teleport;
@@ -804,8 +869,8 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     /* Static per-process setting: result-cache entries never cross profiles.
      * Latent replay requires a dense trajectory, so it cannot use EasyCache. */
     bool overridden = req->cache_threshold > 0.0f || req->cache_end > 0.0f || req->cache_off || req->notch ||
-                      req->flow_shift > 0.0f || req->sampler[0] || req->scheduler[0] || req->extra_args[0];
-    if (!req->teleport && g_cfg.cache_mode && !req->cache_off) {
+                      req->flow_shift > 0.0f || req->sampler[0] || req->scheduler[0] || req->extra_args[0] || turbo;
+    if (!req->teleport && g_cfg.cache_mode && !req->cache_off && !turbo) {
         const char *mode = g_cfg.cache_mode;
         float easycache_threshold = req->cache_threshold > 0.0f ? req->cache_threshold : g_cfg.easycache_threshold;
         params.cache.start_percent = g_cfg.cache_start;

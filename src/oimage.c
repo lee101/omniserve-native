@@ -525,6 +525,16 @@ bool oimage_request_parse(const char *json, size_t json_len, oimage_request *req
         }
         request->generation.notch = on ? 1 : 2;
     }
+    token = oj_obj_get(json, tokens, token_count, 0, "turbo");
+    if (token >= 0) {
+        bool on = false;
+        if (!token_bool(json, &tokens[token], &on)) {
+            set_error(error, error_cap, "turbo must be a boolean");
+            oimage_request_free(request);
+            return false;
+        }
+        request->generation.turbo = on ? 1 : 2;
+    }
     static const struct { const char *key; size_t off; size_t cap; } strs[] = {
         {"sampler", offsetof(oimg_req, sampler), sizeof(((oimg_req *)0)->sampler)},
         {"scheduler", offsetof(oimg_req, scheduler), sizeof(((oimg_req *)0)->scheduler)},

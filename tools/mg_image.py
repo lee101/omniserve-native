@@ -21,6 +21,7 @@ import os
 import random
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -46,13 +47,17 @@ def post(url: str, body: dict, headers: dict, timeout: float) -> tuple[int, byte
         return 0, str(error).encode(), {}
 
 
-def with_retries(url: str, body: dict, headers: dict, timeout: float, retries: int, label: str):
+def with_retries(url: str, body: dict, headers: dict, timeout: float, retries: int, label: str, on_fail=None, before=None):
     status, payload, response_headers = 0, b"", {}
     for attempt in range(retries + 1):
+        if before and attempt:
+            before(attempt >= retries)
         status, payload, response_headers = post(url, body, headers, timeout)
         if status and status not in TRANSIENT:
             return status, payload
-        if attempt == retries:
+        if on_fail:
+            retries = min(retries, on_fail(attempt))
+        if attempt >= retries:
             break
         wait = min(30.0, 1.5 * (2 ** attempt)) * (0.75 + random.random() / 2)
         retry_after = response_headers.get("Retry-After", "")
@@ -75,12 +80,52 @@ def lane_up(base: str) -> bool:
 def ensure_lane(base: str) -> bool:
     if lane_up(base):
         return True
-    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "start-ra2-lane.sh")
+    script = os.environ.get("MG_LANE_START") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "start-ra2-lane.sh")
     if not os.access(script, os.X_OK):
         log(f"local lane {base} is down and {script} is missing")
         return False
     log(f"local lane {base} is down; starting it (first start takes about a minute)")
     return subprocess.call([script], stdout=sys.stderr, stderr=sys.stderr) == 0 and lane_up(base)
+
+
+class Lane:
+    """The local RA2 lane. A 502 from the API usually means its upstream lane is down, so
+    the second transient failure starts the lane in the background while the retries back
+    off; a lane that is already up makes one retry enough before rendering locally."""
+
+    def __init__(self, base: str, enabled: bool):
+        self.base = base
+        self.enabled = enabled and base.split("//", 1)[-1].startswith(("127.0.0.1", "localhost", "[::1]"))
+        self.up = self.enabled and lane_up(base)
+        self.thread = None
+        self.ok = self.up
+
+    def _start(self) -> None:
+        self.ok = ensure_lane(self.base)
+
+    def on_fail(self, attempt: int) -> int:
+        if not self.enabled:
+            return 1 << 30
+        if self.up:
+            return 1
+        if attempt >= 1 and self.thread is None:
+            log("api unavailable and the local lane is down; starting the lane while retrying")
+            self.thread = threading.Thread(target=self._start, daemon=True)
+            self.thread.start()
+        return 1 << 30
+
+    def before(self, last: bool) -> None:
+        """The last API attempt waits for a lane that is still starting instead of racing it."""
+        if last and self.thread and self.thread.is_alive():
+            log("waiting for the local lane before the last attempt")
+            self.thread.join(timeout=300)
+
+    def ready(self) -> bool:
+        if self.thread:
+            self.thread.join()
+            return bool(self.ok)
+        return ensure_lane(self.base)
 
 
 def sniff(blob: bytes) -> str:
@@ -202,6 +247,8 @@ def main() -> int:
 
     document = None
     engine = credits = "?"
+    api_seconds = 0.0
+    lane = Lane(args.lane, not args.direct and not args.no_fallback)
     if not args.direct:
         body = {"service": args.service, "prompt": args.prompt, "model": args.model or None,
                 "image_backend": args.backend, "width": args.width, "height": args.height,
@@ -211,10 +258,11 @@ def main() -> int:
         started = time.time()
         status, payload = with_retries(args.api.rstrip("/") + "/api/service", body,
                                        {"Authorization": f"Bearer {args.key}"},
-                                       args.timeout, args.retries, "api")
+                                       args.timeout, args.retries, "api", lane.on_fail, lane.before)
         if status == 401:
             return 77
         if status in (200, 201, 202):
+            api_seconds = time.time() - started
             document = json.loads(payload)
             result = document.get("result") if isinstance(document.get("result"), dict) else {}
             engine, credits = result.get("engine", "?"), document.get("credits_used", "?")
@@ -227,7 +275,7 @@ def main() -> int:
             if args.no_fallback:
                 return 1
     if document is None:
-        if not ensure_lane(args.lane):
+        if not lane.ready():
             log("no local lane available")
             return 1
         log("rendering on the local lane")
@@ -246,8 +294,10 @@ def main() -> int:
     if args.json:
         json.dump(document, sys.stdout)
         return 0
+    saved = time.time()
     paths = save(args, document)
-    log(f"engine={engine} credits={credits}")
+    timing = f" api={api_seconds:.1f}s" if api_seconds else ""
+    log(f"engine={engine} credits={credits}{timing} save={time.time() - saved:.1f}s")
     print("\n".join(paths))
     return 0
 

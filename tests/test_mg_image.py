@@ -2,6 +2,7 @@
 import base64, http.server, json, os, subprocess, sys, tempfile, threading, unittest
 
 TOOL = os.path.join(os.path.dirname(__file__), "..", "tools", "mg_image.py")
+START = os.path.join(os.path.dirname(__file__), "fake_lane_start.sh")
 WEBP = b"RIFF" + (100).to_bytes(4, "little") + b"WEBP" + b"VP8 " + bytes(100)
 
 
@@ -35,16 +36,15 @@ def handler(statuses, hits, bodies):
 def run(api, lane, *extra, cwd):
     return subprocess.run([sys.executable, "-S", TOOL, "--api", api, "--key", "k", "--lane", lane,
                            "--out-dir", cwd, "--retries", "2", *extra, "--", "a fox"],
-                          capture_output=True, text=True, timeout=60, env={**os.environ, "PYTHONHASHSEED": "0"})
+                          capture_output=True, text=True, timeout=60, env={**os.environ, "PYTHONHASHSEED": "0", "MG_LANE_START": START})
 
 
 class MgImage(unittest.TestCase):
     def test_retries_then_succeeds(self):
         hits, bodies = [], []
         api, url = serve(handler([502, 503, 200], hits, bodies))
-        lane, lane_url = serve(handler([200], [], []))
         with tempfile.TemporaryDirectory() as d:
-            r = run(url, lane_url, "--quality", "hq", "--steps", "24", cwd=d)
+            r = run(url, "http://127.0.0.1:9", "--quality", "hq", "--steps", "24", cwd=d)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(len(hits), 3)
             self.assertEqual(bodies[-1]["quality"], "hq")
@@ -59,9 +59,19 @@ class MgImage(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             r = run(url, lane_url, "--quality", "hq", cwd=d)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertEqual(len(hits), 3)
+            self.assertEqual(len(hits), 2)
             self.assertEqual(lane_bodies[0]["turbo"], False)
             self.assertIn("local", r.stderr)
+
+    def test_down_lane_is_started_while_retrying(self):
+        hits = []
+        api, url = serve(handler([502], hits, []))
+        with tempfile.TemporaryDirectory() as d:
+            r = run(url, "http://127.0.0.1:9", cwd=d)
+            self.assertEqual(r.returncode, 1)
+            self.assertEqual(len(hits), 3)
+            self.assertIn("starting the lane while retrying", r.stderr)
+            self.assertIn("fake lane start", r.stderr)
 
     def test_no_fallback_fails(self):
         api, url = serve(handler([502], [], []))
