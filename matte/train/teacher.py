@@ -89,6 +89,7 @@ def teach(img, key_name):
         "soft_share": float(soft.float().mean()),
         "key_net_disagree": float((keyed - net).abs()[(net > 0.02) & (net < 0.98)].mean()) if bool(((net > 0.02) & (net < 0.98)).any()) else 0.0,
         "residual_spill": float((mr.spill_map(fg, bg2.mean((1, 2)), k, o) * alpha).sum() / alpha.sum().clamp_min(1)),
+        "key_match": mr._key(bg, net)[0] == k,
         "bg_key_excess": float((bg[k] - torch.maximum(bg[o[0]], bg[o[1]]))[net < 0.05].mean()) if bool((net < 0.05).any()) else 0.0,
     }
     return alpha, fg, net, stats
@@ -97,6 +98,8 @@ def teach(img, key_name):
 def reject(st):
     if st["coverage"] < 0.03 or st["coverage"] > 0.85:
         return "coverage"
+    if not st["key_match"]:
+        return "backdrop is not the requested screen"
     if st["bg_key_excess"] < 0.2:
         return "backdrop not keyable"
     if st["residual_spill"] > 0.02:

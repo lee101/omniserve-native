@@ -22,3 +22,23 @@ Methods (3090 Ti, 2048², GPU only):
 - Worker end to end 2048², cutout + composite: PNG 4.7 s -> 0.64 s (encode was 95%: `optimize=True` 5.8 s/image -> level 3 0.67 s), WebP 0.65 s (method 2 above 2 MP, concurrent encodes).
 
 Bug found: `omatte.estimate_foreground_torch` passed torch's default stream (handle 0) through; the library read 0 as "none" and ran on a private non-blocking stream, racing torch's queued writes (NaN / stale foreground right after a BiRefNet call). Fixed by passing cudaStreamLegacy; `tests/test_matte_decontamination.py::test_device_path_waits_for_queued_torch_work`.
+
+## Learned refiner (matte/train, 2026-10-06)
+
+Pipeline: `gen.py` (Qwen renders of hair/fur/veils/dandelions on green/blue screens + scenes) -> `teacher.py`
+(network alpha + full-res key, hue/translucency-gated vector despill, auto-reject) -> `build.py` (originals +
+composites on scenes/colours/spill-lit screens, BiRefNet on each) -> `train.py` (2.5M-param refiner,
+(image, prob) -> (alpha, F)) -> `compare.py` (real renders side by side). Data in `~/matte-data`.
+
+v2 (295 subjects, 2950 samples, 20k it, 3090 Ti 53 min), held-out SAD / fg error:
+
+| | BiRefNet | K (hand-built) | v2 |
+|---|---:|---:|---:|
+| scenes | 27.2 / 8.5 | 26.8 / 5.3 | **22.9 / 4.4** |
+| colours | 11.6 / 4.0 | 10.6 / 3.6 | **10.1 / 2.2** |
+| synthetic screens | 22.7 / 12.7 | 22.7 / 8.7 | **12.5 / 5.5** |
+| real screen renders | 18.3 / 7.7 | **5.3 / 1.2** | 8.9 / 2.7 (GT is teacher, K-like: biased to K) |
+
+On real renders v2 still leaves strong backlit lime halos that K removes, so the worker (BIREFNET_REFINER)
+uses the refiner only when no keyable screen is detected and the K path otherwise. Refiner: 22 ms at 1k.
+Next: more real halo data (more backlit prompts), train on originals only for the screen branch.
