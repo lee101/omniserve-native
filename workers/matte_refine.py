@@ -230,7 +230,8 @@ def refiner_loaded() -> bool:
 
 
 @torch.inference_mode()
-def refine_learned(image_hi, prob_lo, *, radius: int | None = None, eps: float = 1e-4):
+def refine_learned(image_hi, prob_lo, *, radius: int | None = None, eps: float = 1e-4,
+                   keyed_fallback: bool = True):
     """(alpha, foreground) at full resolution from the learned refiner run at network size."""
     size_hi = image_hi.shape[1:]
     size_lo = low_size(*size_hi, max(prob_lo.shape))
@@ -239,6 +240,12 @@ def refine_learned(image_hi, prob_lo, *, radius: int | None = None, eps: float =
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=image_hi.is_cuda):
         alpha_lo, fg_lo = _refiner(image_lo[None].contiguous(memory_format=torch.channels_last), prob[None])
     alpha_lo, fg_lo = alpha_lo[0, 0].float(), fg_lo[0].float()
+    if keyed_fallback:
+        # On a green/blue screen the hand-built key still beats the refiner on backlit spill
+        # halos (matte/train README); the caller takes that path when this returns None.
+        _, bg_lo = _solve(image_lo, alpha_lo)
+        if _key(bg_lo, alpha_lo)[0] is not None:
+            return None
     if tuple(size_lo) == tuple(size_hi):
         return alpha_lo, fg_lo
     r = radius or max(2, max(size_lo) // 256)

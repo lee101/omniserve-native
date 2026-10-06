@@ -940,10 +940,13 @@ def _refines(image: Image.Image, side: int) -> bool:
 
 def _finish_mask(mask, image: Image.Image, threshold: float):
     """One (1, 1, h, w) probability map -> (device alpha, byte alpha)."""
-    learned_fg = None
+    learned = None
     if mask.is_cuda and matte_refine is not None and matte_refine.refiner_loaded():
         source = image_to_device(image, str(mask.device)).permute(2, 0, 1)
-        mask, learned_fg = matte_refine.refine_learned(source, mask[0, 0].float())
+        learned = matte_refine.refine_learned(source, mask[0, 0].float(), keyed_fallback=omatte is not None)
+    learned_fg = None
+    if learned is not None:
+        mask, learned_fg = learned
     elif mask.is_cuda and _refines(image, max(mask.shape[-2:])):
         source = image_to_device(image, str(mask.device)).permute(2, 0, 1)
         mask = matte_refine.refine_alpha(source, mask[0, 0].float(),
