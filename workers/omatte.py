@@ -222,6 +222,19 @@ def _check_device_tensor(tensor, name: str):
     return tensor
 
 
+def _torch_stream(device) -> int:
+    """torch's current stream as a handle the library will order behind.
+
+    torch reports its default stream as 0, which the library reads as "no
+    stream" and replaces with a private non-blocking one that does not wait for
+    torch's queued work, so a pass could read the alpha before it was written.
+    1 is cudaStreamLegacy, the same default stream named explicitly.
+    """
+    import torch
+
+    return torch.cuda.current_stream(device).cuda_stream or 1
+
+
 def estimate_foreground_torch(
     image,
     alpha,
@@ -275,7 +288,7 @@ def estimate_foreground_torch(
     fg = torch.empty_like(image)
     bg = torch.empty_like(image) if return_background else None
     if stream is None:
-        stream = torch.cuda.current_stream(image.device).cuda_stream
+        stream = _torch_stream(image.device)
 
     rc = lib.omatte_estimate_fb_cuda_device(
         ctypes.c_void_p(image.data_ptr()), ctypes.c_void_p(alpha.data_ptr()),
@@ -317,7 +330,7 @@ def composite_torch(fg, alpha, background=None, background_rgb=None, out=None, s
     if background_rgb is not None:
         solid = (ctypes.c_float * depth)(*[float(v) for v in background_rgb][:depth])
     if stream is None:
-        stream = torch.cuda.current_stream(fg.device).cuda_stream
+        stream = _torch_stream(fg.device)
 
     rc = lib.omatte_composite_cuda_device(
         ctypes.c_void_p(fg.data_ptr()), ctypes.c_void_p(alpha.data_ptr()),

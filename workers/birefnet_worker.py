@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,11 @@ try:
     import omatte
 except ImportError:  # pragma: no cover - worker still runs without the library
     omatte = None
+
+try:
+    import matte_refine
+except ImportError:  # pragma: no cover
+    matte_refine = None
 
 try:
     import object_store
@@ -64,11 +70,24 @@ MAX_DOWNLOAD_BYTES = int(os.getenv("BIREFNET_MAX_DOWNLOAD_BYTES", str(64 << 20))
 # (green screens especially) stops bleeding into semi-transparent edges.
 DECONTAMINATE = os.getenv("BIREFNET_DECONTAMINATE", "1") == "1"
 DECONTAMINATE_MAX_PIXELS = int(os.getenv("BIREFNET_DECONTAMINATE_MAX_PIXELS", str(16 << 20)))
+# Images larger than the network input (by REFINE_MIN_SCALE) get a guided-filter alpha
+# upsample and a low-resolution colour solve applied to the full-resolution pixels
+# (matte_refine.py); KEY adds a colour-difference key near the edge on green/blue screens.
+REFINE = os.getenv("BIREFNET_REFINE", "1") == "1"
+REFINE_KEY = os.getenv("BIREFNET_KEY", "1") == "1"
+REFINE_MIN_SCALE = float(os.getenv("BIREFNET_REFINE_MIN_SCALE", "1.25"))
 # WebP keeps the alpha channel at a fraction of PNG's size; 85 is the quality
 # used across the stack. Hidden RGB is deliberately blacked before encoding:
 # it is not visible, and random source colours under alpha=0 defeat compression.
 WEBP_QUALITY = max(0, min(100, int(os.getenv("BIREFNET_WEBP_QUALITY", "85"))))
 WEBP_METHOD = max(0, min(6, int(os.getenv("BIREFNET_WEBP_METHOD", "4"))))
+# Encoding dominates large cutouts (2048^2 WebP: method 4 1.1 s, method 2 0.64 s for 3% more
+# bytes; PNG optimize=True 5.8 s, level 3 0.67 s for 10% more), so large images use the faster
+# settings and a request's artifacts encode concurrently (Pillow releases the GIL).
+WEBP_METHOD_LARGE = max(0, min(6, int(os.getenv("BIREFNET_WEBP_METHOD_LARGE", "2"))))
+LARGE_PIXELS = int(os.getenv("BIREFNET_LARGE_PIXELS", str(2 << 20)))
+PNG_LEVEL = max(0, min(9, int(os.getenv("BIREFNET_PNG_LEVEL", "3"))))
+_encoder = ThreadPoolExecutor(max_workers=3, thread_name_prefix="encode")
 DEFAULT_FORMAT = os.getenv("BIREFNET_OUTPUT_FORMAT", "webp").lower()
 CACHE_ENABLED = os.getenv("BIREFNET_CACHE", "1") == "1"
 JOB_TTL_SECONDS = int(os.getenv("BIREFNET_JOB_TTL", "3600"))
@@ -601,7 +620,7 @@ def device_to_image(tensor) -> Image.Image:
 
 
 def estimate_foreground_background(image: Image.Image, alpha_device, alpha_array: np.ndarray,
-                                   want_background: bool):
+                                   want_background: bool, side: int | None = None):
     """The decontamination pass: recovers true foreground (and backdrop) colour.
 
     Without it the RGB under a semi-transparent edge is still the composite -
@@ -619,6 +638,12 @@ def estimate_foreground_background(image: Image.Image, alpha_device, alpha_array
 
     if alpha_device is not None and omatte.device_api_available():
         source = image_to_device(image, str(alpha_device.device))
+        if _refines(image, side or INPUT_SIZE):
+            foreground, background = matte_refine.recolor(
+                source.permute(2, 0, 1), alpha_device, side or INPUT_SIZE,
+                want_background=want_background)
+            return (foreground.permute(1, 2, 0).contiguous(),
+                    background.permute(1, 2, 0).contiguous() if background is not None else None, True)
         alpha = alpha_device.contiguous()
         result = omatte.estimate_foreground_torch(source, alpha, return_background=want_background)
         foreground, background = result if want_background else (result, None)
@@ -680,12 +705,17 @@ def encode_image(rgba: Image.Image, output_format: str) -> tuple[bytes, str]:
     if output_format == "webp":
         # The cutout's alpha is the contract. Invisible RGB is blacked above,
         # and exact=False lets libwebp use that fact for a smaller/faster encode.
+        method = WEBP_METHOD if rgba.width * rgba.height <= LARGE_PIXELS else min(WEBP_METHOD, WEBP_METHOD_LARGE)
         _black_fully_transparent(rgba).save(
-            buffer, format="WEBP", quality=WEBP_QUALITY, method=WEBP_METHOD, exact=False,
+            buffer, format="WEBP", quality=WEBP_QUALITY, method=method, exact=False,
         )
         return buffer.getvalue(), "image/webp"
-    rgba.save(buffer, format="PNG", optimize=True)
+    rgba.save(buffer, format="PNG", compress_level=PNG_LEVEL)
     return buffer.getvalue(), "image/png"
+
+
+def _encode_later(rgba: Image.Image, output_format: str):
+    return _encoder.submit(lambda: encode_image(rgba, output_format)[0])
 
 
 def artifact_key(request: RemoveBackgroundRequest, name: str) -> str | None:
@@ -888,11 +918,21 @@ def _forward(tensor):
                 return runtime.model(tensor)
 
 
+def _refines(image: Image.Image, side: int) -> bool:
+    return (REFINE and matte_refine is not None and DEVICE.startswith("cuda")
+            and max(image.width, image.height) > side * REFINE_MIN_SCALE)
+
+
 def _finish_mask(mask, image: Image.Image, threshold: float):
     """One (1, 1, h, w) probability map -> (device alpha, byte alpha)."""
-    mask = functional.interpolate(mask, size=(image.height, image.width), mode="bilinear",
-                                  align_corners=False)
-    mask = mask[0, 0].float().clamp(0, 1)
+    if mask.is_cuda and _refines(image, max(mask.shape[-2:])):
+        source = image_to_device(image, str(mask.device)).permute(2, 0, 1)
+        mask = matte_refine.refine_alpha(source, mask[0, 0].float(),
+                                         key=REFINE_KEY and omatte is not None)
+    else:
+        mask = functional.interpolate(mask, size=(image.height, image.width), mode="bilinear",
+                                      align_corners=False)[0, 0]
+    mask = mask.float().clamp(0, 1)
     if threshold > 0:
         mask = torch.where(mask >= threshold, mask, torch.zeros_like(mask))
     mask = mask.contiguous()
@@ -961,7 +1001,7 @@ def remove_background(image: Image.Image, request: RemoveBackgroundRequest,
     if want_decontaminate or needs_backdrop:
         try:
             foreground, estimated_backdrop, on_device = estimate_foreground_background(
-                image, mask_device, mask_array, needs_backdrop)
+                image, mask_device, mask_array, needs_backdrop, request.input_size or INPUT_SIZE)
         except Exception as error:  # never fail the cutout over colour cleanup
             print(f"colour decontamination skipped: {error}")
             foreground, estimated_backdrop, on_device = None, None, False
@@ -970,13 +1010,13 @@ def remove_background(image: Image.Image, request: RemoveBackgroundRequest,
     rgba = base.convert("RGBA")
     rgba.putalpha(alpha)
 
-    artifacts: dict[str, bytes] = {"cutout": encode_image(rgba, output_format)[0]}
+    artifacts = {"cutout": _encode_later(rgba, output_format)}
 
     backdrop_image = None
     if estimated_backdrop is not None:
         backdrop_image = to_pil_rgb(estimated_backdrop, on_device)
         if request.return_background:
-            artifacts["background"] = encode_image(backdrop_image, output_format)[0]
+            artifacts["background"] = _encode_later(backdrop_image, output_format)
 
     if replacing:
         backdrop, backdrop_rgb = resolve_backdrop(request, backdrop_image, image.width,
@@ -992,9 +1032,9 @@ def remove_background(image: Image.Image, request: RemoveBackgroundRequest,
             else:
                 composite = composite_over(foreground, mask_device, mask_array, on_device,
                                            backdrop=backdrop, backdrop_rgb=backdrop_rgb)
-            artifacts["composite"] = encode_image(composite, output_format)[0]
+            artifacts["composite"] = _encode_later(composite, output_format)
 
-    return artifacts
+    return {name: future.result() for name, future in artifacts.items()}
 
 
 @asynccontextmanager
