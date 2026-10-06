@@ -113,7 +113,25 @@ def refine_alpha(image_hi, prob_lo, *, key: bool = True, radius: int | None = No
     return alpha - band * (alpha - torch.minimum(alpha, keyed))
 
 
-def recolor(image_hi, alpha_hi, side: int, *, band_lo: int = 48, want_background: bool = False):
+def despill(fg, bg_lo, k: int, others, weight):
+    """Remove screen light as a vector: F_seen = F + s * K, K the backdrop colour.
+
+    s is what cancels the key channel's excess over the mean of the other two
+    (green spill on hair: lime (0.75, 0.95, 0.15) -> brown, not the yellow or
+    orange a per-channel clamp gives). Part of K's luminance comes back as a
+    neutral highlight so backlit rims stay bright.
+    """
+    key = bg_lo.mean((1, 2))
+    key_excess = float(key[k] - (key[others[0]] + key[others[1]]) * 0.5)
+    if key_excess <= 0.05:
+        return fg
+    excess = fg[k] - (fg[others[0]] + fg[others[1]]) * 0.5
+    s = (excess / key_excess).clamp_min(0) * weight
+    luma = float(0.299 * key[0] + 0.587 * key[1] + 0.114 * key[2])
+    return (fg - s * key[:, None, None] + s * (luma * DESPILL_RESTORE)).clamp(0, 1)
+
+
+def recolor(image_hi, alpha_hi, side: int, *, band_lo: int = 96, want_background: bool = False):
     """Foreground (and backdrop) at full resolution from a low-resolution solve."""
     size_hi = image_hi.shape[1:]
     size_lo = low_size(*size_hi, side)
@@ -123,15 +141,6 @@ def recolor(image_hi, alpha_hi, side: int, *, band_lo: int = 48, want_background
     fg = (image_hi + (1 - alpha_hi) * _resize(fg_lo - bg_lo, size_hi)).clamp(0, 1)
     k, others = _key(bg_lo, alpha_lo)
     if k is not None:
-        band = _edge_band(alpha_lo, size_hi, band_lo)
-        # Limit to the mean of the other two, not their max: backlit spill is lime (blue near 0),
-        # which a max limit turns yellow, a mean limit back into the warm hue it lit.
-        limit = (fg[others[0]] + fg[others[1]]) * 0.5
-        excess = (fg[k] - limit).clamp_min(0) * band
-        # Return part of the removed light to every channel so the rim keeps its brightness
-        # as a neutral highlight instead of turning a saturated orange.
-        fg[k] -= excess
-        fg += excess * DESPILL_RESTORE
-        fg.clamp_(0, 1)
+        fg = despill(fg, bg_lo, k, others, _edge_band(alpha_lo, size_hi, band_lo))
     bg = _resize(bg_lo, size_hi).clamp(0, 1) if want_background else None
     return fg, bg
