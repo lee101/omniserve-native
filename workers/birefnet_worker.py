@@ -76,6 +76,11 @@ DECONTAMINATE_MAX_PIXELS = int(os.getenv("BIREFNET_DECONTAMINATE_MAX_PIXELS", st
 REFINE = os.getenv("BIREFNET_REFINE", "1") == "1"
 REFINE_KEY = os.getenv("BIREFNET_KEY", "1") == "1"
 REFINE_MIN_SCALE = float(os.getenv("BIREFNET_REFINE_MIN_SCALE", "1.25"))
+# Learned refiner weights (matte/train): alpha and clean foreground from (image, probability) at
+# network size, every image size. Unset keeps the hand-built path above.
+REFINER_PATH = os.getenv("BIREFNET_REFINER", "").strip()
+_refined_fg: dict[int, tuple[Any, Any]] = {}
+_refined_lock = threading.Lock()
 # WebP keeps the alpha channel at a fraction of PNG's size; 85 is the quality
 # used across the stack. Hidden RGB is deliberately blacked before encoding:
 # it is not visible, and random source colours under alpha=0 defeat compression.
@@ -473,6 +478,11 @@ def _load_model_on(device: str) -> None:
     runtime.eager_model = model
     runtime.model = model
     runtime.engine = f"birefnet-{runtime.dtype}-eager"
+    if REFINER_PATH and DEVICE.startswith("cuda") and matte_refine is not None:
+        try:
+            matte_refine.load_refiner(REFINER_PATH, DEVICE)
+        except Exception as error:  # the hand-built path still works without it
+            print(f"matte refiner not loaded: {error}")
     runtime.compile_error = ""
     runtime.compile_seconds = 0.0
     runtime.compile_validation = {}
@@ -636,6 +646,11 @@ def estimate_foreground_background(image: Image.Image, alpha_device, alpha_array
     if omatte is None or image.width * image.height > DECONTAMINATE_MAX_PIXELS:
         return None, None, False
 
+    if alpha_device is not None:
+        with _refined_lock:
+            entry = _refined_fg.pop(id(alpha_device), None)
+        if entry is not None and entry[0] is alpha_device and not want_background:
+            return entry[1], None, True
     if alpha_device is not None and omatte.device_api_available():
         source = image_to_device(image, str(alpha_device.device))
         if _refines(image, side or INPUT_SIZE):
@@ -925,7 +940,11 @@ def _refines(image: Image.Image, side: int) -> bool:
 
 def _finish_mask(mask, image: Image.Image, threshold: float):
     """One (1, 1, h, w) probability map -> (device alpha, byte alpha)."""
-    if mask.is_cuda and _refines(image, max(mask.shape[-2:])):
+    learned_fg = None
+    if mask.is_cuda and matte_refine is not None and matte_refine.refiner_loaded():
+        source = image_to_device(image, str(mask.device)).permute(2, 0, 1)
+        mask, learned_fg = matte_refine.refine_learned(source, mask[0, 0].float())
+    elif mask.is_cuda and _refines(image, max(mask.shape[-2:])):
         source = image_to_device(image, str(mask.device)).permute(2, 0, 1)
         mask = matte_refine.refine_alpha(source, mask[0, 0].float(),
                                          key=REFINE_KEY and omatte is not None)
@@ -937,6 +956,13 @@ def _finish_mask(mask, image: Image.Image, threshold: float):
         mask = torch.where(mask >= threshold, mask, torch.zeros_like(mask))
     mask = mask.contiguous()
     if mask.is_cuda:
+        if learned_fg is not None:
+            # segment() returns (alpha, bytes); the decontamination step picks the refiner's
+            # foreground up by the identity of that alpha tensor.
+            with _refined_lock:
+                while len(_refined_fg) >= 16:
+                    _refined_fg.pop(next(iter(_refined_fg)))
+                _refined_fg[id(mask)] = (mask, learned_fg.permute(1, 2, 0).contiguous())
         # The CUDA matte pass keeps the float alpha above. Pillow only needs a
         # byte plane, so avoid downloading a 4-byte float for every pixel.
         alpha_bytes = mask.mul(255.0).round().to(torch.uint8).cpu().numpy()
@@ -1081,6 +1107,7 @@ def health() -> dict[str, Any]:
         "decontaminate": DECONTAMINATE and omatte is not None,
         "matte_library": omatte.library_path() if omatte else None,
         "matte_cuda": bool(omatte and omatte.cuda_available()),
+        "matte_refiner": bool(matte_refine and matte_refine.refiner_loaded()),
         "output_format": DEFAULT_FORMAT,
         "webp_quality": WEBP_QUALITY,
         "webp_method": WEBP_METHOD,

@@ -19,6 +19,7 @@ Tensors are channel-first float32 on the GPU.
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 import omatte
@@ -26,6 +27,8 @@ import omatte
 KEYABLE_EXCESS = 0.15
 KEYABLE_SHARE = 0.6
 DESPILL_RESTORE = 0.5
+HUE_GATE_LOW = 0.45
+HUE_GATE_HIGH = 0.7
 
 
 def _box(x, r):
@@ -113,6 +116,23 @@ def refine_alpha(image_hi, prob_lo, *, key: bool = True, radius: int | None = No
     return alpha - band * (alpha - torch.minimum(alpha, keyed))
 
 
+def spill_map(fg, key, k: int, others):
+    """Key-channel excess that is screen light: excess over the mean of the other two channels,
+    gated by hue. Yellow on a green screen has green excess too (chroma cosine to the key ~0.5)
+    and keeps it; a green tint (~1.0) or lime spill (~0.7) counts."""
+    excess = (fg[k] - (fg[others[0]] + fg[others[1]]) * 0.5).clamp_min(0)
+    chroma = fg - fg.mean(0, keepdim=True)
+    key_chroma = key - key.mean()
+    cosine = (chroma * key_chroma[:, None, None]).sum(0) / (chroma.norm(dim=0) * key_chroma.norm()).clamp_min(1e-4)
+    return excess * ((cosine - HUE_GATE_LOW) / (HUE_GATE_HIGH - HUE_GATE_LOW)).clamp(0, 1)
+
+
+def despill_weight(alpha, band):
+    """Full vector despill near the edge and wherever the subject is see-through (screen light
+    passes through it there); deep opaque interior only gets the cast cap."""
+    return torch.maximum(band, ((1 - alpha) * 2).clamp(0, 1))
+
+
 def despill(fg, bg_lo, k: int, others, weight):
     """Remove screen light as a vector: F_seen = F + s * K, K the backdrop colour.
 
@@ -125,10 +145,14 @@ def despill(fg, bg_lo, k: int, others, weight):
     key_excess = float(key[k] - (key[others[0]] + key[others[1]]) * 0.5)
     if key_excess <= 0.05:
         return fg
-    excess = fg[k] - (fg[others[0]] + fg[others[1]]) * 0.5
-    s = (excess / key_excess).clamp_min(0) * weight
+    s = spill_map(fg, key, k, others) / key_excess * weight
     luma = float(0.299 * key[0] + 0.587 * key[1] + 0.114 * key[2])
-    return (fg - s * key[:, None, None] + s * (luma * DESPILL_RESTORE)).clamp(0, 1)
+    fg = (fg - s * key[:, None, None] + s * (luma * DESPILL_RESTORE)).clamp(0, 1)
+    # Away from the edge only a cast is removed: the key channel is capped at the larger of the
+    # other two, which keeps yellow and orange objects (G < R) but not a green tint.
+    cap = torch.maximum(fg[others[0]], fg[others[1]])
+    fg[k] = fg[k] - (fg[k] - cap).clamp_min(0) * (1 - weight)
+    return fg
 
 
 def recolor(image_hi, alpha_hi, side: int, *, band_lo: int = 96, want_background: bool = False):
@@ -141,6 +165,85 @@ def recolor(image_hi, alpha_hi, side: int, *, band_lo: int = 96, want_background
     fg = (image_hi + (1 - alpha_hi) * _resize(fg_lo - bg_lo, size_hi)).clamp(0, 1)
     k, others = _key(bg_lo, alpha_lo)
     if k is not None:
-        fg = despill(fg, bg_lo, k, others, _edge_band(alpha_lo, size_hi, band_lo))
+        fg = despill(fg, bg_lo, k, others, despill_weight(alpha_hi, _edge_band(alpha_lo, size_hi, band_lo)))
     bg = _resize(bg_lo, size_hi).clamp(0, 1) if want_background else None
     return fg, bg
+
+
+# Learned refiner (matte/train): (image, network probability) -> (alpha, clean foreground) at
+# network resolution; larger images take its result through the guided upsample and an F - B
+# correction map, like the hand-built path.
+
+def conv(i, o, s=1):
+    return nn.Sequential(nn.Conv2d(i, o, 3, s, 1, bias=False), nn.BatchNorm2d(o), nn.ReLU(inplace=True))
+
+
+class Block(nn.Module):
+    def __init__(self, i, o, s=1):
+        super().__init__()
+        self.a, self.b = conv(i, o, s), conv(o, o)
+
+    def forward(self, x):
+        return self.b(self.a(x))
+
+
+class Refiner(nn.Module):
+    def __init__(self, w=(24, 48, 96, 160, 224)):
+        super().__init__()
+        self.stem = Block(4, w[0])
+        self.down = nn.ModuleList([Block(w[i], w[i + 1], 2) for i in range(len(w) - 1)])
+        self.up = nn.ModuleList([Block(w[i + 1] + w[i], w[i]) for i in reversed(range(len(w) - 1))])
+        self.head = nn.Sequential(conv(w[0] + 4, 32), nn.Conv2d(32, 4, 3, 1, 1))
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+
+    def forward(self, img, prob):
+        x0 = torch.cat([img * 2 - 1, prob * 2 - 1], 1)
+        skips = [self.stem(x0)]
+        for d in self.down:
+            skips.append(d(skips[-1]))
+        x = skips.pop()
+        for u in self.up:
+            s = skips.pop()
+            x = F.interpolate(x, size=s.shape[2:], mode="bilinear", align_corners=False)
+            x = u(torch.cat([x, s], 1))
+        out = self.head(torch.cat([x, x0], 1))
+        logit = torch.logit(prob.clamp(1e-4, 1 - 1e-4)) + out[:, :1] * 4
+        alpha = torch.sigmoid(logit)
+        fg = (img + torch.tanh(out[:, 1:])).clamp(0, 1)
+        return alpha, fg
+
+
+_refiner = None
+
+
+def load_refiner(path: str, device: str):
+    global _refiner
+    model = Refiner()
+    model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+    _refiner = model.to(device).eval().to(memory_format=torch.channels_last)
+    return _refiner
+
+
+def refiner_loaded() -> bool:
+    return _refiner is not None
+
+
+@torch.inference_mode()
+def refine_learned(image_hi, prob_lo, *, radius: int | None = None, eps: float = 1e-4):
+    """(alpha, foreground) at full resolution from the learned refiner run at network size."""
+    size_hi = image_hi.shape[1:]
+    size_lo = low_size(*size_hi, max(prob_lo.shape))
+    image_lo = _resize(image_hi, size_lo, "area")
+    prob = _resize(prob_lo[None], size_lo).clamp(0, 1)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=image_hi.is_cuda):
+        alpha_lo, fg_lo = _refiner(image_lo[None].contiguous(memory_format=torch.channels_last), prob[None])
+    alpha_lo, fg_lo = alpha_lo[0, 0].float(), fg_lo[0].float()
+    if tuple(size_lo) == tuple(size_hi):
+        return alpha_lo, fg_lo
+    r = radius or max(2, max(size_lo) // 256)
+    alpha = guided_upsample(image_lo, alpha_lo[None], image_hi, r, eps)[0].clamp(0, 1)
+    # I = aF + (1-a)B, so F - I = (1-a)(F - B); F - B is smooth enough to upsample.
+    diff = (fg_lo - image_lo) / (1 - alpha_lo).clamp_min(0.1)
+    fg = (image_hi + (1 - alpha) * _resize(diff, size_hi)).clamp(0, 1)
+    return alpha, fg
