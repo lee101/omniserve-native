@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "obackend.h"
 #include "ocapacity.h"
 #include "ohttp.h"
 #include "oimage.h"
@@ -108,6 +109,26 @@ static void test_image_contract(void) {
         CHECK(!oimage_request_parse(bad_edits[i], strlen(bad_edits[i]),
                                    &request, error, sizeof error));
     }
+    const char *good_args[] = {
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"guidance_schedule=1x10+2x20\"}",
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"exit_tol=0.02,guidance_schedule=1x100\"}",
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"exit_tol=0.02\"}",
+    };
+    for (size_t i = 0; i < sizeof good_args / sizeof good_args[0]; ++i) {
+        CHECK(oimage_request_parse(good_args[i], strlen(good_args[i]), &request, error, sizeof error));
+        oimage_request_free(&request);
+    }
+    const char *bad_args[] = {
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"guidance_schedule=1x2000000000\"}",
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"guidance_schedule=1x999\"}",
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"guidance_schedule=1x60+2x60\"}",
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"exit_tol=0.1,guidance_schedule=1x101\"}",
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"guidance_schedule=1\"}",
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"guidance_schedule=1x\"}",
+    };
+    for (size_t i = 0; i < sizeof bad_args / sizeof bad_args[0]; ++i) {
+        CHECK(!oimage_request_parse(bad_args[i], strlen(bad_args[i]), &request, error, sizeof error));
+    }
     CHECK(oimage_request_parse(body, strlen(body), &request, error, sizeof error));
     CHECK(request.generation.prompt && strcmp(request.generation.prompt, "red cube") == 0);
     CHECK(request.generation.negative_prompt && strcmp(request.generation.negative_prompt, "blur") == 0);
@@ -122,7 +143,7 @@ static void test_image_contract(void) {
     const char *turbo_off = "{\"prompt\":\"p\",\"turbo\":false}";
     const char *turbo_bad = "{\"prompt\":\"p\",\"turbo\":3}";
     CHECK(oimage_request_parse(turbo_on, strlen(turbo_on), &request, error, sizeof error));
-    CHECK(request.generation.turbo == 1);
+    CHECK(request.generation.turbo == 0);
     oimage_request_free(&request);
     CHECK(oimage_request_parse(turbo_off, strlen(turbo_off), &request, error, sizeof error));
     CHECK(request.generation.turbo == 2);
@@ -326,6 +347,32 @@ static void test_completion_spacing(void) {
     CHECK(!otext_completion_needs_space("looking", 7, " for", 4, true));
     CHECK(!otext_completion_needs_space("hello", 5, ".", 1, true));
     CHECK(otext_completion_needs_space("looking", 7, "for", 3, false));
+}
+
+static void test_utf8_slice(void) {
+    char buf[1024];
+    memset(buf, 'a', sizeof buf);
+    CHECK(otext_utf8_slice(buf, 100, 256) == 100);
+    CHECK(otext_utf8_slice(buf, 256, 256) == 256);
+    CHECK(otext_utf8_slice(buf, 1000, 256) == 256);
+    memset(buf, 'a', 255);
+    memcpy(buf + 255, "\xc3\xa9", 2);
+    memset(buf + 257, 'b', 100);
+    CHECK(otext_utf8_slice(buf, 357, 256) == 255);
+    memset(buf, 0x80, sizeof buf);
+    CHECK(otext_utf8_slice(buf, 1000, 256) == 256);
+    size_t total = 0, off = 0, len = 1000;
+    memset(buf, 'x', 250);
+    for (int i = 0; i < 250; i++) memcpy(buf + 250 + i * 3, "\xe2\x82\xac", 3);
+    len = 250 + 750;
+    while (off < len) {
+        size_t n = otext_utf8_slice(buf + off, len - off, 256);
+        CHECK(n > 0 && n <= 256);
+        if (off + n < len) CHECK(((unsigned char)buf[off + n] & 0xc0u) != 0x80u);
+        off += n;
+        total += n;
+    }
+    CHECK(total == len);
 }
 
 static void test_openapi(void) {
@@ -737,13 +784,17 @@ static bool collect_relay(const void *data, size_t len, void *user) {
     return true;
 }
 
+static int g_port_a = 18791;
+
 static void test_proxy_relay(void) {
+    char url_a_slash[64];
+    snprintf(url_a_slash, sizeof url_a_slash, "http://127.0.0.1:%d/", g_port_a);
     relay_sink sink = {0};
     oproxy_result result;
     char error[256];
     const char *body = "{\"proxied\":true}";
     bool ok = oproxy_relay(
-        "http://127.0.0.1:18791/",
+        url_a_slash,
         "POST", 4,
         "/echo", 5,
         "source=test", 11,
@@ -760,6 +811,45 @@ static void test_proxy_relay(void) {
     CHECK(sink.data && strstr(sink.data, "Content-Type: application/json"));
     CHECK(sink.data && strstr(sink.data, body));
     free(sink.data);
+}
+
+static void test_proxy_breaker(void) {
+    char error[256];
+    oproxy_target *t = oproxy_target_create("http://127.0.0.1:1", 1, error, sizeof error);
+    CHECK(t != NULL);
+    if (!t) return;
+    oproxy_target_breaker_config(t, 2, 40, 100);
+    relay_sink sink = {0};
+    oproxy_result result;
+    for (int i = 0; i < 2; i++) {
+        CHECK(oproxy_target_allow(t));
+        CHECK(!oproxy_target_relay(t, "GET", 3, "/x", 2, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+                                   500, collect_relay, &sink, &result, error, sizeof error));
+        CHECK(!result.response_started);
+    }
+    CHECK(oproxy_target_open_ms(t) > 0);
+    CHECK(!oproxy_target_allow(t));
+    usleep(50 * 1000);
+    CHECK(oproxy_target_open_ms(t) == 0);
+    CHECK(oproxy_target_allow(t));   /* half-open probe claimed */
+    CHECK(!oproxy_target_allow(t));  /* concurrent callers stay out */
+    oproxy_target_record(t, false);  /* probe failed: reopen, cooldown doubles */
+    oproxy_stats st;
+    oproxy_target_snapshot(t, &st);
+    CHECK(st.open_ms_left > 40 && st.breaker_opens == 1 && st.breaker_rejects >= 2);
+    for (int i = 0; i < 3; i++) oproxy_target_record(t, false);
+    oproxy_target_snapshot(t, &st);
+    CHECK(st.open_ms_left <= 80);
+    usleep(90 * 1000);
+    CHECK(oproxy_target_allow(t));
+    oproxy_target_record(t, false);
+    oproxy_target_snapshot(t, &st);
+    CHECK(st.open_ms_left > 80);
+    oproxy_target_record(t, true);
+    CHECK(oproxy_target_open_ms(t) == 0);
+    CHECK(oproxy_target_allow(t));
+    free(sink.data);
+    oproxy_target_destroy(t);
 }
 
 static void test_proxy_service_credentials(void) {
@@ -804,43 +894,46 @@ static void test_proxy_service_credentials(void) {
 
 static void test_http_server(void) {
     char target_error[256];
+    char url_a[64], url_b[64];
+    snprintf(url_a, sizeof url_a, "http://127.0.0.1:%d", g_port_a);
+    snprintf(url_b, sizeof url_b, "http://127.0.0.1:%d", g_port_a + 1);
     echo_context context = {
-        .target = oproxy_target_create("http://127.0.0.1:18791", 4,
+        .target = oproxy_target_create(url_a, 4,
                                        target_error, sizeof target_error),
-        .bare_target = oproxy_target_create("http://127.0.0.1:18792", 1,
+        .bare_target = oproxy_target_create(url_b, 1,
                                             target_error, sizeof target_error),
     };
     CHECK(context.target != NULL);
     CHECK(context.bare_target != NULL);
-    ohttp_config cfg = { .port = 18791, .reactor_threads = 1, .worker_threads = 4,
+    ohttp_config cfg = { .port = g_port_a, .reactor_threads = 1, .worker_threads = 4,
                          .handler = echo_handler, .user = &context };
     ohttp_server *srv = ohttp_start(&cfg);
     CHECK(srv != NULL);
     usleep(100000);
 
-    char *r = http_roundtrip(18791, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"a\":\"b\\n\"}", NULL);
+    char *r = http_roundtrip(g_port_a, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"a\":\"b\\n\"}", NULL);
     CHECK(r && strstr(r, "200 OK") && strstr(r, "{\"a\":\"b\\n\"}"));
     CHECK(r && strstr(r, "Access-Control-Allow-Origin: *"));
     free(r);
 
-    r = http_roundtrip(18791, "GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
+    r = http_roundtrip(g_port_a, "GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
     CHECK(r && strstr(r, "Transfer-Encoding: chunked") && strstr(r, "one") && strstr(r, "two"));
     free(r);
 
-    r = http_roundtrip(18791, "GET /hdr HTTP/1.1\r\nHost: x\r\nX-Test: abc\r\nConnection: close\r\n\r\n", NULL);
+    r = http_roundtrip(g_port_a, "GET /hdr HTTP/1.1\r\nHost: x\r\nX-Test: abc\r\nConnection: close\r\n\r\n", NULL);
     CHECK(r && strstr(r, "header-ok"));
     free(r);
 
-    r = http_roundtrip(18791, "GET /missing HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
+    r = http_roundtrip(g_port_a, "GET /missing HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
     CHECK(r && strstr(r, "404"));
     free(r);
 
-    r = http_roundtrip(18791, "POST /relay?source=gateway HTTP/1.1\r\nHost: x\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"relay\":true}", NULL);
+    r = http_roundtrip(g_port_a, "POST /relay?source=gateway HTTP/1.1\r\nHost: x\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"relay\":true}", NULL);
     CHECK(r && strstr(r, "HTTP/1.1 200 OK") && strstr(r, "{\"relay\":true}"));
     free(r);
 
     raw_http_context raw_context = {
-        .port = 18792,
+        .port = g_port_a + 1,
         .response = "HTTP/1.1 401 Unauthorized\r\n"
                     "Content-Type: application/json\r\n"
                     "Content-Length: 20\r\n"
@@ -851,7 +944,7 @@ static void test_http_server(void) {
     pthread_create(&raw_thread, NULL, raw_http_server, &raw_context);
     while (!atomic_load(&raw_context.ready)) usleep(1000);
     CHECK(!atomic_load(&raw_context.failed));
-    r = http_roundtrip(18791, "POST /relay-bare HTTP/1.1\r\nHost: x\r\nOrigin: https://text-generator.io\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}", NULL);
+    r = http_roundtrip(g_port_a, "POST /relay-bare HTTP/1.1\r\nHost: x\r\nOrigin: https://text-generator.io\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}", NULL);
     pthread_join(raw_thread, NULL);
     CHECK(r && strstr(r, "HTTP/1.1 401 Unauthorized"));
     CHECK(r && strstr(r, "Access-Control-Allow-Origin: *"));
@@ -859,7 +952,7 @@ static void test_http_server(void) {
     CHECK(r && strstr(r, "{\"detail\":\"invalid\"}"));
     free(r);
 
-    r = http_roundtrip(18791, "GET /relay-stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
+    r = http_roundtrip(g_port_a, "GET /relay-stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", NULL);
     CHECK(r && strstr(r, "Transfer-Encoding: chunked") && strstr(r, "one") && strstr(r, "two"));
     free(r);
 
@@ -870,8 +963,9 @@ static void test_http_server(void) {
     CHECK(proxy_stats.failures == 0);
 
     test_proxy_relay();
+    test_proxy_breaker();
 
-    int fd = connect_local(18791);
+    int fd = connect_local(g_port_a);
     CHECK(fd >= 0);
     const char *req1 = "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi";
     CHECK(test_write_all(fd, req1, strlen(req1)));
@@ -885,7 +979,7 @@ static void test_http_server(void) {
     CHECK(n > 0);
     close(fd);
 
-    fd = connect_local(18791);
+    fd = connect_local(g_port_a);
     CHECK(fd >= 0);
     const char *close_req =
         "GET /close HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -903,12 +997,12 @@ static void test_http_server(void) {
     const char *pipelined =
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\none"
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntwo";
-    r = http_roundtrip(18791, pipelined, NULL);
+    r = http_roundtrip(g_port_a, pipelined, NULL);
     CHECK(r && count_text(r, "HTTP/1.1 200 OK") == 2);
     CHECK(r && strstr(r, "one") && strstr(r, "two"));
     free(r);
 
-    fd = connect_local(18791);
+    fd = connect_local(g_port_a);
     CHECK(fd >= 0);
     const char *expect_headers =
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n"
@@ -930,7 +1024,7 @@ static void test_http_server(void) {
     close(fd);
 
     r = http_roundtrip(
-        18791,
+        g_port_a,
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n"
         "Content-Length: 2\r\nConnection: close\r\n\r\nx",
         NULL);
@@ -938,7 +1032,7 @@ static void test_http_server(void) {
     free(r);
 
     r = http_roundtrip(
-        18791,
+        g_port_a,
         "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
         "Connection: close\r\n\r\n1\r\nx\r\n0\r\n\r\n",
         NULL);
@@ -1780,12 +1874,43 @@ static void test_spec_governor(void) {
     CHECK(g3.accepted == 2 && g3.saved_calls == 2);
 }
 
+static void test_spec_mtp_config(void) {
+    ollm_spec_mtp_config cfg;
+    ollm_spec_mtp_default(&cfg);
+    CHECK(cfg.draft_max == 1);
+    CHECK(cfg.p_min == 0.0f);
+
+    CHECK(ollm_spec_mtp_parse(&cfg, NULL, NULL) == 0);
+    CHECK(cfg.draft_max == 1 && cfg.p_min == 0.0f);
+    CHECK(ollm_spec_mtp_parse(&cfg, "", "") == 0);
+    CHECK(cfg.draft_max == 1 && cfg.p_min == 0.0f);
+
+    CHECK(ollm_spec_mtp_parse(&cfg, "2", "0") == 0);
+    CHECK(cfg.draft_max == 2 && cfg.p_min == 0.0f);
+    CHECK(ollm_spec_mtp_parse(&cfg, "0", "1") == 0);
+    CHECK(cfg.draft_max == 0 && cfg.p_min == 1.0f);
+    CHECK(ollm_spec_mtp_parse(&cfg, "1", "0.75") == 0);
+    CHECK(cfg.draft_max == 1 && cfg.p_min > 0.74f && cfg.p_min < 0.76f);
+
+    CHECK(ollm_spec_mtp_parse(&cfg, "3", NULL) != 0);
+    CHECK(ollm_spec_mtp_parse(&cfg, "-1", NULL) != 0);
+    CHECK(ollm_spec_mtp_parse(&cfg, "x", NULL) != 0);
+    CHECK(ollm_spec_mtp_parse(&cfg, "1x", NULL) != 0);
+    CHECK(ollm_spec_mtp_parse(&cfg, NULL, "1.5") != 0);
+    CHECK(ollm_spec_mtp_parse(&cfg, NULL, "-0.1") != 0);
+    CHECK(ollm_spec_mtp_parse(&cfg, NULL, "nan") != 0);
+    CHECK(ollm_spec_mtp_parse(&cfg, NULL, "x") != 0);
+    CHECK(ollm_spec_mtp_parse(NULL, NULL, NULL) != 0);
+}
+
 /* The deterministic entry points take the clock and the device figure as
  * arguments precisely so the arbitration policy is provable without a GPU. */
 static void test_vram_arbitration(void) {
     char id_a[40], id_b[40];
     ovram *v = ovram_create(1024, 60.0);
     CHECK(v != NULL);
+    /* This test predates in-flight lower-tier charging; keep its policy. */
+    ovram_set_job_lease_s(v, 0.0);
 
     /* 8192 free, 1024 floor for background: 7168 grantable. */
     CHECK(ovram_headroom_at(v, TIER_BACKGROUND, 100.0, 8192) == 7168);
@@ -1861,6 +1986,92 @@ static void test_vram_arbitration(void) {
     ovram_destroy(v);
 }
 
+/* Materialisation credit: once a holder has grown into its lease, the driver's
+ * free figure already shows those bytes and the lease must stop charging them. */
+static void test_vram_credit(void) {
+    ovram *v = ovram_create(1024, 60.0);
+    CHECK(v != NULL);
+    ogpu_proc procs[2] = {{4242, 1000}, {5151, 500}};
+    ovram_set_procs(v, procs, 2);
+    char id[40];
+    CHECK(ovram_lease_pid_at(v, "qwen", 4242, 10000, 10000, TIER_PAID, 60.0, 10.0, 20000,
+                             id, sizeof id) == 10000);
+    /* Nothing materialised yet: the full lease is withheld (20000-256-10000). */
+    CHECK(ovram_headroom_at(v, TIER_PAID, 11.0, 20000) == 9744);
+    /* Holder grew by 8000 and the device shows it: only 2000 still withheld. */
+    procs[0].used_mb = 9000;
+    ovram_set_procs(v, procs, 2);
+    CHECK(ovram_headroom_at(v, TIER_PAID, 12.0, 12000) == 12000 - 256 - 2000);
+    /* Growth beyond the lease never goes negative. */
+    procs[0].used_mb = 15000;
+    ovram_set_procs(v, procs, 2);
+    CHECK(ovram_headroom_at(v, TIER_PAID, 13.0, 6000) == 6000 - 256);
+    CHECK(ovram_release(v, id));
+    ovram_destroy(v);
+}
+
+typedef struct { ovram *v; int got; } vram_waiter_arg;
+
+static void *vram_paid_waiter(void *p) {
+    vram_waiter_arg *a = p;
+    char id[40];
+    a->got = ovram_lease_wait(a->v, "paid-waiter", 0, 1024, 1024, TIER_PAID, 60.0, 400,
+                              id, sizeof id, NULL);
+    return NULL;
+}
+
+static double test_mono_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* A queued higher tier blocks lower tiers while its need is coverable once
+ * live leases end, and only for a bounded time. */
+static void test_vram_priority(void) {
+    ovram *v = ovram_create(1024, 60.0);
+    CHECK(v != NULL);
+    char hold[40], id[40];
+    /* A paid holder larger than any real device keeps the waiter queued. */
+    CHECK(ovram_lease_at(v, "holder", 400000, 400000, TIER_PAID, 1e9, 1.0, 500000,
+                         hold, sizeof hold) == 400000);
+    vram_waiter_arg a = {v, -1};
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, vram_paid_waiter, &a) == 0);
+    for (int i = 0; i < 100 && ovram_waiting(v, TIER_PAID) == 0; i++) usleep(5000);
+    CHECK(ovram_waiting(v, TIER_PAID) == 1);
+    double now = test_mono_s();
+    /* Feasible (the holder will hand back 400000) and young: free tier waits. */
+    CHECK(ovram_lease_at(v, "free-tenant", 512, 512, TIER_FREE, 60.0, now, 8192, id, sizeof id) == 0);
+    /* Past the blocking bound the lower tier may proceed. */
+    ovram_set_block_max_s(v, 0.05);
+    usleep(100000);
+    now = test_mono_s();
+    CHECK(ovram_lease_at(v, "free-tenant", 512, 512, TIER_FREE, 60.0, now, 8192 + 400000, id, sizeof id) == 512);
+    CHECK(ovram_release(v, id));
+    ovram_set_block_max_s(v, 15.0);
+    pthread_join(t, NULL);
+    CHECK(a.got == 0);
+    CHECK(ovram_waiting(v, TIER_PAID) == 0);
+    CHECK(ovram_release(v, hold));
+    char ledger[16384];
+    CHECK(ovram_ledger_json(v, ledger, sizeof ledger) > 0);
+    CHECK(strstr(ledger, "\"wait_timeouts\":1") != NULL);
+    ovram_destroy(v);
+
+    /* A young background lease binds paid too (in-flight job); an old one is a
+     * reservation paid may squeeze. */
+    v = ovram_create(1024, 60.0);
+    ovram_set_job_lease_s(v, 30.0);
+    CHECK(ovram_lease_at(v, "bg-job", 4096, 4096, TIER_BACKGROUND, 600.0, 100.0, 8192, id, sizeof id) == 4096);
+    CHECK(ovram_headroom_at(v, TIER_PAID, 110.0, 8192) == 8192 - 256 - 4096);
+    CHECK(ovram_headroom_at(v, TIER_PAID, 140.0, 8192) == 8192 - 256);
+    CHECK(ovram_release(v, id));
+    CHECK(strstr(ledger, "\"owner\":\"paid-waiter\"") != NULL);
+    ovram_destroy(v);
+
+}
+
 static void test_host_prefetch_policy(void) {
     ohost_meminfo mi = {0};
     mi.mem_total_kb = 256L * 1024 * 1024;      /* 256 GiB */
@@ -1912,17 +2123,163 @@ static void test_sched_try_acquire(void) {
     osched_destroy(s);
 }
 
+static void test_tensor_overrides(void) {
+    ollm_tensor_override out[8];
+    CHECK(ollm_parse_tensor_overrides(NULL, out, 8) == 0);
+    CHECK(ollm_parse_tensor_overrides("", out, 8) == 0);
+    CHECK(ollm_parse_tensor_overrides("blk\\.3\\.ffn_.*_exps=CPU", out, 8) == 1);
+    CHECK(strcmp(out[0].pattern, "blk\\.3\\.ffn_.*_exps") == 0 && out[0].cpu);
+    CHECK(ollm_parse_tensor_overrides("a=CPU,b=CUDA0", out, 8) == 2);
+    CHECK(out[0].cpu && !out[1].cpu);
+    CHECK(ollm_parse_tensor_overrides(" a = cpu ", out, 8) == 1 && out[0].cpu);
+    CHECK(ollm_parse_tensor_overrides("noequals", out, 8) < 0);
+    CHECK(ollm_parse_tensor_overrides("=CPU", out, 8) < 0);
+    CHECK(ollm_parse_tensor_overrides("a=", out, 8) < 0);
+    CHECK(ollm_parse_tensor_overrides("a=CUDA1", out, 8) < 0);
+    CHECK(ollm_parse_tensor_overrides("a=CPU", out, 0) < 0);
+    CHECK(ollm_parse_tensor_overrides("a=CPU,b=CPU", out, 1) < 0);
+
+    ollm_moe_mode mode = OLLM_MOE_OFF;
+    int n = -1;
+    CHECK(ollm_parse_moe_cpu_experts(NULL, &mode, &n) == 0 && mode == OLLM_MOE_OFF);
+    CHECK(ollm_parse_moe_cpu_experts("", &mode, &n) == 0 && mode == OLLM_MOE_OFF);
+    CHECK(ollm_parse_moe_cpu_experts("0", &mode, &n) == 0 && mode == OLLM_MOE_OFF);
+    CHECK(ollm_parse_moe_cpu_experts("8", &mode, &n) == 0 && mode == OLLM_MOE_N && n == 8);
+    CHECK(ollm_parse_moe_cpu_experts("all", &mode, &n) == 0 && mode == OLLM_MOE_ALL);
+    CHECK(ollm_parse_moe_cpu_experts("auto", &mode, &n) == 0 && mode == OLLM_MOE_AUTO);
+    CHECK(ollm_parse_moe_cpu_experts("bogus", &mode, &n) != 0);
+    CHECK(ollm_parse_moe_cpu_experts("-1", &mode, &n) != 0);
+    CHECK(ollm_parse_moe_cpu_experts("4x", &mode, &n) != 0);
+
+    CHECK(ollm_tensor_is_expert("blk.3.ffn_up_exps.weight"));
+    CHECK(ollm_tensor_is_expert("blk.12.ffn_gate_inp.weight") == false);
+    CHECK(ollm_tensor_is_expert("blk.0.ffn_up.weight") == false);
+    CHECK(ollm_tensor_block_index("blk.3.ffn_up_exps.weight") == 3);
+    CHECK(ollm_tensor_block_index("blk.12.attn_q.weight") == 12);
+    CHECK(ollm_tensor_block_index("token_embd.weight") < 0);
+    CHECK(ollm_tensor_block_index("blk.x.foo") < 0);
+
+    unsigned long long exps[4] = {100, 100, 100, 100};
+    CHECK(ollm_gpu_expert_layers(exps, 4, 1000, 100, 50, 2000) == 4);
+    CHECK(ollm_gpu_expert_layers(exps, 4, 1000, 100, 50, 1350) == 2);
+    CHECK(ollm_gpu_expert_layers(exps, 4, 1000, 100, 50, 1150) == 0);
+    CHECK(ollm_gpu_expert_layers(exps, 4, 1000, 100, 50, 1149) == 0);
+    CHECK(ollm_gpu_expert_layers(NULL, 4, 0, 0, 0, 100) == 0);
+    CHECK(ollm_gpu_expert_layers(exps, 0, 0, 0, 0, 100) == 0);
+    CHECK(ollm_kv_type_size("q8_0") < 1.1 && ollm_kv_type_size("q8_0") > 1.0);
+    CHECK(ollm_kv_type_size("q4_0") < 0.6 && ollm_kv_type_size("q4_0") > 0.5);
+    CHECK(ollm_kv_type_size("f16") == 2.0);
+    CHECK(ollm_kv_type_size(NULL) == 2.0);
+
+    char stripped[128];
+    ollm_strip_channels("plain text", stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "plain text") == 0);
+    ollm_strip_channels("<|channel>thought\n<channel|>Hello", stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "Hello") == 0);
+    ollm_strip_channels("a<|channel>x<channel|>b<|channel>y<channel|>c", stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "abc") == 0);
+    ollm_strip_channels("keep <|channel>unterminated", stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "keep ") == 0);
+    ollm_strip_channels("a<channel|>b", stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "ab") == 0);
+    ollm_strip_channels("a<channel|>b<|channel>c<channel|>d", stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "abd") == 0);
+    ollm_strip_channels(NULL, stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "") == 0);
+    ollm_strip_channels("abcdef", stripped, 4);
+    CHECK(strcmp(stripped, "abc") == 0);
+    strcpy(stripped, "a<|channel>x<channel|>b<|channel>unterminated");
+    ollm_strip_channels(stripped, stripped, sizeof stripped);
+    CHECK(strcmp(stripped, "ab") == 0);
+
+    char final[128];
+    strcpy(final, "Hello <|channel>thought\nsecret");
+    ollm_strip_channels_final(final, sizeof final);
+    CHECK(strcmp(final, "Hello ") == 0);
+    strcpy(final, "a<channel|>b");
+    ollm_strip_channels_final(final, sizeof final);
+    CHECK(strcmp(final, "ab") == 0);
+    strcpy(final, "Hello <|chan");
+    ollm_strip_channels_final(final, sizeof final);
+    CHECK(strcmp(final, "Hello ") == 0);
+    strcpy(final, "Hello <channe");
+    ollm_strip_channels_final(final, sizeof final);
+    CHECK(strcmp(final, "Hello ") == 0);
+    strcpy(final, "a<|channel>thought\n<channe");
+    ollm_strip_channels_final(final, sizeof final);
+    CHECK(strcmp(final, "a") == 0);
+    strcpy(final, "score a<");
+    ollm_strip_channels_final(final, sizeof final);
+    CHECK(strcmp(final, "score a<") == 0);
+    strcpy(final, "clean prose");
+    ollm_strip_channels_final(final, sizeof final);
+    CHECK(strcmp(final, "clean prose") == 0);
+
+    CHECK(ollm_regex_balanced("blk\\.3\\.ffn_.*_exps"));
+    CHECK(ollm_regex_balanced("a(b|c)*"));
+    CHECK(ollm_regex_balanced("[ab]+\\d"));
+    CHECK(ollm_regex_balanced("blk\\.(25|26)\\.ffn_(up|down)_exps"));
+    CHECK(!ollm_regex_balanced("(a"));
+    CHECK(!ollm_regex_balanced("a)"));
+    CHECK(!ollm_regex_balanced("[ab"));
+    CHECK(!ollm_regex_balanced("a\\"));
+    CHECK(!ollm_regex_balanced("*a"));
+    CHECK(!ollm_regex_balanced("a|*b"));
+    CHECK(!ollm_regex_balanced(""));
+    CHECK(!ollm_regex_balanced(NULL));
+
+    char pat[512];
+    CHECK(ollm_moe_cpu_pattern(25, 30, pat, sizeof pat) == 0);
+    CHECK(strcmp(pat, "blk\\.(25|26|27|28|29)\\.ffn_(up|down|gate|gate_up)_(ch|)exps") == 0);
+    CHECK(ollm_moe_cpu_pattern(0, 1, pat, sizeof pat) == 0);
+    CHECK(strcmp(pat, "blk\\.(0)\\.ffn_(up|down|gate|gate_up)_(ch|)exps") == 0);
+    CHECK(ollm_moe_cpu_pattern(0, 0, pat, sizeof pat) != 0);
+    CHECK(ollm_moe_cpu_pattern(5, 5, pat, sizeof pat) != 0);
+    CHECK(ollm_moe_cpu_pattern(-1, 3, pat, sizeof pat) != 0);
+    CHECK(ollm_moe_cpu_pattern(0, 30, pat, 32) != 0);
+    CHECK(ollm_moe_cpu_pattern(0, 1, NULL, 0) != 0);
+
+    const char *saved_think = getenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT");
+    char saved_buf[32] = {0};
+    if (saved_think) snprintf(saved_buf, sizeof saved_buf, "%s", saved_think);
+    unsetenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT");
+    CHECK(ollm_thinking_default() == false);
+    setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", "0", 1);
+    CHECK(ollm_thinking_default() == false);
+    setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", "false", 1);
+    CHECK(ollm_thinking_default() == false);
+    setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", "", 1);
+    CHECK(ollm_thinking_default() == false);
+    setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", "bogus", 1);
+    CHECK(ollm_thinking_default() == false);
+    setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", "1", 1);
+    CHECK(ollm_thinking_default() == true);
+    setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", "TRUE", 1);
+    CHECK(ollm_thinking_default() == true);
+    setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", "on", 1);
+    CHECK(ollm_thinking_default() == true);
+    if (saved_think) setenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT", saved_buf, 1);
+    else unsetenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT");
+}
+
 int main(void) {
+    const char *port_env = getenv("ONATIVE_TEST_PORT");
+    if (port_env && atoi(port_env) > 1024 && atoi(port_env) < 65000) g_port_a = atoi(port_env);
+    test_tensor_overrides();
     test_sched_try_acquire();
     test_spec_draft();
     test_spec_governor();
+    test_spec_mtp_config();
     test_host_prefetch_policy();
     test_vram_arbitration();
+    test_vram_credit();
+    test_vram_priority();
     test_json();
     test_image_contract();
     test_matte();
     test_tier_parse();
     test_completion_spacing();
+    test_utf8_slice();
     test_openapi();
     test_sched_priority();
     test_sched_timeout();

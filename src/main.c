@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "obackend.h"
 #include "ocapacity.h"
+#include "ofrontier.h"
+#include "oguard.h"
 #include "ohttp.h"
 #include "oimage.h"
 #include "ojson.h"
@@ -10,10 +12,14 @@
 #include "osched.h"
 #include "ohost.h"
 #include "otext.h"
+#include <unistd.h>
+
 #include "ovram.h"
+#include "obroker.h"
 
 #include <math.h>
 #include <limits.h>
+#include <stdint.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +50,7 @@ typedef struct {
     oproxy_target *birefnet_upstream;
     oproxy_target *tts_upstream;
     oproxy_target *stt_upstream;
+    oproxy_target *music_upstream;
     oproxy_target *forecast_upstream;
     oproxy_target *training_upstream;
     oproxy_target *embedding_upstream;
@@ -52,6 +59,7 @@ typedef struct {
     oproxy_target *threed_upstream;
     oproxy_target *aux_upstream;
     int upstream_timeout_ms;
+    int music_timeout_ms;
     int h3_timeout_ms;
     int llm_permits;
     int image_permits;
@@ -73,6 +81,11 @@ typedef struct {
     oscale *scale;
     ocapacity *capacity;
     ovram *vram;
+    /* Box-wide broker in another process (the :8791 gateway). When set, this
+     * gateway's image lane leases there instead of from its own ovram, so
+     * co-resident gateways arbitrate one ledger rather than two. */
+    const char *vram_broker_url;
+    char vram_owner[32];
     /* Standing remote endpoints, distinct from oscale's rented instances: no
      * provisioning, no per-hour bill to reason about, just somewhere to send
      * work when the local device is full. Paid-only by default for the same
@@ -91,12 +104,16 @@ typedef struct {
     unsigned overflow_tier_mask;
     unsigned long long overflow_saturated;
     unsigned long long overflow_failover;
+    ofrontier *frontier;
+    bool frontier_routing;
+    unsigned long long frontier_kept_local;
 } app_state;
 
 extern const char *DOCS_HTML;
 extern const char *OPENAPI_JSON;
 
 static bool env_flag(const char *name, int fallback);
+static size_t gpu_sched_json(char *out, size_t cap);
 static const char *configured_path(const char *name, const char *fallback);
 static bool overflow_path_passthrough(void);
 static const char *overflow_path_label(void);
@@ -117,6 +134,10 @@ static int build_relay_headers(const app_state *app, const ohttp_request *req,
 static pthread_mutex_t g_llm_swap_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_llm_active_path[PATH_MAX];
 static char g_llm_active_ngl[32];
+static char g_llm_active_tensor_override[512];
+static char g_llm_active_moe_cpu_experts[32];
+static char g_llm_active_spec_mtp[PATH_MAX];
+static bool g_llm_active_placement_set;
 static int g_llm_active_ctx;
 static int g_llm_active_contexts;
 
@@ -144,14 +165,13 @@ static bool llm_swap_path(const char *requested, char *resolved, size_t resolved
  * configurable runtime margin fits in the driver's current free memory. A
  * caller that wants a partial split can continue to pass an explicit layer
  * count. */
-static int resolve_llm_ngl(const char *model_path, const char *value, int fallback) {
+static int resolve_llm_ngl(const char *model_path, const char *value, int fallback,
+                           int ctx, int contexts) {
     if (!value || !value[0] || strcasecmp(value, "auto") != 0) {
         return value && value[0] ? atoi(value) : fallback;
     }
 
     struct stat st;
-    double free_gib = -1.0;
-    bool have_vram = ogpu_memory_gib(&free_gib, NULL);
     long long keep_mb = 2048;
     const char *keep_env = getenv("OMNISERVE_NATIVE_NGL_AUTO_KEEP_FREE_MB");
     if (keep_env && keep_env[0]) keep_mb = atoll(keep_env);
@@ -161,17 +181,45 @@ static int resolve_llm_ngl(const char *model_path, const char *value, int fallba
     if (stat(model_path, &st) == 0 && st.st_size > 0) {
         model_bytes = (unsigned long long)st.st_size;
     }
+    unsigned long long offloaded = ollm_cpu_offloaded_bytes(model_path, ctx, contexts);
+    if (offloaded > model_bytes) offloaded = model_bytes;
     unsigned long long margin_bytes = (unsigned long long)keep_mb * 1024ULL * 1024ULL;
-    unsigned long long required_bytes = model_bytes + margin_bytes;
-    unsigned long long free_bytes = have_vram && free_gib > 0.0
-        ? (unsigned long long)(free_gib * 1024.0 * 1024.0 * 1024.0) : 0;
-    bool fits = have_vram && model_bytes > 0 && free_bytes >= required_bytes;
+
+    /* The MoE decision sampled free VRAM once; the verdict reuses that exact
+     * sample so the log line and the placement can never disagree. */
+    bool moe_active = ollm_moe_last_active();
+    unsigned long long est_bytes = ollm_moe_last_est_bytes();
+    unsigned long long free_bytes = ollm_moe_last_free_bytes();
+    bool have_vram = moe_active && free_bytes > 0;
+    if (!have_vram) {
+        double free_gib = -1.0;
+        have_vram = ogpu_memory_gib(&free_gib, NULL) && free_gib > 0.0;
+        free_bytes = have_vram
+            ? (unsigned long long)(free_gib * 1024.0 * 1024.0 * 1024.0) : 0;
+    }
+    bool fits;
+    if (moe_active && est_bytes > 0) {
+        fits = have_vram && model_bytes > 0 && free_bytes >= margin_bytes &&
+            est_bytes <= free_bytes - margin_bytes;
+    } else {
+        unsigned long long required_bytes = model_bytes - offloaded + margin_bytes;
+        fits = have_vram && model_bytes > 0 && free_bytes >= required_bytes;
+    }
 
     fprintf(stderr,
-            "llm NGL=auto: model=%llu MiB free=%llu MiB keep_free=%lld MiB -> %s\n",
-            model_bytes / (1024ULL * 1024ULL), free_bytes / (1024ULL * 1024ULL),
+            "llm NGL=auto: model=%llu MiB cpu_experts=%llu MiB est=%llu MiB free=%llu MiB keep_free=%lld MiB -> %s\n",
+            model_bytes / (1024ULL * 1024ULL), offloaded / (1024ULL * 1024ULL),
+            est_bytes / (1024ULL * 1024ULL), free_bytes / (1024ULL * 1024ULL),
             keep_mb, fits ? "full GPU offload" : "CPU placement");
     return fits ? 999 : 0;
+}
+
+static bool ct_eq(const void *a, const void *b, size_t n) {
+    const volatile unsigned char *x = a;
+    const volatile unsigned char *y = b;
+    unsigned char d = 0;
+    for (size_t i = 0; i < n; i++) d |= (unsigned char)(x[i] ^ y[i]);
+    return d == 0;
 }
 
 static bool query_secret_matches(const ohttp_request *req, const char *secret, size_t secret_len) {
@@ -183,7 +231,7 @@ static bool query_secret_matches(const ohttp_request *req, const char *secret, s
         const char *eq = memchr(p, '=', (size_t)(field_end - p));
         if (eq && (size_t)(eq - p) == 6 && memcmp(p, "secret", 6) == 0 &&
             (size_t)(field_end - eq - 1) == secret_len &&
-            memcmp(eq + 1, secret, secret_len) == 0) {
+            ct_eq(eq + 1, secret, secret_len)) {
             return true;
         }
         p = amp ? amp + 1 : end;
@@ -191,19 +239,82 @@ static bool query_secret_matches(const ohttp_request *req, const char *secret, s
     return false;
 }
 
+/* Per-caller tiers: OMNISERVE_NATIVE_KEY_TIERS="key=sub,key2=paid". A mapped
+ * key authenticates like the shared secret and names the caller's default
+ * tier, which is also its ceiling: a keyed caller may send X-Omniserve-Tier to
+ * lower a request (a free user of a subscription site) but never raise it.
+ * This is how relayed callers (tunnel, other hosts) get a non-free tier. */
+#define KEY_TIER_MAX 64
+typedef struct { char key[160]; size_t len; otier tier; } key_tier;
+static key_tier g_key_tiers[KEY_TIER_MAX];
+static int g_key_tier_n;
+static pthread_once_t g_key_tiers_once = PTHREAD_ONCE_INIT;
+
+static void key_tiers_load(void) {
+    const char *env = getenv("OMNISERVE_NATIVE_KEY_TIERS");
+    if (!env) return;
+    const char *p = env;
+    while (*p && g_key_tier_n < KEY_TIER_MAX) {
+        const char *end = strchr(p, ',');
+        if (!end) end = p + strlen(p);
+        const char *eq = memchr(p, '=', (size_t)(end - p));
+        if (eq && eq > p && (size_t)(eq - p) < sizeof g_key_tiers[0].key) {
+            const char *t = eq + 1;
+            int tlen = (int)(end - t);
+            otier tier = otier_parse(t, tlen);
+            bool named = tier != TIER_FREE || (tlen == 4 && strncasecmp(t, "free", 4) == 0);
+            if (named) {
+                key_tier *k = &g_key_tiers[g_key_tier_n++];
+                k->len = (size_t)(eq - p);
+                memcpy(k->key, p, k->len);
+                k->key[k->len] = 0;
+                k->tier = tier;
+            } else {
+                fprintf(stderr, "OMNISERVE_NATIVE_KEY_TIERS: ignoring entry with unknown tier\n");
+            }
+        }
+        p = *end ? end + 1 : end;
+    }
+    fprintf(stderr, "key tiers: %d caller keys mapped\n", g_key_tier_n);
+}
+
+static bool credential_matches(const ohttp_request *req, const char *key, size_t klen) {
+    size_t len = 0;
+    const char *v = ohttp_req_header(req, "secret", &len);
+    if (v && len == klen && ct_eq(v, key, klen)) return true;
+    v = ohttp_req_header(req, "Authorization", &len);
+    if (v && len > 7 && strncasecmp(v, "Bearer ", 7) == 0 &&
+        len - 7 == klen && ct_eq(v + 7, key, klen)) return true;
+    v = ohttp_req_header(req, "X-API-Key", &len);
+    if (v && len == klen && ct_eq(v, key, klen)) return true;
+    v = ohttp_req_header(req, "X-Rapid-API-Key", &len);
+    if (v && len == klen && ct_eq(v, key, klen)) return true;
+    return query_secret_matches(req, key, klen);
+}
+
+/* The mapped tier of the caller's credential, or -1 when it presents none. */
+static int request_key_tier(const ohttp_request *req) {
+    pthread_once(&g_key_tiers_once, key_tiers_load);
+    for (int i = 0; i < g_key_tier_n; i++)
+        if (credential_matches(req, g_key_tiers[i].key, g_key_tiers[i].len))
+            return (int)g_key_tiers[i].tier;
+    return -1;
+}
+
 static bool authorized(const app_state *app, const ohttp_request *req) {
     if (!app->secret || !app->secret[0]) return true;
+    if (request_key_tier(req) >= 0) return true;
     size_t len = 0;
     const char *v = ohttp_req_header(req, "secret", &len);
     size_t slen = strlen(app->secret);
-    if (v && len == slen && memcmp(v, app->secret, slen) == 0) return true;
+    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
     v = ohttp_req_header(req, "Authorization", &len);
     if (v && len > 7 && strncasecmp(v, "Bearer ", 7) == 0 &&
-        len - 7 == slen && memcmp(v + 7, app->secret, slen) == 0) return true;
+        len - 7 == slen && ct_eq(v + 7, app->secret, slen)) return true;
     v = ohttp_req_header(req, "X-API-Key", &len);
-    if (v && len == slen && memcmp(v, app->secret, slen) == 0) return true;
+    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
     v = ohttp_req_header(req, "X-Rapid-API-Key", &len);
-    if (v && len == slen && memcmp(v, app->secret, slen) == 0) return true;
+    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
     if (query_secret_matches(req, app->secret, slen)) return true;
     return false;
 }
@@ -233,12 +344,154 @@ static bool request_is_internal(const ohttp_request *req) {
     return ohttp_req_peer_is_loopback(req) && !request_via_proxy(req);
 }
 
+/* Public auth gate. OMNISERVE_NATIVE_AUTH_MODE=off|shadow|enforce and
+ * OMNISERVE_NATIVE_AUTH_SCOPE=relayed|all. In scope, a request must carry a
+ * mapped service key (KEY_TIERS or the shared secret) or an end-user
+ * credential the subscriber verifier (OMNISERVE_NATIVE_AUTH_VERIFY_URL)
+ * vouches for. Verdicts are cached per credential so the verifier sees at
+ * most one call per credential per TTL; a verifier outage keeps a recently
+ * verified subscriber serving from the stale entry. */
+typedef enum { AUTH_OFF, AUTH_SHADOW, AUTH_ENFORCE } auth_mode;
+#define SUBCACHE_N 4096
+#define SUBCRED_MAX 256
+typedef struct {
+    char cred[SUBCRED_MAX];
+    size_t len;
+    int verdict; /* >=0 subscriber tier, -401 unknown, -402 not subscribed */
+    time_t fresh_until, stale_until;
+} subcache_ent;
+static subcache_ent g_subcache[SUBCACHE_N];
+static pthread_mutex_t g_subcache_lock = PTHREAD_MUTEX_INITIALIZER;
+static auth_mode g_auth_mode;
+static bool g_auth_scope_all;
+static oproxy_target *g_auth_verify;
+static char g_auth_verify_path[256];
+static const char *g_auth_verify_secret;
+static int g_auth_ok_ttl = 300, g_auth_deny_ttl = 60, g_auth_stale_ttl = 3600;
+static unsigned long long g_auth_counts[6]; /* service, subscriber, internal, 401, 402, verify_err */
+
+static uint64_t cred_hash(const char *s, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+/* The end-user credential, in the order callers of this API send it. */
+static const char *request_credential(const ohttp_request *req, size_t *len) {
+    size_t n = 0;
+    const char *v = ohttp_req_header(req, "Authorization", &n);
+    if (v && n > 7 && strncasecmp(v, "Bearer ", 7) == 0) { *len = n - 7; return v + 7; }
+    static const char *names[] = { "secret", "X-API-Key", "X-Rapid-API-Key" };
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        v = ohttp_req_header(req, names[i], &n);
+        if (v && n) { *len = n; return v; }
+    }
+    const char *p = req->query, *end = p ? p + req->query_len : NULL;
+    while (p && p < end) {
+        const char *amp = memchr(p, '&', (size_t)(end - p));
+        const char *fe = amp ? amp : end;
+        if (fe - p > 7 && strncmp(p, "secret=", 7) == 0) { *len = (size_t)(fe - p - 7); return p + 7; }
+        p = amp ? amp + 1 : end;
+    }
+    *len = 0;
+    return NULL;
+}
+
+/* 1 hit (fresh), 2 stale-positive usable only on verifier failure, 0 miss. */
+static int subcache_get(const char *cred, size_t len, int *verdict, bool allow_stale) {
+    if (len >= SUBCRED_MAX) return 0;
+    time_t now = time(NULL);
+    subcache_ent *e = &g_subcache[cred_hash(cred, len) % SUBCACHE_N];
+    int rc = 0;
+    pthread_mutex_lock(&g_subcache_lock);
+    if (e->len == len && memcmp(e->cred, cred, len) == 0) {
+        if (now < e->fresh_until) { *verdict = e->verdict; rc = 1; }
+        else if (allow_stale && e->verdict >= 0 && now < e->stale_until) { *verdict = e->verdict; rc = 2; }
+    }
+    pthread_mutex_unlock(&g_subcache_lock);
+    return rc;
+}
+
+static void subcache_put(const char *cred, size_t len, int verdict) {
+    if (len >= SUBCRED_MAX) return;
+    time_t now = time(NULL);
+    subcache_ent *e = &g_subcache[cred_hash(cred, len) % SUBCACHE_N];
+    pthread_mutex_lock(&g_subcache_lock);
+    memcpy(e->cred, cred, len);
+    e->len = len;
+    e->verdict = verdict;
+    e->fresh_until = now + (verdict >= 0 ? g_auth_ok_ttl : g_auth_deny_ttl);
+    e->stale_until = verdict >= 0 ? now + g_auth_stale_ttl : 0;
+    pthread_mutex_unlock(&g_subcache_lock);
+}
+
+typedef struct { char buf[4096]; size_t n; } verify_sink_buf;
+static bool verify_sink(const void *data, size_t len, void *user) {
+    verify_sink_buf *b = user;
+    size_t room = sizeof b->buf - 1 - b->n;
+    if (len > room) len = room;
+    memcpy(b->buf + b->n, data, len);
+    b->n += len;
+    b->buf[b->n] = 0;
+    return true;
+}
+
+/* Asks the verifier about one credential. Returns the verdict, or INT_MIN when
+ * the verifier could not answer. */
+static int subscriber_verify_remote(const char *cred, size_t len) {
+    if (!g_auth_verify) return -401;
+    oproxy_header h[2] = {
+        { .name = "X-Subscriber-Credential", .name_len = sizeof "X-Subscriber-Credential" - 1,
+          .value = cred, .value_len = len },
+        { .name = "X-Verify-Secret", .name_len = sizeof "X-Verify-Secret" - 1,
+          .value = g_auth_verify_secret ? g_auth_verify_secret : "",
+          .value_len = g_auth_verify_secret ? strlen(g_auth_verify_secret) : 0 },
+    };
+    verify_sink_buf b = { .n = 0 };
+    oproxy_result res = {0};
+    char err[256];
+    bool ok = oproxy_target_relay(g_auth_verify, "GET", 3, g_auth_verify_path, strlen(g_auth_verify_path),
+                                  NULL, 0, NULL, 0, NULL, 0, h, 2, 5000,
+                                  verify_sink, &b, &res, err, sizeof err);
+    if (!ok || res.status == 0 || res.status >= 500) return INT_MIN;
+    if (res.status == 401) return -401;
+    if (res.status == 402 || res.status == 403) return -402;
+    if (res.status != 200) return INT_MIN;
+    const char *t = strstr(b.buf, "\"tier\"");
+    otier tier = TIER_SUB;
+    if (t && (t = strchr(t + 6, '"'))) {
+        const char *e = strchr(t + 1, '"');
+        if (e) tier = otier_parse_public(t + 1, (int)(e - t - 1));
+    }
+    return (int)tier;
+}
+
+/* Cached subscriber tier for this request's credential, or -1. */
+static int request_subscriber_tier(const ohttp_request *req) {
+    if (g_auth_mode == AUTH_OFF) return -1;
+    size_t len = 0;
+    const char *cred = request_credential(req, &len);
+    int verdict;
+    if (!cred || !len || !subcache_get(cred, len, &verdict, true) || verdict < 0) return -1;
+    return verdict;
+}
+
 static otier request_tier(const ohttp_request *req) {
     /* Priority is a privilege too: a public caller must not be able to claim
      * the paid lane, so an untrusted X-Omniserve-Tier falls back to default. */
-    if (!request_is_internal(req)) return otier_parse_public(NULL, 0);
+    int keyed = request_key_tier(req);
+    bool internal = request_is_internal(req);
+    if (!internal && keyed < 0) {
+        keyed = request_subscriber_tier(req);
+        if (keyed < 0) return otier_parse_public(NULL, 0);
+    }
     size_t len = 0;
     const char *v = ohttp_req_header(req, "X-Omniserve-Tier", &len);
+    if (keyed >= 0 && !(internal && v && len)) {
+        if (!v || !len) return (otier)keyed;
+        otier asked = otier_parse(v, (int)len);
+        return (int)asked < keyed ? (otier)keyed : asked;
+    }
     /* Internal callers are the only callers allowed to request the true
      * background lane.  otier_parse_public deliberately collapses background
      * to free, which would let a batch image occupy ordinary serving capacity
@@ -250,6 +503,156 @@ static void respond_error(ohttp_request *req, int status, const char *msg) {
     char body[512];
     snprintf(body, sizeof body, "{\"error\":{\"message\":\"%s\",\"type\":\"invalid_request_error\"}}", msg);
     ohttp_respond_str(req, status, "application/json", body);
+}
+
+#define SUBSCRIBE_URL "https://text-generator.io/subscribe"
+
+static void respond_subscription_required(ohttp_request *req, int status) {
+    const char *msg = status == 401
+        ? "An API key from a paid or subscribed account is required. Send it as Authorization: Bearer <key> or a secret header."
+        : "This API is available to paid and subscribed accounts. Subscribe to continue.";
+    char body[512];
+    int n = snprintf(body, sizeof body,
+        "{\"error\":{\"code\":\"subscription_required\",\"message\":\"%s\",\"subscribe_url\":\"" SUBSCRIBE_URL "\"}}",
+        msg);
+    ohttp_respond_h(req, status, "application/json", body, n > 0 ? (size_t)n : 0,
+                    "X-Subscribe-URL: " SUBSCRIBE_URL);
+}
+
+static bool auth_path_exempt(const ohttp_request *req) {
+    static const char *open_paths[] = {
+        "/health", "/healthz", "/liveness_check", "/readyz", "/readiness_check",
+        "/status", "/", "/docs", "/openapi.json", "/v1/models", "/api/v1/speech/catalog",
+    };
+    for (size_t i = 0; i < sizeof open_paths / sizeof open_paths[0]; i++)
+        if (ohttp_path_is(req, open_paths[i])) return true;
+    return false;
+}
+
+static void auth_gate_log(const ohttp_request *req, const char *verdict, const char *cred, size_t len) {
+    char path[160];
+    size_t pn = req->path_len < sizeof path - 1 ? req->path_len : sizeof path - 1;
+    memcpy(path, req->path, pn);
+    path[pn] = 0;
+    for (size_t i = 0; i < pn; i++) if (path[i] == '"' || path[i] < 0x20) path[i] = '_';
+    fprintf(stderr, "auth_gate mode=%s verdict=%s cred=%08x path=\"%s\"\n",
+            g_auth_mode == AUTH_SHADOW ? "shadow" : "enforce", verdict,
+            cred && len ? (unsigned)(cred_hash(cred, len) >> 32) : 0u, path);
+}
+
+static auth_mode auth_mode_parse(const char *m) {
+    if (!m || !m[0] || strncasecmp(m, "off", 3) == 0 || m[0] == '0') return AUTH_OFF;
+    return strncasecmp(m, "shadow", 6) == 0 ? AUTH_SHADOW : AUTH_ENFORCE;
+}
+
+/* OMNISERVE_NATIVE_AUTH_MODE_FILE, when set, overrides the mode and is re-read
+ * every few seconds, so rollout and rollback need no gateway restart. A
+ * missing or unreadable file keeps the last mode. */
+static const char *g_auth_mode_file;
+static time_t g_auth_mode_checked;
+static void auth_mode_refresh(void) {
+    if (!g_auth_mode_file) return;
+    time_t now = time(NULL);
+    time_t last = __atomic_load_n(&g_auth_mode_checked, __ATOMIC_RELAXED);
+    if (now - last < 3 ||
+        !__atomic_compare_exchange_n(&g_auth_mode_checked, &last, now, false,
+                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        return;
+    FILE *f = fopen(g_auth_mode_file, "r");
+    if (!f) return;
+    char buf[32] = {0};
+    if (fgets(buf, sizeof buf, f)) {
+        auth_mode m = auth_mode_parse(buf);
+        if (m != g_auth_mode) {
+            fprintf(stderr, "auth gate: mode %d -> %d from %s\n", (int)g_auth_mode, (int)m, g_auth_mode_file);
+            __atomic_store_n(&g_auth_mode, m, __ATOMIC_RELAXED);
+        }
+    }
+    fclose(f);
+}
+
+/* True when the request may proceed; otherwise the response has been sent. */
+static bool auth_gate(ohttp_request *req, const app_state *app) {
+    auth_mode_refresh();
+    if (g_auth_mode == AUTH_OFF) return true;
+    if (!g_auth_scope_all && request_is_internal(req)) {
+        __atomic_add_fetch(&g_auth_counts[2], 1, __ATOMIC_RELAXED);
+        return true;
+    }
+    if (auth_path_exempt(req)) return true;
+    size_t len = 0;
+    const char *cred = request_credential(req, &len);
+    if (request_key_tier(req) >= 0 ||
+        (app->secret && app->secret[0] && cred && len == strlen(app->secret) &&
+         memcmp(cred, app->secret, len) == 0)) {
+        __atomic_add_fetch(&g_auth_counts[0], 1, __ATOMIC_RELAXED);
+        return true;
+    }
+    int verdict = -401;
+    if (cred && len && len < SUBCRED_MAX) {
+        if (!subcache_get(cred, len, &verdict, false)) {
+            int v = subscriber_verify_remote(cred, len);
+            if (v == INT_MIN) {
+                __atomic_add_fetch(&g_auth_counts[5], 1, __ATOMIC_RELAXED);
+                if (subcache_get(cred, len, &verdict, true) != 2) {
+                    auth_gate_log(req, "verify_error", cred, len);
+                    if (g_auth_mode == AUTH_SHADOW) return true;
+                    ohttp_respond_h(req, 503, "application/json",
+                        "{\"error\":{\"code\":\"auth_unavailable\",\"message\":\"subscription check unavailable; retry\"}}",
+                        sizeof "{\"error\":{\"code\":\"auth_unavailable\",\"message\":\"subscription check unavailable; retry\"}}" - 1,
+                        "Retry-After: 5");
+                    return false;
+                }
+            } else {
+                verdict = v;
+                subcache_put(cred, len, verdict);
+            }
+        }
+    }
+    if (verdict >= 0) {
+        __atomic_add_fetch(&g_auth_counts[1], 1, __ATOMIC_RELAXED);
+        return true;
+    }
+    int status = verdict == -402 ? 402 : 401;
+    __atomic_add_fetch(&g_auth_counts[status == 401 ? 3 : 4], 1, __ATOMIC_RELAXED);
+    auth_gate_log(req, status == 401 ? "deny_401" : "deny_402", cred, len);
+    if (g_auth_mode == AUTH_SHADOW) return true;
+    respond_subscription_required(req, status);
+    return false;
+}
+
+static void auth_gate_init(void) {
+    g_auth_mode = auth_mode_parse(getenv("OMNISERVE_NATIVE_AUTH_MODE"));
+    g_auth_mode_file = getenv("OMNISERVE_NATIVE_AUTH_MODE_FILE");
+    if (g_auth_mode_file && !g_auth_mode_file[0]) g_auth_mode_file = NULL;
+    auth_mode_refresh();
+    const char *s = getenv("OMNISERVE_NATIVE_AUTH_SCOPE");
+    g_auth_scope_all = s && strcasecmp(s, "all") == 0;
+    const char *v;
+    if ((v = getenv("OMNISERVE_NATIVE_AUTH_OK_TTL_S")) && atoi(v) > 0) g_auth_ok_ttl = atoi(v);
+    if ((v = getenv("OMNISERVE_NATIVE_AUTH_DENY_TTL_S")) && atoi(v) > 0) g_auth_deny_ttl = atoi(v);
+    if ((v = getenv("OMNISERVE_NATIVE_AUTH_STALE_TTL_S")) && atoi(v) >= 0) g_auth_stale_ttl = atoi(v);
+    g_auth_verify_secret = getenv("OMNISERVE_NATIVE_AUTH_VERIFY_SECRET");
+    const char *url = getenv("OMNISERVE_NATIVE_AUTH_VERIFY_URL");
+    if (url && url[0]) {
+        const char *host = strstr(url, "://");
+        const char *slash = host ? strchr(host + 3, '/') : NULL;
+        char base[256];
+        size_t bn = slash ? (size_t)(slash - url) : strlen(url);
+        if (bn < sizeof base) {
+            memcpy(base, url, bn);
+            base[bn] = 0;
+            snprintf(g_auth_verify_path, sizeof g_auth_verify_path, "%s", slash ? slash : "/");
+            char err[256];
+            g_auth_verify = oproxy_target_create(base, 4, err, sizeof err);
+            if (!g_auth_verify) fprintf(stderr, "auth gate: verifier %s unusable: %s\n", base, err);
+        }
+    }
+    pthread_once(&g_key_tiers_once, key_tiers_load);
+    if (g_auth_mode != AUTH_OFF || g_auth_mode_file)
+        fprintf(stderr, "auth gate: mode=%s scope=%s verifier=%s\n",
+                g_auth_mode == AUTH_OFF ? "off" : g_auth_mode == AUTH_SHADOW ? "shadow" : "enforce",
+                g_auth_scope_all ? "all" : "relayed", g_auth_verify ? "on" : "off");
 }
 
 /* An embedded model that fell back to CPU still answers, so it cannot be
@@ -391,8 +794,28 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
             "# HELP omniserve_overflow_total Requests sent to a standing remote endpoint.\n"
             "# TYPE omniserve_overflow_total counter\n"
             "omniserve_overflow_total{cause=\"saturated\"} %llu\n"
-            "omniserve_overflow_total{cause=\"local_failed\"} %llu\n",
-            app->overflow_saturated, app->overflow_failover);
+            "omniserve_overflow_total{cause=\"local_failed\"} %llu\n"
+            "# HELP omniserve_frontier_kept_local_total Busy-lane requests the frontier policy queued locally.\n"
+            "# TYPE omniserve_frontier_kept_local_total counter\n"
+            "omniserve_frontier_kept_local_total %llu\n",
+            app->overflow_saturated, app->overflow_failover, app->frontier_kept_local);
+    }
+    const struct { const char *name; oproxy_target *target; } remotes[] = {
+        {"image_overflow", app->image_overflow}, {"stt_overflow", app->stt_overflow},
+        {"tts_overflow", app->tts_overflow},
+    };
+    for (size_t i = 0; i < sizeof remotes / sizeof remotes[0] && len < sizeof body; i++) {
+        if (!remotes[i].target) continue;
+        oproxy_stats rs;
+        oproxy_target_snapshot(remotes[i].target, &rs);
+        len += (size_t)snprintf(body + len, sizeof body - len,
+            "omniserve_upstream_breaker_open{upstream=\"%s\"} %d\n"
+            "omniserve_upstream_breaker_opens_total{upstream=\"%s\"} %llu\n"
+            "omniserve_upstream_breaker_rejects_total{upstream=\"%s\"} %llu\n"
+            "omniserve_upstream_failures_total{upstream=\"%s\"} %llu\n",
+            remotes[i].name, rs.open_ms_left > 0,
+            remotes[i].name, rs.breaker_opens, remotes[i].name, rs.breaker_rejects,
+            remotes[i].name, rs.failures);
     }
     for (int i = 0; i < app->image_model_upstream_count && len < sizeof body; i++) {
         image_model_upstream *model = &app->image_model_upstreams[i];
@@ -400,6 +823,7 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
             "omniserve_image_model_relay_total{model=\"%s\"} %llu\n",
             model->model, __atomic_load_n(&model->relay_total, __ATOMIC_RELAXED));
     }
+    oguard_metrics_append(body, sizeof body, &len);
     ohttp_respond(req, 200, "text/plain; version=0.0.4", body, len);
 }
 
@@ -466,12 +890,18 @@ static void handle_status(ohttp_request *req, app_state *app) {
     /* Zero-initialised because the capacity object below is appended by seeking
      * to strlen(body); starting from a known state keeps that arithmetic sound
      * even if the first format is ever truncated. */
+    char *ovr_esc = NULL;
+    size_t ovr_len = 0, ovr_cap = 0;
+    (void)oj_escape_append(&ovr_esc, &ovr_len, &ovr_cap,
+                           placement.tensor_override, strlen(placement.tensor_override));
     char body[8192] = {0};
     snprintf(body, sizeof body,
              "{\"vram_free_gib\":%.2f,\"vram_total_gib\":%.2f,\"vram_available\":%s,"
              "\"gpu\":{\"device_present\":%s,\"requested\":%s,\"placement\":\"%s\","
              "\"device\":\"%.80s\",\"kv_type\":\"%s\",\"flash_attn\":%s,\"degraded\":%s},"
-             "\"llm\":{\"ready\":%s,\"model\":\"%s\"},"
+             "\"llm\":{\"ready\":%s,\"model\":\"%s\","
+             "\"gpu_expert_layers\":%d,\"cpu_expert_layers\":%d,"
+             "\"tensor_override\":\"%s\",\"est_gpu_bytes\":%llu},"
              "\"embedding\":{\"ready\":%s,\"model\":\"%s\"},"
              "\"diffusion\":{\"ready\":%s,\"model\":\"%s\",\"reference_edit\":%s},"
              /* Key order must track the argument order below, which matches the
@@ -506,6 +936,8 @@ static void handle_status(ohttp_request *req, app_state *app) {
              placement.kv_type, placement.flash_attn ? "true" : "false",
              (ollm_ready() && placement.gpu_requested && !placement.on_gpu) ? "true" : "false",
              ollm_ready() ? "true" : "false", ollm_model_name(),
+             placement.gpu_expert_layers, placement.cpu_expert_layers,
+             ovr_esc ? ovr_esc : "", placement.est_gpu_bytes,
              oembed_ready() ? "true" : "false", oembed_model_name(),
              osd_ready() ? "true" : "false", osd_model_name(),
              osd_reference_edit_ready() ? "true" : "false",
@@ -565,23 +997,35 @@ static void handle_status(ohttp_request *req, app_state *app) {
     if (len > 1 && body[len - 1] == '}') {
         char capacity_json[2048];
         ocapacity_status_json(app->capacity, capacity_json, sizeof capacity_json);
+        char guard_json[1024];
+        oguard_status_json(guard_json, sizeof guard_json);
+        oproxy_stats overflow_stats;
+        oproxy_target_snapshot(app->image_overflow, &overflow_stats);
         double acceptance = placement.spec_drafted
             ? (double)placement.spec_accepted / (double)placement.spec_drafted : 0.0;
         snprintf(body + len - 1, sizeof body - (len - 1),
                  ",\"tune\":{\"class\":\"%s\",\"n_batch\":%d,\"n_ubatch\":%d},"
-                 "\"speculation\":{\"draft_max\":%d,\"rounds\":%llu,\"drafted\":%llu,"
-                 "\"accepted\":%llu,\"acceptance\":%.3f,\"calls_saved\":%llu},"
+                 "\"speculation\":{\"source\":\"%s\",\"draft_max\":%d,\"rounds\":%llu,"
+                 "\"drafted\":%llu,\"accepted\":%llu,\"acceptance\":%.3f,"
+                 "\"calls_saved\":%llu},"
                  "\"overflow\":{\"image\":%s,\"image_path\":\"%s\",\"tiers\":%u,"
-                 "\"saturated\":%llu,\"local_failed\":%llu},"
-                 "\"capacity\":%s}",
+                 "\"saturated\":%llu,\"local_failed\":%llu,"
+                 "\"frontier\":%s,\"frontier_kept_local\":%llu,"
+                 "\"breaker\":{\"open_ms\":%lld,\"consecutive_failures\":%u,"
+                 "\"opens\":%llu,\"rejects\":%llu}},"
+                 "\"capacity\":%s,\"guard\":%s}",
                  placement.tune_class, placement.n_batch, placement.n_ubatch,
-                 placement.spec_draft_max, placement.spec_rounds, placement.spec_drafted,
-                 placement.spec_accepted, acceptance, placement.spec_saved_calls,
+                 placement.spec_source, placement.spec_draft_max, placement.spec_rounds,
+                 placement.spec_drafted, placement.spec_accepted, acceptance,
+                 placement.spec_saved_calls,
                  app->image_overflow ? "true" : "false",
                  overflow_path_label(),
                  app->overflow_tier_mask,
                  app->overflow_saturated, app->overflow_failover,
-                 capacity_json);
+                 app->frontier_routing ? "true" : "false", app->frontier_kept_local,
+                 overflow_stats.open_ms_left, overflow_stats.consecutive_failures,
+                 overflow_stats.breaker_opens, overflow_stats.breaker_rejects,
+                 capacity_json, guard_json);
     }
     len = strlen(body);
     if (len > 0 && body[len - 1] == '}') body[--len] = '\0';
@@ -592,7 +1036,10 @@ static void handle_status(ohttp_request *req, app_state *app) {
             "%s\"%s\":{\"relay_total\":%llu}", i ? "," : "", model->model,
             __atomic_load_n(&model->relay_total, __ATOMIC_RELAXED));
     }
-    snprintf(body + len, sizeof body - len, "}}");
+    char sched_json[1024];
+    gpu_sched_json(sched_json, sizeof sched_json);
+    snprintf(body + len, sizeof body - len, "},\"gpu_sched\":%s}", sched_json);
+    free(ovr_esc);
     ohttp_force_close(req);
     ohttp_respond_str(req, 200, "application/json", body);
 }
@@ -629,6 +1076,7 @@ static void handle_models(ohttp_request *req, const app_state *app) {
                                     "tts", "proxy");
     if (app->stt_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_STT_MODEL", "upstream-stt"),
                                     "stt", "proxy");
+    if (app->music_upstream) ADD_MODEL("m-a-p/YuE2-3B", "music", "proxy-capacity-aware");
     if (app->forecast_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_FORECAST_MODEL", "amazon/chronos-2"),
                                          "forecast", "proxy");
     if (app->embedding_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_EMBEDDING_MODEL", "upstream-embedding"),
@@ -795,8 +1243,9 @@ static void reload_embedded_models_after_background(void) {
         if (parallel_contexts < 1) parallel_contexts = 1;
         if (parallel_contexts > slots) parallel_contexts = slots;
         fprintf(stderr, "exclusive background window: reloading LLM %s\n", gguf);
-        if (!ollm_init(gguf, resolve_llm_ngl(gguf, ngl, 999), ctx ? atoi(ctx) : 8192,
-                       parallel_contexts)) {
+        if (!ollm_init(gguf, resolve_llm_ngl(gguf, ngl, 999, ctx ? atoi(ctx) : 8192,
+                                            parallel_contexts),
+                       ctx ? atoi(ctx) : 8192, parallel_contexts)) {
             fprintf(stderr, "exclusive background window: LLM reload failed\n");
         }
         ollm_placement placement;
@@ -826,10 +1275,13 @@ static void reload_embedded_models_after_background(void) {
  * to carry a lane name they otherwise never need. */
 static oproxy_target *overflow_for(const app_state *app, const oproxy_target *local, otier tier) {
     if (!(app->overflow_tier_mask & (1u << (unsigned)tier))) return NULL;
-    if (local == app->image_upstream) return app->image_overflow;
-    if (local == app->stt_upstream) return app->stt_overflow;
-    if (local == app->tts_upstream) return app->tts_overflow;
-    return NULL;
+    oproxy_target *remote = NULL;
+    if (local == app->image_upstream) remote = app->image_overflow;
+    else if (local == app->stt_upstream) remote = app->stt_overflow;
+    else if (local == app->tts_upstream) remote = app->tts_overflow;
+    /* An open breaker makes the lane behave as if it had no remote: queue
+     * locally instead of spending a round trip on a known-dead upstream. */
+    return remote && oproxy_target_open_ms(remote) == 0 ? remote : NULL;
 }
 
 static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_target *upstream,
@@ -850,7 +1302,7 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
     oproxy_target *overflow = admit ? overflow_for(app, local, tier) : NULL;
     bool on_overflow = false;
     if (overflow) {
-        if (!osched_try_acquire_n(app->sched, tier, permits)) {
+        if (!osched_try_acquire_n(app->sched, tier, permits) && oproxy_target_allow(overflow)) {
             upstream = overflow;
             on_overflow = true;
             app->overflow_saturated++;
@@ -894,8 +1346,8 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
     oproxy_result result;
     const char *upstream_path = path_override ? path_override : req->path;
     size_t upstream_path_len = path_override ? strlen(path_override) : req->path_len;
-    int upstream_timeout_ms = local == app->h3_upstream
-        ? app->h3_timeout_ms : app->upstream_timeout_ms;
+    int upstream_timeout_ms = local == app->music_upstream ? app->music_timeout_ms :
+        (local == app->h3_upstream ? app->h3_timeout_ms : app->upstream_timeout_ms);
     bool ok = oproxy_target_relay(
         upstream,
         req->method, req->method_len,
@@ -914,7 +1366,8 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
      * retrying would splice a second response onto a partial one. The local
      * slot is released first so the retry cannot hold the device it just
      * failed to use. */
-    if (!ok && !result.response_started && !on_overflow && overflow) {
+    if (!ok && !result.response_started && !on_overflow && overflow &&
+        oproxy_target_allow(overflow)) {
         osched_release_n(app->sched, tier, permits);
         permits = 0;
         app->overflow_failover++;
@@ -969,11 +1422,10 @@ typedef struct {
     ohttp_request *req;
 } stream_ctx;
 
-static bool stream_token(const char *piece, size_t len, void *user) {
+static bool stream_slice(const char *piece, size_t len, void *user) {
     stream_ctx *sc = user;
     const char *pre = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"";
     size_t pren = strlen(pre);
-    if (len > 256) return false;
     char payload[2048];
     memcpy(payload, pre, pren);
     size_t plen = pren;
@@ -1003,6 +1455,17 @@ static bool stream_token(const char *piece, size_t len, void *user) {
     memcpy(payload + plen, post, strlen(post));
     plen += strlen(post);
     return ohttp_stream_write(sc->req, payload, plen);
+}
+
+static bool stream_token(const char *piece, size_t len, void *user) {
+    if (len == 0) return stream_slice(piece, 0, user);
+    while (len > 0) {
+        size_t n = otext_utf8_slice(piece, len, 256);
+        if (!stream_slice(piece, n, user)) return false;
+        piece += n;
+        len -= n;
+    }
+    return true;
 }
 
 static int parse_stop_values(const char *js, const oj_tok *toks, int n, int root,
@@ -1037,8 +1500,419 @@ static int parse_stop_values(const char *js, const oj_tok *toks, int n, int root
     return count;
 }
 
+static void guard_request_id(const ohttp_request *req, char *dst, size_t cap) {
+    size_t len = 0;
+    const char *v = ohttp_req_header(req, "X-Request-ID", &len);
+    if (!v || !len || cap == 0) {
+        if (cap > 0) snprintf(dst, cap, "-");
+        return;
+    }
+    if (len > cap - 1) len = cap - 1;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)v[i];
+        dst[i] = (c >= 0x20 && c < 0x7f && c != ' ') ? (char)c : '_';
+    }
+    dst[len] = 0;
+}
+
+static long guard_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)(ts.tv_sec * 1000000L + ts.tv_nsec / 1000L);
+}
+
+#define GUARD_PART_CAP 16384
+
+static void guard_append(char *dst, size_t *len, const char *s) {
+    if (!dst || !s) return;
+    if (*len > 0 && *len < GUARD_PART_CAP) dst[(*len)++] = '\n';
+    size_t n = strlen(s);
+    if (*len + n > GUARD_PART_CAP) n = GUARD_PART_CAP - *len;
+    memcpy(dst + *len, s, n);
+    *len += n;
+    dst[*len] = 0;
+}
+
+static void guard_collect_chat(const ochat_msg *msgs, int msg_n, char **system_out,
+                               const char **user_out, char **ctx_out) {
+    char *sys = malloc(GUARD_PART_CAP + 1);
+    char *ctx = malloc(GUARD_PART_CAP + 1);
+    size_t sys_len = 0, ctx_len = 0;
+    if (sys) sys[0] = 0;
+    if (ctx) ctx[0] = 0;
+    int last_user = -1;
+    for (int i = 0; i < msg_n; i++)
+        if (strcmp(msgs[i].role, "user") == 0) last_user = i;
+    *user_out = last_user >= 0 ? msgs[last_user].content : "";
+    int ctx_items = 0;
+    for (int i = 0; i < msg_n; i++) {
+        if (i == last_user) continue;
+        if (strcmp(msgs[i].role, "system") == 0) {
+            guard_append(sys, &sys_len, msgs[i].content);
+        } else if (i >= msg_n - 7 && ctx_items < 6) {
+            guard_append(ctx, &ctx_len, msgs[i].content);
+            ctx_items++;
+        }
+    }
+    *system_out = sys;
+    *ctx_out = ctx;
+}
+
+static void guard_block_log(const ohttp_request *req, oguard_category category,
+                            const char *rule, const char *sys, const char *user,
+                            const char *ctx, long elapsed_us) {
+    char req_id[64];
+    char hash[65];
+    guard_request_id(req, req_id, sizeof req_id);
+    oguard_text_hash(sys, user, ctx, hash);
+    oguard_record_block(category);
+    fprintf(stderr, "guard block category=%s rule=%.63s req=%.60s hash=%s latency_us=%ld\n",
+            oguard_category_name(category), rule ? rule : "-", req_id, hash, elapsed_us);
+}
+
+static bool guard_embed_ready(void) {
+    return oembed_ready();
+}
+
+static bool guard_embed_text(const char *text, size_t len, float **values, int *dim) {
+    oembed_result r;
+    if (!oembed_text(text, len, 0, &r)) return false;
+    *values = r.values;
+    *dim = r.dimensions;
+    return true;
+}
+
+static void guard_embed_free(float *values) {
+    oembed_result r;
+    memset(&r, 0, sizeof r);
+    r.values = values;
+    oembed_result_free(&r);
+}
+
+/* The judge can be admitted and evicted at runtime by the GPU scheduler, so
+ * every use holds the read side and load/unload holds the write side. */
+static pthread_rwlock_t g_judge_rw = PTHREAD_RWLOCK_INITIALIZER;
+
+static bool guard_judge_ready(void) {
+    pthread_rwlock_rdlock(&g_judge_rw);
+    bool ready = ojudge_ready();
+    pthread_rwlock_unlock(&g_judge_rw);
+    return ready;
+}
+
+static bool guard_judge_score(const char *prompt, size_t len, double *pyes, double *ms) {
+    pthread_rwlock_rdlock(&g_judge_rw);
+    bool ok = ojudge_score(prompt, len, pyes, ms);
+    pthread_rwlock_unlock(&g_judge_rw);
+    return ok;
+}
+
+static bool guard_judge_multi(const char **prompts, const size_t *lens, int n,
+                              double *pyes, double *ms) {
+    pthread_rwlock_rdlock(&g_judge_rw);
+    bool ok = ojudge_score_multi(prompts, lens, n, pyes, ms);
+    pthread_rwlock_unlock(&g_judge_rw);
+    return ok;
+}
+
+/* ---- GPU scheduler: queue, evict idle residents, admit optional ones ----
+ *
+ * The broker (ovram) queues leases by tier. When a waiter stays blocked, the
+ * pressure hook frees what is resident but idle in this process, cheapest
+ * first: the optional guard judge, then the embedded LLM once it has been idle
+ * for OMNISERVE_NATIVE_EVICT_LLM_IDLE_S. An evicted LLM reloads on its next
+ * request (weights are page-cache warm: ~2.7 s for gemma-roleplay-v2 q8). */
+typedef struct {
+    int llm_idle_s;          /* 0 = never evict the LLM */
+    otier llm_evict_max_tier; /* waiters at this tier or better may evict */
+    bool llm_evicted;
+    char llm_path[PATH_MAX];
+    char llm_ngl[32];
+    int llm_ctx, llm_contexts;
+    int llm_mb;              /* device MB freed by the last eviction */
+    double llm_last_used_s;
+    unsigned long long llm_evictions, llm_reloads, llm_reload_failures;
+    double llm_reload_ms_last;
+    bool judge_auto;
+    const char *judge_gguf;
+    int judge_threads;
+    int judge_margin_mb;
+    double judge_next_admit_s;
+    unsigned long long judge_admits, judge_evictions;
+    int wait_ms[4];
+    int sd_lease_mb, sd_edit_lease_mb;
+    bool lease_scale_by_pixels;
+    unsigned force_tier_mask; /* tiers that run anyway after the wait, holding a forced lease */
+    unsigned long long image_waits, image_wait_denials, broker_unreachable;
+} gpu_sched_state;
+
+static gpu_sched_state g_gs;
+static pthread_mutex_t g_gs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static double gs_now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void gs_llm_touch(void) {
+    double now = gs_now_s();
+    __atomic_store(&g_gs.llm_last_used_s, &now, __ATOMIC_RELAXED);
+}
+
+static int gs_device_free_mb(void) {
+    double free_gib = -1.0;
+    return ogpu_memory_gib(&free_gib, NULL) && free_gib >= 0.0 ? (int)(free_gib * 1024.0) : -1;
+}
+
+static int gs_judge_need_mb(void) {
+    unsigned long long b = ojudge_vram_reserve_bytes();
+    return b ? (int)(b / (1024ULL * 1024ULL)) : 2304;
+}
+
+static int gpu_pressure(void *ctx, otier tier, int deficit_mb) {
+    (void)ctx;
+    int freed = 0;
+    if (g_gs.judge_auto && guard_judge_ready()) {
+        int before = gs_device_free_mb();
+        pthread_rwlock_wrlock(&g_judge_rw);
+        ojudge_shutdown();
+        pthread_rwlock_unlock(&g_judge_rw);
+        int delta = gs_device_free_mb() - before;
+        freed += delta > 0 ? delta : gs_judge_need_mb();
+        pthread_mutex_lock(&g_gs_lock);
+        g_gs.judge_evictions++;
+        g_gs.judge_next_admit_s = gs_now_s() + 600.0;
+        pthread_mutex_unlock(&g_gs_lock);
+        fprintf(stderr, "gpu-sched: evicted guard judge for a %s waiter (deficit %d MB, freed %d MB)\n",
+                otier_name(tier), deficit_mb, delta);
+        if (freed >= deficit_mb) return freed;
+    }
+    double last = 0.0;
+    __atomic_load(&g_gs.llm_last_used_s, &last, __ATOMIC_RELAXED);
+    double idle = gs_now_s() - last;
+    if (g_gs.llm_idle_s > 0 && tier <= g_gs.llm_evict_max_tier && ollm_ready() &&
+        idle >= g_gs.llm_idle_s && pthread_mutex_trylock(&g_llm_swap_lock) == 0) {
+        if (ollm_ready()) {
+            snprintf(g_gs.llm_path, sizeof g_gs.llm_path, "%s",
+                     g_llm_active_path[0] ? g_llm_active_path : getenv("OMNISERVE_NATIVE_LLM_GGUF"));
+            snprintf(g_gs.llm_ngl, sizeof g_gs.llm_ngl, "%s", g_llm_active_ngl[0] ? g_llm_active_ngl : "auto");
+            g_gs.llm_ctx = g_llm_active_ctx > 0 ? g_llm_active_ctx : 8192;
+            g_gs.llm_contexts = g_llm_active_contexts > 0 ? g_llm_active_contexts : 1;
+            int before = gs_device_free_mb();
+            ollm_shutdown();
+            int delta = gs_device_free_mb() - before;
+            pthread_mutex_lock(&g_gs_lock);
+            g_gs.llm_evicted = true;
+            g_gs.llm_evictions++;
+            if (delta > 0) g_gs.llm_mb = delta;
+            pthread_mutex_unlock(&g_gs_lock);
+            freed += delta > 0 ? delta : 0;
+            fprintf(stderr, "gpu-sched: evicted idle LLM (idle %.0f s) for a %s waiter "
+                    "(deficit %d MB, freed %d MB)\n", idle, otier_name(tier), deficit_mb, delta);
+        }
+        pthread_mutex_unlock(&g_llm_swap_lock);
+    }
+    return freed;
+}
+
+static int gs_wait_ms(otier tier) {
+    return (int)tier >= TIER_PAID && (int)tier <= TIER_BACKGROUND ? g_gs.wait_ms[tier] : 0;
+}
+
+/* Reload an LLM the scheduler evicted. Leases its footprint first so the
+ * reload neither lands on CPU nor pushes a neighbour into OOM. */
+static bool llm_ensure_loaded(app_state *app, otier tier) {
+    if (ollm_ready()) { gs_llm_touch(); return true; }
+    if (!g_gs.llm_evicted) return false;
+    gs_llm_touch();
+    pthread_mutex_lock(&g_llm_swap_lock);
+    if (!ollm_ready() && g_gs.llm_evicted) {
+        int need = g_gs.llm_mb > 512 ? g_gs.llm_mb : 6144;
+        char id[40] = {0};
+        int waited = 0;
+        int got = app->vram ? ovram_lease_wait(app->vram, "llm-reload", (int)getpid(), need, need,
+                                               tier, 120.0, gs_wait_ms(tier), id, sizeof id, &waited)
+                            : need;
+        if (got >= need) {
+            double t0 = gs_now_s();
+            int ngl = resolve_llm_ngl(g_gs.llm_path, g_gs.llm_ngl, 999, g_gs.llm_ctx, g_gs.llm_contexts);
+            bool ok = ollm_init(g_gs.llm_path, ngl, g_gs.llm_ctx, g_gs.llm_contexts);
+            ollm_placement placement;
+            ollm_placement_snapshot(&placement);
+            if (ok && placement.gpu_requested && !placement.on_gpu) {
+                fprintf(stderr, "gpu-sched: LLM reload landed on CPU; unloading\n");
+                ollm_shutdown();
+                ok = false;
+            }
+            pthread_mutex_lock(&g_gs_lock);
+            if (ok) {
+                g_gs.llm_evicted = false;
+                g_gs.llm_reloads++;
+                g_gs.llm_reload_ms_last = (gs_now_s() - t0) * 1000.0;
+            } else {
+                g_gs.llm_reload_failures++;
+            }
+            pthread_mutex_unlock(&g_gs_lock);
+            fprintf(stderr, "gpu-sched: LLM reload %s in %.0f ms (queued %d ms)\n",
+                    ok ? "ok" : "FAILED", (gs_now_s() - t0) * 1000.0, waited);
+        } else {
+            pthread_mutex_lock(&g_gs_lock);
+            g_gs.llm_reload_failures++;
+            pthread_mutex_unlock(&g_gs_lock);
+            fprintf(stderr, "gpu-sched: LLM reload denied VRAM after %d ms\n", waited);
+        }
+        if (id[0]) ovram_release(app->vram, id);
+    }
+    pthread_mutex_unlock(&g_llm_swap_lock);
+    return ollm_ready();
+}
+
+/* Admit the optional guard judge only while the device has had spare
+ * headroom for a minute and nobody is queued; evicted first under pressure. */
+static void *judge_admit_main(void *arg) {
+    app_state *app = arg;
+    int stable = 0;
+    for (;;) {
+        sleep(15);
+        if (guard_judge_ready()) { stable = 0; continue; }
+        if (gs_now_s() < g_gs.judge_next_admit_s) { stable = 0; continue; }
+        int need = gs_judge_need_mb();
+        bool quiet = true;
+        for (int t = TIER_PAID; t <= TIER_BACKGROUND; t++) {
+            if (ovram_waiting(app->vram, (otier)t) > 0) quiet = false;
+        }
+        int head = ovram_headroom(app->vram, TIER_BACKGROUND);
+        stable = quiet && head >= need + g_gs.judge_margin_mb ? stable + 1 : 0;
+        if (stable < 4) continue;
+        stable = 0;
+        char id[40] = {0};
+        if (ovram_lease_wait(app->vram, "guard-judge", (int)getpid(), need, need, TIER_BACKGROUND,
+                             120.0, 0, id, sizeof id, NULL) < need) continue;
+        pthread_rwlock_wrlock(&g_judge_rw);
+        bool ok = ojudge_init(g_gs.judge_gguf, 4096, g_gs.judge_threads);
+        pthread_rwlock_unlock(&g_judge_rw);
+        ovram_release(app->vram, id);
+        pthread_mutex_lock(&g_gs_lock);
+        if (ok) g_gs.judge_admits++;
+        else g_gs.judge_next_admit_s = gs_now_s() + 1800.0;
+        pthread_mutex_unlock(&g_gs_lock);
+        fprintf(stderr, "gpu-sched: guard judge admit %s (headroom %d MB, need %d MB)\n",
+                ok ? "ok" : "failed", head, need);
+    }
+    return NULL;
+}
+
+static size_t gpu_sched_json(char *out, size_t cap) {
+    double last = 0.0;
+    __atomic_load(&g_gs.llm_last_used_s, &last, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_gs_lock);
+    int n = snprintf(out, cap,
+        "{\"wait_ms\":{\"paid\":%d,\"sub\":%d,\"free\":%d,\"background\":%d},"
+        "\"image_lease_mb\":%d,\"image_edit_lease_mb\":%d,\"image_waits\":%llu,"
+        "\"image_wait_denials\":%llu,\"broker_unreachable\":%llu,"
+        "\"llm\":{\"evict_idle_s\":%d,\"evict_max_tier\":\"%s\",\"loaded\":%s,\"evicted\":%s,"
+        "\"idle_s\":%.0f,\"evictions\":%llu,\"reloads\":%llu,\"reload_failures\":%llu,"
+        "\"reload_ms_last\":%.0f,\"freed_mb_last\":%d},"
+        "\"judge\":{\"auto\":%s,\"loaded\":%s,\"admits\":%llu,\"evictions\":%llu}}",
+        g_gs.wait_ms[0], g_gs.wait_ms[1], g_gs.wait_ms[2], g_gs.wait_ms[3],
+        g_gs.sd_lease_mb, g_gs.sd_edit_lease_mb, g_gs.image_waits, g_gs.image_wait_denials,
+        g_gs.broker_unreachable,
+        g_gs.llm_idle_s, otier_name(g_gs.llm_evict_max_tier), ollm_ready() ? "true" : "false",
+        g_gs.llm_evicted ? "true" : "false", last > 0 ? gs_now_s() - last : -1.0,
+        g_gs.llm_evictions, g_gs.llm_reloads, g_gs.llm_reload_failures, g_gs.llm_reload_ms_last,
+        g_gs.llm_mb, g_gs.judge_auto ? "true" : "false", ojudge_ready() ? "true" : "false",
+        g_gs.judge_admits, g_gs.judge_evictions);
+    pthread_mutex_unlock(&g_gs_lock);
+    return n > 0 ? ((size_t)n < cap ? (size_t)n : cap - 1) : 0;
+}
+
+/* Image-lane lease: remote broker when configured (fail open if unreachable),
+ * else the local one. Returns granted MB; *remote tells the release path. */
+static int image_gpu_lease(app_state *app, int mb, otier tier, char *id, size_t id_cap,
+                           bool *remote, int *waited_ms) {
+    *remote = false;
+    *waited_ms = 0;
+    int wait = gs_wait_ms(tier);
+    if (app->vram_broker_url) {
+        bool force = (g_gs.force_tier_mask >> (unsigned)tier) & 1u;
+        int got = obroker_lease(app->vram_broker_url, app->vram_owner, (int)getpid(), mb, mb,
+                                tier, 600.0, wait, force, id, id_cap, waited_ms);
+        if (got < 0) {
+            pthread_mutex_lock(&g_gs_lock);
+            g_gs.broker_unreachable++;
+            pthread_mutex_unlock(&g_gs_lock);
+            fprintf(stderr, "gpu-sched: broker %s unreachable; using local headroom check\n",
+                    app->vram_broker_url);
+            id[0] = 0;
+            return mb;
+        }
+        *remote = true;
+        return got;
+    }
+    if (!app->vram) return mb;
+    int got = ovram_lease_wait(app->vram, app->vram_owner, (int)getpid(), mb, mb, tier, 600.0,
+                               wait, id, id_cap, waited_ms);
+    if (got < mb && ((g_gs.force_tier_mask >> (unsigned)tier) & 1u)) {
+        got = ovram_lease_force(app->vram, app->vram_owner, (int)getpid(), mb, tier, 600.0, id, id_cap);
+    }
+    return got;
+}
+
+static void image_gpu_release(app_state *app, const char *id, bool remote) {
+    if (!id || !id[0]) return;
+    if (remote) (void)obroker_release(app->vram_broker_url, id);
+    else if (app->vram) ovram_release(app->vram, id);
+}
+
+#define OGUARD_REFUSAL "I can't help with that."
+
+static void guard_refuse_chat(ohttp_request *req, bool stream, oguard_category category) {
+    char hdr[96];
+    snprintf(hdr, sizeof hdr, "X-Content-Policy: blocked:%s", oguard_category_name(category));
+    if (stream) {
+        ohttp_stream_begin_h(req, 200, "text/event-stream", hdr);
+        char chunk[1024];
+        int n = snprintf(chunk, sizeof chunk,
+            "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,"
+            "\"delta\":{\"role\":\"assistant\",\"content\":\"%s\"},"
+            "\"finish_reason\":\"content_filter\"}],\"usage\":{\"prompt_tokens\":0,"
+            "\"completion_tokens\":0}}\n\ndata: [DONE]\n\n", OGUARD_REFUSAL);
+        if (n > 0) ohttp_stream_write(req, chunk, (size_t)n);
+        ohttp_stream_end(req);
+        return;
+    }
+    char body[1024];
+    int n = snprintf(body, sizeof body,
+        "{\"id\":\"chatcmpl-guard\",\"object\":\"chat.completion\",\"created\":%ld,"
+        "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+        "\"content\":\"%s\"},\"finish_reason\":\"content_filter\"}],"
+        "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}",
+        time(NULL), ollm_model_name(), OGUARD_REFUSAL);
+    ohttp_respond_h(req, 200, "application/json", body, n > 0 ? (size_t)n : 0, hdr);
+}
+
+static void guard_refuse_completion(ohttp_request *req, bool legacy, oguard_category category) {
+    char hdr[96];
+    snprintf(hdr, sizeof hdr, "X-Content-Policy: blocked:%s", oguard_category_name(category));
+    char body[1024];
+    int n;
+    if (legacy) {
+        n = snprintf(body, sizeof body,
+            "[{\"generated_text\":\"%s\",\"stop_reason\":\"content_filter\","
+            "\"thinking_content\":null}]", OGUARD_REFUSAL);
+    } else {
+        n = snprintf(body, sizeof body,
+            "{\"id\":\"cmpl-guard\",\"object\":\"text_completion\",\"choices\":[{\"index\":0,"
+            "\"text\":\"%s\",\"finish_reason\":\"content_filter\"}],\"model\":\"%s\","
+            "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}",
+            OGUARD_REFUSAL, ollm_model_name());
+    }
+    ohttp_respond_h(req, 200, "application/json", body, n > 0 ? (size_t)n : 0, hdr);
+}
+
 static void handle_chat(ohttp_request *req, app_state *app) {
-    if (!ollm_ready()) {
+    if (!llm_ensure_loaded(app, request_tier(req))) {
         respond_error(req, 503, "no LLM model loaded; start with OMNISERVE_NATIVE_LLM_GGUF");
         return;
     }
@@ -1089,9 +1963,35 @@ static void handle_chat(ohttp_request *req, app_state *app) {
         return;
     }
 
+    bool guard_stream = false;
+    int stream_tok = oj_obj_get(req->body, toks, n, 0, "stream");
+    if (stream_tok >= 0) guard_stream = oj_bool(req->body, &toks[stream_tok], false);
+    if (oguard_enabled()) {
+        char *gsys = NULL;
+        char *gctx = NULL;
+        const char *guser = "";
+        guard_collect_chat(msgs, msg_n, &gsys, &guser, &gctx);
+        long guard_t0 = guard_now_us();
+        oguard_verdict gv = oguard_classify(gsys, guser, gctx);
+        long guard_elapsed = guard_now_us() - guard_t0;
+        if (gv.category != OGUARD_NONE) {
+            guard_block_log(req, gv.category, gv.matched_rule, gsys, guser, gctx, guard_elapsed);
+            guard_refuse_chat(req, guard_stream, gv.category);
+            free(gsys);
+            free(gctx);
+            for (int i = 0; i < owned_n; i++) free(owned[i]);
+            free(toks);
+            return;
+        }
+        free(gsys);
+        free(gctx);
+    }
+
+    bool thinking_default = ollm_thinking_default();
     ochat_req creq = { .messages = msgs, .message_count = msg_n, .max_tokens = 512,
                        .temperature = 0.8f, .top_p = 0.92f, .top_k = 40,
-                       .repetition_penalty = 1.0f, .seed = -1, .enable_thinking = true };
+                       .repetition_penalty = 1.0f, .seed = -1,
+                       .enable_thinking = thinking_default };
     int t = oj_obj_get(req->body, toks, n, 0, "max_tokens");
     if (t >= 0) creq.max_tokens = (int)oj_number(req->body, &toks[t], 512);
     t = oj_obj_get(req->body, toks, n, 0, "temperature");
@@ -1109,7 +2009,7 @@ static void handle_chat(ohttp_request *req, app_state *app) {
     t = oj_obj_get(req->body, toks, n, 0, "seed");
     if (t >= 0) creq.seed = (int64_t)oj_number(req->body, &toks[t], -1);
     t = oj_obj_get(req->body, toks, n, 0, "enable_thinking");
-    if (t >= 0) creq.enable_thinking = oj_bool(req->body, &toks[t], true);
+    if (t >= 0) creq.enable_thinking = oj_bool(req->body, &toks[t], thinking_default);
     const char *stop_values[16];
     creq.stop_count = parse_stop_values(req->body, toks, n, 0, "stop", stop_values,
                                         owned, &owned_n, MAX_MSGS * 2 + 16);
@@ -1241,7 +2141,7 @@ static void parse_sampling(const char *js, const oj_tok *toks, int n, int root,
 }
 
 static void handle_completion(ohttp_request *req, app_state *app, bool legacy, bool autocomplete) {
-    if (!ollm_ready()) {
+    if (!llm_ensure_loaded(app, request_tier(req))) {
         respond_error(req, 503, "no LLM model loaded or configured upstream");
         return;
     }
@@ -1279,7 +2179,8 @@ static void handle_completion(ohttp_request *req, app_state *app, bool legacy, b
         .raw_prompt = system_owned ? NULL : prompt, .completion_prefix = prompt,
         .max_tokens = 100,
         .temperature = 0.7f, .top_p = 0.9f, .top_k = 40,
-        .repetition_penalty = 1.0f, .seed = -1, .enable_thinking = false,
+        .repetition_penalty = 1.0f, .seed = -1,
+        .enable_thinking = ollm_thinking_default(),
     };
     if (autocomplete) {
         creq.max_tokens = 32;
@@ -1311,6 +2212,20 @@ static void handle_completion(ohttp_request *req, app_state *app, bool legacy, b
     int echo_tok = oj_obj_get(req->body, toks, n, 0, "echo");
     if (echo_tok >= 0) echo = oj_bool(req->body, &toks[echo_tok], false);
     free(toks);
+
+    if (oguard_enabled()) {
+        long guard_t0 = guard_now_us();
+        oguard_verdict gv = oguard_classify(system_owned, prompt, NULL);
+        long guard_elapsed = guard_now_us() - guard_t0;
+        if (gv.category != OGUARD_NONE) {
+            guard_block_log(req, gv.category, gv.matched_rule, system_owned, prompt, NULL, guard_elapsed);
+            guard_refuse_completion(req, legacy, gv.category);
+            free(system_owned);
+            free(prompt);
+            for (int i = 0; i < stop_owned_n; i++) free(stop_owned[i]);
+            return;
+        }
+    }
 
     otier tier = request_tier(req);
     int permits = tier == TIER_BACKGROUND ? osched_capacity(app->sched) : app->llm_permits;
@@ -1398,10 +2313,15 @@ static void handle_completion(ohttp_request *req, app_state *app, bool legacy, b
 /* Defined with the other relay helpers below; the embedded image lane needs
  * both before that. */
 static oproxy_target *image_overflow_for(const app_state *app, otier tier);
-static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_target *overflow);
+static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_target *overflow,
+                                 bool claimed);
 
 /* Inspect only routing metadata: sibling bodies need not satisfy Z-Image's
  * parser, and source images must not be decoded by this gateway. */
+static void relay_image_model_to(ohttp_request *req, app_state *app, image_model_upstream *model,
+                                 const char *body, size_t body_len,
+                                 const char *content_type, size_t content_type_len);
+
 static bool relay_image_model(ohttp_request *req, app_state *app) {
     if (!app->image_model_upstream_count || !req->body) return false;
     oj_tok tokens[MAX_TOKS];
@@ -1422,12 +2342,25 @@ static bool relay_image_model(ohttp_request *req, app_state *app) {
         }
     }
     if (!model) return false;
+    size_t content_type_len = 0;
+    const char *content_type = ohttp_req_header(req, "Content-Type", &content_type_len);
+    if (!content_type) {
+        content_type = "application/json";
+        content_type_len = strlen(content_type);
+    }
+    relay_image_model_to(req, app, model, req->body, req->body_len, content_type, content_type_len);
+    return true;
+}
+
+static void relay_image_model_to(ohttp_request *req, app_state *app, image_model_upstream *model,
+                                 const char *body, size_t body_len,
+                                 const char *content_type, size_t content_type_len) {
     otier tier = request_tier(req);
     /* This sibling uses the same GPU, so it must queue. The standing remote
      * overflow is not an alternative backend for this selected model. */
     if (!osched_acquire_n(app->sched, tier, app->image_permits)) {
         respond_error(req, 503, "admission timeout; retry");
-        return true;
+        return;
     }
     char auth[1024];
     oproxy_header forwarded[20];
@@ -1447,18 +2380,12 @@ static bool relay_image_model(ohttp_request *req, app_state *app) {
     const char *tier_name = otier_name(tier);
     forwarded[n++] = (oproxy_header){
         "X-Omniserve-Tier", sizeof "X-Omniserve-Tier" - 1, tier_name, strlen(tier_name)};
-    size_t content_type_len = 0;
-    const char *content_type = ohttp_req_header(req, "Content-Type", &content_type_len);
-    if (!content_type) {
-        content_type = "application/json";
-        content_type_len = strlen(content_type);
-    }
     char error[256];
     oproxy_result result;
     __atomic_fetch_add(&model->relay_total, 1, __ATOMIC_RELAXED);
     bool ok = oproxy_target_relay(model->target,
         req->method, req->method_len, req->path, req->path_len,
-        NULL, 0, req->body, req->body_len, content_type, content_type_len,
+        NULL, 0, body, body_len, content_type, content_type_len,
         forwarded, n, app->upstream_timeout_ms, proxy_sink_raw, req,
         &result, error, sizeof error);
     osched_release_n(app->sched, tier, app->image_permits);
@@ -1467,7 +2394,66 @@ static bool relay_image_model(ohttp_request *req, app_state *app) {
         if (!result.response_started) respond_error(req, 502, "image model backend unavailable");
         else ohttp_force_close(req);
     } else if (result.downstream_close) ohttp_force_close(req);
+}
+
+static image_model_upstream *image_model_named(app_state *app, const char *name) {
+    if (!name || !name[0]) return NULL;
+    for (int i = 0; i < app->image_model_upstream_count; i++)
+        if (!strcasecmp(name, app->image_model_upstreams[i].model))
+            return &app->image_model_upstreams[i];
+    return NULL;
+}
+
+/* /v1/images/edits without a routable model: OpenAI multipart is converted to
+ * the sibling's JSON reference-edit contract, and JSON is relayed unchanged,
+ * to OMNISERVE_NATIVE_IMAGE_EDIT_MODEL (default: the first image model). A
+ * configured masked-edit pool keeps JSON requests; local reference edit wins. */
+static bool relay_image_edit_default(ohttp_request *req, app_state *app) {
+    if (!app->image_model_upstream_count || !req->body) return false;
+    size_t content_type_len = 0;
+    const char *content_type = ohttp_req_header(req, "Content-Type", &content_type_len);
+    bool multipart = content_type && content_type_len >= 19 &&
+                     !strncasecmp(content_type, "multipart/form-data", 19);
+    if (!multipart && (app->image_editor_upstream || osd_reference_edit_ready())) return false;
+    image_model_upstream *model = image_model_named(app, getenv("OMNISERVE_NATIVE_IMAGE_EDIT_MODEL"));
+    if (!model) model = &app->image_model_upstreams[0];
+    if (!multipart) {
+        relay_image_model_to(req, app, model, req->body, req->body_len,
+                             "application/json", strlen("application/json"));
+        return true;
+    }
+    char named[64], error[256];
+    size_t json_len = 0;
+    char *json = oimage_edit_multipart_to_json(content_type, content_type_len, req->body,
+                                               req->body_len, &json_len, named, sizeof named,
+                                               error, sizeof error);
+    if (!json) {
+        respond_error(req, 400, error);
+        return true;
+    }
+    image_model_upstream *chosen = image_model_named(app, named);
+    relay_image_model_to(req, app, chosen ? chosen : model, json, json_len,
+                         "application/json", strlen("application/json"));
+    free(json);
     return true;
+}
+
+static double frontier_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static double request_deadline_ms(const ohttp_request *req) {
+    if (!request_is_internal(req)) return 0;
+    size_t len = 0;
+    const char *v = ohttp_req_header(req, "X-Omniserve-Deadline-Ms", &len);
+    if (!v || !len || len > 12) return 0;
+    char buf[16];
+    memcpy(buf, v, len);
+    buf[len] = 0;
+    double d = atof(buf);
+    return d > 0 ? d : 0;
 }
 
 static void handle_images(ohttp_request *req, app_state *app) {
@@ -1479,7 +2465,7 @@ static void handle_images(ohttp_request *req, app_state *app) {
         if (overflow) {
             app->overflow_failover++;
             fprintf(stderr, "no diffusion model loaded; relaying to the image overflow\n");
-            relay_image_overflow(req, app, overflow);
+            relay_image_overflow(req, app, overflow, false);
             return;
         }
         respond_error(req, 503, "no diffusion model loaded; start with OMNISERVE_NATIVE_SD_MODEL");
@@ -1506,8 +2492,13 @@ static void handle_images(ohttp_request *req, app_state *app) {
         return;
     }
     oimg_result result;
+    double frontier_started = frontier_now_ms();
+    double frontier_queue_ms = 0, frontier_wait_ms = 0;
     bool ok = osd_try_cached_result(&image_request.generation, &result);
-    if (ok) goto encode_image;
+    if (ok) {
+        ofrontier_log(app->frontier, tier, "cache", "exact", 0, frontier_now_ms() - frontier_started, 0, 200);
+        goto encode_image;
+    }
     int permits = app->image_permits;
     /* With a remote available, queueing locally is the wrong default: the wait
      * buys nothing the remote would not have already delivered. Try-acquire
@@ -1515,10 +2506,47 @@ static void handle_images(ohttp_request *req, app_state *app) {
      * cannot jump ahead of one that has already paid the latency. */
     if (overflow) {
         if (!osched_try_acquire_n(app->sched, tier, permits)) {
-            app->overflow_saturated++;
-            oimage_request_free(&image_request);
-            relay_image_overflow(req, app, overflow);
-            return;
+            ofr_table table;
+            bool keep_local = false, have_table = false;
+            if (app->frontier_routing && ofrontier_snapshot(app->frontier, &table)) {
+                have_table = true;
+                osched_stats stats;
+                osched_snapshot(app->sched, &stats);
+                frontier_wait_ms = ofrontier_local_wait_ms(&stats, tier, permits, table.local_p50_ms);
+                keep_local = ofrontier_decide(&table, tier, frontier_wait_ms,
+                                              request_deadline_ms(req)) == OFR_LOCAL;
+            }
+            /* Breaker open (or another caller holds the half-open probe): the
+             * local queue is the next upstream in the chain. */
+            bool claimed = !keep_local && oproxy_target_allow(overflow);
+            if (claimed) {
+                app->overflow_saturated++;
+                oimage_request_free(&image_request);
+                double relay_started = frontier_now_ms();
+                relay_image_overflow(req, app, overflow, true);
+                ofrontier_log(app->frontier, tier, "overflow", "saturated", 0,
+                              frontier_now_ms() - relay_started, frontier_wait_ms, 0);
+                return;
+            }
+            __atomic_fetch_add(&app->frontier_kept_local, 1, __ATOMIC_RELAXED);
+            double queued = frontier_now_ms();
+            if (!osched_acquire_n(app->sched, tier, permits)) {
+                oimage_request_free(&image_request);
+                if (!have_table || ofrontier_decide(&table, tier, 1e12, 0) == OFR_LOCAL) {
+                    ofrontier_log(app->frontier, tier, "local", "admission_timeout",
+                                  frontier_now_ms() - queued, 0, frontier_wait_ms, 503);
+                    respond_error(req, 503, "admission timeout; retry");
+                    return;
+                }
+                app->overflow_saturated++;
+                double relay_started = frontier_now_ms();
+                relay_image_overflow(req, app, overflow, false);
+                ofrontier_log(app->frontier, tier, "overflow", "admission_timeout",
+                              relay_started - queued, frontier_now_ms() - relay_started,
+                              frontier_wait_ms, 0);
+                return;
+            }
+            frontier_queue_ms = frontier_now_ms() - queued;
         }
     } else if (!osched_acquire_n(app->sched, tier, permits)) {
         oimage_request_free(&image_request);
@@ -1530,16 +2558,31 @@ static void handle_images(ohttp_request *req, app_state *app) {
      * lets another tenant claim the same bytes between admission and a late
      * denoising cache allocation. */
     char image_lease_id[40] = {0};
-    int required_headroom_mb = oimage_gpu_headroom_mb();
-    if (app->vram && required_headroom_mb > 0 &&
-        ovram_lease(app->vram, "embedded-zimage", required_headroom_mb,
-                    required_headroom_mb, tier, 0.0,
-                    image_lease_id, sizeof image_lease_id) != required_headroom_mb) {
+    bool image_lease_remote = false;
+    int required_headroom_mb = img2img ? g_gs.sd_edit_lease_mb : g_gs.sd_lease_mb;
+    /* Lease figures are for 1024x1024. Activation memory scales with pixels
+     * on top of a fixed part (weights streamed per layer, text encoder):
+     * measured Qwen 2.1 growth ~7.7 GB at 768^2 vs ~10.3 GB at 1024^2. */
+    if (g_gs.lease_scale_by_pixels && required_headroom_mb > 0) {
+        double mpx = (double)image_request.generation.width * image_request.generation.height /
+                     (1024.0 * 1024.0);
+        if (mpx > 0.0) {
+            double scaled = required_headroom_mb * (0.45 + 0.55 * mpx);
+            required_headroom_mb = (int)(scaled < 256.0 ? 256.0 : scaled);
+        }
+    }
+    int image_waited_ms = 0;
+    if (required_headroom_mb > 0 &&
+        image_gpu_lease(app, required_headroom_mb, tier, image_lease_id, sizeof image_lease_id,
+                        &image_lease_remote, &image_waited_ms) < required_headroom_mb) {
+        pthread_mutex_lock(&g_gs_lock);
+        g_gs.image_wait_denials++;
+        pthread_mutex_unlock(&g_gs_lock);
         char lease_error[160];
         snprintf(lease_error, sizeof lease_error,
                  "image generation needs at least %d MB free GPU memory; "
-                 "managed GPU capacity is busy",
-                 required_headroom_mb);
+                 "managed GPU capacity is busy (queued %d ms)",
+                 required_headroom_mb, image_waited_ms);
         osched_release_n(app->sched, tier, permits);
         oimage_request_free(&image_request);
         /* A device that cannot take this request is a capacity refusal, not a
@@ -1547,7 +2590,7 @@ static void handle_images(ohttp_request *req, app_state *app) {
          * can serve it. */
         if (overflow) {
             app->overflow_saturated++;
-            relay_image_overflow(req, app, overflow);
+            relay_image_overflow(req, app, overflow, false);
             return;
         }
         respond_error(req, 503, lease_error);
@@ -1558,20 +2601,28 @@ static void handle_images(ohttp_request *req, app_state *app) {
     char headroom_error[160];
     if (ogpu_memory_gib(&free_gib, &total_gib) &&
         !oimage_gpu_headroom_ok(free_gib, headroom_error, sizeof headroom_error)) {
-        if (image_lease_id[0]) ovram_release(app->vram, image_lease_id);
+        image_gpu_release(app, image_lease_id, image_lease_remote);
         osched_release_n(app->sched, tier, permits);
         oimage_request_free(&image_request);
         if (overflow) {
             app->overflow_saturated++;
-            relay_image_overflow(req, app, overflow);
+            relay_image_overflow(req, app, overflow, false);
             return;
         }
         respond_error(req, 503, headroom_error);
         return;
     }
+    double exec_started = frontier_now_ms();
+    if (image_waited_ms > 0) {
+        pthread_mutex_lock(&g_gs_lock);
+        g_gs.image_waits++;
+        pthread_mutex_unlock(&g_gs_lock);
+    }
     ok = osd_generate(&image_request.generation, &result);
-    if (image_lease_id[0]) ovram_release(app->vram, image_lease_id);
+    image_gpu_release(app, image_lease_id, image_lease_remote);
     osched_release_n(app->sched, tier, permits);
+    ofrontier_log(app->frontier, tier, "local", frontier_queue_ms > 0 ? "queued" : "admitted",
+                  frontier_queue_ms, frontier_now_ms() - exec_started, frontier_wait_ms, ok ? 200 : 500);
     if (!ok) {
         oimage_request_free(&image_request);
         /* Nothing has been written to the caller yet, so this is still a safe
@@ -1579,7 +2630,7 @@ static void handle_images(ohttp_request *req, app_state *app) {
         if (overflow) {
             app->overflow_failover++;
             fprintf(stderr, "local image generation failed; relaying to the image overflow\n");
-            relay_image_overflow(req, app, overflow);
+            relay_image_overflow(req, app, overflow, false);
             return;
         }
         respond_error(req, 500, "image generation failed");
@@ -1706,6 +2757,7 @@ static int build_relay_headers(const app_state *app, const ohttp_request *req,
 static oproxy_target *image_overflow_for(const app_state *app, otier tier) {
     if (!app->image_overflow) return NULL;
     if (!(app->overflow_tier_mask & (1u << (unsigned)tier))) return NULL;
+    if (oproxy_target_open_ms(app->image_overflow) > 0) return NULL;
     return app->image_overflow;
 }
 
@@ -1713,14 +2765,24 @@ static oproxy_target *image_overflow_for(const app_state *app, otier tier) {
  * as the caller's own. The body goes across unchanged: the remote is handed
  * exactly the JSON this gateway parses, which is what lets the app.nz cog seam
  * be addressed like any other upstream. */
-static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_target *overflow) {
+static void relay_image_overflow(ohttp_request *req, app_state *app, oproxy_target *overflow,
+                                 bool claimed) {
+    if (!claimed && !oproxy_target_allow(overflow)) {
+        respond_error(req, 503, "overflow backend unavailable; retry");
+        return;
+    }
     char auth[1024];
     oproxy_header forwarded[17];
-    int forwarded_n = build_relay_headers(app, req, overflow, -1, forwarded, 17,
+    int forwarded_n = build_relay_headers(app, req, overflow, -1, forwarded, 16,
                                           auth, sizeof auth);
     if (forwarded_n < 0) {
         respond_error(req, 500, "image overflow credential is invalid");
         return;
+    }
+    if (app->frontier) {
+        const char *tier_name = otier_name(request_tier(req));
+        forwarded[forwarded_n++] = (oproxy_header){
+            "X-Omniserve-Tier", sizeof "X-Omniserve-Tier" - 1, tier_name, strlen(tier_name)};
     }
     const char *path = configured_path("OMNISERVE_NATIVE_IMAGE_OVERFLOW_PATH", "/predict-sync");
     size_t path_len = strlen(path);
@@ -1922,7 +2984,7 @@ static void handle_embedding(ohttp_request *req, bool openai_shape) {
 }
 
 static void handle_summarization(ohttp_request *req, app_state *app) {
-    if (!ollm_ready()) {
+    if (!llm_ensure_loaded(app, request_tier(req))) {
         if (app->aux_upstream) {
             handle_proxy(req, app, app->aux_upstream, app->aux_permits, "application/json");
         } else {
@@ -2015,6 +3077,9 @@ static void handle_host_memory(ohttp_request *req) {
 typedef struct {
     char path[PATH_MAX];
     char ngl[32];
+    char tensor_override[512];
+    char moe_cpu_experts[32];
+    char spec_mtp_gguf[PATH_MAX];
     int ctx;
     int contexts;
 } llm_admin_config;
@@ -2027,6 +3092,17 @@ static bool parse_llm_admin_config(const ohttp_request *req, llm_admin_config *o
     const char *default_ngl = g_llm_active_ngl[0]
         ? g_llm_active_ngl : getenv("OMNISERVE_NATIVE_NGL");
     if (default_ngl) snprintf(out->ngl, sizeof out->ngl, "%s", default_ngl);
+    const char *default_tensor = g_llm_active_placement_set
+        ? g_llm_active_tensor_override : getenv("OMNISERVE_NATIVE_TENSOR_OVERRIDE");
+    if (default_tensor) {
+        snprintf(out->tensor_override, sizeof out->tensor_override, "%s", default_tensor);
+    }
+    const char *default_moe = g_llm_active_placement_set
+        ? g_llm_active_moe_cpu_experts : getenv("OMNISERVE_NATIVE_MOE_CPU_EXPERTS");
+    if (default_moe) snprintf(out->moe_cpu_experts, sizeof out->moe_cpu_experts, "%s", default_moe);
+    const char *default_mtp = g_llm_active_placement_set
+        ? g_llm_active_spec_mtp : getenv("OMNISERVE_NATIVE_SPEC_MTP_GGUF");
+    if (default_mtp) snprintf(out->spec_mtp_gguf, sizeof out->spec_mtp_gguf, "%s", default_mtp);
     out->ctx = g_llm_active_ctx > 0 ? g_llm_active_ctx : 8192;
     out->contexts = g_llm_active_contexts > 0 ? g_llm_active_contexts : 1;
 
@@ -2055,6 +3131,36 @@ static bool parse_llm_admin_config(const ohttp_request *req, llm_admin_config *o
             return false;
         }
     }
+    int tensor_tok = oj_obj_get(req->body, toks, n, 0, "tensor_override");
+    if (tensor_tok >= 0) {
+        if (toks[tensor_tok].type != OJ_STRING) {
+            free(toks);
+            return false;
+        }
+        out->tensor_override[0] = 0;
+        (void)oj_unescape(req->body, &toks[tensor_tok],
+                          out->tensor_override, sizeof out->tensor_override);
+    }
+    int moe_tok = oj_obj_get(req->body, toks, n, 0, "moe_cpu_experts");
+    if (moe_tok >= 0) {
+        if (toks[moe_tok].type != OJ_STRING) {
+            free(toks);
+            return false;
+        }
+        out->moe_cpu_experts[0] = 0;
+        (void)oj_unescape(req->body, &toks[moe_tok],
+                          out->moe_cpu_experts, sizeof out->moe_cpu_experts);
+    }
+    int mtp_tok = oj_obj_get(req->body, toks, n, 0, "spec_mtp_gguf");
+    if (mtp_tok >= 0) {
+        if (toks[mtp_tok].type != OJ_STRING) {
+            free(toks);
+            return false;
+        }
+        out->spec_mtp_gguf[0] = 0;
+        (void)oj_unescape(req->body, &toks[mtp_tok],
+                          out->spec_mtp_gguf, sizeof out->spec_mtp_gguf);
+    }
     int ctx_tok = oj_obj_get(req->body, toks, n, 0, "ctx");
     if (ctx_tok >= 0) out->ctx = (int)oj_number(req->body, &toks[ctx_tok], out->ctx);
     int contexts_tok = oj_obj_get(req->body, toks, n, 0, "contexts");
@@ -2070,33 +3176,65 @@ static void llm_admin_response(ohttp_request *req, bool ok, int status, const ch
     ollm_placement_snapshot(&placement);
     double free_gib = -1.0;
     (void)ogpu_memory_gib(&free_gib, NULL);
-    char body[768];
+    char *ovr = NULL;
+    size_t ovr_len = 0, ovr_cap = 0;
+    (void)oj_escape_append(&ovr, &ovr_len, &ovr_cap,
+                           placement.tensor_override, strlen(placement.tensor_override));
+    char body[2048];
     snprintf(body, sizeof body,
              "{\"ok\":%s,\"action\":\"%s\",\"loaded\":%s,"
              "\"model\":\"%.240s\",\"placement\":\"%s\","
+             "\"gpu_expert_layers\":%d,\"cpu_expert_layers\":%d,"
+             "\"tensor_override\":\"%s\",\"est_gpu_bytes\":%llu,"
              "\"gpu_free_gib\":%.2f}",
              ok ? "true" : "false", action, ollm_ready() ? "true" : "false",
              ollm_model_name(), placement.on_gpu ? "gpu" : "cpu",
+             placement.gpu_expert_layers, placement.cpu_expert_layers,
+             ovr ? ovr : "", placement.est_gpu_bytes,
              free_gib);
+    free(ovr);
     ohttp_respond_str(req, status, "application/json", body);
 }
 
 static bool llm_admin_load(const llm_admin_config *config) {
     char resolved[PATH_MAX];
-    if (!llm_swap_path(config->path, resolved, sizeof resolved)) return false;
+    if (!llm_swap_path(config->path, resolved, sizeof resolved)) {
+        const char *root = getenv("OMNISERVE_NATIVE_LLM_SWAP_DIR");
+        fprintf(stderr, "admin LLM load rejected: '%s' is not a regular file under %s='%s'\n",
+                config->path, "OMNISERVE_NATIVE_LLM_SWAP_DIR", root ? root : "(unset)");
+        return false;
+    }
     int contexts = config->contexts > 0 ? config->contexts : 1;
     const char *slots_env = getenv("OMNISERVE_NATIVE_SLOTS");
     int slots = slots_env ? atoi(slots_env) : contexts;
     if (slots < 1) slots = 1;
     if (contexts > slots) contexts = slots;
+    char mtp_resolved[PATH_MAX] = "";
+    if (config->spec_mtp_gguf[0] &&
+        !llm_swap_path(config->spec_mtp_gguf, mtp_resolved, sizeof mtp_resolved)) {
+        const char *root = getenv("OMNISERVE_NATIVE_LLM_SWAP_DIR");
+        fprintf(stderr, "admin LLM load rejected: spec_mtp_gguf '%s' is not a regular file under %s='%s'\n",
+                config->spec_mtp_gguf, "OMNISERVE_NATIVE_LLM_SWAP_DIR", root ? root : "(unset)");
+        return false;
+    }
     const char *ngl = config->ngl[0] ? config->ngl : "auto";
-    int layers = resolve_llm_ngl(resolved, ngl, 999);
-    fprintf(stderr, "admin LLM load: path=%s ngl=%s ctx=%d contexts=%d\n",
-            resolved, ngl, config->ctx, contexts);
-    if (!ollm_init(resolved, layers, config->ctx > 0 ? config->ctx : 8192, contexts)) return false;
+    ollm_set_load_overrides(config->tensor_override, config->moe_cpu_experts, mtp_resolved);
+    int ctx = config->ctx > 0 ? config->ctx : 8192;
+    int layers = resolve_llm_ngl(resolved, ngl, 999, ctx, contexts);
+    fprintf(stderr, "admin LLM load: path=%s ngl=%s ctx=%d contexts=%d tensor_override=%s moe_cpu_experts=%s spec_mtp=%s\n",
+            resolved, ngl, config->ctx, contexts,
+            config->tensor_override, config->moe_cpu_experts,
+            mtp_resolved[0] ? mtp_resolved : "(off)");
+    if (!ollm_init(resolved, layers, ctx, contexts)) return false;
     snprintf(g_llm_active_path, sizeof g_llm_active_path, "%s", resolved);
     snprintf(g_llm_active_ngl, sizeof g_llm_active_ngl, "%s", ngl);
-    g_llm_active_ctx = config->ctx > 0 ? config->ctx : 8192;
+    snprintf(g_llm_active_tensor_override, sizeof g_llm_active_tensor_override,
+             "%s", config->tensor_override);
+    snprintf(g_llm_active_moe_cpu_experts, sizeof g_llm_active_moe_cpu_experts,
+             "%s", config->moe_cpu_experts);
+    snprintf(g_llm_active_spec_mtp, sizeof g_llm_active_spec_mtp, "%s", mtp_resolved);
+    g_llm_active_placement_set = true;
+    g_llm_active_ctx = ctx;
     g_llm_active_contexts = contexts;
     return true;
 }
@@ -2136,6 +3274,12 @@ static void handle_llm_swap(ohttp_request *req) {
     llm_admin_config previous = {0};
     snprintf(previous.path, sizeof previous.path, "%s", g_llm_active_path);
     snprintf(previous.ngl, sizeof previous.ngl, "%s", g_llm_active_ngl);
+    snprintf(previous.tensor_override, sizeof previous.tensor_override,
+             "%s", g_llm_active_tensor_override);
+    snprintf(previous.moe_cpu_experts, sizeof previous.moe_cpu_experts,
+             "%s", g_llm_active_moe_cpu_experts);
+    snprintf(previous.spec_mtp_gguf, sizeof previous.spec_mtp_gguf,
+             "%s", g_llm_active_spec_mtp);
     previous.ctx = g_llm_active_ctx;
     previous.contexts = g_llm_active_contexts;
     ollm_shutdown();
@@ -2153,6 +3297,22 @@ static void handle_vram_status(ohttp_request *req, app_state *app) {
     char body[512];
     ovram_status_json(app->vram, body, sizeof body);
     ohttp_respond_str(req, 200, "application/json", body);
+}
+
+static void handle_gpu_status(ohttp_request *req, app_state *app) {
+    size_t cap = 32768;
+    char *body = malloc(cap);
+    if (!body) { respond_error(req, 500, "out of memory"); return; }
+    size_t len = (size_t)snprintf(body, cap, "{\"broker\":%s,\"owner\":\"%s\",\"ledger\":",
+                                  app->vram_broker_url ? "\"remote\"" : app->vram ? "\"local\"" : "null",
+                                  app->vram_owner);
+    if (app->vram) len += ovram_ledger_json(app->vram, body + len, cap - len - 1024);
+    else len += (size_t)snprintf(body + len, cap - len, "null");
+    len += (size_t)snprintf(body + len, cap - len, ",\"sched\":");
+    len += gpu_sched_json(body + len, cap - len - 2);
+    snprintf(body + len, cap - len, "}");
+    ohttp_respond_str(req, 200, "application/json", body);
+    free(body);
 }
 
 static void handle_vram_lease(ohttp_request *req, app_state *app) {
@@ -2183,6 +3343,16 @@ static void handle_vram_lease(ohttp_request *req, app_state *app) {
     int min_mb = min_tok >= 0 ? (int)oj_number(req->body, &toks[min_tok], 0) : 0;
     int ttl_tok = oj_obj_get(req->body, toks, n, 0, "ttl_s");
     double ttl_s = ttl_tok >= 0 ? oj_number(req->body, &toks[ttl_tok], 0) : 0;
+    int pid_tok = oj_obj_get(req->body, toks, n, 0, "pid");
+    int pid = pid_tok >= 0 ? (int)oj_number(req->body, &toks[pid_tok], 0) : 0;
+    /* A waiting lease holds an HTTP worker, so the wait is bounded. */
+    int wait_tok = oj_obj_get(req->body, toks, n, 0, "wait_ms");
+    int wait_ms = wait_tok >= 0 ? (int)oj_number(req->body, &toks[wait_tok], 0) : 0;
+    if (wait_ms < 0) wait_ms = 0;
+    if (wait_ms > 120000) wait_ms = 120000;
+    int force_tok = oj_obj_get(req->body, toks, n, 0, "force");
+    bool force = force_tok >= 0 && req->body_len > (size_t)toks[force_tok].start &&
+                 req->body[toks[force_tok].start] == 't';
 
     /* An internal caller may name its own tier here; request_tier already
      * refuses to honour the header for anyone else, and this endpoint is
@@ -2199,7 +3369,14 @@ static void handle_vram_lease(ohttp_request *req, app_state *app) {
     if (mb <= 0) { respond_error(req, 400, "mb must be positive"); return; }
 
     char id[40] = {0};
-    int granted = ovram_lease(app->vram, owner, mb, min_mb, tier, ttl_s, id, sizeof id);
+    int waited_ms = 0;
+    int granted = ovram_lease_wait(app->vram, owner, pid, mb, min_mb, tier, ttl_s, wait_ms,
+                                   id, sizeof id, &waited_ms);
+    bool forced = false;
+    if (granted <= 0 && force) {
+        granted = ovram_lease_force(app->vram, owner, pid, mb, tier, ttl_s, id, sizeof id);
+        forced = granted > 0;
+    }
     char body[320];
     if (granted > 0) {
         /* Reported so the holder knows when the broker will take the headroom
@@ -2207,15 +3384,17 @@ static void handle_vram_lease(ohttp_request *req, app_state *app) {
         double effective_ttl = ttl_s > 0.0 ? ttl_s : ovram_default_ttl_s(app->vram);
         snprintf(body, sizeof body,
                  "{\"granted\":true,\"lease_id\":\"%s\",\"mb\":%d,\"tier\":\"%s\","
-                 "\"expires_in_s\":%d}",
-                 id, granted, otier_name(tier), (int)effective_ttl);
+                 "\"expires_in_s\":%d,\"waited_ms\":%d,\"forced\":%s}",
+                 id, granted, otier_name(tier), (int)effective_ttl, waited_ms,
+                 forced ? "true" : "false");
     } else {
         /* A denial is a normal answer, not a fault: the caller's fallback path
          * is exactly what "no headroom" should trigger, and a 5xx here would
          * make a healthy broker look broken to every monitor watching it. */
         snprintf(body, sizeof body,
-                 "{\"granted\":false,\"mb\":0,\"reason\":\"no_headroom\",\"tier\":\"%s\"}",
-                 otier_name(tier));
+                 "{\"granted\":false,\"mb\":0,\"reason\":\"no_headroom\",\"tier\":\"%s\","
+                 "\"waited_ms\":%d}",
+                 otier_name(tier), waited_ms);
     }
     ohttp_respond_str(req, 200, "application/json", body);
 }
@@ -2264,12 +3443,51 @@ static void handle_vram_renew(ohttp_request *req, app_state *app) {
                       renewed ? "{\"renewed\":true}" : "{\"renewed\":false}");
 }
 
+static void handle_guard_classify(ohttp_request *req, app_state *app) {
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+    if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+    char *sys = NULL;
+    char *user = NULL;
+    char *ctx = NULL;
+    oj_tok *toks = malloc(sizeof(oj_tok) * 32);
+    if (!toks) { respond_error(req, 500, "out of memory"); return; }
+    int n = oj_parse(req->body, req->body_len, toks, 32);
+    if (n <= 0 || toks[0].type != OJ_OBJECT) {
+        free(toks);
+        respond_error(req, 400, "body must be a JSON object");
+        return;
+    }
+    int st = oj_obj_get(req->body, toks, n, 0, "system");
+    int ut = oj_obj_get(req->body, toks, n, 0, "user");
+    int ct = oj_obj_get(req->body, toks, n, 0, "context");
+    if (st >= 0) sys = oj_strdup(req->body, &toks[st]);
+    if (ut >= 0) user = oj_strdup(req->body, &toks[ut]);
+    if (ct >= 0) ctx = oj_strdup(req->body, &toks[ct]);
+    free(toks);
+    long t0 = guard_now_us();
+    oguard_full f = oguard_classify_diagnose(sys, user, ctx);
+    long dt = guard_now_us() - t0;
+    oguard_classify_note((double)dt / 1000.0);
+    free(sys);
+    free(user);
+    free(ctx);
+    char body[256];
+    snprintf(body, sizeof body,
+             "{\"blocked\":%s,\"category\":\"%s\",\"rule\":\"%.63s\",\"stage\":\"%s\",\"score\":%.4f}",
+             f.final.category != OGUARD_NONE ? "true" : "false",
+             oguard_category_name(f.final.category), f.final.matched_rule,
+             oguard_stage_name(&f), f.final.score);
+    ohttp_respond_str(req, 200, "application/json", body);
+}
+
 static void route(ohttp_request *req, void *user) {
     app_state *app = user;
     if (ohttp_method_is(req, "OPTIONS")) {
         ohttp_respond_str(req, 204, "text/plain", "");
         return;
     }
+    if (!auth_gate(req, app)) return;
     if (ohttp_path_is(req, "/health") || ohttp_path_is(req, "/healthz") ||
         ohttp_path_is(req, "/liveness_check")) { handle_health(req); return; }
     if (ohttp_path_is(req, "/readyz") || ohttp_path_is(req, "/readiness_check")) {
@@ -2279,10 +3497,12 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/errors")) { handle_errors(req); return; }
     if (ohttp_path_is(req, "/status") || ohttp_path_is(req, "/backend_status")) { handle_status(req, app); return; }
     if (ohttp_path_is(req, "/v1/gpu/vram")) { handle_vram_status(req, app); return; }
+    if (ohttp_path_is(req, "/v1/gpu/status")) { handle_gpu_status(req, app); return; }
     if (ohttp_path_is(req, "/v1/host/memory")) { handle_host_memory(req); return; }
     if (ohttp_path_is(req, "/v1/gpu/lease")) { handle_vram_lease(req, app); return; }
     if (ohttp_path_is(req, "/v1/gpu/renew")) { handle_vram_renew(req, app); return; }
     if (ohttp_path_is(req, "/v1/gpu/release")) { handle_vram_release(req, app); return; }
+    if (ohttp_path_is(req, "/v1/guard/classify")) { handle_guard_classify(req, app); return; }
     if (ohttp_path_is(req, "/admin/llm/unload") || ohttp_path_is(req, "/admin/unload")) {
         handle_llm_unload(req); return;
     }
@@ -2381,6 +3601,7 @@ static void route(ohttp_request *req, void *user) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
         if (relay_image_model(req, app)) return;
+        if (ohttp_path_is(req, "/v1/images/edits") && relay_image_edit_default(req, app)) return;
     }
     if (ohttp_path_is(req, "/v1/images/generations")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
@@ -2588,6 +3809,12 @@ static void route(ohttp_request *req, void *user) {
         handle_proxy_as(req, app, app->threed_upstream, 1, NULL, mapped_path);
         return;
     }
+    if (ohttp_path_is(req, "/v1/music/generations")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_proxy(req, app, app->music_upstream, 0, "application/json");
+        return;
+    }
     if (ohttp_path_is(req, "/v1/audio/speech") ||
         ohttp_path_is(req, "/api/v1/generate_speech")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
@@ -2766,6 +3993,11 @@ int main(int argc, char **argv) {
     app.aux_permits = configured_permits("OMNISERVE_NATIVE_AUX_PERMITS", 1, slots);
     const char *admission_env = getenv("OMNISERVE_NATIVE_ADMISSION_TIMEOUT_S");
     app.sched = osched_create(slots, admission_env ? atof(admission_env) : 30.0);
+    {
+        const char *bg_timeout = getenv("OMNISERVE_NATIVE_BACKGROUND_ADMISSION_TIMEOUT_S");
+        const char *bg_age = getenv("OMNISERVE_NATIVE_BACKGROUND_MAX_WAIT_S");
+        osched_set_background(app.sched, bg_timeout ? atof(bg_timeout) : 0, bg_age ? atof(bg_age) : 0);
+    }
     if (env_flag("OMNISERVE_NATIVE_VRAM_BROKER", 1)) {
         const char *keep_env = getenv("OMNISERVE_NATIVE_VRAM_KEEP_FREE_MB");
         const char *ttl_env = getenv("OMNISERVE_NATIVE_VRAM_LEASE_TTL_S");
@@ -2790,6 +4022,43 @@ int main(int argc, char **argv) {
         }
     }
 
+    {
+        const char *url = getenv("OMNISERVE_NATIVE_VRAM_BROKER_URL");
+        app.vram_broker_url = url && url[0] ? url : NULL;
+        const char *owner = getenv("OMNISERVE_NATIVE_VRAM_OWNER");
+        snprintf(app.vram_owner, sizeof app.vram_owner, "%s", owner && owner[0] ? owner : "embedded-zimage");
+        /* Queue budget per tier before an image request gives up on local
+         * VRAM (then overflow or 503). 0 restores the old instant refusal. */
+        static const char *wait_env[4] = {
+            "OMNISERVE_NATIVE_VRAM_WAIT_MS_PAID", "OMNISERVE_NATIVE_VRAM_WAIT_MS_SUB",
+            "OMNISERVE_NATIVE_VRAM_WAIT_MS_FREE", "OMNISERVE_NATIVE_VRAM_WAIT_MS_BACKGROUND"};
+        static const int wait_default[4] = {60000, 45000, 30000, 20000};
+        for (int t = 0; t < 4; t++) {
+            int w = env_int(wait_env[t], wait_default[t]);
+            g_gs.wait_ms[t] = w < 0 ? 0 : w > 120000 ? 120000 : w;
+        }
+        g_gs.sd_lease_mb = env_int("OMNISERVE_NATIVE_SD_LEASE_MB", oimage_gpu_headroom_mb());
+        g_gs.sd_edit_lease_mb = env_int("OMNISERVE_NATIVE_SD_EDIT_LEASE_MB", g_gs.sd_lease_mb);
+        g_gs.lease_scale_by_pixels = env_flag("OMNISERVE_NATIVE_SD_LEASE_SCALE_PIXELS", 0);
+        const char *force_env = getenv("OMNISERVE_NATIVE_VRAM_FORCE_TIERS");
+        g_gs.force_tier_mask = force_env && force_env[0] ? parse_tier_mask(force_env) : 0;
+        if (app.vram) ovram_set_block_max_s(app.vram, env_int("OMNISERVE_NATIVE_VRAM_BLOCK_MAX_S", 15));
+        if (app.vram) ovram_set_job_lease_s(app.vram, env_int("OMNISERVE_NATIVE_VRAM_JOB_LEASE_S", 180));
+        g_gs.llm_idle_s = env_int("OMNISERVE_NATIVE_EVICT_LLM_IDLE_S", 0);
+        const char *evict_tier = getenv("OMNISERVE_NATIVE_EVICT_LLM_MAX_TIER");
+        g_gs.llm_evict_max_tier = evict_tier && evict_tier[0]
+            ? otier_parse(evict_tier, (int)strlen(evict_tier)) : TIER_SUB;
+        gs_llm_touch();
+        if (app.vram && !app.vram_broker_url) {
+            ovram_set_pressure_hook(app.vram, gpu_pressure, &app,
+                                    env_int("OMNISERVE_NATIVE_VRAM_PRESSURE_AFTER_MS", 1500));
+        }
+        if (app.vram_broker_url) {
+            fprintf(stderr, "gpu-sched: image lane leases from %s as %s (%d/%d MB)\n",
+                    app.vram_broker_url, app.vram_owner, g_gs.sd_lease_mb, g_gs.sd_edit_lease_mb);
+        }
+    }
+
     /* Warm the weights the broker may later ask us to drop. Defaults to the
      * models this process already loads, so the common case needs no config;
      * an explicit list can add files owned by co-tenants. */
@@ -2808,6 +4077,7 @@ int main(int argc, char **argv) {
         if (paths[0]) ohost_prefetch_start(paths, keep_pct);
     }
     app.secret = getenv("OMNISERVE_NATIVE_SECRET");
+    auth_gate_init();
     app.h3_api_key = getenv("OMNISERVE_NATIVE_H3_API_KEY");
     app.h3_tier_mask = parse_tier_mask(getenv("OMNISERVE_NATIVE_H3_TIERS"));
     app.prefer_embedded_image = env_flag("OMNISERVE_NATIVE_IMAGE_PREFER_EMBEDDED", 0);
@@ -2829,6 +4099,7 @@ int main(int argc, char **argv) {
     const char *birefnet_upstream = getenv("OMNISERVE_NATIVE_BIREFNET_UPSTREAM");
     const char *tts_upstream = getenv("OMNISERVE_NATIVE_TTS_UPSTREAM");
     const char *stt_upstream = getenv("OMNISERVE_NATIVE_STT_UPSTREAM");
+    const char *music_upstream = getenv("OMNISERVE_NATIVE_MUSIC_UPSTREAM");
     const char *forecast_upstream = getenv("OMNISERVE_NATIVE_FORECAST_UPSTREAM");
     const char *training_upstream = getenv("OMNISERVE_NATIVE_TRAINING_UPSTREAM");
     const char *embedding_upstream = getenv("OMNISERVE_NATIVE_EMBEDDING_UPSTREAM");
@@ -2865,6 +4136,7 @@ int main(int argc, char **argv) {
     CREATE_UPSTREAM(birefnet_upstream, birefnet_upstream, "birefnet");
     CREATE_UPSTREAM(tts_upstream, tts_upstream, "TTS");
     CREATE_UPSTREAM(stt_upstream, stt_upstream, "STT");
+    CREATE_UPSTREAM(music_upstream, music_upstream, "music");
     CREATE_UPSTREAM(forecast_upstream, forecast_upstream, "forecast");
     CREATE_UPSTREAM(training_upstream, training_upstream, "training");
     CREATE_UPSTREAM(embedding_upstream, embedding_upstream, "embedding");
@@ -2937,6 +4209,7 @@ int main(int argc, char **argv) {
     }
     const char *upstream_timeout = getenv("OMNISERVE_NATIVE_UPSTREAM_TIMEOUT_MS");
     app.upstream_timeout_ms = upstream_timeout ? atoi(upstream_timeout) : 600000;
+    app.music_timeout_ms = 1530000;
     const char *h3_timeout = getenv("OMNISERVE_NATIVE_H3_TIMEOUT_MS");
     app.h3_timeout_ms = h3_timeout ? atoi(h3_timeout) : 1800000;
     /* The image overflow is reached by a metered cog that has to cold start a
@@ -2944,6 +4217,12 @@ int main(int argc, char **argv) {
      * generous: a timeout here is a paid request thrown away. */
     app.image_overflow_api_key = getenv("OMNISERVE_NATIVE_IMAGE_OVERFLOW_API_KEY");
     app.image_overflow_timeout_ms = env_int("OMNISERVE_NATIVE_IMAGE_OVERFLOW_TIMEOUT_MS", 600000);
+    {
+        const char *policy = getenv("OMNISERVE_NATIVE_FRONTIER_POLICY");
+        app.frontier = ofrontier_open(policy, getenv("OMNISERVE_NATIVE_FRONTIER_WORKLOAD"),
+                                      getenv("OMNISERVE_NATIVE_FRONTIER_LOG"), (int)port);
+        app.frontier_routing = app.frontier && policy && policy[0];
+    }
 
     const char *gguf = getenv("OMNISERVE_NATIVE_LLM_GGUF");
     if (gguf && gguf[0]) {
@@ -2961,11 +4240,22 @@ int main(int argc, char **argv) {
             snprintf(g_llm_active_path, sizeof g_llm_active_path, "%s", gguf);
         }
         snprintf(g_llm_active_ngl, sizeof g_llm_active_ngl, "%s", ngl ? ngl : "auto");
+        const char *startup_tensor = getenv("OMNISERVE_NATIVE_TENSOR_OVERRIDE");
+        const char *startup_moe = getenv("OMNISERVE_NATIVE_MOE_CPU_EXPERTS");
+        snprintf(g_llm_active_tensor_override, sizeof g_llm_active_tensor_override,
+                 "%s", startup_tensor ? startup_tensor : "");
+        snprintf(g_llm_active_moe_cpu_experts, sizeof g_llm_active_moe_cpu_experts,
+                 "%s", startup_moe ? startup_moe : "");
+        const char *startup_mtp = getenv("OMNISERVE_NATIVE_SPEC_MTP_GGUF");
+        snprintf(g_llm_active_spec_mtp, sizeof g_llm_active_spec_mtp,
+                 "%s", startup_mtp ? startup_mtp : "");
+        g_llm_active_placement_set = true;
         g_llm_active_ctx = ctx ? atoi(ctx) : 8192;
         if (g_llm_active_ctx < 1) g_llm_active_ctx = 8192;
         g_llm_active_contexts = parallel_contexts;
-        if (!ollm_init(gguf, resolve_llm_ngl(gguf, ngl, 999), ctx ? atoi(ctx) : 8192,
-                       parallel_contexts)) {
+        if (!ollm_init(gguf, resolve_llm_ngl(gguf, ngl, 999, ctx ? atoi(ctx) : 8192,
+                                            parallel_contexts),
+                       ctx ? atoi(ctx) : 8192, parallel_contexts)) {
             fprintf(stderr, "llm load failed\n");
         }
         ollm_placement placement;
@@ -2997,6 +4287,31 @@ int main(int argc, char **argv) {
                          embed_threads ? atoi(embed_threads) : 8)) {
             fprintf(stderr, "embedding model load failed\n");
         }
+    }
+    g_gs.judge_auto = app.vram && !app.vram_broker_url &&
+                      env_flag("OMNISERVE_NATIVE_GUARD_JUDGE_AUTO", 0);
+    if (g_gs.judge_auto) {
+        /* oguard consults the judge only when this flag is on; the scheduler
+         * decides when it is actually resident. */
+        setenv("OMNISERVE_NATIVE_GUARD_JUDGE", "1", 1);
+        g_gs.judge_gguf = getenv("OMNISERVE_NATIVE_GUARD_JUDGE_GGUF");
+        if (!g_gs.judge_gguf || !g_gs.judge_gguf[0])
+            g_gs.judge_gguf = "/nvme0n1-disk/models/omniserve-native/shieldgemma-2b-q4_k_m.gguf";
+        const char *jt = getenv("OMNISERVE_NATIVE_GUARD_JUDGE_THREADS");
+        g_gs.judge_threads = jt ? atoi(jt) : 24;
+        g_gs.judge_margin_mb = env_int("OMNISERVE_NATIVE_GUARD_JUDGE_MARGIN_MB", 6144);
+        pthread_t judge_thread;
+        if (pthread_create(&judge_thread, NULL, judge_admit_main, &app) == 0) pthread_detach(judge_thread);
+        fprintf(stderr, "gpu-sched: guard judge admitted on headroom (need %d MB + margin %d MB)\n",
+                gs_judge_need_mb(), g_gs.judge_margin_mb);
+    } else if (env_flag("OMNISERVE_NATIVE_GUARD_JUDGE", 1)) {
+        const char *judge_gguf = getenv("OMNISERVE_NATIVE_GUARD_JUDGE_GGUF");
+        if (!judge_gguf || !judge_gguf[0])
+            judge_gguf = "/nvme0n1-disk/models/omniserve-native/shieldgemma-2b-q4_k_m.gguf";
+        const char *judge_threads = getenv("OMNISERVE_NATIVE_GUARD_JUDGE_THREADS");
+        fprintf(stderr, "loading guard judge %s\n", judge_gguf);
+        if (!ojudge_init(judge_gguf, 4096, judge_threads ? atoi(judge_threads) : 24))
+            fprintf(stderr, "guard judge load failed, stages 1+2 only\n");
     }
     const char *sd = getenv("OMNISERVE_NATIVE_SD_MODEL");
     if (!sd || !sd[0]) sd = getenv("OMNISERVE_NATIVE_SD_DIFFUSION_MODEL");
@@ -3036,6 +4351,12 @@ int main(int argc, char **argv) {
     olog_set_internal_fn(request_is_internal);
     olog_init();
     if (olog_enabled()) fprintf(stderr, "access log: %s\n", olog_path());
+    oguard_init();
+    oguard_set_embed_backend(guard_embed_ready, guard_embed_text, guard_embed_free);
+    oguard_embed_warmup();
+    oguard_set_judge_backend(guard_judge_ready, guard_judge_score);
+    oguard_set_judge_multi_backend(guard_judge_multi);
+    oguard_judge_warmup();
 
     const char *reactors_env = getenv("OMNISERVE_NATIVE_REACTORS");
     ohttp_config cfg = {
@@ -3065,6 +4386,7 @@ int main(int argc, char **argv) {
     oproxy_target_destroy(app.birefnet_upstream);
     oproxy_target_destroy(app.tts_upstream);
     oproxy_target_destroy(app.stt_upstream);
+    oproxy_target_destroy(app.music_upstream);
     oproxy_target_destroy(app.forecast_upstream);
     oproxy_target_destroy(app.training_upstream);
     oproxy_target_destroy(app.embedding_upstream);

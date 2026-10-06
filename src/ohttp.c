@@ -354,19 +354,39 @@ bool ohttp_method_is(const ohttp_request *req, const char *method) {
     return req->method_len == mlen && memcmp(req->method, method, mlen) == 0;
 }
 
-void ohttp_respond(ohttp_request *req, int status, const char *content_type,
-                   const char *body, size_t body_len) {
+static int retry_after_s(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("OMNISERVE_NATIVE_RETRY_AFTER_S");
+        int n = v && *v ? atoi(v) : 5;
+        cached = n > 0 && n <= 3600 ? n : 5;
+    }
+    return cached;
+}
+
+void ohttp_respond_h(ohttp_request *req, int status, const char *content_type,
+                     const char *body, size_t body_len, const char *extra_header) {
     struct ohttp_conn *c = req->conn;
-    char head[512];
+    char head[800];
+    char retry[40] = "";
+    /* Every locally generated 503 is a capacity or upstream-availability
+     * refusal; tell well-behaved clients when to come back. */
+    if ((status == 503 || status == 429) &&
+        !(extra_header && strncasecmp(extra_header, "Retry-After:", 12) == 0))
+        snprintf(retry, sizeof retry, "Retry-After: %d\r\n", retry_after_s());
     int hn = snprintf(head, sizeof head,
                       "HTTP/1.1 %d %s\r\n"
+                      "%s"
                       "Content-Type: %s\r\n"
                       "Content-Length: %zu\r\n"
+                      "%s%s"
                       "Access-Control-Allow-Origin: *\r\n"
                       "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
                       "Access-Control-Allow-Headers: Authorization, Content-Type, secret, X-API-Key, X-Rapid-API-Key, X-Omniserve-Tier\r\n"
                       "Connection: %s\r\n\r\n",
-                      status, status_text(status), content_type, body_len,
+                      status, status_text(status), retry, content_type, body_len,
+                      extra_header ? extra_header : "",
+                      extra_header ? "\r\n" : "",
                       c->keep_alive ? "keep-alive" : "close");
     struct iovec iov[2] = {
         { .iov_base = head, .iov_len = (size_t)hn },
@@ -376,19 +396,26 @@ void ohttp_respond(ohttp_request *req, int status, const char *content_type,
     record_status(req, status);
 }
 
+void ohttp_respond(ohttp_request *req, int status, const char *content_type,
+                   const char *body, size_t body_len) {
+    ohttp_respond_h(req, status, content_type, body, body_len, NULL);
+}
+
 void ohttp_respond_str(ohttp_request *req, int status, const char *content_type,
                        const char *body) {
     ohttp_respond(req, status, content_type, body, strlen(body));
 }
 
-void ohttp_stream_begin(ohttp_request *req, int status, const char *content_type) {
+void ohttp_stream_begin_h(ohttp_request *req, int status, const char *content_type,
+                           const char *extra_header) {
     struct ohttp_conn *c = req->conn;
     c->streaming = true;
     c->chunked_out = true;
-    char head[512];
+    char head[768];
     int hn = snprintf(head, sizeof head,
                       "HTTP/1.1 %d %s\r\n"
                       "Content-Type: %s\r\n"
+                      "%s%s"
                       "Transfer-Encoding: chunked\r\n"
                       "Cache-Control: no-cache\r\n"
                       "Access-Control-Allow-Origin: *\r\n"
@@ -396,9 +423,15 @@ void ohttp_stream_begin(ohttp_request *req, int status, const char *content_type
                       "Access-Control-Allow-Headers: Authorization, Content-Type, secret, X-API-Key, X-Rapid-API-Key, X-Omniserve-Tier\r\n"
                       "Connection: %s\r\n\r\n",
                       status, status_text(status), content_type,
+                      extra_header ? extra_header : "",
+                      extra_header ? "\r\n" : "",
                       c->keep_alive ? "keep-alive" : "close");
     write_all(c->fd, head, (size_t)hn);
     record_status(req, status);
+}
+
+void ohttp_stream_begin(ohttp_request *req, int status, const char *content_type) {
+    ohttp_stream_begin_h(req, status, content_type, NULL);
 }
 
 bool ohttp_stream_write(ohttp_request *req, const char *data, size_t len) {

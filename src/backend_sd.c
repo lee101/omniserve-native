@@ -225,9 +225,14 @@ static fn_free_latent p_free_latent;
 static bool g_webp_enabled = true;
 static float g_webp_quality = 85.0f;
 
-static void sd_log_line(int level, const char *text, void *data) {
+static int sd_env_int(const char *name, int fallback, int minimum, int maximum);
+static int g_sd_log_min = SD_LOG_WARN;
+
+static void sd_log_to_stderr(enum sd_log_level_t level, const char *text, void *data) {
     (void)data;
-    if (level >= 2) fputs(text, stderr);
+    if ((int)level >= g_sd_log_min && text) {
+        fputs(text, stderr);
+    }
 }
 
 static bool sd_lib_load(void) {
@@ -254,11 +259,13 @@ static bool sd_lib_load(void) {
     p_latent_params_init = (fn_latent_params_init)dlsym(lib, "sd_latent_replay_params_init");
     p_generate_image_with_latent = (fn_generate_image_with_latent)dlsym(lib, "generate_image_with_latent");
     p_free_latent = (fn_free_latent)dlsym(lib, "free_sd_latent");
-    const char *log_env = getenv("OMNISERVE_NATIVE_SD_LOG");
-    if (log_env && log_env[0] == '1') {
-        void (*set_log)(void (*)(int, const char *, void *), void *) =
-            (void (*)(void (*)(int, const char *, void *), void *))dlsym(lib, "sd_set_log_callback");
-        if (set_log) set_log(sd_log_line, NULL);
+    /* Without a callback sd.cpp/ggml drop their logs, including the CUDA error
+     * text printed right before GGML_ABORT. */
+    typedef void (*fn_set_log_callback)(sd_log_cb_t, void *);
+    fn_set_log_callback set_log = (fn_set_log_callback)dlsym(lib, "sd_set_log_callback");
+    if (set_log) {
+        g_sd_log_min = sd_env_int("OMNISERVE_NATIVE_SD_LOG_LEVEL", SD_LOG_WARN, SD_LOG_DEBUG, SD_LOG_ERROR);
+        set_log(sd_log_to_stderr, NULL);
     }
     return p_ctx_params_init && p_new_sd_ctx && p_img_params_init && p_generate_image && p_free_images;
 }
@@ -398,14 +405,60 @@ static struct {
     float spectrum_stop, residual_diff;
     int teleport_start; /* -1: steps - 1 */
     size_t cache_bytes_max;
-    bool notch;
-    char *turbo_lora;
-    bool turbo_default;
+    int turbo_n; /* >0: distilled few-step schedule, nodes in turbo_nodes */
     float turbo_nodes[16];
-    int turbo_count;
+    char default_lora[1024]; /* applied to requests that carry no LoRA of their own */
+    float default_lora_scale;
+    bool notch;
+    bool teleport; /* OMNISERVE_NATIVE_SD_TELEPORT=0 ignores request teleport flags (Qwen lanes: latent capture makes a first render ~2x slower and only an exact repeat benefits) */
+    float hq_threshold; /* EasyCache threshold for non-turbo text-to-image; 0 = use the global one */
 } g_cfg;
 
+/* Distilled few-step Qwen-Image (Viggle turbo) schedule: raw nodes pushed through the
+ * pipeline's resolution-dependent exponential time shift, then a terminal 0. */
+static void turbo_sigmas(int width, int height, float *out) {
+    double seq = (double)(width / 16) * (double)(height / 16);
+    double mu = 0.5 + (seq - 256.0) * (0.9 - 0.5) / (8192.0 - 256.0);
+    double e = exp(mu);
+    for (int i = 0; i < g_cfg.turbo_n; ++i) {
+        double t = (double)g_cfg.turbo_nodes[i];
+        out[i] = (float)(e / (e + (1.0 / t - 1.0)));
+    }
+    out[g_cfg.turbo_n] = 0.0f;
+}
+
+static void turbo_cfg_load(void) {
+    const char *lora = getenv("OMNISERVE_NATIVE_SD_DEFAULT_LORA");
+    g_cfg.default_lora[0] = 0;
+    g_cfg.default_lora_scale = sd_env_float("OMNISERVE_NATIVE_SD_DEFAULT_LORA_SCALE", 1.0f, -4.0f, 4.0f);
+    if (lora && lora[0] == '/' && strlen(lora) < sizeof g_cfg.default_lora) {
+        strcpy(g_cfg.default_lora, lora);
+        fprintf(stderr, "sd: default LoRA %s scale=%.2f\n", lora, (double)g_cfg.default_lora_scale);
+    }
+    const char *spec = getenv("OMNISERVE_NATIVE_SD_TURBO_NODES");
+    g_cfg.turbo_n = 0;
+    if (!spec || !spec[0]) return;
+    float nodes[16];
+    int n = 0;
+    const char *p = spec;
+    while (*p && n < 16) {
+        char *end = NULL;
+        float v = strtof(p, &end);
+        if (end == p || !isfinite(v) || v <= 0.0f || v > 1.0f) {
+            fprintf(stderr, "sd: ignoring OMNISERVE_NATIVE_SD_TURBO_NODES=%s\n", spec);
+            return;
+        }
+        nodes[n++] = v;
+        p = end;
+        if (*p == ',') ++p;
+    }
+    memcpy(g_cfg.turbo_nodes, nodes, sizeof nodes);
+    g_cfg.turbo_n = n;
+    fprintf(stderr, "sd: turbo schedule enabled, %d steps\n", n);
+}
+
 static void sd_cfg_load(void) {
+    turbo_cfg_load();
     g_cfg.zero_guidance = sd_env_float("OMNISERVE_NATIVE_SD_ZERO_GUIDANCE", 1.0f, 0.0f, 30.0f);
     const char *tiling = getenv("OMNISERVE_NATIVE_SD_VAE_TILING");
     g_cfg.vae_tiling = tiling && tiling[0] ? (int)sd_env_flag("OMNISERVE_NATIVE_SD_VAE_TILING", false) : -1;
@@ -422,20 +475,8 @@ static void sd_cfg_load(void) {
     g_cfg.spectrum_stop = sd_env_float("OMNISERVE_NATIVE_SD_SPECTRUM_STOP", 0.9f, 0.0f, 1.0f);
     g_cfg.residual_diff = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_RESIDUAL_DIFF", 0.08f, 0.0f, 10.0f);
     g_cfg.notch = sd_env_flag("OMNISERVE_NATIVE_SD_NOTCH", false);
-    /* Distilled few-step tier: OMNISERVE_NATIVE_SD_TURBO_LORA names the LoRA, _TURBO=1 makes it the default
-     * for text-to-image, a request's "turbo" overrides either way. Nodes are the flow-matching timesteps. */
-    const char *turbo_lora = getenv("OMNISERVE_NATIVE_SD_TURBO_LORA");
-    g_cfg.turbo_lora = turbo_lora && turbo_lora[0] ? strdup(turbo_lora) : NULL;
-    g_cfg.turbo_default = sd_env_flag("OMNISERVE_NATIVE_SD_TURBO", false);
-    const char *nodes = getenv("OMNISERVE_NATIVE_SD_TURBO_NODES");
-    if (!nodes || !nodes[0]) nodes = "1.0,0.9375,0.875,0.75,0.5,0.25";
-    for (const char *at = nodes; *at && g_cfg.turbo_count < 16;) {
-        char *end;
-        double node = strtod(at, &end);
-        if (end == at) break;
-        if (node > 0.0 && node <= 1.0) g_cfg.turbo_nodes[g_cfg.turbo_count++] = (float)node;
-        at = *end == ',' ? end + 1 : end;
-    }
+    g_cfg.teleport = sd_env_flag("OMNISERVE_NATIVE_SD_TELEPORT", true);
+    g_cfg.hq_threshold = sd_env_float("OMNISERVE_NATIVE_SD_HQ_EASYCACHE_THRESHOLD", 0.0f, 0.0f, 1.0f);
     g_cfg.teleport_start = sd_env_int("OMNISERVE_NATIVE_SD_TELEPORT_START_STEP", -1, 1, 99);
     g_cfg.cache_bytes_max = (size_t)sd_env_int("OMNISERVE_NATIVE_SD_CACHE_MAX_MB", 1024, 0, 1 << 20) << 20;
     /* OMNISERVE_NATIVE_SD_CACHE_MODE selects the stable-diffusion.cpp denoiser
@@ -455,6 +496,13 @@ static void sd_cfg_load(void) {
 static bool latent_api_ready(void) {
     return p_latent_params_init && p_generate_image_with_latent && p_free_latent &&
            g_latent_cache && g_latent_cache_size > 0;
+}
+
+/* A teleport request only changes how the render runs when the library has the latent-replay API.
+ * Without it (upstream sd.cpp, the Qwen lanes) the flag must not switch off EasyCache or the result
+ * cache, or every caller that sends teleport:true pays for a dense run. */
+static bool teleport_effective(const oimg_req *req) {
+    return g_cfg.teleport && req->teleport && !req->image_pixels && req->batch_count <= 1 && req->steps > 1 && latent_api_ready();
 }
 
 /* Everything in a request that selects a cache entry and is not a plain scalar.
@@ -616,7 +664,7 @@ static bool cache_copy_encoded_result(const latent_cache_entry *entry, oimg_resu
 }
 
 bool osd_try_cached_result(const oimg_req *req, oimg_result *out) {
-    if (!g_sd || !req->cache || req->teleport || req->seed < 0 || req->batch_count > 1) return false;
+    if (!g_sd || !req->cache || teleport_effective(req) || req->seed < 0 || req->batch_count > 1) return false;
     memset(out, 0, sizeof *out);
     double started = now_ms();
     cache_key key;
@@ -678,6 +726,7 @@ static void osd_warmup(void) {
     req.steps = 1;
     req.seed = 1;
     req.notch = 2;
+    req.turbo = 2;
     double started = now_ms();
     if (osd_generate(&req, &out)) osd_result_free(&out);
     fprintf(stderr, "sd: warmup render %.1fs\n", (now_ms() - started) / 1000.0);
@@ -806,6 +855,17 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         params.vae_tiling_params.tile_size_y = g_cfg.tile_y;
         params.vae_tiling_params.target_overlap = g_cfg.tile_overlap;
     }
+    /* Turbo only for plain text-to-image: reference edits and requests that bring their
+     * own LoRA keep the base schedule, so edit quality is untouched. */
+    bool turbo = g_cfg.turbo_n > 0 && !req->image_pixels && !req->lora_count && req->turbo != 2;
+    float turbo_sig[17];
+    if (turbo) {
+        turbo_sigmas(params.width, params.height, turbo_sig);
+        params.sample_params.sample_steps = g_cfg.turbo_n;
+        params.sample_params.custom_sigmas = turbo_sig;
+        params.sample_params.custom_sigmas_count = g_cfg.turbo_n + 1;
+        params.sample_params.guidance.txt_cfg = 1.0f;
+    }
     if (req->sampler[0] && p_str_to_sample_method) {
         int method = p_str_to_sample_method(req->sampler);
         if (method >= 0 && method < SAMPLE_METHOD_COUNT) params.sample_params.sample_method = (enum sample_method_t)method;
@@ -834,10 +894,6 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         }
     }
     params.batch_count = req->batch_count > 0 ? req->batch_count : 1;
-    bool turbo = g_cfg.turbo_lora && g_cfg.turbo_count > 0 && !req->image_pixels && !req->lora_count &&
-                 !req->teleport && (req->turbo ? req->turbo == 1 : g_cfg.turbo_default);
-    float turbo_sigmas[17];
-    sd_lora_t turbo_lora = {0};
     sd_lora_t *loras = NULL;
     if (req->lora_count) {
         loras = calloc(req->lora_count, sizeof *loras);
@@ -848,20 +904,13 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         }
         params.loras = loras;
         params.lora_count = (uint32_t)req->lora_count;
-    } else if (turbo) {
-        float seq = (float)((params.width / 16) * (params.height / 16));
-        float shift = expf(0.5f + (seq - 256.0f) * (0.9f - 0.5f) / (8192.0f - 256.0f));
-        for (int i = 0; i < g_cfg.turbo_count; ++i)
-            turbo_sigmas[i] = shift / (shift + (1.0f / g_cfg.turbo_nodes[i] - 1.0f));
-        turbo_sigmas[g_cfg.turbo_count] = 0.0f;
-        turbo_lora.path = g_cfg.turbo_lora;
-        turbo_lora.multiplier = 1.0f;
-        params.loras = &turbo_lora;
+    }
+    sd_lora_t default_lora = {0};
+    if (turbo && g_cfg.default_lora[0]) {
+        default_lora.path = g_cfg.default_lora;
+        default_lora.multiplier = g_cfg.default_lora_scale;
+        params.loras = &default_lora;
         params.lora_count = 1;
-        params.sample_params.sample_steps = g_cfg.turbo_count;
-        params.sample_params.custom_sigmas = turbo_sigmas;
-        params.sample_params.custom_sigmas_count = g_cfg.turbo_count + 1;
-        params.sample_params.guidance.txt_cfg = 1.0f;
     }
 
     out->teleport_requested = req->teleport;
@@ -869,10 +918,13 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     /* Static per-process setting: result-cache entries never cross profiles.
      * Latent replay requires a dense trajectory, so it cannot use EasyCache. */
     bool overridden = req->cache_threshold > 0.0f || req->cache_end > 0.0f || req->cache_off || req->notch ||
-                      req->flow_shift > 0.0f || req->sampler[0] || req->scheduler[0] || req->extra_args[0] || turbo;
-    if (!req->teleport && g_cfg.cache_mode && !req->cache_off && !turbo) {
+                      req->flow_shift > 0.0f || req->sampler[0] || req->scheduler[0] || req->extra_args[0] ||
+                      req->turbo;
+    if (!teleport_effective(req) && g_cfg.cache_mode && !req->cache_off && !turbo) {
         const char *mode = g_cfg.cache_mode;
-        float easycache_threshold = req->cache_threshold > 0.0f ? req->cache_threshold : g_cfg.easycache_threshold;
+        float easycache_threshold = g_cfg.easycache_threshold;
+        if (!req->image_pixels && g_cfg.hq_threshold > 0.0f) easycache_threshold = g_cfg.hq_threshold;
+        if (req->cache_threshold > 0.0f) easycache_threshold = req->cache_threshold;
         params.cache.start_percent = g_cfg.cache_start;
         params.cache.end_percent = req->cache_end > 0.0f ? req->cache_end : g_cfg.cache_end;
         if (strcmp(mode, "easycache") == 0 || strcmp(mode, "ucache") == 0) {
@@ -899,9 +951,8 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     out->teleport_capture_step = -1;
     out->teleport_resume_step = 0;
 
-    bool result_cache = req->cache && !req->teleport && !overridden && req->seed >= 0 && params.batch_count == 1;
-    bool teleport_cache = req->teleport && !req->image_pixels && params.batch_count == 1 &&
-                          req->steps > 1 && latent_api_ready();
+    bool result_cache = req->cache && !teleport_effective(req) && !overridden && req->seed >= 0 && params.batch_count == 1;
+    bool teleport_cache = teleport_effective(req) && params.batch_count == 1;
     cache_key key = {0};
     if ((result_cache || teleport_cache) && !cache_key_make(req, &key)) {
         result_cache = teleport_cache = false;

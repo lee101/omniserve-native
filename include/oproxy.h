@@ -17,6 +17,7 @@ typedef struct {
     bool response_started;
     bool downstream_close;
     bool upstream_reused;
+    int status;
     size_t bytes_relayed;
 } oproxy_result;
 
@@ -27,6 +28,10 @@ typedef struct {
     unsigned long long connections_opened;
     unsigned long long connections_reused;
     unsigned long long failures;
+    unsigned consecutive_failures;
+    unsigned long long breaker_opens;
+    unsigned long long breaker_rejects;
+    long long open_ms_left;
 } oproxy_stats;
 
 /* Resolve an upstream once and retain up to ``max_idle`` HTTP/1.1
@@ -35,6 +40,21 @@ oproxy_target *oproxy_target_create(const char *base_url, int max_idle,
                                     char *error, size_t error_cap);
 void oproxy_target_destroy(oproxy_target *target);
 void oproxy_target_snapshot(oproxy_target *target, oproxy_stats *out);
+
+/* Per-target circuit breaker. A relay that fails before a response or answers
+ * 5xx counts as a failure; ``failure_limit`` in a row opens the breaker for
+ * ``cooldown_ms`` (doubling per failed probe up to ``max_cooldown_ms``). Once
+ * the cooldown lapses one caller is let through as the half-open probe; the
+ * rest see it open until that probe succeeds. Enforcement is the caller's:
+ * oproxy_target_allow() is consulted where a fallback exists. Defaults come
+ * from OMNISERVE_NATIVE_BREAKER_{FAILURES,COOLDOWN_MS,MAX_COOLDOWN_MS} and
+ * OMNISERVE_NATIVE_CONNECT_TIMEOUT_MS bounds the TCP connect of every relay. */
+void oproxy_target_breaker_config(oproxy_target *target, unsigned failure_limit,
+                                  int cooldown_ms, int max_cooldown_ms);
+bool oproxy_target_allow(oproxy_target *target);
+void oproxy_target_record(oproxy_target *target, bool ok);
+/* Milliseconds until the breaker may admit a probe; 0 when closed. */
+long long oproxy_target_open_ms(oproxy_target *target);
 
 bool oproxy_target_relay(oproxy_target *target,
                          const char *method, size_t method_len,

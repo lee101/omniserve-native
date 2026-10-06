@@ -49,6 +49,11 @@ typedef struct {
     unsigned long long denials;
     unsigned long long releases;
     unsigned long long expirations;
+    int waiting;
+    unsigned long long waits;
+    unsigned long long wait_timeouts;
+    unsigned long long pressure_calls;
+    long long pressure_freed_mb;
 } ovram_stats;
 
 /* keep_free_mb is the floor left untouched for tenants that allocate scratch
@@ -75,6 +80,52 @@ bool ovram_reserve(ovram *v, const char *owner, int mb);
 int ovram_lease(ovram *v, const char *owner, int mb, int min_mb, otier tier,
                 double ttl_s, char *id_out, size_t id_cap);
 
+/*
+ * Queue instead of failing: waits up to wait_ms for headroom. Waiters are
+ * ordered by tier (a lower tier is never granted while a higher tier waits);
+ * within a tier whoever fits first wins. pid (0 = unknown) lets the broker see
+ * how much of the lease the holder has already materialised, so the same bytes
+ * are not counted twice once they appear in the driver's free figure.
+ * waited_ms_out (optional) reports the time spent queued.
+ */
+int ovram_lease_wait(ovram *v, const char *owner, int pid, int mb, int min_mb, otier tier,
+                     double ttl_s, int wait_ms, char *id_out, size_t id_cap,
+                     int *waited_ms_out);
+
+/*
+ * Called (outside the broker lock) while a waiter has been blocked for at
+ * least after_ms and still lacks deficit_mb. Returns MB it expects to have
+ * freed (0 = nothing evictable for this tier). Used to drop idle residents.
+ */
+typedef int (*ovram_pressure_fn)(void *ctx, otier waiter_tier, int deficit_mb);
+void ovram_set_pressure_hook(ovram *v, ovram_pressure_fn fn, void *ctx, int after_ms);
+
+/* Record a lease even though it does not fit: the holder will run anyway
+ * (it already did before brokering) and everyone else should queue behind it
+ * rather than race it into OOM. */
+int ovram_lease_force(ovram *v, const char *owner, int pid, int mb, otier tier, double ttl_s,
+                      char *id_out, size_t id_cap);
+
+/* A queued higher tier blocks lower tiers for at most this long (default 15 s,
+ * 0 = no limit), and only while its need is coverable once live leases end. */
+void ovram_set_block_max_s(ovram *v, double s);
+
+/* Lower-tier leases younger than this still count against higher tiers
+ * (in-flight jobs); older ones are standing reservations that higher tiers may
+ * squeeze. Default 180 s; 0 restores "higher tiers ignore lower leases". */
+void ovram_set_job_lease_s(ovram *v, double s);
+
+/* Current headroom for a tier, and queued waiters for a tier. */
+int ovram_headroom(ovram *v, otier tier);
+int ovram_waiting(ovram *v, otier tier);
+
+/* Full ledger: device, per-tier headroom, waiters, leases (with charged MB),
+ * owners (idle time, waits), and every GPU process named by systemd unit. */
+size_t ovram_ledger_json(ovram *v, char *out, size_t cap);
+
+/* Test hook: the per-process table the materialisation credit reads. */
+void ovram_set_procs(ovram *v, const ogpu_proc *procs, int n);
+
 bool ovram_release(ovram *v, const char *id);
 bool ovram_renew(ovram *v, const char *id, double ttl_s);
 
@@ -92,6 +143,9 @@ size_t ovram_status_json(ovram *v, char *out, size_t cap);
 int ovram_lease_at(ovram *v, const char *owner, int mb, int min_mb, otier tier,
                    double ttl_s, double now_s, int device_free_mb,
                    char *id_out, size_t id_cap);
+int ovram_lease_pid_at(ovram *v, const char *owner, int pid, int mb, int min_mb, otier tier,
+                       double ttl_s, double now_s, int device_free_mb,
+                       char *id_out, size_t id_cap);
 int ovram_expire_at(ovram *v, double now_s);
 bool ovram_renew_at(ovram *v, const char *id, double ttl_s, double now_s);
 int ovram_headroom_at(ovram *v, otier tier, double now_s, int device_free_mb);

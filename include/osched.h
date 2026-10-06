@@ -28,6 +28,12 @@ void osched_release_n(osched *s, otier tier, int permits);
 bool osched_try_acquire_n(osched *s, otier tier, int permits);
 int osched_capacity(const osched *s);
 
+/* Background admission: its own queue timeout (0 keeps the shared one) and a
+ * starvation bound. A background waiter older than max_wait_s is ordered as
+ * free, and older than 2 * max_wait_s as paid (behind those already queued);
+ * 0 disables aging. It still needs an otherwise idle device to start. */
+void osched_set_background(osched *s, double timeout_s, double max_wait_s);
+
 typedef struct {
     int slots;
     int used_slots;
@@ -52,5 +58,10 @@ double ogpu_total_gib(void);
  * outputs. A real 0 GiB free and "cannot ask the driver" are different
  * conditions and must not both surface as 0.00. */
 bool ogpu_memory_gib(double *free_gib, double *total_gib);
+
+/* Per-process device memory (NVML compute processes). Returns the count
+ * written, or -1 when the driver cannot be asked. */
+typedef struct { int pid; int used_mb; } ogpu_proc;
+int ogpu_processes(ogpu_proc *out, int cap);
 
 #endif

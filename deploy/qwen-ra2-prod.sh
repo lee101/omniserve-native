@@ -16,7 +16,8 @@ CUDA_ARCH=${CUDA_ARCH:-120}                            # RTX 5090
 RA2_PARAMS_BACKEND=${RA2_PARAMS_BACKEND:-*=cpu}
 # qualitybench frontier (3090 Ti, 4 prompts, LPIPS vs dense 30 steps): 30 steps + EasyCache 0.15 = 18.7 s / 0.030,
 # against 20 steps + 0.05 = 19.4 s / 0.084 and 30 steps + 0.05 = 23.8 s / 0.010. Callers send steps=20, so the unit floors it to RA2_MIN_STEPS.
-RA2_EASYCACHE=${RA2_EASYCACHE:-0.15}
+RA2_EASYCACHE=${RA2_EASYCACHE:-0.08}
+RA2_HQ_EASYCACHE=${RA2_HQ_EASYCACHE:-0.15}   # non-turbo text-to-image only; edits keep RA2_EASYCACHE
 RA2_MIN_STEPS=${RA2_MIN_STEPS:-30}
 HF=${HF:-/nvme0n1-disk/code/omniserve-native/.venv/bin/hf}
 NVCC=${NVCC:-/usr/local/cuda-12.9/bin/nvcc}
@@ -79,8 +80,9 @@ Environment=OMNISERVE_NATIVE_SD_CACHE_MODE=easycache
 Environment=OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD=$RA2_EASYCACHE
 Environment=OMNISERVE_NATIVE_SD_NOTCH=${RA2_NOTCH:-1}
 Environment=OMNISERVE_NATIVE_SD_MIN_STEPS=$RA2_MIN_STEPS
+Environment=OMNISERVE_NATIVE_SD_HQ_EASYCACHE_THRESHOLD=$RA2_HQ_EASYCACHE
 Environment=OMNISERVE_NATIVE_SD_ZERO_GUIDANCE=1.0
-Environment=OMNISERVE_NATIVE_SD_WEBP_QUALITY=88
+Environment=OMNISERVE_NATIVE_SD_WEBP_QUALITY=85
 ExecStart=$OMNI/build-qwen/omniserve-native --port $PORT
 Restart=always
 RestartSec=5

@@ -55,10 +55,12 @@ export OMNISERVE_NATIVE_SD_CACHE_MODE="${RA2_CACHE_MODE:-easycache}"
 export OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD="${RA2_EASYCACHE:-0.15}"
 # qualitybench/README.md: 30 steps at 0.15 beats 20 steps at 0.05 for the same time; the notch removes the 2 px VAE lattice.
 export OMNISERVE_NATIVE_SD_MIN_STEPS="${RA2_MIN_STEPS:-30}"
-# Distilled 6-step tier (what the prod worker serves by default). The LoRA makes {"turbo":true} available per
-# request; RA2_TURBO=1 makes it the default for text-to-image and {"turbo":false} selects the 30-step base.
-[[ -e "$TURBO_LORA" ]] && export OMNISERVE_NATIVE_SD_TURBO_LORA="$TURBO_LORA"
-export OMNISERVE_NATIVE_SD_TURBO="${RA2_TURBO:-0}"
+# Distilled 6-step tier (what prod serves by default). RA2_TURBO=1 makes it the default for text-to-image and
+# {"turbo":false} selects the 30-step base; off, every request takes the base path.
+if [[ "${RA2_TURBO:-0}" == 1 && -e "$TURBO_LORA" ]]; then
+  export OMNISERVE_NATIVE_SD_DEFAULT_LORA="$TURBO_LORA"
+  export OMNISERVE_NATIVE_SD_TURBO_NODES="${RA2_TURBO_NODES:-1.0,0.9375,0.875,0.75,0.5,0.25}"
+fi
 export OMNISERVE_NATIVE_SD_WARMUP="${RA2_WARMUP:-1}"
 export OMNISERVE_NATIVE_SD_NOTCH="${RA2_NOTCH:-1}"
 export OMNISERVE_NATIVE_SD_ZERO_GUIDANCE="${RA2_ZERO_GUIDANCE:-1.0}"

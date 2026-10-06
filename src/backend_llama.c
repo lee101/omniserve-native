@@ -6,13 +6,343 @@
 #include "otune.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+
+int ollm_parse_tensor_overrides(const char *spec, ollm_tensor_override *out, int cap) {
+    if (!spec || !spec[0]) return 0;
+    if (!out || cap <= 0) return -1;
+    int count = 0;
+    const char *p = spec;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t')) len--;
+        const char *eq = memchr(p, '=', len);
+        if (!eq) return -1;
+        const char *pend = eq;
+        while (pend > p && (pend[-1] == ' ' || pend[-1] == '\t')) pend--;
+        const char *bstart = eq + 1;
+        while (bstart < p + len && (*bstart == ' ' || *bstart == '\t')) bstart++;
+        size_t plen = (size_t)(pend - p);
+        size_t blen = (size_t)(p + len - bstart);
+        if (plen == 0 || plen >= sizeof out[0].pattern) return -1;
+        if (blen == 0 || blen >= 16) return -1;
+        char buft[16];
+        memcpy(buft, bstart, blen);
+        buft[blen] = 0;
+        bool cpu;
+        if (strcasecmp(buft, "CPU") == 0) cpu = true;
+        else if (strcasecmp(buft, "CUDA0") == 0) cpu = false;
+        else return -1;
+        if (count >= cap) return -1;
+        memcpy(out[count].pattern, p, plen);
+        out[count].pattern[plen] = 0;
+        out[count].cpu = cpu;
+        count++;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return count;
+}
+
+int ollm_parse_moe_cpu_experts(const char *spec, ollm_moe_mode *mode_out, int *n_out) {
+    ollm_moe_mode mode = OLLM_MOE_OFF;
+    int n = 0;
+    if (spec && spec[0]) {
+        while (*spec == ' ' || *spec == '\t') spec++;
+        if (strcasecmp(spec, "all") == 0) mode = OLLM_MOE_ALL;
+        else if (strcasecmp(spec, "auto") == 0) mode = OLLM_MOE_AUTO;
+        else {
+            char *end = NULL;
+            long v = strtol(spec, &end, 10);
+            if (end == spec || v < 0 || v > 100000) return -1;
+            while (*end == ' ' || *end == '\t') end++;
+            if (*end) return -1;
+            if (v > 0) {
+                mode = OLLM_MOE_N;
+                n = (int)v;
+            }
+        }
+    }
+    if (mode_out) *mode_out = mode;
+    if (n_out) *n_out = n;
+    return 0;
+}
+
+void ollm_spec_mtp_default(ollm_spec_mtp_config *cfg) {
+    if (!cfg) return;
+    cfg->draft_max = 1;
+    /* Zero: the head decode is sunk cost before confidence is known, so the
+     * filter only saves the verify widening while forfeiting unsure-but-right
+     * drafts. Measured on CPU: p_min 0.5 accepts more (61% vs 58%) but runs
+     * 7% slower than no filter. */
+    cfg->p_min = 0.0f;
+}
+
+int ollm_spec_mtp_parse(ollm_spec_mtp_config *cfg, const char *draft_env,
+                        const char *pmin_env) {
+    if (!cfg) return -1;
+    ollm_spec_mtp_default(cfg);
+    if (draft_env && draft_env[0]) {
+        char *end = NULL;
+        long v = strtol(draft_env, &end, 10);
+        if (end == draft_env || v < 0 || v > OLLM_SPEC_MTP_DRAFT_MAX) return -1;
+        while (*end == ' ' || *end == '\t') end++;
+        if (*end) return -1;
+        cfg->draft_max = (int)v;
+    }
+    if (pmin_env && pmin_env[0]) {
+        char *end = NULL;
+        float v = strtof(pmin_env, &end);
+        if (end == pmin_env || !(v >= 0.0f) || !(v <= 1.0f)) return -1;
+        while (*end == ' ' || *end == '\t') end++;
+        if (*end) return -1;
+        cfg->p_min = v;
+    }
+    return 0;
+}
+
+bool ollm_tensor_is_expert(const char *name) {
+    if (!name) return false;
+    if (!strstr(name, "exps")) return false;
+    return strstr(name, "ffn_") != NULL;
+}
+
+int ollm_tensor_block_index(const char *name) {
+    if (!name) return -1;
+    const char *blk = strstr(name, "blk.");
+    if (!blk) return -1;
+    char *end = NULL;
+    long v = strtol(blk + 4, &end, 10);
+    if (end == blk + 4 || v < 0 || v > 100000 || *end != '.') return -1;
+    return (int)v;
+}
+
+int ollm_gpu_expert_layers(const unsigned long long *expert_bytes, int n_layers,
+                           unsigned long long nonexp_bytes, unsigned long long kv_bytes,
+                           unsigned long long compute_reserve, unsigned long long budget) {
+    if (!expert_bytes || n_layers <= 0) return 0;
+    if (nonexp_bytes > ULLONG_MAX - kv_bytes) return 0;
+    unsigned long long base = nonexp_bytes + kv_bytes;
+    if (base > ULLONG_MAX - compute_reserve) return 0;
+    base += compute_reserve;
+    int best = 0;
+    unsigned long long acc = 0;
+    for (int k = 1; k <= n_layers; k++) {
+        if (expert_bytes[k - 1] > ULLONG_MAX - acc) break;
+        acc += expert_bytes[k - 1];
+        if (acc > ULLONG_MAX - base) break;
+        if (base + acc <= budget) best = k;
+        else break;
+    }
+    return best;
+}
+
+double ollm_kv_type_size(const char *kv_type) {
+    if (!kv_type) return 2.0;
+    if (strcasecmp(kv_type, "q8_0") == 0) return 34.0 / 32.0;
+    if (strcasecmp(kv_type, "q4_0") == 0) return 18.0 / 32.0;
+    if (strcasecmp(kv_type, "q5_1") == 0) return 24.0 / 32.0;
+    return 2.0;
+}
+
+void ollm_strip_channels(const char *src, char *dst, size_t cap) {
+    if (!dst || cap == 0) return;
+    static const char open[] = "<|channel>";
+    static const char close[] = "<channel|>";
+    size_t n = 0;
+    if (src) {
+        const char *p = src;
+        for (;;) {
+            const char *cut = strstr(p, open);
+            size_t keep = cut ? (size_t)(cut - p) : strlen(p);
+            size_t room = n + 1 < cap ? cap - n - 1 : 0;
+            if (room > 0) {
+                if (keep > room) keep = room;
+                memmove(dst + n, p, keep);
+                n += keep;
+            }
+            if (!cut) break;
+            const char *end = strstr(cut + sizeof open - 1, close);
+            if (!end) break;
+            p = end + sizeof close - 1;
+        }
+    }
+    size_t r = 0, w = 0;
+    while (r < n) {
+        if (n - r >= sizeof close - 1 && memcmp(dst + r, close, sizeof close - 1) == 0) {
+            r += sizeof close - 1;
+        } else {
+            dst[w++] = dst[r++];
+        }
+    }
+    dst[w] = 0;
+}
+
+void ollm_strip_channels_final(char *text, size_t cap) {
+    if (!text || cap == 0) return;
+    ollm_strip_channels(text, text, cap);
+    static const char *markers[] = {"<|channel>", "<channel|>"};
+    size_t len = strlen(text);
+    for (size_t k = 9; k >= 2; k--) {
+        if (len < k) continue;
+        for (size_t m = 0; m < 2; m++) {
+            if (memcmp(text + len - k, markers[m], k) == 0) {
+                text[len - k] = 0;
+                return;
+            }
+        }
+    }
+}
+
+bool ollm_thinking_default(void) {
+    const char *v = getenv("OMNISERVE_NATIVE_LLM_THINKING_DEFAULT");
+    if (!v || !v[0]) return false;
+    return strcasecmp(v, "1") == 0 || strcasecmp(v, "true") == 0 ||
+        strcasecmp(v, "yes") == 0 || strcasecmp(v, "on") == 0;
+}
+
+bool ollm_regex_balanced(const char *pattern) {
+    if (!pattern || !pattern[0]) return false;
+    int depth = 0;
+    bool atom = false;
+    for (size_t i = 0; pattern[i]; i++) {
+        char c = pattern[i];
+        if (c == '\\') {
+            if (!pattern[i + 1]) return false;
+            i++;
+            atom = true;
+            continue;
+        }
+        if (c == '[') {
+            i++;
+            if (pattern[i] == '^') i++;
+            if (pattern[i] == ']') i++;
+            bool closed = false;
+            for (; pattern[i]; i++) {
+                if (pattern[i] == '\\' && pattern[i + 1]) {
+                    i++;
+                    continue;
+                }
+                if (pattern[i] == ']') {
+                    closed = true;
+                    break;
+                }
+            }
+            if (!closed) return false;
+            atom = true;
+            continue;
+        }
+        if (c == '(') {
+            depth++;
+            atom = false;
+            continue;
+        }
+        if (c == ')') {
+            if (depth == 0) return false;
+            depth--;
+            atom = true;
+            continue;
+        }
+        if (c == '*' || c == '+' || c == '?') {
+            if (!atom) return false;
+            continue;
+        }
+        if (c == '{') {
+            size_t j = i + 1;
+            unsigned long lo = 0, hi = 0;
+            bool range = false;
+            while (pattern[j] >= '0' && pattern[j] <= '9') {
+                lo = lo * 10 + (unsigned long)(pattern[j++] - '0');
+                range = true;
+            }
+            if (pattern[j] == ',') {
+                j++;
+                range = false;
+                while (pattern[j] >= '0' && pattern[j] <= '9') {
+                    hi = hi * 10 + (unsigned long)(pattern[j++] - '0');
+                    range = true;
+                }
+                if (!range) hi = lo;
+            } else {
+                hi = lo;
+            }
+            if (range && pattern[j] == '}' && atom && hi >= lo) {
+                i = j;
+                continue;
+            }
+            atom = true;
+            continue;
+        }
+        if (c == '|' || c == '^' || c == '$' || c == '.') {
+            if (c == '|') atom = false;
+            else if (c == '.') atom = true;
+            continue;
+        }
+        atom = true;
+    }
+    return depth == 0;
+}
+
+int ollm_moe_cpu_pattern(int first_layer, int n_layers, char *out, size_t cap) {
+    static const char tail[] = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+    if (!out || cap == 0 || first_layer < 0 || n_layers <= first_layer) return -1;
+    size_t n = 0;
+    if (n + 5 >= cap) return -1;
+    memcpy(out + n, "blk\\.(", 6);
+    n += 6;
+    for (int layer = first_layer; layer < n_layers; layer++) {
+        char num[16];
+        int len = snprintf(num, sizeof num, "%s%d", layer > first_layer ? "|" : "", layer);
+        if (len < 0 || (size_t)len + n + sizeof tail >= cap) return -1;
+        memcpy(out + n, num, (size_t)len);
+        n += (size_t)len;
+    }
+    if (n + 1 + sizeof tail > cap) return -1;
+    out[n++] = ')';
+    memcpy(out + n, tail, sizeof tail);
+    return 0;
+}
+
+typedef struct {
+    bool valid;
+    bool active;
+    char path[1024];
+    int ctx_len;
+    int contexts;
+    char kv_type[16];
+    ollm_moe_mode mode;
+    int n_layers;
+    int cpu_layers;
+    unsigned long long free_bytes;
+    unsigned long long budget_bytes;
+    unsigned long long nonexp_bytes;
+    unsigned long long kv_bytes;
+    unsigned long long cpu_bytes;
+    unsigned long long est_bytes;
+} moe_decision;
+
+static moe_decision g_moe_decision;
+
+bool ollm_moe_last_active(void) { return g_moe_decision.valid && g_moe_decision.active; }
+
+unsigned long long ollm_moe_last_free_bytes(void) {
+    return g_moe_decision.valid ? g_moe_decision.free_bytes : 0;
+}
+
+unsigned long long ollm_moe_last_est_bytes(void) {
+    return g_moe_decision.valid ? g_moe_decision.est_bytes : 0;
+}
 
 #ifdef USE_LLAMA
 #include "llama.h"
@@ -40,9 +370,49 @@ static bool g_flash_attn;
 
 static struct llama_model *g_model;
 static const struct llama_vocab *g_vocab;
+/* Next-token-prediction staging API from llama.cpp's src/llama-ext.h. That
+ * header is C++-only, and the symbols it declares have C++ linkage, so they
+ * are resolved by mangled name out of the already-loaded libllama exactly
+ * like the ggml device probes above. Pinned to the same checkout as the
+ * rest of this backend; a missing symbol disables MTP, nothing else. */
+typedef void (*onextn_set_fn)(struct llama_context *ctx, bool value, bool masked);
+typedef float *(*onextn_get_ith_fn)(struct llama_context *ctx, int32_t i);
+typedef struct llama_context *(*oget_ctx_other_fn)(struct llama_context *ctx);
+static onextn_set_fn ollama_set_nextn;
+static onextn_get_ith_fn ollama_get_nextn_ith;
+static oget_ctx_other_fn ollama_get_ctx_other;
+
+static bool probe_nextn_fns(void) {
+    if (!ollama_set_nextn) {
+        ollama_set_nextn = (onextn_set_fn)dlsym(
+            RTLD_DEFAULT, "_Z26llama_set_embeddings_nextnP13llama_contextbb");
+        ollama_get_nextn_ith = (onextn_get_ith_fn)dlsym(
+            RTLD_DEFAULT, "_Z30llama_get_embeddings_nextn_ithP13llama_contexti");
+        ollama_get_ctx_other = (oget_ctx_other_fn)dlsym(
+            RTLD_DEFAULT, "_Z19llama_get_ctx_otherP13llama_context");
+    }
+    return ollama_set_nextn && ollama_get_nextn_ith && ollama_get_ctx_other;
+}
+
 enum { OLLM_VERIFY_BATCH_CAP = 17 };
+enum { OLLM_MTP_DRAFT_CAP = 2 };
 typedef struct {
     struct llama_context *ctx;
+    /* MTP draft context sharing this slot's target context: one per parallel
+     * target context, travelling with the slot so prefix reuse keeps working.
+     * NULL unless an MTP head is loaded and this slot initialized one. */
+    struct llama_context *mtp_ctx;
+    struct llama_sampler *mtp_smpl; /* chain holding only top_k(10) */
+    float *mtp_pending; /* h row of the last committed token, [n_embd] */
+    float *mtp_verify;  /* h rows of the last verify batch, [rows][n_embd] */
+    float *mtp_embd;    /* staging row for the single-row draft batch */
+    llama_token_data *mtp_cand; /* draft sampling candidates, [n_vocab] */
+    llama_token mtp_token;
+    llama_pos mtp_pos;
+    int32_t mtp_n_seq;
+    llama_seq_id mtp_seq;
+    llama_seq_id *mtp_seq_ptr;
+    int8_t mtp_logits;
     bool busy;
     llama_token *cached_tokens;
     int cached_count;
@@ -81,6 +451,31 @@ static unsigned long long g_spec_accepted;
 static unsigned long long g_spec_rounds;
 static unsigned long long g_spec_saved_calls;
 
+/* MTP-head speculation. Empty GGUF path means off; when a head is loaded it
+ * replaces prompt-lookup as the draft source while reusing the same verify
+ * loop, governor, and counters. */
+static struct llama_model *g_spec_mtp_model;
+static const struct llama_vocab *g_spec_mtp_vocab;
+static ollm_spec_mtp_config g_spec_mtp_cfg;
+static int32_t g_spec_mtp_embd;
+static int32_t g_spec_mtp_vocab_size;
+static char g_spec_mtp_path[1024];
+
+static bool spec_mtp_active(void) {
+    return g_spec_mtp_model != NULL && g_spec_mtp_cfg.draft_max > 0;
+}
+
+static const char *spec_source_name(void) {
+    if (spec_mtp_active()) return "mtp";
+    if (g_spec_draft_max > 0) return "prompt-lookup";
+    return "off";
+}
+
+static int spec_effective_max(void) {
+    if (spec_mtp_active()) return g_spec_mtp_cfg.draft_max;
+    return g_spec_draft_max;
+}
+
 static void spec_record(const ospec_governor *g) {
     if (!g || g->rounds == 0) return;
     pthread_mutex_lock(&g_spec_lock);
@@ -104,6 +499,23 @@ static int g_runtime_refs;
  * chat request, including prompt formatting and decode, so an admin unload
  * cannot free a llama model while a request still holds its vocab/context. */
 static pthread_rwlock_t g_model_lifecycle_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+static char g_ovr_tensor[512];
+static char g_ovr_moe[32];
+static char g_ovr_mtp[4096];
+static bool g_ovr_set;
+
+void ollm_set_load_overrides(const char *tensor_override, const char *moe_cpu_experts,
+                             const char *spec_mtp_gguf) {
+    snprintf(g_ovr_tensor, sizeof g_ovr_tensor, "%s", tensor_override ? tensor_override : "");
+    snprintf(g_ovr_moe, sizeof g_ovr_moe, "%s", moe_cpu_experts ? moe_cpu_experts : "");
+    snprintf(g_ovr_mtp, sizeof g_ovr_mtp, "%s", spec_mtp_gguf ? spec_mtp_gguf : "");
+    g_ovr_set = true;
+}
+
+static const char *ollm_cfg(const char *name, const char *ovr) {
+    return g_ovr_set ? ovr : getenv(name);
+}
 
 static void llama_runtime_acquire(void) {
     pthread_mutex_lock(&g_runtime_lock);
@@ -172,6 +584,517 @@ static void probe_gpu_device(void) {
     g_gpu_device_present = dev != NULL;
     const char *desc = dev && oggml_dev_description ? oggml_dev_description(dev) : NULL;
     snprintf(g_device_desc, sizeof g_device_desc, "%s", desc ? desc : (dev ? "gpu" : "cpu"));
+}
+
+typedef void *oggml_buft;
+typedef oggml_dev (*odev_by_name_fn)(const char *name);
+typedef oggml_buft (*odev_buft_fn)(oggml_dev dev);
+typedef oggml_buft (*ocpu_buft_fn)(void);
+
+static odev_by_name_fn oggml_dev_by_name;
+static odev_buft_fn oggml_dev_buft;
+static ocpu_buft_fn oggml_cpu_buft;
+
+static void probe_buft_fns(void) {
+    if (!oggml_dev_by_name) {
+        oggml_dev_by_name = (odev_by_name_fn)dlsym(RTLD_DEFAULT, "ggml_backend_dev_by_name");
+        oggml_dev_buft =
+            (odev_buft_fn)dlsym(RTLD_DEFAULT, "ggml_backend_dev_buffer_type");
+        oggml_cpu_buft =
+            (ocpu_buft_fn)dlsym(RTLD_DEFAULT, "ggml_backend_cpu_buffer_type");
+    }
+}
+
+enum { MOE_MAX_LAYERS = 1024 };
+
+typedef struct {
+    unsigned long long *expert_bytes;
+    int n_layers;
+    unsigned long long nonexp_bytes;
+    int n_head_kv;
+    int key_len;
+    int n_layer_meta;
+} moe_scan;
+
+static moe_scan g_scan;
+static char g_scan_path[1024];
+static struct stat g_scan_st;
+static bool g_scan_valid;
+
+static void moe_scan_reset(moe_scan *scan) {
+    free(scan->expert_bytes);
+    memset(scan, 0, sizeof *scan);
+}
+
+static int64_t moe_meta_key(const struct gguf_context *gguf, const char *arch, const char *suffix) {
+    char key[96];
+    snprintf(key, sizeof key, "%.70s.%s", arch ? arch : "unknown", suffix);
+    int64_t id = gguf_find_key(gguf, key);
+    if (id >= 0) return id;
+    snprintf(key, sizeof key, "general.%s", suffix);
+    return gguf_find_key(gguf, key);
+}
+
+static int moe_meta_u32(const struct gguf_context *gguf, int64_t id) {
+    enum gguf_type type = gguf_get_kv_type(gguf, id);
+    if (type == GGUF_TYPE_UINT32) {
+        uint32_t v = gguf_get_val_u32(gguf, id);
+        return v <= INT_MAX ? (int)v : 0;
+    }
+    if (type == GGUF_TYPE_INT32) {
+        int32_t v = gguf_get_val_i32(gguf, id);
+        return v > 0 && v <= INT_MAX ? v : 0;
+    }
+    if (type == GGUF_TYPE_UINT64) {
+        uint64_t v = gguf_get_val_u64(gguf, id);
+        return v <= INT_MAX ? (int)v : 0;
+    }
+    if (type == GGUF_TYPE_INT64) {
+        int64_t v = gguf_get_val_i64(gguf, id);
+        return v > 0 && v <= INT_MAX ? (int)v : 0;
+    }
+    return 0;
+}
+
+static bool moe_scan_file(const char *path, moe_scan *out) {
+    moe_scan_reset(out);
+    struct gguf_init_params params;
+    memset(&params, 0, sizeof params);
+    params.no_alloc = true;
+    struct gguf_context *gguf = gguf_init_from_file(path, params);
+    if (!gguf) return false;
+    bool ok = false;
+    int64_t n_tensors = gguf_get_n_tensors(gguf);
+    for (int64_t i = 0; i < n_tensors; i++) {
+        const char *name = gguf_get_tensor_name(gguf, i);
+        if (!name) continue;
+        size_t size = gguf_get_tensor_size(gguf, i);
+        if (!ollm_tensor_is_expert(name)) {
+            out->nonexp_bytes += (unsigned long long)size;
+            continue;
+        }
+        int layer = ollm_tensor_block_index(name);
+        if (layer < 0 || layer >= MOE_MAX_LAYERS) {
+            if (layer >= MOE_MAX_LAYERS)
+                fprintf(stderr, "MoE scan: tensor %s beyond layer cap, counting as dense\n", name);
+            out->nonexp_bytes += (unsigned long long)size;
+            continue;
+        }
+        if (layer >= out->n_layers) {
+            int grown_n = layer + 1;
+            unsigned long long *grown =
+                realloc(out->expert_bytes, (size_t)grown_n * sizeof *grown);
+            if (!grown) goto done;
+            memset(grown + out->n_layers, 0,
+                   (size_t)(grown_n - out->n_layers) * sizeof *grown);
+            out->expert_bytes = grown;
+            out->n_layers = grown_n;
+        }
+        out->expert_bytes[layer] += (unsigned long long)size;
+    }
+    const char *arch = "unknown";
+    int64_t arch_id = gguf_find_key(gguf, "general.architecture");
+    if (arch_id >= 0 && gguf_get_kv_type(gguf, arch_id) == GGUF_TYPE_STRING) {
+        arch = gguf_get_val_str(gguf, arch_id);
+    }
+    int64_t id = moe_meta_key(gguf, arch, "block_count");
+    if (id >= 0) out->n_layer_meta = moe_meta_u32(gguf, id);
+    id = moe_meta_key(gguf, arch, "attention.head_count_kv");
+    if (id >= 0) {
+        if (gguf_get_kv_type(gguf, id) == GGUF_TYPE_ARRAY &&
+            gguf_get_arr_n(gguf, id) > 0) {
+            enum gguf_type elem = gguf_get_arr_type(gguf, id);
+            size_t n = gguf_get_arr_n(gguf, id);
+            const void *data = gguf_get_arr_data(gguf, id);
+            int peak = 0;
+            if (data && elem == GGUF_TYPE_UINT32) {
+                const uint32_t *heads = data;
+                for (size_t k = 0; k < n; k++) {
+                    if (heads[k] <= INT_MAX && (int)heads[k] > peak) peak = (int)heads[k];
+                }
+            } else if (data && elem == GGUF_TYPE_INT32) {
+                const int32_t *heads = data;
+                for (size_t k = 0; k < n; k++) {
+                    if (heads[k] > peak && heads[k] <= INT_MAX) peak = heads[k];
+                }
+            } else if (data && elem == GGUF_TYPE_UINT64) {
+                const uint64_t *heads = data;
+                for (size_t k = 0; k < n; k++) {
+                    if (heads[k] <= INT_MAX && (int)heads[k] > peak) peak = (int)heads[k];
+                }
+            } else if (data && elem == GGUF_TYPE_INT64) {
+                const int64_t *heads = data;
+                for (size_t k = 0; k < n; k++) {
+                    if (heads[k] > peak && heads[k] <= INT_MAX) peak = (int)heads[k];
+                }
+            }
+            out->n_head_kv = peak;
+        } else {
+            out->n_head_kv = moe_meta_u32(gguf, id);
+        }
+    }
+    id = moe_meta_key(gguf, arch, "attention.key_length");
+    if (id >= 0 && moe_meta_u32(gguf, id) > 0) {
+        out->key_len = moe_meta_u32(gguf, id);
+    } else {
+        int n_embd = 0, n_head = 0;
+        id = moe_meta_key(gguf, arch, "embedding_length");
+        if (id >= 0) n_embd = moe_meta_u32(gguf, id);
+        id = moe_meta_key(gguf, arch, "attention.head_count");
+        if (id >= 0) n_head = moe_meta_u32(gguf, id);
+        if (n_embd > 0 && n_head > 0) out->key_len = n_embd / n_head;
+    }
+    ok = true;
+done:
+    gguf_free(gguf);
+    if (!ok) moe_scan_reset(out);
+    return ok;
+}
+
+static const moe_scan *moe_cached_scan(const char *path) {
+    if (!path || !path[0]) return NULL;
+    struct stat st;
+    if (stat(path, &st) != 0) return NULL;
+    if (g_scan_valid && strcmp(g_scan_path, path) == 0 &&
+        g_scan_st.st_ino == st.st_ino && g_scan_st.st_mtime == st.st_mtime &&
+        g_scan_st.st_mtim.tv_nsec == st.st_mtim.tv_nsec &&
+        g_scan_st.st_size == st.st_size) {
+        return &g_scan;
+    }
+    if (!moe_scan_file(path, &g_scan)) {
+        g_scan_valid = false;
+        return NULL;
+    }
+    snprintf(g_scan_path, sizeof g_scan_path, "%s", path);
+    g_scan_st = st;
+    g_scan_valid = true;
+    return &g_scan;
+}
+
+static unsigned long long moe_kv_bytes(const moe_scan *scan, int ctx_len,
+                                       int contexts, const char *kv_type) {
+    if (!scan || scan->n_head_kv <= 0 || scan->key_len <= 0) return 0;
+    int n_layer = scan->n_layer_meta > 0 ? scan->n_layer_meta : scan->n_layers;
+    if (n_layer <= 0 || ctx_len <= 0 || contexts <= 0) return 0;
+    double bytes = 2.0 * (double)n_layer * (double)scan->n_head_kv *
+        (double)scan->key_len * (double)ctx_len *
+        ollm_kv_type_size(kv_type) * (double)contexts;
+    if (bytes > (double)ULLONG_MAX) return ULLONG_MAX;
+    return (unsigned long long)bytes;
+}
+
+static bool moe_sample_free(unsigned long long *free_out, unsigned long long *budget_out) {
+    if (free_out) *free_out = 0;
+    if (budget_out) *budget_out = 0;
+    double free_gib = -1.0;
+    if (!ogpu_memory_gib(&free_gib, NULL) || free_gib <= 0.0) return false;
+    long long keep_mb = 2048;
+    const char *keep_env = getenv("OMNISERVE_NATIVE_NGL_AUTO_KEEP_FREE_MB");
+    if (keep_env && keep_env[0]) keep_mb = atoll(keep_env);
+    if (keep_mb < 0) keep_mb = 0;
+    double free_b = free_gib * 1024.0 * 1024.0 * 1024.0;
+    double budget = free_b - (double)keep_mb * 1024.0 * 1024.0;
+    if (free_b <= 0.0 || free_b > (double)ULLONG_MAX) return false;
+    if (free_out) *free_out = (unsigned long long)free_b;
+    if (budget > 0.0 && budget <= (double)ULLONG_MAX) {
+        if (budget_out) *budget_out = (unsigned long long)budget;
+    }
+    return true;
+}
+
+static const char *moe_mode_name(ollm_moe_mode mode) {
+    switch (mode) {
+    case OLLM_MOE_N: return "N";
+    case OLLM_MOE_ALL: return "all";
+    case OLLM_MOE_AUTO: return "auto";
+    default: return "off";
+    }
+}
+
+static int moe_decide_fresh(const char *model_path, int ctx_len, int contexts,
+                            const char *kv_type, unsigned long long *est_gpu_out,
+                            unsigned long long *cpu_bytes_out) {
+    if (est_gpu_out) *est_gpu_out = 0;
+    if (cpu_bytes_out) *cpu_bytes_out = 0;
+    memset(&g_moe_decision, 0, sizeof g_moe_decision);
+    ollm_moe_mode mode = OLLM_MOE_OFF;
+    int n = 0;
+    if (ollm_parse_moe_cpu_experts(ollm_cfg("OMNISERVE_NATIVE_MOE_CPU_EXPERTS", g_ovr_moe),
+                                   &mode, &n) != 0) {
+        fprintf(stderr, "OMNISERVE_NATIVE_MOE_CPU_EXPERTS: invalid value, ignoring\n");
+        return 0;
+    }
+    if (mode == OLLM_MOE_OFF) return 0;
+    const moe_scan *scan = moe_cached_scan(model_path);
+    if (!scan || scan->n_layers <= 0) {
+        fprintf(stderr, "MOE_CPU_EXPERTS set but no expert tensors found in %s\n",
+                model_path ? model_path : "(null)");
+        return 0;
+    }
+    int cpu_layers = 0;
+    unsigned long long kv = moe_kv_bytes(scan, ctx_len, contexts, kv_type);
+    unsigned long long free_bytes = 0, budget = 0;
+    if (mode == OLLM_MOE_ALL) {
+        cpu_layers = scan->n_layers;
+    } else if (mode == OLLM_MOE_N) {
+        cpu_layers = n < scan->n_layers ? n : scan->n_layers;
+    } else if (scan->n_head_kv <= 0 || scan->key_len <= 0) {
+        fprintf(stderr, "llm moe experts: mode=auto KV dims unknown for %s, placing all experts on CPU\n",
+                model_path ? model_path : "(null)");
+        cpu_layers = scan->n_layers;
+    } else {
+        if (!moe_sample_free(&free_bytes, &budget)) {
+            fprintf(stderr, "llm moe experts: mode=auto VRAM sample failed, placing all experts on CPU\n");
+            cpu_layers = scan->n_layers;
+        } else {
+            unsigned long long judge_reserve = ojudge_vram_reserve_bytes();
+            if (judge_reserve > budget) judge_reserve = budget;
+            budget -= judge_reserve;
+            int gpu = ollm_gpu_expert_layers(scan->expert_bytes, scan->n_layers,
+                                             scan->nonexp_bytes, kv,
+                                             1024ULL * 1024ULL * 1024ULL, budget);
+            cpu_layers = scan->n_layers - gpu;
+        }
+    }
+    unsigned long long cpu_bytes = 0, gpu_experts = 0;
+    for (int i = 0; i < scan->n_layers; i++) {
+        if (i >= scan->n_layers - cpu_layers) cpu_bytes += scan->expert_bytes[i];
+        else gpu_experts += scan->expert_bytes[i];
+    }
+    unsigned long long est =
+        scan->nonexp_bytes + gpu_experts + kv + 1024ULL * 1024ULL * 1024ULL;
+    g_moe_decision.valid = true;
+    g_moe_decision.active = true;
+    snprintf(g_moe_decision.path, sizeof g_moe_decision.path, "%s",
+             model_path ? model_path : "");
+    g_moe_decision.ctx_len = ctx_len;
+    g_moe_decision.contexts = contexts;
+    snprintf(g_moe_decision.kv_type, sizeof g_moe_decision.kv_type, "%s",
+             kv_type ? kv_type : "f16");
+    g_moe_decision.mode = mode;
+    g_moe_decision.n_layers = scan->n_layers;
+    g_moe_decision.cpu_layers = cpu_layers;
+    g_moe_decision.free_bytes = free_bytes;
+    g_moe_decision.budget_bytes = budget;
+    g_moe_decision.nonexp_bytes = scan->nonexp_bytes;
+    g_moe_decision.kv_bytes = kv;
+    g_moe_decision.cpu_bytes = cpu_bytes;
+    g_moe_decision.est_bytes = est;
+    if (mode == OLLM_MOE_AUTO && free_bytes > 0) {
+        fprintf(stderr,
+                "llm moe experts: mode=auto free=%llu MiB budget=%llu MiB nonexp=%llu MiB kv=%llu MiB reserve=1024 MiB judge=%llu MiB -> gpu=%d cpu=%d est=%llu MiB\n",
+                free_bytes / (1024ULL * 1024ULL), budget / (1024ULL * 1024ULL),
+                scan->nonexp_bytes / (1024ULL * 1024ULL), kv / (1024ULL * 1024ULL),
+                ojudge_vram_reserve_bytes() / (1024ULL * 1024ULL),
+                scan->n_layers - cpu_layers, cpu_layers, est / (1024ULL * 1024ULL));
+    } else {
+        fprintf(stderr, "llm moe experts: mode=%s -> gpu=%d cpu=%d est=%llu MiB\n",
+                moe_mode_name(mode), scan->n_layers - cpu_layers, cpu_layers,
+                est / (1024ULL * 1024ULL));
+    }
+    if (cpu_bytes_out) *cpu_bytes_out = cpu_bytes;
+    if (est_gpu_out) *est_gpu_out = est;
+    return cpu_layers;
+}
+
+static bool moe_decision_matches(const char *model_path, int ctx_len, int contexts,
+                                 const char *kv_type) {
+    if (!g_moe_decision.valid || !g_moe_decision.active) return false;
+    const char *want_path = model_path ? model_path : "";
+    const char *want_kv = kv_type ? kv_type : "f16";
+    return strcmp(g_moe_decision.path, want_path) == 0 &&
+        g_moe_decision.ctx_len == ctx_len && g_moe_decision.contexts == contexts &&
+        strcmp(g_moe_decision.kv_type, want_kv) == 0;
+}
+
+static int moe_cached_or_fresh(const char *model_path, int ctx_len, int contexts,
+                               const char *kv_type, unsigned long long *est_gpu_out,
+                               unsigned long long *cpu_bytes_out) {
+    if (moe_decision_matches(model_path, ctx_len, contexts, kv_type)) {
+        int cpu = g_moe_decision.cpu_layers;
+        if (cpu_bytes_out) *cpu_bytes_out = g_moe_decision.cpu_bytes;
+        if (est_gpu_out) *est_gpu_out = g_moe_decision.est_bytes;
+        return cpu;
+    }
+    return moe_decide_fresh(model_path, ctx_len, contexts, kv_type,
+                            est_gpu_out, cpu_bytes_out);
+}
+
+unsigned long long ollm_cpu_offloaded_bytes(const char *model_path, int ctx_len, int contexts) {
+    unsigned long long cpu_bytes = 0;
+    int ctx = ctx_len;
+    if (ctx < 1) {
+        const char *ctx_env = getenv("OMNISERVE_NATIVE_CTX");
+        ctx = ctx_env ? atoi(ctx_env) : 8192;
+        if (ctx < 1) ctx = 8192;
+    }
+    if (contexts < 1) {
+        const char *contexts_env = getenv("OMNISERVE_NATIVE_LLM_CONTEXTS");
+        contexts = contexts_env ? atoi(contexts_env) : 1;
+        if (contexts < 1) contexts = 1;
+    }
+    (void)moe_decide_fresh(model_path, ctx, contexts,
+                            getenv("OMNISERVE_NATIVE_KV_TYPE"), NULL, &cpu_bytes);
+    return cpu_bytes;
+}
+
+static struct llama_model_tensor_buft_override *g_buft_overrides;
+static char *g_buft_pattern_store;
+static int g_gpu_expert_layers;
+static int g_cpu_expert_layers;
+static char g_override_display[512];
+static unsigned long long g_est_gpu_bytes;
+
+static void buft_overrides_clear(void) {
+    free(g_buft_overrides);
+    g_buft_overrides = NULL;
+    free(g_buft_pattern_store);
+    g_buft_pattern_store = NULL;
+    g_gpu_expert_layers = 0;
+    g_cpu_expert_layers = 0;
+    g_override_display[0] = 0;
+    g_est_gpu_bytes = 0;
+}
+
+static const struct llama_model_tensor_buft_override *buft_overrides_build(
+    const char *model_path, int ctx_len, int contexts, const char *kv_type) {
+    buft_overrides_clear();
+    probe_buft_fns();
+    ollm_tensor_override user[128];
+    int user_count =
+        ollm_parse_tensor_overrides(ollm_cfg("OMNISERVE_NATIVE_TENSOR_OVERRIDE", g_ovr_tensor),
+                                    user, (int)(sizeof user / sizeof *user));
+    if (user_count < 0) {
+        fprintf(stderr, "OMNISERVE_NATIVE_TENSOR_OVERRIDE: invalid syntax, ignoring\n");
+        user_count = 0;
+    }
+    int valid_users = 0;
+    for (int i = 0; i < user_count; i++) {
+        if (!ollm_regex_balanced(user[i].pattern)) {
+            fprintf(stderr, "tensor override '%s': invalid regex, skipping\n",
+                    user[i].pattern);
+            continue;
+        }
+        user[valid_users++] = user[i];
+    }
+    user_count = valid_users;
+    g_est_gpu_bytes = 0;
+    int cpu_layers =
+        moe_cached_or_fresh(model_path, ctx_len, contexts, kv_type,
+                            &g_est_gpu_bytes, NULL);
+    bool decided = g_moe_decision.valid && g_moe_decision.active;
+    int snap_n = decided ? g_moe_decision.n_layers : 0;
+    g_moe_decision.valid = false;
+    if (decided) {
+        g_cpu_expert_layers = cpu_layers;
+        g_gpu_expert_layers = snap_n - cpu_layers;
+    }
+    int moe_patterns = (decided && cpu_layers > 0) ? 1 : 0;
+    int total = user_count + moe_patterns;
+    if (total <= 0) return NULL;
+    size_t omax = llama_max_tensor_buft_overrides();
+    if (omax < 2) omax = 2;
+    if ((size_t)total + 1 > omax) {
+        int keep_users = (int)(omax - 1) - moe_patterns;
+        if (keep_users < 0) keep_users = 0;
+        if (user_count > keep_users) {
+            fprintf(stderr, "tensor overrides: %d exceed llama limit %zu, keeping %d user + %d MoE\n",
+                    total, omax, keep_users, moe_patterns);
+            user_count = keep_users;
+            total = user_count + moe_patterns;
+        }
+    }
+    enum { MOE_PATTERN_CAP = 4608 };
+    g_buft_overrides = calloc((size_t)total + 1, sizeof *g_buft_overrides);
+    size_t store_cap = (size_t)user_count * 256 + (moe_patterns ? MOE_PATTERN_CAP : 0) + 1;
+    g_buft_pattern_store = malloc(store_cap);
+    if (!g_buft_overrides || !g_buft_pattern_store) {
+        buft_overrides_clear();
+        return NULL;
+    }
+    char *store = g_buft_pattern_store;
+    char *store_end = store + store_cap;
+    int filled = 0;
+    oggml_buft cuda_buft = NULL;
+    if (oggml_dev_by_name && oggml_dev_buft) {
+        oggml_dev dev = oggml_dev_by_name("CUDA0");
+        if (dev) cuda_buft = oggml_dev_buft(dev);
+    }
+    oggml_buft cpu_buft = oggml_cpu_buft ? oggml_cpu_buft() : NULL;
+    for (int i = 0; i < user_count; i++) {
+        oggml_buft buft = user[i].cpu ? cpu_buft : cuda_buft;
+        if (!buft) {
+            fprintf(stderr, "tensor override '%s': backend unavailable, skipping\n",
+                    user[i].pattern);
+            continue;
+        }
+        size_t plen = strlen(user[i].pattern) + 1;
+        if (store + plen > store_end) break;
+        memcpy(store, user[i].pattern, plen);
+        g_buft_overrides[filled].pattern = store;
+        g_buft_overrides[filled].buft =
+            (ggml_backend_buffer_type_t)(void *)buft;
+        store += plen;
+        filled++;
+    }
+    int user_filled = filled;
+    if (moe_patterns && cpu_buft) {
+        if (ollm_moe_cpu_pattern(snap_n - cpu_layers, snap_n, store,
+                                 (size_t)(store_end - store)) == 0) {
+            g_buft_overrides[filled].pattern = store;
+            g_buft_overrides[filled].buft =
+                (ggml_backend_buffer_type_t)(void *)cpu_buft;
+            store += strlen(store) + 1;
+            filled++;
+        } else {
+            fprintf(stderr, "MoE override pattern exceeds %d bytes, skipping\n",
+                    MOE_PATTERN_CAP);
+        }
+    } else if (moe_patterns) {
+        fprintf(stderr, "MoE CPU experts requested but no CPU buffer type, skipping\n");
+    }
+    g_buft_overrides[filled].pattern = NULL;
+    g_buft_overrides[filled].buft = NULL;
+    if (filled == 0) {
+        buft_overrides_clear();
+        return NULL;
+    }
+    char *d = g_override_display;
+    size_t left = sizeof g_override_display;
+    if (decided) {
+        int w = cpu_layers > 0
+            ? snprintf(d, left, "moe:blk.%d-%d->CPU", snap_n - cpu_layers, snap_n - 1)
+            : snprintf(d, left, "moe:all-gpu");
+        if (w < 0) w = 0;
+        if ((size_t)w >= left) w = (int)(left - 1);
+        d += w;
+        left -= (size_t)w;
+    }
+    if (user_filled > 0 && left > 1) {
+        int w = snprintf(d, left, "%suser:", d == g_override_display ? "" : ";");
+        if (w < 0) w = 0;
+        if ((size_t)w >= left) w = (int)(left - 1);
+        d += w;
+        left -= (size_t)w;
+        for (int i = 0; i < user_filled; i++) {
+            const char *pat = g_buft_overrides[i].pattern;
+            size_t need = strlen(pat) + (size_t)(i ? 1 : 0);
+            if (need + 1 > left) {
+                snprintf(d, left, "%s+%d more", i ? "," : "", user_filled - i);
+                break;
+            }
+            if (i) {
+                *d++ = ',';
+                left--;
+            }
+            size_t len = strlen(pat);
+            memcpy(d, pat, len + 1);
+            d += len;
+            left -= len;
+        }
+    }
+    fprintf(stderr, "llm tensor overrides: %d active (%s)\n", filled, g_override_display);
+    return g_buft_overrides;
 }
 
 /* Quantized KV halves (q8_0) or quarters (q4_0) the per-context cache, which
@@ -253,16 +1176,169 @@ int ollm_suggested_contexts(void) {
     return profile.parallel_contexts;
 }
 
+static void spec_mtp_free_locked(void) {
+    if (g_slots) {
+        for (int i = 0; i < g_slot_count; i++) {
+            if (g_slots[i].mtp_smpl) llama_sampler_free(g_slots[i].mtp_smpl);
+            g_slots[i].mtp_smpl = NULL;
+            if (g_slots[i].mtp_ctx) llama_free(g_slots[i].mtp_ctx);
+            g_slots[i].mtp_ctx = NULL;
+            free(g_slots[i].mtp_pending);
+            g_slots[i].mtp_pending = NULL;
+            free(g_slots[i].mtp_verify);
+            g_slots[i].mtp_verify = NULL;
+            free(g_slots[i].mtp_embd);
+            g_slots[i].mtp_embd = NULL;
+            free(g_slots[i].mtp_cand);
+            g_slots[i].mtp_cand = NULL;
+        }
+    }
+    if (g_spec_mtp_model) llama_model_free(g_spec_mtp_model);
+    g_spec_mtp_model = NULL;
+    g_spec_mtp_vocab = NULL;
+    g_spec_mtp_embd = 0;
+    g_spec_mtp_vocab_size = 0;
+    g_spec_mtp_path[0] = 0;
+}
+
+/* Loads the MTP head and pairs every target context with a draft context.
+ * Any failure disables MTP and leaves the target usable on its own: a draft
+ * source must never take down the model it accelerates. */
+static void spec_mtp_init_locked(int n_gpu_layers, const struct llama_context_params *tcp,
+                                 enum ggml_type kv_type) {
+    spec_mtp_free_locked();
+    ollm_spec_mtp_default(&g_spec_mtp_cfg);
+    const char *path = ollm_cfg("OMNISERVE_NATIVE_SPEC_MTP_GGUF", g_ovr_mtp);
+    if (!path || !path[0]) return;
+    if (ollm_spec_mtp_parse(&g_spec_mtp_cfg, getenv("OMNISERVE_NATIVE_SPEC_MTP_DRAFT"),
+                            getenv("OMNISERVE_NATIVE_SPEC_MTP_P_MIN")) != 0) {
+        fprintf(stderr, "spec MTP: invalid SPEC_MTP_DRAFT/P_MIN, MTP off\n");
+        ollm_spec_mtp_default(&g_spec_mtp_cfg);
+        g_spec_mtp_cfg.draft_max = 0;
+        return;
+    }
+    if (g_spec_mtp_cfg.draft_max <= 0) return;
+    if (!probe_nextn_fns()) {
+        fprintf(stderr, "spec MTP: nextn staging API missing from libllama, MTP off\n");
+        g_spec_mtp_cfg.draft_max = 0;
+        return;
+    }
+    struct llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = n_gpu_layers;
+    struct llama_model *head = llama_model_load_from_file(path, mp);
+    if (!head) {
+        fprintf(stderr, "spec MTP: failed to load head '%s', MTP off\n", path);
+        g_spec_mtp_cfg.draft_max = 0;
+        return;
+    }
+    int32_t head_embd = llama_model_n_embd_out(head);
+    int32_t tgt_embd = llama_model_n_embd(g_model);
+    if (head_embd != tgt_embd) {
+        fprintf(stderr, "spec MTP: head n_embd %d != target %d, MTP off\n",
+                head_embd, tgt_embd);
+        llama_model_free(head);
+        g_spec_mtp_cfg.draft_max = 0;
+        return;
+    }
+    int32_t vocab_size = 0;
+    const struct llama_vocab *hv = llama_model_get_vocab(head);
+    if (hv) vocab_size = llama_vocab_n_tokens(hv);
+    if (vocab_size <= 0) {
+        fprintf(stderr, "spec MTP: head has no vocab, MTP off\n");
+        llama_model_free(head);
+        g_spec_mtp_cfg.draft_max = 0;
+        return;
+    }
+    bool fail = false;
+    for (int i = 0; i < g_slot_count && !fail; i++) {
+        struct llama_context_params dcp = llama_context_default_params();
+        dcp.n_ctx = (unsigned)g_ctx_len;
+        dcp.n_batch = 8;
+        dcp.n_ubatch = 8;
+        dcp.n_seq_max = 1;
+        dcp.type_k = kv_type;
+        dcp.type_v = kv_type;
+        dcp.flash_attn_type = tcp->flash_attn_type;
+        dcp.no_perf = true;
+        dcp.n_threads = tcp->n_threads;
+        dcp.n_threads_batch = tcp->n_threads_batch;
+        dcp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        dcp.ctx_other = g_slots[i].ctx;
+        dcp.n_rs_seq = 0;
+        struct llama_context *dctx = llama_init_from_model(head, dcp);
+        if (!dctx) {
+            fprintf(stderr, "spec MTP: draft context %d failed to init, MTP off\n", i);
+            fail = true;
+            break;
+        }
+        g_slots[i].mtp_ctx = dctx;
+        /* Unmasked on the target: every decoded row stages its h vector for
+         * the snapshot below. Masked on the draft: only logits rows. */
+        ollama_set_nextn(g_slots[i].ctx, true, false);
+        ollama_set_nextn(dctx, true, true);
+        /* Only the shared-memory (Gemma-4) layout is implemented: other
+         * arches need a catch-up decode per target batch to fill the draft
+         * KV, and drafting against an empty cache would only burn time. */
+        if (ollama_get_ctx_other(dctx) != g_slots[i].ctx) {
+            fprintf(stderr, "spec MTP: head does not share target memory, MTP off\n");
+            fail = true;
+            break;
+        }
+        g_slots[i].mtp_pending = malloc((size_t)head_embd * sizeof(float));
+        g_slots[i].mtp_verify =
+            malloc((size_t)(OLLM_MTP_DRAFT_CAP + 1) * (size_t)head_embd * sizeof(float));
+        g_slots[i].mtp_embd = malloc((size_t)head_embd * sizeof(float));
+        g_slots[i].mtp_cand = malloc((size_t)vocab_size * sizeof *g_slots[i].mtp_cand);
+        struct llama_sampler_chain_params sp = llama_sampler_chain_default_params();
+        g_slots[i].mtp_smpl = llama_sampler_chain_init(sp);
+        if (!g_slots[i].mtp_pending || !g_slots[i].mtp_verify || !g_slots[i].mtp_embd ||
+            !g_slots[i].mtp_cand || !g_slots[i].mtp_smpl) {
+            fprintf(stderr, "spec MTP: out of memory for slot %d, MTP off\n", i);
+            fail = true;
+            break;
+        }
+        llama_sampler_chain_add(g_slots[i].mtp_smpl, llama_sampler_init_top_k(10));
+        memset(g_slots[i].mtp_pending, 0, (size_t)head_embd * sizeof(float));
+        g_slots[i].mtp_n_seq = 1;
+        g_slots[i].mtp_seq = 0;
+        g_slots[i].mtp_seq_ptr = &g_slots[i].mtp_seq;
+        g_slots[i].mtp_logits = 1;
+    }
+    if (fail) {
+        spec_mtp_free_locked();
+        for (int i = 0; i < g_slot_count; i++) ollama_set_nextn(g_slots[i].ctx, false, false);
+        llama_model_free(head);
+        g_spec_mtp_cfg.draft_max = 0;
+        return;
+    }
+    g_spec_mtp_model = head;
+    g_spec_mtp_vocab = hv;
+    g_spec_mtp_embd = head_embd;
+    g_spec_mtp_vocab_size = vocab_size;
+    snprintf(g_spec_mtp_path, sizeof g_spec_mtp_path, "%s", path);
+    fprintf(stderr, "spec MTP: head '%s' draft_max=%d p_min=%.2f n_embd=%d layers_nextn=%d\n",
+            path, g_spec_mtp_cfg.draft_max, (double)g_spec_mtp_cfg.p_min,
+            head_embd, llama_model_n_layer_nextn(head));
+}
+
 static bool ollm_init_locked(const char *model_path, int n_gpu_layers, int ctx_len,
                              int parallel_contexts) {
     llama_runtime_acquire();
     probe_gpu_device();
     g_gpu_requested = n_gpu_layers > 0;
     g_on_gpu = g_gpu_requested && g_gpu_device_present;
+    otune_profile early_profile;
+    otune_profile_for(g_on_gpu ? g_device_desc : "cpu", &early_profile);
+    const char *early_kv = "f16";
+    (void)kv_type_resolved(&early_profile, &early_kv);
     struct llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = n_gpu_layers;
+    mp.tensor_buft_overrides = buft_overrides_build(
+        model_path, ctx_len > 0 ? ctx_len : 8192,
+        parallel_contexts > 0 ? parallel_contexts : 1, early_kv);
     g_model = llama_model_load_from_file(model_path, mp);
     if (!g_model) {
+        buft_overrides_clear();
         llama_runtime_release();
         return false;
     }
@@ -344,16 +1420,24 @@ static bool ollm_init_locked(const char *model_path, int n_gpu_layers, int ctx_l
     cp.flash_attn_type = flash_attn;
     cp.no_perf = true;
     /* Decode and prefill have different bandwidth/compute profiles on a
-     * shared CPU host. Keep llama defaults unless explicitly tuned. */
+     * shared CPU host. llama.cpp defaults to 4 threads, which starves
+     * CPU-side MoE experts on a many-core box; 16 keeps a loaded host
+     * responsive without oversubscribing it. Explicit settings win. */
     const char *thread_names[] = {"OMNISERVE_NATIVE_LLM_THREADS",
                                   "OMNISERVE_NATIVE_LLM_THREADS_BATCH"};
     for (int i = 0; i < 2; ++i) {
         const char *value = getenv(thread_names[i]);
-        if (!value || !value[0]) continue;
+        if (!value || !value[0]) {
+            if (i == 0) cp.n_threads = 16;
+            else cp.n_threads_batch = 16;
+            continue;
+        }
         char *end = NULL;
         long threads = strtol(value, &end, 10);
         if (end == value || *end || threads < 1 || threads > 256) {
-            fprintf(stderr, "%s must be an integer in [1, 256]; using llama default\n", thread_names[i]);
+            fprintf(stderr, "%s must be an integer in [1, 256]; using 16\n", thread_names[i]);
+            if (i == 0) cp.n_threads = 16;
+            else cp.n_threads_batch = 16;
             continue;
         }
         if (i == 0) cp.n_threads = (int)threads;
@@ -373,6 +1457,8 @@ static bool ollm_init_locked(const char *model_path, int n_gpu_layers, int ctx_l
             return false;
         }
     }
+
+    spec_mtp_init_locked(n_gpu_layers, &cp, kv_type);
 
     const char *slash = strrchr(model_path, '/');
     snprintf(g_model_name, sizeof g_model_name, "%s", slash ? slash + 1 : model_path);
@@ -398,7 +1484,12 @@ void ollm_placement_snapshot(ollm_placement *out) {
     snprintf(out->tune_class, sizeof out->tune_class, "%s", g_tune_class);
     out->n_batch = g_batch_size;
     out->n_ubatch = g_ubatch_size;
-    out->spec_draft_max = g_spec_draft_max;
+    out->gpu_expert_layers = g_gpu_expert_layers;
+    out->cpu_expert_layers = g_cpu_expert_layers;
+    snprintf(out->tensor_override, sizeof out->tensor_override, "%s", g_override_display);
+    out->est_gpu_bytes = g_est_gpu_bytes;
+    out->spec_draft_max = spec_effective_max();
+    snprintf(out->spec_source, sizeof out->spec_source, "%s", spec_source_name());
     pthread_mutex_lock(&g_spec_lock);
     out->spec_rounds = g_spec_rounds;
     out->spec_drafted = g_spec_drafted;
@@ -454,6 +1545,92 @@ static void cache_prompt(ollm_slot *slot, const llama_token *tokens, int count) 
     slot->cached_count = count;
 }
 
+/* Snapshots the h rows staged by the target decode that just ran: pending
+ * becomes the last row, and short batches (verify rounds and single decodes,
+ * never prefill chunks) are kept whole for the accept step. Must run after
+ * EVERY target decode while MTP is active; a skipped decode leaves pending
+ * paired with the wrong token and the drafts silently degrade. */
+static void spec_mtp_process(ollm_slot *slot, int n_rows) {
+    if (!slot->mtp_ctx || n_rows <= 0) return;
+    size_t row_bytes = (size_t)g_spec_mtp_embd * sizeof(float);
+    float *last = ollama_get_nextn_ith(slot->ctx, n_rows - 1);
+    if (last) memcpy(slot->mtp_pending, last, row_bytes);
+    if (n_rows > OLLM_MTP_DRAFT_CAP + 1) return;
+    for (int i = 0; i < n_rows; i++) {
+        float *row = ollama_get_nextn_ith(slot->ctx, i);
+        if (row) memcpy(slot->mtp_verify + (size_t)i * g_spec_mtp_embd, row, row_bytes);
+    }
+}
+
+/* The last committed token's h row is verify row `matched`: row 0 is the
+ * sampled token and row i the i-th draft, so the next draft round pairs its
+ * first row with the state left behind by the last token that landed. */
+static void spec_mtp_accept(ollm_slot *slot, int matched) {
+    if (!slot->mtp_ctx) return;
+    if (matched < 0) matched = 0;
+    if (matched > OLLM_MTP_DRAFT_CAP) matched = OLLM_MTP_DRAFT_CAP;
+    size_t row_bytes = (size_t)g_spec_mtp_embd * sizeof(float);
+    memcpy(slot->mtp_pending,
+           slot->mtp_verify + (size_t)matched * g_spec_mtp_embd, row_bytes);
+}
+
+/* Drafts up to cap tokens with the MTP head: one single-row decode per token,
+ * each pairing the previous token with its h row at the same position (the
+ * shared-memory layout reads the target KV, so positions never advance).
+ * Stops early on a decode failure or when the head is unsure of itself. */
+static int spec_mtp_draft(ollm_slot *slot, llama_token id_last, int n_past,
+                          llama_token *draft_out, int cap) {
+    if (!slot->mtp_ctx || !draft_out || cap <= 0) return 0;
+    if (cap > OLLM_MTP_DRAFT_CAP) cap = OLLM_MTP_DRAFT_CAP;
+    size_t row_bytes = (size_t)g_spec_mtp_embd * sizeof(float);
+    memcpy(slot->mtp_embd, slot->mtp_pending, row_bytes);
+    slot->mtp_token = id_last;
+    slot->mtp_pos = (llama_pos)n_past;
+    int drafted = 0;
+    for (int step = 0; step < cap; step++) {
+        struct llama_batch batch = {
+            .n_tokens = 1,
+            .token = &slot->mtp_token,
+            .embd = slot->mtp_embd,
+            .pos = &slot->mtp_pos,
+            .n_seq_id = &slot->mtp_n_seq,
+            .seq_id = &slot->mtp_seq_ptr,
+            .logits = &slot->mtp_logits,
+        };
+        if (llama_decode(slot->mtp_ctx, batch) != 0) break;
+        float *logits = llama_get_logits_ith(slot->mtp_ctx, 0);
+        float *h_row = ollama_get_nextn_ith(slot->mtp_ctx, 0);
+        if (!logits || !h_row) break;
+        for (int32_t i = 0; i < g_spec_mtp_vocab_size; i++) {
+            slot->mtp_cand[i].id = i;
+            slot->mtp_cand[i].logit = logits[i];
+            slot->mtp_cand[i].p = 0.0f;
+        }
+        llama_token_data_array cur = {
+            slot->mtp_cand, (size_t)g_spec_mtp_vocab_size, -1, false
+        };
+        llama_sampler_apply(slot->mtp_smpl, &cur);
+        if (cur.size == 0) break;
+        float max_logit = cur.data[0].logit;
+        for (size_t i = 1; i < cur.size; i++) {
+            if (cur.data[i].logit > max_logit) max_logit = cur.data[i].logit;
+        }
+        float sum = 0.0f;
+        for (size_t i = 0; i < cur.size; i++) {
+            float p = expf(cur.data[i].logit - max_logit);
+            cur.data[i].p = p;
+            sum += p;
+        }
+        if (!(sum > 0.0f)) break;
+        float top_p = cur.data[0].p / sum;
+        if (top_p < g_spec_mtp_cfg.p_min) break;
+        draft_out[drafted++] = cur.data[0].id;
+        slot->mtp_token = cur.data[0].id;
+        memcpy(slot->mtp_embd, h_row, row_bytes);
+    }
+    return drafted;
+}
+
 /* One decode round, speculative or not, returning how many tokens it produced
  * into out_tokens/out_probs (0 on a decode failure).
  *
@@ -490,18 +1667,24 @@ static int decode_round(ollm_slot *slot, struct llama_sampler *smpl,
     llama_token draft[16];
     int draft_len = 0;
     int want = gov ? ospec_governor_next(gov) : 0;
-    if (want > 0 && g_spec_draft_max > 0) {
-        int cap = want < g_spec_draft_max ? want : g_spec_draft_max;
+    int eff_max = spec_effective_max();
+    if (want > 0 && eff_max > 0) {
+        int cap = want < eff_max ? want : eff_max;
         if (cap > (int)(sizeof draft / sizeof *draft)) cap = (int)(sizeof draft / sizeof *draft);
         if (cap > out_cap - 1) cap = out_cap - 1;
         if (cap > 0) {
-            draft_len = ospec_draft(&g_spec_cfg, context, context_len, draft, cap);
+            if (slot->mtp_ctx) {
+                draft_len = spec_mtp_draft(slot, previous, *n_past, draft, cap);
+            } else {
+                draft_len = ospec_draft(&g_spec_cfg, context, context_len, draft, cap);
+            }
         }
     }
 
     if (draft_len <= 0) {
         struct llama_batch one = llama_batch_get_one(&previous, 1);
         if (llama_decode(ctx, one) != 0) return 0;
+        spec_mtp_process(slot, 1);
         (*n_past)++;
         out_tokens[0] = llama_sampler_sample(smpl, ctx, -1);
         out_probs[0] = sampled->probability;
@@ -533,6 +1716,7 @@ static int decode_round(ollm_slot *slot, struct llama_sampler *smpl,
     };
     int rc = llama_decode(ctx, batch);
     if (rc != 0) return 0;
+    spec_mtp_process(slot, verify_count);
 
     int produced = 0;
     int matched = 0;
@@ -556,6 +1740,13 @@ static int decode_round(ollm_slot *slot, struct llama_sampler *smpl,
     *n_past += matched + 1;
     llama_memory_t memory = llama_get_memory(ctx);
     if (matched < draft_len) llama_memory_seq_rm(memory, 0, *n_past, -1);
+    if (slot->mtp_ctx) {
+        spec_mtp_accept(slot, matched);
+        if (matched < draft_len) {
+            llama_memory_t dmem = llama_get_memory(slot->mtp_ctx);
+            llama_memory_seq_rm(dmem, 0, *n_past, -1);
+        }
+    }
     if (gov) ospec_governor_observe(gov, draft_len, matched);
     return produced;
 }
@@ -598,6 +1789,17 @@ static size_t possible_stop_prefix(const ochat_req *req, const char *text, size_
         }
     }
     return held;
+}
+
+static size_t think_marker_hold(const char *text, size_t text_len,
+                                  const char *marker, size_t marker_len) {
+    size_t most = marker_len - 1;
+    if (most > text_len) most = text_len;
+    for (size_t k = most; k >= 1; k--) {
+        if (memcmp(text + text_len - k, marker, k) == 0) return k;
+        if (k == 1) break;
+    }
+    return 0;
 }
 
 static bool prompt_append(char **prompt, size_t *length, size_t *capacity,
@@ -673,21 +1875,42 @@ static char *format_gemma4_prompt(const struct llama_chat_message *messages,
         APPEND_LITERAL("<turn|>\n");
     }
 
+    const char *prev_role = NULL;
     for (int i = first_message; i < message_count; i++) {
         const char *source_role = messages[i].role;
         if (strcmp(source_role, "tool") == 0) continue;
-        const char *role = "user";
-        if (strcmp(source_role, "assistant") == 0) role = "model";
-        else if (strcmp(source_role, "system") == 0 ||
-                 strcmp(source_role, "developer") == 0) role = "system";
-        APPEND_LITERAL("<|turn>");
-        APPEND_LITERAL(role);
-        APPEND_LITERAL("\n");
-        if (!prompt_append_trimmed(&prompt, &length, &capacity,
-                                   messages[i].content)) goto fail;
-        APPEND_LITERAL("<turn|>\n");
+        const char *role = strcmp(source_role, "assistant") == 0 ? "model" : source_role;
+        if (!(strcmp(role, "model") == 0 && prev_role &&
+              strcmp(prev_role, "assistant") == 0)) {
+            APPEND_LITERAL("<|turn>");
+            APPEND_LITERAL(role);
+            APPEND_LITERAL("\n");
+        }
+        prev_role = source_role;
+        const char *content = messages[i].content;
+        char *stripped = NULL;
+        if (strcmp(role, "model") == 0 && strstr(content, "<|channel>") != NULL) {
+            stripped = malloc(strlen(content) + 1);
+            if (!stripped) goto fail;
+            ollm_strip_channels(content, stripped, strlen(content) + 1);
+            content = stripped;
+        }
+        bool appended = prompt_append_trimmed(&prompt, &length, &capacity, content);
+        free(stripped);
+        if (!appended) goto fail;
+        bool continues = strcmp(role, "model") == 0;
+        if (continues) {
+            continues = false;
+            for (int j = i + 1; j < message_count; j++) {
+                if (strcmp(messages[j].role, "tool") == 0) continue;
+                continues = strcmp(messages[j].role, "assistant") == 0;
+                break;
+            }
+        }
+        if (!continues) APPEND_LITERAL("<turn|>\n");
     }
     APPEND_LITERAL("<|turn>model\n");
+    if (!enable_thinking) APPEND_LITERAL("<|channel>thought\n<channel|>");
     if (length > INT32_MAX) goto fail;
     *formatted_len = (int32_t)length;
 #undef APPEND_LITERAL
@@ -842,13 +2065,26 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
     } else {
         llama_memory_clear(memory, false);
     }
+    if (slot->mtp_ctx) {
+        llama_memory_t dmem = llama_get_memory(slot->mtp_ctx);
+        if (dmem != memory) {
+            if (cached_tokens > 0) {
+                if (!llama_memory_seq_rm(dmem, -1, cached_tokens, -1)) {
+                    llama_memory_clear(dmem, false);
+                }
+            } else {
+                llama_memory_clear(dmem, false);
+            }
+        }
+    }
     slot->cached_count = cached_tokens;
     out->cached_prompt_tokens = cached_tokens;
 
     struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
     struct llama_sampler *smpl = llama_sampler_chain_init(sparams);
     probability_capture sampled = { .probability = 1.0f };
-    llama_sampler_chain_add(smpl, llama_sampler_init(&probability_capture_i, &sampled));
+    if (req->min_probability > 0.0f)
+        llama_sampler_chain_add(smpl, llama_sampler_init(&probability_capture_i, &sampled));
     float repetition = req->repetition_penalty > 0 ? req->repetition_penalty : 1.0f;
     bool penalized = repetition != 1.0f;
     if (penalized) {
@@ -886,6 +2122,7 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
     bool sentence_end = false;
     int sentences = 0;
     size_t streamed_len = 0;
+    size_t think_hold = (size_t)-1;
 
     int decoded = cached_tokens;
     while (decoded < n_tokens) {
@@ -897,6 +2134,7 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
             out->finish_reason = "error";
             break;
         }
+        spec_mtp_process(slot, chunk);
         decoded += chunk;
     }
     if (ok) cache_prompt(slot, tokens, n_tokens);
@@ -920,7 +2158,7 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
     memcpy(context, tokens, (size_t)n_tokens * sizeof *context);
 
     ospec_governor gov;
-    ospec_governor_init(&gov, g_spec_draft_max, g_spec_probe_interval, g_spec_patience);
+    ospec_governor_init(&gov, spec_effective_max(), g_spec_probe_interval, g_spec_patience);
     int n_past = n_tokens;
     llama_token round_tokens[17];
     float round_probs[17];
@@ -931,7 +2169,7 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
         if (round_pos >= round_count) {
             round_count = decode_round(slot, smpl, &sampled, previous, &n_past,
                                        context, context_len,
-                                       g_spec_draft_max > 0 ? &gov : NULL,
+                                       spec_effective_max() > 0 ? &gov : NULL,
                                        round_tokens, round_probs,
                                        (int)(sizeof round_tokens / sizeof *round_tokens));
             round_pos = 0;
@@ -990,6 +2228,56 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
                     ? piece_start - no_think_marker_len : 0;
             }
 
+            /* A reasoning model may still open a thought channel with thinking
+             * disabled. Excise closed blocks and hold an unterminated one out
+             * of the streamed prefix; the tail below drops a dangling block.
+             * Token pieces split markers arbitrarily, so the search reaches
+             * back over the previous piece tail. */
+            static const char think_open[] = "<|channel>";
+            static const char think_close[] = "<channel|>";
+            static const size_t think_open_len = sizeof think_open - 1;
+            static const size_t think_close_len = sizeof think_close - 1;
+            if (!req->enable_thinking) {
+                size_t search_from = piece_start >= think_open_len - 1
+                    ? piece_start - (think_open_len - 1) : 0;
+                if (think_hold == (size_t)-1) {
+                    const char *open_at = strstr(text + search_from, think_open);
+                    if (open_at) {
+                        think_hold = (size_t)(open_at - text);
+                    } else {
+                        size_t close_from = piece_start >= think_close_len - 1
+                            ? piece_start - (think_close_len - 1) : 0;
+                        char *bare = strstr(text + close_from, think_close);
+                        if (bare) {
+                            size_t off = (size_t)(bare - text);
+                            memmove(bare, bare + think_close_len,
+                                    text_len - off - think_close_len + 1);
+                            text_len -= think_close_len;
+                            if (piece_start > off) {
+                                piece_start = piece_start >= off + think_close_len
+                                    ? piece_start - think_close_len : off;
+                            }
+                        }
+                    }
+                }
+                if (think_hold != (size_t)-1) {
+                    const char *close_at = strstr(text + think_hold + think_open_len,
+                                                  think_close);
+                    if (close_at) {
+                        size_t drop = (size_t)(close_at - text) - think_hold +
+                            think_close_len;
+                        memmove(text + think_hold, text + think_hold + drop,
+                                text_len - think_hold - drop + 1);
+                        text_len -= drop;
+                        if (piece_start > think_hold) {
+                            piece_start = piece_start >= think_hold + drop
+                                ? piece_start - drop : think_hold;
+                        }
+                        think_hold = (size_t)-1;
+                    }
+                }
+            }
+
             size_t stop_len = matched_stop_suffix(req, text, text_len);
             bool should_stop = stop_len > 0;
             if (should_stop) {
@@ -1020,6 +2308,18 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
                     memcmp(text, no_think_marker, text_len) == 0;
                 size_t held = should_stop ? 0 : possible_stop_prefix(req, text, text_len);
                 size_t safe_len = text_len - held;
+                if (think_hold != (size_t)-1 && safe_len > think_hold) safe_len = think_hold;
+                if (!req->enable_thinking) {
+                    size_t open_hold = think_marker_hold(text, text_len, think_open,
+                                                         think_open_len);
+                    size_t close_hold = think_marker_hold(text, text_len, think_close,
+                                                          think_close_len);
+                    size_t marker_hold =
+                        open_hold > close_hold ? open_hold : close_hold;
+                    if (marker_hold > 0 && safe_len > text_len - marker_hold)
+                        safe_len = text_len - marker_hold;
+                }
+                if (safe_len < streamed_len) safe_len = streamed_len;
                 if (!hold_no_think_marker && safe_len > streamed_len &&
                     !on_token(text + streamed_len, safe_len - streamed_len, user)) {
                     out->finish_reason = "cancelled";
@@ -1036,6 +2336,16 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
             out->finish_reason = "min_probability";
             break;
         }
+    }
+
+    if (!req->enable_thinking) {
+        if (think_hold != (size_t)-1 && think_hold < text_len) {
+            text_len = think_hold;
+            text[text_len] = 0;
+        }
+        ollm_strip_channels_final(text, text_cap);
+        text_len = strlen(text);
+        if (streamed_len > text_len) streamed_len = text_len;
     }
 
     if (on_token && !cancelled && text_len > streamed_len &&
@@ -1067,6 +2377,7 @@ void ollm_result_free(ochat_result *r) {
 
 static void ollm_shutdown_locked(void) {
     bool had_model = g_model != NULL;
+    spec_mtp_free_locked();
     for (int i = 0; i < g_slot_count; i++) {
         if (g_slots[i].ctx) llama_free(g_slots[i].ctx);
         free(g_slots[i].cached_tokens);
@@ -1077,6 +2388,7 @@ static void ollm_shutdown_locked(void) {
     if (g_model) llama_model_free(g_model);
     g_model = NULL;
     g_vocab = NULL;
+    buft_overrides_clear();
     g_model_name[0] = 0;
     g_gpu_requested = false;
     g_on_gpu = false;
@@ -1258,7 +2570,332 @@ void oembed_shutdown(void) {
     if (had_model) llama_runtime_release();
 }
 
+static struct llama_model *g_judge_model;
+static struct llama_context *g_judge_ctx;
+static const struct llama_vocab *g_judge_vocab;
+static pthread_mutex_t g_judge_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_judge_model_name[256];
+static int g_judge_ctx_len;
+static int g_judge_batch;
+static int g_judge_ngl;
+static llama_token g_judge_yes[4];
+static int g_judge_yes_n;
+static llama_token g_judge_no[4];
+static int g_judge_no_n;
+
+#define OLLM_JUDGE_DEFAULT_GGUF \
+    "/nvme0n1-disk/models/omniserve-native/shieldgemma-2b-q4_k_m.gguf"
+#define OLLM_JUDGE_MAX_SEQ 4
+#define OLLM_JUDGE_SEQ_TOKENS 1024
+
+static const char *ojudge_gguf_path(void) {
+    const char *p = getenv("OMNISERVE_NATIVE_GUARD_JUDGE_GGUF");
+    if (p && p[0]) return p;
+    return OLLM_JUDGE_DEFAULT_GGUF;
+}
+
+static bool ojudge_enabled_env(void) {
+    const char *v = getenv("OMNISERVE_NATIVE_GUARD_JUDGE");
+    if (!v || !v[0]) return true;
+    return v[0] == '1' || v[0] == 't' || v[0] == 'T' || v[0] == 'y' || v[0] == 'Y';
+}
+
+static unsigned long long ojudge_file_bytes(void) {
+    struct stat st;
+    if (stat(ojudge_gguf_path(), &st) != 0 || st.st_size <= 0) return 0;
+    return (unsigned long long)st.st_size;
+}
+
+/* NGL env: integer layer count, or "auto" (default): full GPU offload when
+ * the weights plus KV/compute headroom fit in current free VRAM. Returns
+ * 999 for full offload, 0 for CPU, -1 when undecided (auto at estimate
+ * time, before the LLM has claimed its share). */
+static int ojudge_parse_ngl_env(void) {
+    const char *v = getenv("OMNISERVE_NATIVE_GUARD_JUDGE_NGL");
+    if (!v || !v[0] || strcasecmp(v, "auto") == 0) return -1;
+    long n = atol(v);
+    if (n >= 999) return 999;
+    if (n > 0) return (int)n;
+    return 0;
+}
+
+unsigned long long ojudge_vram_reserve_bytes(void) {
+    if (!ojudge_enabled_env()) return 0;
+    int ngl = ojudge_parse_ngl_env();
+    if (ngl == 0) return 0;
+    unsigned long long file = ojudge_file_bytes();
+    if (file == 0) return 0;
+    unsigned long long kv =
+        256ULL * 1024ULL * 1024ULL + 1024ULL * 1024ULL * 1024ULL / 4;
+    if (file > ULLONG_MAX - kv) return ULLONG_MAX;
+    return file + kv;
+}
+
+static int ojudge_decide_ngl(void) {
+    int ngl = ojudge_parse_ngl_env();
+    if (ngl >= 0) return ngl;
+    unsigned long long need = ojudge_vram_reserve_bytes();
+    if (need == 0) return 0;
+    double free_gib = -1.0;
+    if (!ogpu_memory_gib(&free_gib, NULL) || free_gib <= 0.0) return 0;
+    long long keep_mb = 2048;
+    const char *keep_env = getenv("OMNISERVE_NATIVE_NGL_AUTO_KEEP_FREE_MB");
+    if (keep_env && keep_env[0]) keep_mb = atoll(keep_env);
+    if (keep_mb < 0) keep_mb = 0;
+    double free_b = free_gib * 1024.0 * 1024.0 * 1024.0;
+    double avail = free_b - (double)keep_mb * 1024.0 * 1024.0;
+    bool fits = avail > 0.0 && (double)need <= avail;
+    fprintf(stderr,
+            "guard judge NGL=auto: need=%llu MiB free=%.0f MiB keep_free=%lld MiB -> %s\n",
+            need / (1024ULL * 1024ULL), free_b / (1024.0 * 1024.0),
+            keep_mb, fits ? "full GPU offload" : "CPU");
+    return fits ? 999 : 0;
+}
+
+static void ojudge_resolve_verdict_tokens(void) {
+    static const char *const yes_v[] = {"Yes", " Yes"};
+    static const char *const no_v[] = {"No", " No"};
+    g_judge_yes_n = 0;
+    g_judge_no_n = 0;
+    for (int i = 0; i < 2; i++) {
+        llama_token tok = 0;
+        if (llama_tokenize(g_judge_vocab, yes_v[i], (int32_t)strlen(yes_v[i]),
+                           &tok, 1, false, false) == 1)
+            g_judge_yes[g_judge_yes_n++] = tok;
+        if (llama_tokenize(g_judge_vocab, no_v[i], (int32_t)strlen(no_v[i]),
+                           &tok, 1, false, false) == 1)
+            g_judge_no[g_judge_no_n++] = tok;
+    }
+}
+
+static bool ojudge_try_init(const char *model_path, int ctx_len, int threads,
+                               int ngl) {
+    struct llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = ngl;
+    g_judge_model = llama_model_load_from_file(model_path, mp);
+    if (!g_judge_model) return false;
+    g_judge_vocab = llama_model_get_vocab(g_judge_model);
+    g_judge_ctx_len = ctx_len > 0 ? ctx_len : 4096;
+    int trained_ctx = llama_model_n_ctx_train(g_judge_model);
+    if (trained_ctx > 0 && g_judge_ctx_len > trained_ctx) g_judge_ctx_len = trained_ctx;
+    if (g_judge_ctx_len < OLLM_JUDGE_MAX_SEQ * 256) g_judge_ctx_len = OLLM_JUDGE_MAX_SEQ * 256;
+    struct llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = (uint32_t)g_judge_ctx_len;
+    cp.n_batch = (uint32_t)g_judge_ctx_len;
+    cp.n_ubatch = (uint32_t)(g_judge_ctx_len >= 512 ? 512 : g_judge_ctx_len);
+    cp.n_seq_max = OLLM_JUDGE_MAX_SEQ;
+    cp.n_threads = threads > 0 ? threads : 8;
+    cp.n_threads_batch = cp.n_threads;
+    cp.offload_kqv = ngl > 0;
+    cp.op_offload = ngl > 0;
+    g_judge_ngl = ngl;
+    g_judge_ctx = llama_init_from_model(g_judge_model, cp);
+    if (!g_judge_ctx) {
+        llama_model_free(g_judge_model);
+        g_judge_model = NULL;
+        g_judge_vocab = NULL;
+        return false;
+    }
+    g_judge_batch = (int)cp.n_batch;
+    ojudge_resolve_verdict_tokens();
+    if (g_judge_yes_n == 0 || g_judge_no_n == 0) {
+        llama_free(g_judge_ctx);
+        g_judge_ctx = NULL;
+        llama_model_free(g_judge_model);
+        g_judge_model = NULL;
+        g_judge_vocab = NULL;
+        return false;
+    }
+    const char *slash = strrchr(model_path, '/');
+    snprintf(g_judge_model_name, sizeof g_judge_model_name, "%s",
+             slash ? slash + 1 : model_path);
+    char *dot = strstr(g_judge_model_name, ".gguf");
+    if (dot) *dot = 0;
+    fprintf(stderr, "guard judge live: %s ngl=%d ctx=%d seq=%d\n",
+            g_judge_model_name, g_judge_ngl, g_judge_ctx_len, OLLM_JUDGE_MAX_SEQ);
+    return true;
+}
+
+bool ojudge_init(const char *model_path, int ctx_len, int threads) {
+    if (!model_path || !model_path[0] || g_judge_model) return false;
+    llama_runtime_acquire();
+    int ngl = ojudge_decide_ngl();
+    if (ojudge_try_init(model_path, ctx_len, threads, ngl)) return true;
+    if (ngl > 0) {
+        fprintf(stderr, "guard judge: GPU load failed, retrying CPU-only\n");
+        if (ojudge_try_init(model_path, ctx_len, threads, 0)) return true;
+    }
+    llama_runtime_release();
+    return false;
+}
+
+bool ojudge_ready(void) { return g_judge_ctx != NULL; }
+
+int ojudge_ngl(void) { return g_judge_ngl; }
+
+const char *ojudge_model_name(void) {
+    return g_judge_model_name[0] ? g_judge_model_name : "none";
+}
+
+static double ojudge_pyes_from_row(const float *logits) {
+    if (!logits) return -1.0;
+    int32_t n_vocab = llama_vocab_n_tokens(g_judge_vocab);
+    float yes = -INFINITY, no = -INFINITY;
+    for (int i = 0; i < g_judge_yes_n; i++)
+        if (g_judge_yes[i] >= 0 && g_judge_yes[i] < n_vocab &&
+            logits[g_judge_yes[i]] > yes)
+            yes = logits[g_judge_yes[i]];
+    for (int i = 0; i < g_judge_no_n; i++)
+        if (g_judge_no[i] >= 0 && g_judge_no[i] < n_vocab &&
+            logits[g_judge_no[i]] > no)
+            no = logits[g_judge_no[i]];
+    if (!isfinite(yes) || !isfinite(no)) return -1.0;
+    return 1.0 / (1.0 + exp((double)no - (double)yes));
+}
+
+static int ojudge_tokenize_one(const char *prompt, size_t prompt_len,
+                               llama_token *dst, int cap,
+                               llama_token *scratch, int scratch_cap) {
+    if (prompt_len > INT32_MAX || cap < 1 || !scratch || scratch_cap < 1) return -1;
+    int n = llama_tokenize(g_judge_vocab, prompt, (int32_t)prompt_len,
+                           scratch, scratch_cap, true, false);
+    if (n < 0) {
+        if (-n > scratch_cap) return -1;
+        n = llama_tokenize(g_judge_vocab, prompt, (int32_t)prompt_len,
+                           scratch, -n, true, false);
+    }
+    if (n <= 0) return -1;
+    if (n > cap) n = cap;
+    memcpy(dst, scratch, (size_t)n * sizeof *dst);
+    return n;
+}
+
+bool ojudge_score_multi(const char **prompts, const size_t *lens, int n,
+                        double *pyes_out, double *ms_out) {
+    if (!ojudge_ready() || !prompts || !lens || n <= 0 || n > OLLM_JUDGE_MAX_SEQ ||
+        !pyes_out) return false;
+    double t0 = now_ms();
+    int per_seq = g_judge_ctx_len / OLLM_JUDGE_MAX_SEQ;
+    if (per_seq > OLLM_JUDGE_SEQ_TOKENS) per_seq = OLLM_JUDGE_SEQ_TOKENS;
+    if (per_seq < 1) return false;
+    llama_token *tokens = malloc((size_t)n * (size_t)per_seq * sizeof *tokens);
+    if (!tokens) return false;
+    size_t scratch_cap = 8192;
+    for (int s = 0; s < n; s++)
+        if (lens[s] + 8 > scratch_cap) scratch_cap = lens[s] + 8;
+    if (scratch_cap > (size_t)INT32_MAX) {
+        free(tokens);
+        return false;
+    }
+    llama_token *scratch = malloc(scratch_cap * sizeof *scratch);
+    if (!scratch) {
+        free(tokens);
+        return false;
+    }
+    int counts[OLLM_JUDGE_MAX_SEQ] = {0, 0, 0, 0};
+    int total = 0;
+    for (int s = 0; s < n; s++) {
+        if (!prompts[s] || lens[s] == 0) {
+            free(scratch);
+            free(tokens);
+            return false;
+        }
+        int got = ojudge_tokenize_one(prompts[s], lens[s],
+                                      tokens + (size_t)s * (size_t)per_seq, per_seq,
+                                      scratch, (int)scratch_cap);
+        if (got <= 0) {
+            free(scratch);
+            free(tokens);
+            return false;
+        }
+        counts[s] = got;
+        total += got;
+    }
+    free(scratch);
+    if (total > g_judge_batch) {
+        free(tokens);
+        return false;
+    }
+    struct llama_batch batch = llama_batch_init(total, 0, n);
+    if (!batch.token) {
+        llama_batch_free(batch);
+        free(tokens);
+        return false;
+    }
+    llama_seq_id seq_ids[OLLM_JUDGE_MAX_SEQ];
+    for (int s = 0; s < n; s++) seq_ids[s] = s;
+    int pos = 0;
+    for (int s = 0; s < n; s++) {
+        for (int i = 0; i < counts[s]; i++) {
+            int k = pos++;
+            batch.token[k] = tokens[(size_t)s * (size_t)per_seq + (size_t)i];
+            batch.pos[k] = i;
+            batch.n_seq_id[k] = 1;
+            batch.seq_id[k][0] = seq_ids[s];
+            batch.logits[k] = (i == counts[s] - 1) ? 1 : 0;
+        }
+    }
+    batch.n_tokens = total;
+    pthread_mutex_lock(&g_judge_lock);
+    llama_memory_t memory = llama_get_memory(g_judge_ctx);
+    llama_memory_clear(memory, false);
+    int rc = llama_decode(g_judge_ctx, batch);
+    double pyes[OLLM_JUDGE_MAX_SEQ] = {0.0, 0.0, 0.0, 0.0};
+    if (rc == 0) {
+        int last = 0;
+        for (int s = 0; s < n; s++) {
+            last += counts[s] - 1;
+            const float *row = llama_get_logits_ith(g_judge_ctx, last);
+            last += 1;
+            pyes[s] = ojudge_pyes_from_row(row);
+            if (pyes[s] < 0.0) {
+                rc = -1;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_judge_lock);
+    llama_batch_free(batch);
+    free(tokens);
+    if (rc != 0) return false;
+    for (int s = 0; s < n; s++) pyes_out[s] = pyes[s];
+    if (ms_out) *ms_out = now_ms() - t0;
+    return true;
+}
+
+bool ojudge_score(const char *prompt, size_t prompt_len, double *p_yes_out,
+                  double *ms_out) {
+    double p = 0.0;
+    if (!ojudge_score_multi(&prompt, &prompt_len, 1, &p, ms_out)) return false;
+    if (p_yes_out) *p_yes_out = p;
+    return true;
+}
+
+void ojudge_shutdown(void) {
+    bool had_model = g_judge_model != NULL;
+    if (g_judge_ctx) llama_free(g_judge_ctx);
+    g_judge_ctx = NULL;
+    if (g_judge_model) llama_model_free(g_judge_model);
+    g_judge_model = NULL;
+    g_judge_vocab = NULL;
+    g_judge_model_name[0] = 0;
+    g_judge_ngl = 0;
+    g_judge_yes_n = 0;
+    g_judge_no_n = 0;
+    if (had_model) llama_runtime_release();
+}
+
 #else
+
+unsigned long long ollm_cpu_offloaded_bytes(const char *model_path, int ctx_len, int contexts) {
+    (void)model_path; (void)ctx_len; (void)contexts;
+    return 0;
+}
+
+void ollm_set_load_overrides(const char *tensor_override, const char *moe_cpu_experts,
+                             const char *spec_mtp_gguf) {
+    (void)tensor_override; (void)moe_cpu_experts; (void)spec_mtp_gguf;
+}
 
 bool ollm_init(const char *model_path, int n_gpu_layers, int ctx_len, int parallel_contexts) {
     (void)model_path; (void)n_gpu_layers; (void)ctx_len; (void)parallel_contexts;
@@ -1271,6 +2908,7 @@ void ollm_placement_snapshot(ollm_placement *out) {
     snprintf(out->device, sizeof out->device, "none");
     snprintf(out->kv_type, sizeof out->kv_type, "none");
     snprintf(out->tune_class, sizeof out->tune_class, "none");
+    snprintf(out->spec_source, sizeof out->spec_source, "off");
 }
 int ollm_suggested_contexts(void) { return 1; }
 const char *ollm_model_name(void) { return "none"; }
@@ -1293,6 +2931,25 @@ bool oembed_text(const char *text, size_t text_len, int max_dimensions,
 }
 void oembed_result_free(oembed_result *r) { (void)r; }
 void oembed_shutdown(void) {}
+bool ojudge_init(const char *model_path, int ctx_len, int threads) {
+    (void)model_path; (void)ctx_len; (void)threads;
+    return false;
+}
+bool ojudge_ready(void) { return false; }
+const char *ojudge_model_name(void) { return "none"; }
+int ojudge_ngl(void) { return 0; }
+bool ojudge_score(const char *prompt, size_t prompt_len, double *p_yes_out,
+                  double *ms_out) {
+    (void)prompt; (void)prompt_len; (void)p_yes_out; (void)ms_out;
+    return false;
+}
+bool ojudge_score_multi(const char **prompts, const size_t *lens, int n,
+                        double *pyes_out, double *ms_out) {
+    (void)prompts; (void)lens; (void)n; (void)pyes_out; (void)ms_out;
+    return false;
+}
+unsigned long long ojudge_vram_reserve_bytes(void) { return 0; }
+void ojudge_shutdown(void) {}
 
 #endif
 

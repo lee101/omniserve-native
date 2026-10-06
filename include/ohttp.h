@@ -72,8 +72,12 @@ void ohttp_respond(ohttp_request *req, int status, const char *content_type,
                    const char *body, size_t body_len);
 void ohttp_respond_str(ohttp_request *req, int status, const char *content_type,
                        const char *body);
+void ohttp_respond_h(ohttp_request *req, int status, const char *content_type,
+                     const char *body, size_t body_len, const char *extra_header);
 
 void ohttp_stream_begin(ohttp_request *req, int status, const char *content_type);
+void ohttp_stream_begin_h(ohttp_request *req, int status, const char *content_type,
+                           const char *extra_header);
 bool ohttp_stream_write(ohttp_request *req, const char *data, size_t len);
 void ohttp_stream_end(ohttp_request *req);
 

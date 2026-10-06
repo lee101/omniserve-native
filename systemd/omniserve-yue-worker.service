@@ -1,0 +1,26 @@
+[Unit]
+Description=OmniServe YuE2 local music worker with RunPod overflow
+After=network-online.target
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/nvme0n1-disk/code/omniserve-native
+EnvironmentFile=-/etc/omniserve-yue.env
+Environment=YUE_COG_ROOT=/nvme0n1-disk/code/yue-cog
+Environment=YUE_DEVICE=cuda
+Environment=YUE_QUANT=none
+Environment=YUE_BACKEND=torch
+Environment=YUE_MEMORY_BUDGET_GIB=18
+Environment=YUE_OFFLOAD_AR=1
+Environment=YUE_MIN_FREE_MIB=18432
+Environment=YUE_IDLE_SECONDS=30
+Environment=YUE_RESULT_CACHE=/nvme0n1-disk/data/omniserve-yue/cache
+ExecStart=/nvme0n1-disk/code/yue-cog/.venv/bin/python workers/yue_worker.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

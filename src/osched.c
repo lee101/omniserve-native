@@ -26,6 +26,7 @@
  */
 typedef struct waiter {
     otier tier;
+    otier prio;
     int permits;
     long seq;
     struct timespec queued_at;
@@ -43,6 +44,8 @@ struct osched {
     int used_slots;
     int active;
     double timeout_s;
+    double bg_timeout_s;
+    double bg_age_s;
     long seq;
     waiter *waiters;
     long served[4];
@@ -109,14 +112,58 @@ static void unlink_waiter(osched *s, waiter *me) {
  * then sequence ascending within a tier. The list is short - it is bounded by
  * the number of in-flight HTTP requests - and keeping it ordered on insert is
  * what makes the head O(1) to find on every release. */
-static void link_waiter(osched *s, waiter *me) {
+static void insert_waiter(osched *s, waiter *me) {
     waiter **p = &s->waiters;
-    while (*p && ((*p)->tier < me->tier ||
-                  ((*p)->tier == me->tier && (*p)->seq < me->seq))) {
+    while (*p && ((*p)->prio < me->prio ||
+                  ((*p)->prio == me->prio && (*p)->seq < me->seq))) {
         p = &(*p)->next;
     }
     me->next = *p;
     *p = me;
+}
+
+/* Starvation bound for background: re-rank aged waiters. The seq it kept from
+ * arrival places it behind anything of the new rank that queued earlier. */
+static void age_locked(osched *s) {
+    if (!(s->bg_age_s > 0)) return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    waiter *aged = NULL;
+    for (waiter **p = &s->waiters; *p;) {
+        waiter *w = *p;
+        otier want = w->prio;
+        if (w->tier == TIER_BACKGROUND) {
+            double waited_s = elapsed_ms(w->queued_at, now) / 1000.0;
+            if (waited_s >= 2 * s->bg_age_s) want = TIER_PAID;
+            else if (waited_s >= s->bg_age_s) want = TIER_FREE;
+        }
+        if (want < w->prio) {
+            w->prio = want;
+            *p = w->next;
+            w->next = aged;
+            aged = w;
+        } else {
+            p = &w->next;
+        }
+    }
+    while (aged) {
+        waiter *next = aged->next;
+        insert_waiter(s, aged);
+        aged = next;
+    }
+}
+
+static void link_waiter(osched *s, waiter *me) {
+    age_locked(s);
+    insert_waiter(s, me);
+}
+
+void osched_set_background(osched *s, double timeout_s, double max_wait_s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->bg_timeout_s = timeout_s > 0 ? timeout_s : 0;
+    s->bg_age_s = max_wait_s > 0 ? max_wait_s : 0;
+    pthread_mutex_unlock(&s->lock);
 }
 
 static bool fits_locked(const osched *s, otier tier, int permits) {
@@ -134,6 +181,7 @@ static bool fits_locked(const osched *s, otier tier, int permits) {
  * overtakes an expensive one that is already waiting, so a lane asking for the
  * whole device cannot be starved by a stream of single-permit callers. */
 static void promote_locked(osched *s) {
+    age_locked(s);
     while (s->waiters) {
         waiter *head = s->waiters;
         if (!fits_locked(s, head->tier, head->permits)) break;
@@ -181,8 +229,9 @@ bool osched_acquire_n(osched *s, otier tier, int permits) {
 
     struct timespec deadline;
     clock_gettime(CLOCK_MONOTONIC, &deadline);
-    time_t whole = (time_t)s->timeout_s;
-    long nanos = (long)((s->timeout_s - (double)whole) * 1e9);
+    double timeout_s = tier == TIER_BACKGROUND && s->bg_timeout_s > 0 ? s->bg_timeout_s : s->timeout_s;
+    time_t whole = (time_t)timeout_s;
+    long nanos = (long)((timeout_s - (double)whole) * 1e9);
     deadline.tv_sec += whole;
     deadline.tv_nsec += nanos;
     if (deadline.tv_nsec >= 1000000000L) {
@@ -192,6 +241,7 @@ bool osched_acquire_n(osched *s, otier tier, int permits) {
 
     waiter me = {0};
     me.tier = tier;
+    me.prio = tier;
     me.permits = permits;
     me.seq = ++s->seq;
     clock_gettime(CLOCK_MONOTONIC, &me.queued_at);
@@ -296,6 +346,8 @@ static pthread_mutex_t nvml_lock = PTHREAD_MUTEX_INITIALIZER;
 static nvml_init_fn nvml_init;
 static nvml_handle_fn nvml_handle_by_index;
 static nvml_mem_fn nvml_mem_info;
+typedef int (*nvml_procs_fn)(void *, unsigned *, void *);
+static nvml_procs_fn nvml_procs;
 static void *nvml_lib;
 static void *nvml_dev;
 static double nvml_next_retry_s;
@@ -325,6 +377,8 @@ static void nvml_load_locked(void) {
         *(void **)&nvml_init = dlsym(nvml_lib, "nvmlInit_v2");
         *(void **)&nvml_handle_by_index = dlsym(nvml_lib, "nvmlDeviceGetHandleByIndex_v2");
         *(void **)&nvml_mem_info = dlsym(nvml_lib, "nvmlDeviceGetMemoryInfo");
+        *(void **)&nvml_procs = dlsym(nvml_lib, "nvmlDeviceGetComputeRunningProcesses_v3");
+        if (!nvml_procs) *(void **)&nvml_procs = dlsym(nvml_lib, "nvmlDeviceGetComputeRunningProcesses_v2");
     }
     if (!nvml_init || !nvml_handle_by_index || nvml_init() != 0) return;
     nvml_dev = NULL;
@@ -350,6 +404,28 @@ bool ogpu_memory_gib(double *free_gib, double *total_gib) {
     if (free_gib) *free_gib = (double)mem.free_b / (1024.0 * 1024.0 * 1024.0);
     if (total_gib) *total_gib = (double)mem.total / (1024.0 * 1024.0 * 1024.0);
     return true;
+}
+
+/* nvmlProcessInfo_v2_t / nvmlProcessInfo_t (v3 has the same layout). */
+struct nvml_proc_info { unsigned pid; unsigned long long used; unsigned gi, ci; };
+
+int ogpu_processes(ogpu_proc *out, int cap) {
+    if (!out || cap <= 0) return -1;
+    struct nvml_proc_info info[64];
+    unsigned count = 64;
+    pthread_mutex_lock(&nvml_lock);
+    nvml_load_locked();
+    int rc = nvml_dev && nvml_procs ? nvml_procs(nvml_dev, &count, info) : -1;
+    pthread_mutex_unlock(&nvml_lock);
+    if (rc != 0) return -1;
+    int n = 0;
+    for (unsigned i = 0; i < count && n < cap; i++) {
+        out[n].pid = (int)info[i].pid;
+        /* NVML reports NVML_VALUE_NOT_AVAILABLE (all ones) for some contexts. */
+        out[n].used_mb = info[i].used == ~0ULL ? 0 : (int)(info[i].used / (1024ULL * 1024ULL));
+        n++;
+    }
+    return n;
 }
 
 double ogpu_free_gib(void) {

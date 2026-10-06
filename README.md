@@ -180,9 +180,9 @@ on the lane directly (`--no-fallback` disables that). With the lane already up
 one retry is enough before rendering locally. The lane warms itself with one
 1024² step before it listens (`OMNISERVE_NATIVE_SD_WARMUP`, size
 `..._WARMUP_SIZE`), so the first request is not slower than the rest. Setting
-`OMNISERVE_NATIVE_SD_TURBO_LORA` (the start script does when the file exists)
-makes `{"turbo":true}` available per request, `OMNISERVE_NATIVE_SD_TURBO=1`
-makes the 6-step tier the default; both are off by default here.
+`OMNISERVE_NATIVE_SD_TURBO_NODES` and `OMNISERVE_NATIVE_SD_DEFAULT_LORA` (the
+start script does with `RA2_TURBO=1`) makes the 6-step tier the default for
+text-to-image, `{"turbo":false}` selects the base path; off by default here.
 
 ## Local-first ASR and background fine-tuning
 
@@ -279,6 +279,63 @@ Deliberately not escalated: 4xx at any volume (clients sending bad requests is
 not an outage), admission timeouts alone (that is load, not a defect), and a
 single transient 5xx below the threshold.
 
+## Content guard
+
+`src/oguard.c` is a three-stage pre-generation filter on the local text
+paths (`/v1/chat/completions`, `/v1/completions`, `/api/v1/generate*`). It
+covers three hard-prohibited categories: sexual content involving minors,
+sexual content depicting non-consent, and sexual content about real
+identifiable people. Stage 1 is deterministic lexical rules (sexual-context
+× category-signal co-occurrence, so adult roleplay alone never trips);
+stage 2 is gte-modernbert seed-cosine (threshold 0.68 + margin 0.04 over
+benign); stage 3 is a ShieldGemma-2B judge (`P(Yes)` from first-token
+logits, CPU-only) that runs only when stage 1 passes and the request
+carries a sexual/romance/category signal or elevated stage-2 cosine.
+Consensual explicit content between fictional adults is allowed at every
+stage, including negotiated CNC with a safeword.
+
+- On a trip the gateway skips generation and returns **HTTP 200** with a
+  normal OpenAI-shaped body whose content is a short refusal,
+  `finish_reason: "content_filter"`, and header
+  `X-Content-Policy: blocked:<category>`. 200, not 4xx, so callers can show
+  the refusal to the user instead of retrying elsewhere. Streaming emits one
+  SSE chunk with the refusal, then `[DONE]`.
+- A negotiated consensual-non-consent scene between adults with a safeword is
+  deliberately **not** blocked: explicit consent language suppresses the
+  lexical non-consent category, and the judge guideline carries the same
+  exception. CNC roleplay without that framing still blocks.
+- Real-person matching is full names (both tokens, case-insensitive)
+  against `data/guard/real_person_names.txt` plus explicit indicators
+  (`real streamer`, `actual president`, `irl`, ...); the judge additionally
+  catches mononymous celebrities the list misses. A missing names file
+  disables only the lexical real-person category, with a startup log line.
+- The judge (one combined call; per-category calls only when ambiguous, LRU
+  verdict cache) can also veto a stage-2 block it confidently clears, but
+  only for explicit-demand requests with zero lexical risk signals. Lexical
+  blocks are final and never consult the judge. Missing judge model degrades
+  to stages 1+2 with one log line.
+- `POST /v1/guard/classify` exposes the classifier for internal callers:
+  loopback-only + secret auth, body
+  `{"system","user","context"}`, responds
+  `{"blocked","category","rule","stage","score"}` (`stage` is
+  `lexical|embedding|judge|both`), never runs generation.
+- `GET /status` reports `guard: {enabled, names_loaded, blocks, judge, classify}`
+  (judge readiness, call/cache counts, avg/last ms; endpoint latency),
+  `/metrics` exposes `omniserve_guard_blocks_total{category}` plus judge
+  counters, and each block logs one stderr line with category, rule,
+  request id, and a truncated SHA-256 of the text — never the prompt text.
+
+Env: `OMNISERVE_NATIVE_GUARD` (default 1; 0 is a pure passthrough),
+`OMNISERVE_NATIVE_GUARD_CATEGORIES` (comma list to narrow:
+`minor,noncon,realperson`), `OMNISERVE_NATIVE_GUARD_NAMES` (names file
+override), `OMNISERVE_NATIVE_GUARD_EMBED_{THRESHOLD,MARGIN}`,
+`OMNISERVE_NATIVE_GUARD_JUDGE{,_GGUF,_THRESHOLD,_THR_MINOR,_THR_NONCON,_THR_REAL,_HIGH,_BAND,_VETO,_THREADS,_CACHE_SIZE}`.
+Corpora and gates: `tests/data/guard-corpus.json` (tune) and
+`tests/data/guard-holdout.json` (`ctest -R guard` runs lexical-only: 100%
+of allow cases must pass, tune blocks >=95%, holdout blocks reported not
+gated). See `performance/guard-validation.md` for the canary validation run
+(three-stage: tune 106/106 + 69/69, holdout 51/57 + 56/56).
+
 ## Per-device tuning
 
 Batch geometry that saturates a 5090 stalls a T4, so `src/otune.c` keys the
@@ -372,6 +429,32 @@ where a miss is expensive and forfeits most of the win where it is not. `/status
 `omniserve_llm_spec_*` report drafted, accepted and calls saved — separately,
 because an acceptance rate alone cannot distinguish speculation that is off from
 speculation that is landing perfectly.
+
+### MTP-head drafting
+
+Where prompt-lookup guesses out of the context, `SPEC_MTP_GGUF` points at a
+Gemma-4 multi-token-prediction head (e.g. `mtp-gemma-4-26B-A4B-it-Q8_0.gguf`,
+0.43 GiB) that drafts the next token from the target's own hidden states. Each
+parallel target context gets a paired MTP context sharing its KV cache; after
+every target decode the caller snapshots the staged hidden rows, drafts up to
+`SPEC_MTP_DRAFT` tokens (default 1, max 2) with the head, and verifies them
+through the same loop and governor as prompt-lookup — only the draft source
+changes, as the design above promised. When a head is loaded it takes
+precedence over prompt-lookup; when it is absent, mismatched (`n_embd` checked,
+never fatal), or unloaded, prompt-lookup settings apply unchanged. The head
+loads and unloads with the model, including over `/admin/llm/swap`, which
+accepts `spec_mtp_gguf` under the same swap-dir allow-list as the model path.
+
+Measured CPU-only on Boulesis-v2.1-26B-A4B (4 roleplay prompts × temp 0/0.9,
+160 tokens): draft 1 accepts 58%/55% and gains +12%/+11% tok/s over
+non-speculative; draft 2 accepts 52%/47% and gains nothing further, so 1 is the
+default. `SPEC_MTP_P_MIN` (default 0) drops drafts the head is unsure of; it
+raises acceptance a little while costing throughput, because the head decode is
+sunk cost before confidence is known. `/status.speculation.source` reports
+`mtp`, `prompt-lookup`, or `off`. Greedy output is not bit-identical to
+non-speculative — the width-2 verify batch sums in a different order than two
+width-1 decodes — but same-config runs are bit-identical, including across
+restarts. Full numbers: `performance/boulesis-5090.md`.
 
 ## Cost- and priority-guided overflow capacity
 
@@ -891,7 +974,7 @@ curl localhost:8791/api/v1/generate \
   -d '{"text":"Hi I am bored so looking","number_of_results":1,"max_length":100,"max_sentences":1,"min_probability":0.7,"model":"best","enable_thinking":false}'
 ```
 
-The embedded path honors `enable_thinking`, `min_probability`, `min_p`, `max_sentences`, and string/array stop sequences. Qwen no-thinking requests prefill the closed reasoning block, so reasoning tags do not leak into `generated_text` or consume output tokens. Repeated chat/system prefixes reuse the matching KV prefix; `usage.cached_prompt_tokens` reports the saving.
+The embedded path honors `enable_thinking`, `min_probability`, `min_p`, `max_sentences`, and string/array stop sequences. Thinking defaults to off (`OMNISERVE_NATIVE_LLM_THINKING_DEFAULT=1` opts back in); with thinking off the generation prompt closes the thought channel and any thought-channel text the model still emits is excised from both streaming and non-streaming output, never returned. Qwen no-thinking requests prefill the closed reasoning block, so reasoning tags do not leak into `generated_text` or consume output tokens. Repeated chat/system prefixes reuse the matching KV prefix; `usage.cached_prompt_tokens` reports the saving.
 
 ## Model conversion
 
@@ -932,6 +1015,32 @@ other tenants. The isolated chat canary was coherent and cut decode time by
 about half versus CPU-only placement. Keep `NGL=auto` for the conservative
 full-fit decision, or pass the measured numeric value when selecting this
 partial profile.
+
+For MoE checkpoints that do not fit even partially, experts can be split from
+the dense weights instead of whole layers. `OMNISERVE_NATIVE_TENSOR_OVERRIDE`
+takes llama.cpp `-ot` syntax (`regex=CPU` or `regex=CUDA0`, comma-separated)
+and is passed through to `llama_model_params.tensor_buft_overrides`.
+`OMNISERVE_NATIVE_MOE_CPU_EXPERTS=<N>|all|auto` is the convenient form: it
+places the `ffn_*_exps` tensors of the last N layers on CPU. `auto` scans the
+GGUF, estimates GPU bytes as non-expert weights plus GPU-resident experts plus
+KV cache for the configured context size and count plus 1 GiB of compute
+headroom, and keeps the largest expert prefix that fits in free VRAM minus
+`OMNISERVE_NATIVE_NGL_AUTO_KEEP_FREE_MB`. The decision samples free VRAM once
+per load and is shared by the `NGL=auto` verdict, so the two can never disagree;
+when MoE placement is active `NGL=auto` compares the same estimate (not raw
+file bytes) against free VRAM. Both knobs are also accepted as
+`tensor_override` and `moe_cpu_experts` in the `/admin/llm/swap` (and
+`/admin/llm/load`) JSON body, and `/status.llm` reports the effective placement
+(`gpu_expert_layers`, `cpu_expert_layers`, `tensor_override` as a
+`moe:blk.A-B->CPU` summary plus user patterns, `est_gpu_bytes`).
+`./scripts/moe_bench.sh` sweeps the placement grid; see
+`performance/boulesis-5090.md` for the measured 5090 profile.
+
+CPU-side experts need CPU threads: `OMNISERVE_NATIVE_LLM_THREADS` (decode)
+and `OMNISERVE_NATIVE_LLM_THREADS_BATCH` (prefill) default to 16 each, a
+middle ground for a loaded many-core host between llama.cpp's 4-thread default
+and full subscription. Raise toward core count on a quiet host, lower if the
+gateway shares the box with hungry tenants.
 
 The checked-in `systemd/omniserve-native-gemma4-iq4.conf` is an optional
 machine-specific drop-in for that profile. It sets one context, `q8_0` KV,
@@ -1094,3 +1203,9 @@ OMNISERVE_PROXY_PROXY_IMAGE=http://127.0.0.1:8791
 2. FP8/NVFP4 weights (Blackwell) — llama.cpp Q4_K/Q8 today; TensorRT-LLM backend as a second `obackend` impl for the big-model path.
 3. Diffusion: sd.cpp `--diffusion-flash-attn`, TAESD preview, step-distilled checkpoints (turbo 4-step); port the fused kernels from `../cutedsl/cutezimage/csrc` (rms/silu-gate/qk-norm, already 5090-tuned) into a custom ggml op.
 4. CUDA graph capture for the small-model path — cutedsl measured 21x on Chronos-2 from graph capture; same lever applies to short-seq LLM decode.
+
+## YuE2 music
+
+Authenticated `POST /v1/music/generations` relays lyrics and musical direction
+to the local YuE2 worker with memory-aware RunPod overflow. See
+[quality, pricing, configuration and validation](performance/yue2-music.md).
