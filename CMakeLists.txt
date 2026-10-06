@@ -68,9 +68,9 @@ endif()
 set(LLAMA_DIR "${CMAKE_SOURCE_DIR}/../llama.cpp" CACHE PATH "llama.cpp checkout")
 set(SD_DIR "${CMAKE_SOURCE_DIR}/../stable-diffusion.cpp" CACHE PATH "stable-diffusion.cpp checkout")
 
-set(CORE_SRC src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c src/omatte.c src/onsfw.c src/oproxy.c src/osched.c
-             src/ohost.c src/ovram.c src/ospec.c
-             src/oscale.c src/otext.c src/otune.c)
+set(CORE_SRC src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c src/omatte.c src/onsfw.c src/oproxy.c src/osched.c src/ofrontier.c
+             src/ohost.c src/ovram.c src/obroker.c src/ospec.c
+             src/oscale.c src/otext.c src/otune.c src/oguard.c)
 
 add_library(onative_core STATIC ${CORE_SRC})
 target_include_directories(onative_core PUBLIC include)
@@ -91,7 +91,19 @@ if(WITH_LLAMA AND EXISTS "${LLAMA_DIR}/build/bin/libllama.so")
     target_compile_definitions(omniserve-native PRIVATE USE_LLAMA)
     target_include_directories(omniserve-native SYSTEM PRIVATE "${LLAMA_DIR}/include" "${LLAMA_DIR}/ggml/include")
     target_link_libraries(omniserve-native PRIVATE "${LLAMA_DIR}/build/bin/libllama.so" "${LLAMA_DIR}/build/bin/libggml.so")
+    if(EXISTS "${LLAMA_DIR}/build/bin/libggml-base.so")
+        target_link_libraries(omniserve-native PRIVATE "${LLAMA_DIR}/build/bin/libggml-base.so")
+    endif()
     set_target_properties(omniserve-native PROPERTIES BUILD_RPATH "${LLAMA_DIR}/build/bin")
+    add_executable(oguard_sweep tools/guard_sweep.c src/backend_llama.c)
+    target_compile_definitions(oguard_sweep PRIVATE USE_LLAMA)
+    target_include_directories(oguard_sweep PRIVATE include)
+    target_include_directories(oguard_sweep SYSTEM PRIVATE "${LLAMA_DIR}/include" "${LLAMA_DIR}/ggml/include")
+    target_link_libraries(oguard_sweep PRIVATE onative_core "${LLAMA_DIR}/build/bin/libllama.so" "${LLAMA_DIR}/build/bin/libggml.so")
+    if(EXISTS "${LLAMA_DIR}/build/bin/libggml-base.so")
+        target_link_libraries(oguard_sweep PRIVATE "${LLAMA_DIR}/build/bin/libggml-base.so")
+    endif()
+    set_target_properties(oguard_sweep PROPERTIES BUILD_RPATH "${LLAMA_DIR}/build/bin")
 endif()
 
 if(WITH_SD AND EXISTS "${SD_DIR}/build/bin/libstable-diffusion.so")
@@ -138,6 +150,30 @@ add_executable(onative_tests tests/test_core.c src/backend_llama.c src/docs.c)
 target_include_directories(onative_tests PRIVATE include)
 target_link_libraries(onative_tests PRIVATE onative_core)
 add_test(NAME core COMMAND onative_tests)
+add_executable(onative_frontier_tests tests/test_frontier.c)
+target_link_libraries(onative_frontier_tests PRIVATE onative_core)
+add_test(NAME frontier COMMAND onative_frontier_tests)
+add_executable(onative_guard_tests tests/test_guard.c)
+target_include_directories(onative_guard_tests PRIVATE include)
+target_link_libraries(onative_guard_tests PRIVATE onative_core)
+add_test(NAME guard COMMAND onative_guard_tests "${CMAKE_SOURCE_DIR}/tests/data/guard-corpus.json")
+set_tests_properties(guard PROPERTIES
+    ENVIRONMENT "OMNISERVE_NATIVE_GUARD_NAMES=${CMAKE_SOURCE_DIR}/data/guard/real_person_names.txt")
+add_test(NAME guard_holdout COMMAND onative_guard_tests "${CMAKE_SOURCE_DIR}/tests/data/guard-holdout.json" --holdout)
+set_tests_properties(guard_holdout PROPERTIES
+    ENVIRONMENT "OMNISERVE_NATIVE_GUARD_NAMES=${CMAKE_SOURCE_DIR}/data/guard/real_person_names.txt")
+add_executable(onative_guard_judge_tests tests/test_guard_judge.c)
+target_include_directories(onative_guard_judge_tests PRIVATE include)
+target_link_libraries(onative_guard_judge_tests PRIVATE onative_core)
+add_test(NAME guard_judge COMMAND onative_guard_judge_tests)
+set_tests_properties(guard_judge PROPERTIES
+    ENVIRONMENT "OMNISERVE_NATIVE_GUARD_NAMES=${CMAKE_SOURCE_DIR}/data/guard/real_person_names.txt")
+add_executable(onative_guard_multiturn_tests tests/test_guard_multiturn.c)
+target_include_directories(onative_guard_multiturn_tests PRIVATE include)
+target_link_libraries(onative_guard_multiturn_tests PRIVATE onative_core)
+add_test(NAME guard_multiturn COMMAND onative_guard_multiturn_tests "${CMAKE_SOURCE_DIR}/tests/data/guard-multiturn.json")
+set_tests_properties(guard_multiturn PROPERTIES
+    ENVIRONMENT "OMNISERVE_NATIVE_GUARD_NAMES=${CMAKE_SOURCE_DIR}/data/guard/real_person_names.txt")
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
     if(TARGET onative_sd_cache_stub)
@@ -187,6 +223,18 @@ if(Python3_Interpreter_FOUND)
     set_tests_properties(internal_trust PROPERTIES
         ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
     add_test(
+        NAME key_tiers
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_key_tiers.py"
+    )
+    set_tests_properties(key_tiers PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    add_test(
+        NAME auth_gate
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_auth_gate.py"
+    )
+    set_tests_properties(auth_gate PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    add_test(
         NAME multimodal_routing
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_multimodal_routing.py"
     )
@@ -219,6 +267,12 @@ if(Python3_Interpreter_FOUND)
             ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
         set_tests_properties(image_overflow_routing PROPERTIES
             ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
+        add_test(
+            NAME image_frontier_routing
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_image_frontier_routing.py"
+        )
+        set_tests_properties(image_frontier_routing PROPERTIES
+            ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
     endif()
     add_test(
         NAME h3_routing
@@ -226,6 +280,8 @@ if(Python3_Interpreter_FOUND)
     )
     set_tests_properties(h3_routing PROPERTIES
         ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    add_test(NAME yue_worker COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_yue_worker.py")
+    add_test(NAME yue_routing COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_yue_routing.py" "$<TARGET_FILE:omniserve-native>")
     # Skips itself when numpy or libomatte.so is missing (CPU-only CI).
     add_test(
         NAME matte_decontamination
