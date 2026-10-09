@@ -69,7 +69,7 @@ set(LLAMA_DIR "${CMAKE_SOURCE_DIR}/../llama.cpp" CACHE PATH "llama.cpp checkout"
 set(SD_DIR "${CMAKE_SOURCE_DIR}/../stable-diffusion.cpp" CACHE PATH "stable-diffusion.cpp checkout")
 
 set(CORE_SRC src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c src/omatte.c src/onsfw.c src/oproxy.c src/osched.c src/ofrontier.c
-             src/ohost.c src/ovram.c src/obroker.c src/ospec.c
+             src/ohost.c src/ovram.c src/obroker.c src/oresidency.c src/ospec.c
              src/oscale.c src/otext.c src/otune.c src/oguard.c)
 
 add_library(onative_core STATIC ${CORE_SRC})
@@ -158,6 +158,9 @@ add_test(NAME core COMMAND onative_tests)
 add_executable(onative_frontier_tests tests/test_frontier.c)
 target_link_libraries(onative_frontier_tests PRIVATE onative_core)
 add_test(NAME frontier COMMAND onative_frontier_tests)
+add_executable(onative_residency_tests tests/test_residency.c)
+target_link_libraries(onative_residency_tests PRIVATE onative_core)
+add_test(NAME residency COMMAND onative_residency_tests)
 add_executable(onative_guard_tests tests/test_guard.c)
 target_include_directories(onative_guard_tests PRIVATE include)
 target_link_libraries(onative_guard_tests PRIVATE onative_core)

@@ -194,6 +194,7 @@ typedef sd_ctx_t *(*fn_new_sd_ctx)(const sd_ctx_params_t *);
 typedef void (*fn_img_params_init)(sd_img_gen_params_t *);
 typedef bool (*fn_generate_image)(sd_ctx_t *, const sd_img_gen_params_t *, sd_image_t **, int *);
 typedef void (*fn_free_images)(sd_image_t *, int);
+typedef void (*fn_free_sd_ctx)(sd_ctx_t *);
 #if !OMNISERVE_SD_LATENT_API
 /* Compatibility shim for upstream stable-diffusion.cpp: the symbols are looked up
  * with dlsym and stay NULL, so latent_api_ready() reports false and every
@@ -219,6 +220,7 @@ static fn_generate_image p_generate_image;
 static int (*p_str_to_sample_method)(const char *);
 static int (*p_str_to_scheduler)(const char *);
 static fn_free_images p_free_images;
+static fn_free_sd_ctx p_free_sd_ctx;
 static fn_latent_params_init p_latent_params_init;
 static fn_generate_image_with_latent p_generate_image_with_latent;
 static fn_free_latent p_free_latent;
@@ -256,6 +258,7 @@ static bool sd_lib_load(void) {
     *(void **)&p_str_to_sample_method = dlsym(lib, "str_to_sample_method");
     *(void **)&p_str_to_scheduler = dlsym(lib, "str_to_scheduler");
     p_free_images = (fn_free_images)dlsym(lib, "free_sd_images");
+    p_free_sd_ctx = (fn_free_sd_ctx)dlsym(lib, "free_sd_ctx");
     p_latent_params_init = (fn_latent_params_init)dlsym(lib, "sd_latent_replay_params_init");
     p_generate_image_with_latent = (fn_generate_image_with_latent)dlsym(lib, "generate_image_with_latent");
     p_free_latent = (fn_free_latent)dlsym(lib, "free_sd_latent");
@@ -714,10 +717,32 @@ static void cache_store_encoded_result(latent_cache_entry *entry, const oimg_res
     pthread_mutex_unlock(&g_cache_lock);
 }
 
-bool osd_init(const char *model_path) {
-    if (g_sd) return true;
-    if (!sd_lib_load()) return false;
-    sd_cfg_load();
+/* Residency profile: the resident build reads OMNISERVE_NATIVE_SD_RESIDENT_<X> before
+ * OMNISERVE_NATIVE_SD_<X> for the placement knobs, with resident defaults (weights on the
+ * compute backend, no streaming, eager upload so a promotion pays the PCIe copy up front). */
+static const char *sd_profile_env(const char *suffix, bool resident, const char *resident_default) {
+    char name[96];
+    if (resident) {
+        snprintf(name, sizeof name, "OMNISERVE_NATIVE_SD_RESIDENT_%s", suffix);
+        const char *v = getenv(name);
+        return v ? v : resident_default;
+    }
+    snprintf(name, sizeof name, "OMNISERVE_NATIVE_SD_%s", suffix);
+    return getenv(name);
+}
+
+static bool sd_profile_flag(const char *suffix, bool resident, bool resident_default, bool fallback) {
+    const char *v = sd_profile_env(suffix, resident, resident_default ? "1" : "0");
+    if (!v || !v[0]) return fallback;
+    return strcmp(v, "0") != 0 && strcasecmp(v, "false") != 0 && strcasecmp(v, "off") != 0;
+}
+
+static char g_model_path[1024];
+static bool g_sd_resident;
+static double g_sd_switch_ms_last;
+static unsigned long long g_sd_switches, g_sd_switch_failures;
+
+static sd_ctx_t *sd_ctx_build(const char *model_path, bool resident) {
     sd_ctx_params_t params;
     p_ctx_params_init(&params);
     const char *diffusion = getenv("OMNISERVE_NATIVE_SD_DIFFUSION_MODEL");
@@ -725,9 +750,9 @@ bool osd_init(const char *model_path) {
     const char *llm = getenv("OMNISERVE_NATIVE_SD_LLM");
     const char *llm_vision = getenv("OMNISERVE_NATIVE_SD_LLM_VISION");
     const char *taesd = getenv("OMNISERVE_NATIVE_SD_TAESD");
-    const char *max_vram = getenv("OMNISERVE_NATIVE_SD_MAX_VRAM");
-    const char *backend = getenv("OMNISERVE_NATIVE_SD_BACKEND");
-    const char *params_backend = getenv("OMNISERVE_NATIVE_SD_PARAMS_BACKEND");
+    const char *max_vram = sd_profile_env("MAX_VRAM", resident, "");
+    const char *backend = sd_profile_env("BACKEND", resident, getenv("OMNISERVE_NATIVE_SD_BACKEND"));
+    const char *params_backend = sd_profile_env("PARAMS_BACKEND", resident, "");
     if (diffusion && diffusion[0]) {
         params.diffusion_model_path = diffusion;
     } else {
@@ -744,14 +769,92 @@ bool osd_init(const char *model_path) {
     params.flash_attn = sd_env_flag("OMNISERVE_NATIVE_SD_FLASH_ATTN", true);
     params.diffusion_flash_attn = sd_env_flag("OMNISERVE_NATIVE_SD_DIFFUSION_FLASH_ATTN", true);
 #if OMNISERVE_SD_STREAM_LAYERS
-    params.stream_layers = sd_env_flag("OMNISERVE_NATIVE_SD_STREAM_LAYERS", false);
+    params.stream_layers = sd_profile_flag("STREAM_LAYERS", resident, false, false);
 #endif
     params.enable_mmap = sd_env_flag("OMNISERVE_NATIVE_SD_MMAP", true);
-    params.eager_load = sd_env_flag("OMNISERVE_NATIVE_SD_EAGER_LOAD", false);
-    params.auto_fit = sd_env_flag("OMNISERVE_NATIVE_SD_AUTO_FIT", false);
+    params.eager_load = sd_profile_flag("EAGER_LOAD", resident, true, false);
+    params.auto_fit = sd_profile_flag("AUTO_FIT", resident, false, false);
     const char *model_args = getenv("OMNISERVE_NATIVE_SD_MODEL_ARGS");
     if (model_args && model_args[0]) params.model_args = model_args;
-    g_sd = p_new_sd_ctx(&params);
+    return p_new_sd_ctx(&params);
+}
+
+bool osd_resident(void) { return g_sd_resident; }
+
+/* Caller holds g_sd_lock. The resident context is built before the streamed one is freed,
+ * so a failed promotion (OOM beside a co-tenant) leaves the streamed context serving;
+ * a demotion frees first because the resident copy is what a co-tenant is waiting for.
+ * Weights come from the page cache either way. */
+static int g_sd_want = -1; /* -1 none, else the residency the arbiter last asked for */
+
+static int sd_switch_locked(bool resident) {
+    if (g_sd_resident == resident) return 1;
+    double t0 = now_ms();
+    sd_ctx_t *next = NULL;
+    if (resident) {
+        next = sd_ctx_build(g_model_path, true);
+        if (!next) {
+            g_sd_switch_failures++;
+            __atomic_store_n(&g_sd_want, -1, __ATOMIC_RELAXED);
+            fprintf(stderr, "sd: promotion to resident failed after %.0f ms; staying streamed\n", now_ms() - t0);
+            return 0;
+        }
+        p_free_sd_ctx(g_sd);
+    } else {
+        p_free_sd_ctx(g_sd);
+        g_sd = NULL;
+        next = sd_ctx_build(g_model_path, false);
+        if (!next) {
+            fprintf(stderr, "sd: streamed rebuild failed; aborting so the unit restarts\n");
+            abort();
+        }
+    }
+    g_sd = next;
+    pthread_mutex_lock(&g_cache_lock);
+    for (int i = 0; i < g_latent_cache_size; i++)
+        if (g_latent_cache[i].latent) cache_entry_clear(&g_latent_cache[i]);
+    pthread_mutex_unlock(&g_cache_lock);
+    g_sd_resident = resident;
+    g_sd_switches++;
+    g_sd_switch_ms_last = now_ms() - t0;
+    fprintf(stderr, "sd: residency -> %s in %.0f ms\n", resident ? "resident" : "streamed", g_sd_switch_ms_last);
+    return 1;
+}
+
+/* Records the arbiter's answer and switches now if the lane is idle (wait=false returns -1
+ * when a generation holds the lane). A pending switch (either way) is also applied by the
+ * next request before it generates, so a back-to-back lane does not starve it; requests
+ * size their VRAM lease from osd_residency_target() so the lease matches that switch. */
+bool osd_residency_target(void) {
+    int want = __atomic_load_n(&g_sd_want, __ATOMIC_RELAXED);
+    return want >= 0 ? want == 1 : g_sd_resident;
+}
+
+void osd_residency_settled(void) { __atomic_store_n(&g_sd_want, -1, __ATOMIC_RELAXED); }
+
+int osd_set_resident(bool resident, bool wait) {
+    if (!g_sd || !p_free_sd_ctx) return 0;
+    __atomic_store_n(&g_sd_want, resident ? 1 : 0, __ATOMIC_RELAXED);
+    if (wait) pthread_mutex_lock(&g_sd_lock);
+    else if (pthread_mutex_trylock(&g_sd_lock) != 0) return -1;
+    int rc = sd_switch_locked(resident);
+    pthread_mutex_unlock(&g_sd_lock);
+    return rc;
+}
+
+size_t osd_residency_json(char *out, size_t cap) {
+    int n = snprintf(out, cap, "{\"resident\":%s,\"switches\":%llu,\"switch_failures\":%llu,\"switch_ms_last\":%.0f}",
+                     g_sd_resident ? "true" : "false", g_sd_switches, g_sd_switch_failures, g_sd_switch_ms_last);
+    return n > 0 && (size_t)n < cap ? (size_t)n : 0;
+}
+
+bool osd_init(const char *model_path) {
+    if (g_sd) return true;
+    if (!sd_lib_load()) return false;
+    sd_cfg_load();
+    snprintf(g_model_path, sizeof g_model_path, "%s", model_path ? model_path : "");
+    const char *diffusion = getenv("OMNISERVE_NATIVE_SD_DIFFUSION_MODEL");
+    g_sd = sd_ctx_build(model_path, false);
     if (!g_sd) return false;
     g_reference_edit = sd_env_flag("OMNISERVE_NATIVE_SD_REFERENCE_EDIT", false);
     const char *named_path = diffusion && diffusion[0] ? diffusion : model_path;
@@ -939,6 +1042,8 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         result_cache = teleport_cache = false;
     }
     pthread_mutex_lock(&g_sd_lock);
+    int want = __atomic_load_n(&g_sd_want, __ATOMIC_RELAXED);
+    if (want >= 0 && (want == 1) != g_sd_resident && p_free_sd_ctx) (void)sd_switch_locked(want == 1);
     double started = now_ms();
     sd_image_t *images = NULL;
     int image_count = 0;

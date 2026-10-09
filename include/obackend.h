@@ -238,6 +238,11 @@ typedef struct {
 } oimg_result;
 
 bool osd_init(const char *model_path);
+bool osd_resident(void);
+int osd_set_resident(bool resident, bool wait); /* 1 ok, 0 failed, -1 busy (wait=false) */
+bool osd_residency_target(void); /* pending arbiter state if any, else current */
+void osd_residency_settled(void); /* drop a pending switch: the arbiter now agrees with the current state */
+size_t osd_residency_json(char *out, size_t cap);
 bool osd_ready(void);
 const char *osd_model_name(void);
 bool osd_generate(const oimg_req *req, oimg_result *out);
