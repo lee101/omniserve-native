@@ -2,6 +2,7 @@
 
 #include "ojson.h"
 
+#include "olora_route.h"
 #include "onsfw.h"
 #include <errno.h>
 #include <limits.h>
@@ -366,6 +367,56 @@ static bool token_bool(const char *json, const oj_tok *token, bool *value) {
     return false;
 }
 
+static bool add_routed_loras(oimage_request *request, const char *json,
+                             const oj_tok *tokens, int token_count) {
+    if (!olora_route_enabled() || request->generation.lora_count ||
+        request->generation.image_base64 || !request->prompt) {
+        return true;
+    }
+    int token = oj_obj_get(json, tokens, token_count, 0, "auto_lora");
+    bool wanted = true;
+    if (token >= 0 && token_bool(json, &tokens[token], &wanted) && !wanted) return true;
+    olora_route_pick pick;
+    if (!olora_route_select(request->prompt, &pick)) return true;
+    oimg_lora *loras = calloc(pick.lora_count, sizeof *loras);
+    if (!loras) return false;
+    char error[160];
+    for (size_t i = 0; i < pick.lora_count; ++i) {
+        loras[i].path = cached_lora_path(pick.ids[i], NULL, error, sizeof error);
+        loras[i].scale = pick.scales[i];
+        if (!loras[i].path) {
+            fprintf(stderr, "[lora-route] %s: %s: %s; generating without route\n",
+                    pick.name, pick.ids[i], error);
+            for (size_t j = 0; j < i; ++j) free((char *)loras[j].path);
+            free(loras);
+            return true;
+        }
+    }
+    if (pick.prefix[0]) {
+        size_t prefix_len = strlen(pick.prefix);
+        size_t prompt_len = strlen(request->prompt);
+        char *prompt = malloc(prefix_len + prompt_len + 1);
+        if (!prompt) {
+            for (size_t i = 0; i < pick.lora_count; ++i) free((char *)loras[i].path);
+            free(loras);
+            return false;
+        }
+        memcpy(prompt, pick.prefix, prefix_len);
+        memcpy(prompt + prefix_len, request->prompt, prompt_len + 1);
+        free(request->prompt);
+        request->prompt = prompt;
+        request->generation.prompt = prompt;
+    }
+    free(request->loras);
+    request->loras = loras;
+    request->generation.loras = loras;
+    request->generation.lora_count = pick.lora_count;
+    snprintf(request->lora_route, sizeof request->lora_route, "%s", pick.name);
+    fprintf(stderr, "[lora-route] %s: %zu lora(s), first %s@%.2f\n", pick.name,
+            pick.lora_count, pick.ids[0], (double)pick.scales[0]);
+    return true;
+}
+
 bool oimage_request_parse(const char *json, size_t json_len, oimage_request *request,
                           char *error, size_t error_cap) {
     if (!json || !request) {
@@ -666,6 +717,11 @@ bool oimage_request_parse(const char *json, size_t json_len, oimage_request *req
             return false;
         }
         request->generation.strength = (float)strength;
+    }
+    if (!add_routed_loras(request, json, tokens, token_count)) {
+        set_error(error, error_cap, "could not prepare routed LoRA");
+        oimage_request_free(request);
+        return false;
     }
     return true;
 }

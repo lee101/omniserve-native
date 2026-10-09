@@ -5,6 +5,7 @@
 #include "oimage.h"
 #include "ojson.h"
 #include "olog.h"
+#include "olora_route.h"
 #include "oproxy.h"
 #include "oscale.h"
 #include "osched.h"
@@ -193,6 +194,56 @@ static void test_image_contract(void) {
     const char *unsafe_lora_id = "{\"prompt\":\"cat\",\"lora_id\":\"../secret\"}";
     CHECK(!oimage_request_parse(unsafe_lora_id, strlen(unsafe_lora_id),
                                 &request, error, sizeof error));
+    char routes_path[512];
+    snprintf(routes_path, sizeof routes_path, "%s/lora_routes.json", lora_dir);
+    FILE *routes_file = fopen(routes_path, "wb");
+    CHECK(routes_file != NULL);
+    if (routes_file) {
+        fputs("{\"routes\":["
+              "{\"name\":\"anime\",\"keywords\":[\"anim*\",\"cel shaded\"],"
+              "\"exclude\":[\"photo\"],\"loras\":[{\"id\":\"zimage_360\",\"scale\":0.5}],"
+              "\"prefix\":\"aesthetic, \"},"
+              "{\"name\":\"missing\",\"keywords\":[\"ghost\"],\"loras\":[{\"id\":\"absent\"}]}"
+              "]}", routes_file);
+        fclose(routes_file);
+    }
+    setenv("OMNISERVE_NATIVE_LORA_ROUTES", routes_path, 1);
+    const char *routed = "{\"prompt\":\"Anime girl at sunset\"}";
+    CHECK(oimage_request_parse(routed, strlen(routed), &request, error, sizeof error));
+    CHECK(request.generation.lora_count == 0);
+    CHECK(strcmp(request.prompt, "Anime girl at sunset") == 0);
+    oimage_request_free(&request);
+    setenv("OMNISERVE_NATIVE_LORA_AUTO_ROUTE", "1", 1);
+    CHECK(oimage_request_parse(routed, strlen(routed), &request, error, sizeof error));
+    CHECK(request.generation.lora_count == 1);
+    CHECK(!request.direct_lora_paths);
+    CHECK(strcmp(request.generation.loras[0].path, registry_lora_path) == 0);
+    CHECK(fabsf(request.generation.loras[0].scale - 0.5f) < 0.0001f);
+    CHECK(strcmp(request.generation.prompt, "aesthetic, Anime girl at sunset") == 0);
+    CHECK(strcmp(request.lora_route, "anime") == 0);
+    oimage_request_free(&request);
+    const char *route_opt_out = "{\"prompt\":\"anime girl\",\"auto_lora\":false}";
+    CHECK(oimage_request_parse(route_opt_out, strlen(route_opt_out), &request, error, sizeof error));
+    CHECK(request.generation.lora_count == 0);
+    oimage_request_free(&request);
+    const char *route_explicit = "{\"prompt\":\"anime girl\",\"lora_id\":\"pixel_art\"}";
+    CHECK(oimage_request_parse(route_explicit, strlen(route_explicit), &request, error, sizeof error));
+    CHECK(request.generation.lora_count == 1);
+    CHECK(strcmp(request.generation.loras[0].path, lora_path) == 0);
+    CHECK(strcmp(request.prompt, "anime girl") == 0);
+    oimage_request_free(&request);
+    const char *route_excluded = "{\"prompt\":\"photo of an animal\"}";
+    CHECK(oimage_request_parse(route_excluded, strlen(route_excluded), &request, error, sizeof error));
+    CHECK(request.generation.lora_count == 0);
+    oimage_request_free(&request);
+    const char *route_missing = "{\"prompt\":\"a ghost ship\"}";
+    CHECK(oimage_request_parse(route_missing, strlen(route_missing), &request, error, sizeof error));
+    CHECK(request.generation.lora_count == 0);
+    CHECK(request.lora_route[0] == 0);
+    oimage_request_free(&request);
+    unsetenv("OMNISERVE_NATIVE_LORA_AUTO_ROUTE");
+    unsetenv("OMNISERVE_NATIVE_LORA_ROUTES");
+    unlink(routes_path);
     unsetenv("OMNISERVE_NATIVE_LORA_REGISTRY");
     unsetenv("OMNISERVE_NATIVE_LORA_DIR");
     unlink(escaped_lora_path);
@@ -296,6 +347,32 @@ static void test_image_contract(void) {
     CHECK(strstr(json, "\"seed\":7") != NULL);
     CHECK(strstr(json, "\"seed\":8") != NULL);
     free(json);
+}
+
+static void test_lora_route_match(void) {
+    const char *routes = "{\"routes\":["
+        "{\"name\":\"text\",\"keywords\":[\"logo\",\"poster\"],\"loras\":[{\"id\":\"a\",\"scale\":0.4},{\"id\":\"b\",\"scale\":0.3}]},"
+        "{\"name\":\"art\",\"keywords\":[\"art\"],\"loras\":[{\"id\":\"c\"}]},"
+        "{\"name\":\"bad\",\"keywords\":[\"bad\"],\"loras\":[{\"id\":\"../x\"}]},"
+        "{\"name\":\"default\",\"loras\":[{\"id\":\"d\",\"scale\":0.6}]}]}";
+    size_t len = strlen(routes);
+    olora_route_pick pick;
+    CHECK(olora_route_select_json(routes, len, "A LOGO for a cafe", &pick));
+    CHECK(strcmp(pick.name, "text") == 0);
+    CHECK(pick.lora_count == 2);
+    CHECK(strcmp(pick.ids[1], "b") == 0);
+    CHECK(fabsf(pick.scales[0] - 0.4f) < 0.0001f);
+    CHECK(olora_route_select_json(routes, len, "party in the street", &pick));
+    CHECK(strcmp(pick.name, "default") == 0);
+    CHECK(olora_route_select_json(routes, len, "digital art, castle", &pick));
+    CHECK(strcmp(pick.name, "art") == 0);
+    CHECK(pick.scales[0] == 1.0f);
+    CHECK(olora_route_select_json(routes, len, "a bad day", &pick));
+    CHECK(strcmp(pick.name, "default") == 0);
+    CHECK(!olora_route_select_json("[]", 2, "logo", &pick));
+    CHECK(pick.lora_count == 0);
+    const char *bad_scale = "{\"routes\":[{\"loras\":[{\"id\":\"a\",\"scale\":9}]}]}";
+    CHECK(!olora_route_select_json(bad_scale, strlen(bad_scale), "x", &pick));
 }
 
 static void test_tier_parse(void) {
@@ -2155,6 +2232,7 @@ int main(void) {
     test_vram_arbitration();
     test_json();
     test_image_contract();
+    test_lora_route_match();
     test_matte();
     test_tier_parse();
     test_completion_spacing();

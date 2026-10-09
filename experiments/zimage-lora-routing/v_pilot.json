@@ -1,0 +1,134 @@
+[
+ {
+  "name": "plain"
+ },
+ {
+  "name": "auto",
+  "auto": true
+ },
+ {
+  "name": "aes06",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/Z-Image-Aesthetic-Base v1.safetensors",
+    "scale": 0.6
+   }
+  ]
+ },
+ {
+  "name": "aes06t",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/Z-Image-Aesthetic-Base v1.safetensors",
+    "scale": 0.6
+   }
+  ],
+  "template": "aesthetic, {prompt}"
+ },
+ {
+  "name": "zit06t",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/ZIT-V6.safetensors",
+    "scale": 0.6
+   }
+  ],
+  "template": "zit v6, {prompt}"
+ },
+ {
+  "name": "zart05",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/Z-Art-3.safetensors",
+    "scale": 0.5
+   }
+  ]
+ },
+ {
+  "name": "look06",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/The Look naturalfacesandexpressions.safetensors",
+    "scale": 0.6
+   }
+  ],
+  "cats": [
+   "portrait",
+   "character"
+  ]
+ },
+ {
+  "name": "phone05",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/smartphone_realistic_real_life_real_pic.safetensors",
+    "scale": 0.5
+   }
+  ],
+  "cats": [
+   "portrait",
+   "product"
+  ]
+ },
+ {
+  "name": "zaesanime06",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/Z-Aesthetic-animedigitalartcosyartworkdogsmileinterestingcolors.safetensors",
+    "scale": 0.6
+   }
+  ],
+  "cats": [
+   "anime",
+   "character"
+  ]
+ },
+ {
+  "name": "serenity06",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/anime_blend_real_life SERENITY style.safetensors",
+    "scale": 0.6
+   }
+  ],
+  "cats": [
+   "anime"
+  ]
+ },
+ {
+  "name": "medland05",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/Medieval02landscapeenvironment.safetensors",
+    "scale": 0.5
+   }
+  ],
+  "cats": [
+   "landscape"
+  ]
+ },
+ {
+  "name": "poster05",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/VintageTravelPoster.safetensors",
+    "scale": 0.5
+   }
+  ],
+  "cats": [
+   "text"
+  ]
+ },
+ {
+  "name": "logo06",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/adapter_model.safetensors",
+    "scale": 0.6
+   }
+  ],
+  "cats": [
+   "text"
+  ]
+ }
+]
