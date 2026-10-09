@@ -1,0 +1,15 @@
+{
+  "routes": [
+    {
+      "name": "people-anime",
+      "exclude": ["text", "texts", "logo*", "lettering", "typograph*", "font", "fonts", "word", "words", "saying", "says", "written", "sign", "signs", "signage", "label*", "t-shirt", "tshirt", "tee shirt", "shirt design", "icon", "icons", "calligraph*", "infographic", "diagram", "screenshot", "ui", "poster*", "banner", "nsfw", "nude", "naked"],
+      "keywords": ["portrait*", "headshot", "selfie", "face", "faces", "woman", "women", "girl", "girls", "man", "men", "boy", "boys", "lady", "person", "people", "character*", "anime", "manga", "cel shaded", "chibi", "waifu", "knight", "warrior", "elf", "witch", "wizard", "mage", "sorceress", "paladin", "princess", "prince", "queen", "king", "goddess", "god", "samurai", "ninja", "cosplay*", "heroine", "hero", "soldier"],
+      "loras": [{"id": "the_look_natural_faces_expressions", "scale": 0.8}]
+    },
+    {
+      "name": "default",
+      "exclude": ["text", "texts", "logo*", "lettering", "typograph*", "font", "fonts", "word", "words", "saying", "says", "written", "sign", "signs", "signage", "label*", "t-shirt", "tshirt", "tee shirt", "shirt design", "icon", "icons", "calligraph*", "infographic", "diagram", "screenshot", "ui", "poster*", "banner", "nsfw", "nude", "naked", "360panorama", "equirectangular", "pixel art", "sprite", "seamless texture", "tileable"],
+      "loras": [{"id": "the_look_natural_faces_expressions", "scale": 0.6}]
+    }
+  ]
+}

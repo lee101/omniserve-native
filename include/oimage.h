@@ -12,6 +12,7 @@ typedef struct {
     char *negative_prompt;
     oimg_lora *loras;
     bool direct_lora_paths;
+    char lora_route[64];
     int count;
 } oimage_request;
 

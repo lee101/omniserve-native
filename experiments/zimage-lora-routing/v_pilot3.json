@@ -1,0 +1,90 @@
+[
+ {
+  "name": "serenity06",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/anime_blend_real_life SERENITY style.safetensors",
+    "scale": 0.6
+   }
+  ],
+  "cats": [
+   "anime"
+  ]
+ },
+ {
+  "name": "medland05",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/Medieval02landscapeenvironment.safetensors",
+    "scale": 0.5
+   }
+  ],
+  "cats": [
+   "landscape"
+  ]
+ },
+ {
+  "name": "poster05",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/VintageTravelPoster.safetensors",
+    "scale": 0.5
+   }
+  ],
+  "cats": [
+   "text"
+  ]
+ },
+ {
+  "name": "phone05",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/smartphone_realistic_real_life_real_pic.safetensors",
+    "scale": 0.5
+   }
+  ],
+  "cats": [
+   "portrait"
+  ]
+ },
+ {
+  "name": "look08",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/The Look naturalfacesandexpressions.safetensors",
+    "scale": 0.8
+   }
+  ],
+  "cats": [
+   "portrait",
+   "character",
+   "anime"
+  ]
+ },
+ {
+  "name": "look06",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/The Look naturalfacesandexpressions.safetensors",
+    "scale": 0.6
+   }
+  ],
+  "cats": [
+   "anime",
+   "landscape",
+   "product"
+  ]
+ },
+ {
+  "name": "serenity08",
+  "loras": [
+   {
+    "path": "/nvme0n1-disk/code/cutedsl-site/inference/.lora_cache/anime_blend_real_life SERENITY style.safetensors",
+    "scale": 0.8
+   }
+  ],
+  "cats": [
+   "anime"
+  ]
+ }
+]

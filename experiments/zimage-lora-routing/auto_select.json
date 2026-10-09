@@ -1,0 +1,685 @@
+{
+ "portrait0": {
+  "lora": "the_look_natural_faces_expressions",
+  "scale": 0.8,
+  "prompt": "the look, closeup hyper-realistic portrait of beautiful high-fantasy elf girl, intricate details, rule of three, by Stanley Artgerm Lau, by greg rutkowski, by thomas kindkade, by alphonse mucha, loish, by norman rockwell J.",
+  "top": [
+   [
+    "the_look_natural_faces_expressions",
+    3.9,
+    "keyword"
+   ],
+   [
+    "anime_serenity",
+    3.6,
+    "keyword"
+   ]
+  ]
+ },
+ "portrait1": {
+  "lora": "the_look_natural_faces_expressions",
+  "scale": 0.8,
+  "prompt": "the look, wide angle cinematic portrait of a pale girl with three black eyes and dark hair, ultrarealistic face with cold fashion studio dramatic lighting by monia merlo and mikhail vrubel, vivid mosaic brushstrokes in background, closeup 4k",
+  "top": [
+   [
+    "the_look_natural_faces_expressions",
+    10.8,
+    "name"
+   ],
+   [
+    "z_dark_aesthetic_girl_anime_realistic_cartoon",
+    6.0,
+    "name"
+   ]
+  ]
+ },
+ "portrait2": {
+  "lora": "flat2",
+  "scale": 1.0,
+  "prompt": "Kodak Portra 400, 8K, highly detailed, britt marling style 3/4 dramatic extreme closeup portrait of a extremely beautiful girl with blue eyes and light brown hair,four fingers maximum, non-illuminated backdrop, illuminated by a dramatic light, Low key lighting, light dark, High constrast, dramatic , nina masic , dark background, high quality, photo-realistic, 8K",
+  "top": [
+   [
+    "flat2",
+    6.0,
+    "name"
+   ],
+   [
+    "z_dark_aesthetic_girl_anime_realistic_cartoon",
+    6.0,
+    "name"
+   ]
+  ]
+ },
+ "portrait3": {
+  "lora": "colorful_pop_art",
+  "scale": 1.0,
+  "prompt": "colorful pop art, intense colorful illustration, half - length portrait of beautiful witch circe with curly hair, gathered in long braids, while she puts the poison in a cup, in the odyssey, art by giotto, leonardo da vinci, moebius, sarah moon",
+  "top": [
+   [
+    "colorful_pop_art",
+    3.0,
+    "name"
+   ],
+   [
+    "pixel_art",
+    3.0,
+    "name"
+   ]
+  ]
+ },
+ "portrait4": {
+  "lora": "the_look_natural_faces_expressions",
+  "scale": 0.8,
+  "prompt": "the look, photograph portrait of a beautiful female jointed wooden art doll as seen through a glass ball glass sphere photography prop, canon 5 d, professional photography, dslr, by agostino arrivabene, by fernand khnopff, by raphael, rendered in octane, photorealistic, ethereal, soft light, surreal, mysterious",
+  "top": [
+   [
+    "the_look_natural_faces_expressions",
+    3.9,
+    "keyword"
+   ],
+   [
+    "anime_serenity",
+    3.3,
+    "keyword"
+   ]
+  ]
+ },
+ "portrait5": {
+  "lora": "samdoesarts",
+  "scale": 1.0,
+  "prompt": "samdoesarts style, comic cartoon, high quality character portrait oil painting of fat bald happy mid-aged king with king crown by Rembrandt, red-faced, middle close up shot",
+  "top": [
+   [
+    "samdoesarts",
+    3.6,
+    "keyword"
+   ],
+   [
+    "inkwash",
+    3.0,
+    "name"
+   ]
+  ]
+ },
+ "portrait6": {
+  "lora": "z_aesthetic_animedigitalartcosyartworkdogsmileinterestingcolors",
+  "scale": 1.0,
+  "prompt": "z aesthetic, portrait of beautiful nature goddess unusual beauty, esoteric, beautiful colors, head in focus, fantasy art, nature aesthetics, intricate, full frame, elegant, highly detailed, hyperrealistic painting, artstation, concept art, painterly, sharp focus, illustration, stunning art by ive freya",
+  "top": [
+   [
+    "z_aesthetic_animedigitalartcosyartworkdogsmileinterestingcolors",
+    11.7,
+    "trigger"
+   ],
+   [
+    "aesthetic_base",
+    10.8,
+    "trigger"
+   ]
+  ]
+ },
+ "anime0": {
+  "lora": "zit_v6",
+  "scale": 1.0,
+  "prompt": "zit v6, high quality anime-style image of a beautiful woman, wearing an elegant outfit",
+  "top": [
+   [
+    "zit_v6",
+    4.2,
+    "keyword"
+   ],
+   [
+    "z_brushwork_paint_illustration_anime",
+    2.7,
+    "keyword"
+   ]
+  ]
+ },
+ "anime1": {
+  "lora": "z_aesthetic_animedigitalartcosyartworkdogsmileinterestingcolors",
+  "scale": 1.0,
+  "prompt": "z aesthetic, a lofi aesthetic anime about a girl who works in a coffee shop, anime key visual",
+  "top": [
+   [
+    "z_aesthetic_animedigitalartcosyartworkdogsmileinterestingcolors",
+    11.1,
+    "trigger"
+   ],
+   [
+    "z_dark_aesthetic_girl_anime_realistic_cartoon",
+    9.0,
+    "name"
+   ]
+  ]
+ },
+ "anime2": {
+  "lora": "neon_paint",
+  "scale": 1.0,
+  "prompt": "neon paint style, makoto shinkai. robotic android girl. futuristic cyberpunk dystopia. vibrant nebula sky. Long pleated skirt",
+  "top": [
+   [
+    "neon_paint",
+    5.4,
+    "keyword"
+   ],
+   [
+    "steampunkanimerealisticsyberpunk_e10",
+    4.5,
+    "name"
+   ]
+  ]
+ },
+ "anime3": {
+  "lora": "flat2",
+  "scale": 1.0,
+  "prompt": "anime art, anime key visual of happy blond terrier, laying down in the grass at sunset, golden hour sunset lighting, background blur bokeh!!, trending on pixiv fanbox, studio ghibli, extremely high quality artwork",
+  "top": [
+   [
+    "flat2",
+    8.1,
+    "name"
+   ],
+   [
+    "anime_artistic",
+    6.6,
+    "id"
+   ]
+  ]
+ },
+ "anime4": {
+  "lora": "flat2",
+  "scale": 1.0,
+  "prompt": "portrait of cute girl with huge very adorable anime eyes, very psychedelic planetary anime scenery illustration concept art anime key visual trending pixiv fanbox by wlop and greg rutkowski and makoto shinkai and studio ghibli and kyoto animation",
+  "top": [
+   [
+    "flat2",
+    10.5,
+    "name"
+   ],
+   [
+    "z_brushwork_paint_illustration_anime",
+    8.7,
+    "name"
+   ]
+  ]
+ },
+ "anime5": {
+  "lora": "flat2",
+  "scale": 1.0,
+  "prompt": "yellow eyed blonde boy wearing a brown cape and flying in t pose, clean cel shaded vector art. shutterstock. behance hd by lois van baarle, artgem, helen huang, by makoto shinkai and ilya kuvshinov, rossdraws, illustration",
+  "top": [
+   [
+    "flat2",
+    7.5,
+    "keyword"
+   ],
+   [
+    "flat_anime",
+    7.2,
+    "keyword"
+   ]
+  ]
+ },
+ "anime6": {
+  "lora": "z_aesthetic_animedigitalartcosyartworkdogsmileinterestingcolors",
+  "scale": 1.0,
+  "prompt": "z aesthetic, young man with short, ash blond greyish hair, light brown eyes, casual clothes, relaxing, happy, path traced, highly detailed, high quality, digital painting, by studio ghibli and alphonse mucha, beautiful details, soft and cosy",
+  "top": [
+   [
+    "z_aesthetic_animedigitalartcosyartworkdogsmileinterestingcolors",
+    5.7,
+    "name"
+   ],
+   [
+    "mecha_zimage",
+    4.2,
+    "name"
+   ]
+  ]
+ },
+ "product0": {
+  "lora": "product_screenshots",
+  "scale": 0.8,
+  "prompt": "prodshot, wooden carving statue of a broccoli, product picture, ebay listing thumbnail, clean modern app interface screenshot",
+  "top": [
+   [
+    "product_screenshots",
+    4.5,
+    "name"
+   ]
+  ]
+ },
+ "product1": {
+  "lora": "orcs",
+  "scale": 1.0,
+  "prompt": "orc, fantasy, 5 5 mm photo of wine - glass on a zen minimalist table with bokeh blurred white orchids in the white background. highly detailed 8 k. intricate. lifelike. soft light. nikon d 8 5 0.",
+  "top": [
+   [
+    "orcs",
+    5.1,
+    "trigger"
+   ],
+   [
+    "mecha_zimage",
+    2.1,
+    "name"
+   ]
+  ]
+ },
+ "product2": {
+  "lora": "flat2",
+  "scale": 1.0,
+  "prompt": "An office chair in the style of the Golden Gate Bridge, light neutral background, professional product photography, studio lighting, auto focus, shot with a tripod, Canon EOS R5 camera | Sigma 20.0mm | f/16.0 | 1/300s shutter speed | ISO 50",
+  "top": [
+   [
+    "flat2",
+    5.4,
+    "name"
+   ],
+   [
+    "product_screenshots",
+    3.9,
+    "name"
+   ]
+  ]
+ },
+ "product3": {
+  "lora": "product_screenshots",
+  "scale": 0.8,
+  "prompt": "prodshot, a clear amethyst quarts crystal cluster, product photography, photorealistic, octane render, clean modern app interface screenshot",
+  "top": [
+   [
+    "product_screenshots",
+    3.9,
+    "name"
+   ],
+   [
+    "flat2",
+    2.4,
+    "name"
+   ]
+  ]
+ },
+ "product4": {
+  "lora": "product_screenshots",
+  "scale": 0.8,
+  "prompt": "prodshot, tomato. professional product photo., clean modern app interface screenshot",
+  "top": [
+   [
+    "product_screenshots",
+    3.9,
+    "name"
+   ],
+   [
+    "cosplay_realistic",
+    1.2,
+    "keyword"
+   ]
+  ]
+ },
+ "product5": {
+  "lora": "product_screenshots",
+  "scale": 0.8,
+  "prompt": "prodshot, product photo of a futuristic stylized pet robot, kindchenschema, large ears, large tail, by artgerm and greg rutkowski and marc newson and zaha hadid, behance lemanoosh, alphonse mucha, otter capybara mix, side view, volumetric light, detailed, octane render, midsommar - t, clean modern app interface screenshot",
+  "top": [
+   [
+    "product_screenshots",
+    3.9,
+    "name"
+   ],
+   [
+    "mecha_zimage",
+    2.7,
+    "name"
+   ]
+  ]
+ },
+ "product6": {
+  "lora": "mecha_klein",
+  "scale": 1.0,
+  "prompt": "mecha, the universe in a bottle, high quality photograph",
+  "top": [
+   [
+    "mecha_klein",
+    1.2,
+    "keyword"
+   ],
+   [
+    "mecha_zimage",
+    1.2,
+    "keyword"
+   ]
+  ]
+ },
+ "landscape0": {
+  "lora": "medieval_landscape_environment",
+  "scale": 1.0,
+  "prompt": "medieval landscape, beautiful dreamy hilly verdant landscape at sunset by Anna dittmann",
+  "top": [
+   [
+    "medieval_landscape_environment",
+    3.0,
+    "name"
+   ],
+   [
+    "aesthetic_base",
+    2.7,
+    "keyword"
+   ]
+  ]
+ },
+ "landscape1": {
+  "lora": "medieval_landscape_environment",
+  "scale": 1.0,
+  "prompt": "medieval landscape, Trending on artstation, Tenerife landscape with snow capped mount Teide dominating the center",
+  "top": [
+   [
+    "medieval_landscape_environment",
+    3.0,
+    "name"
+   ],
+   [
+    "tshirt_comic",
+    0.6,
+    "keyword"
+   ]
+  ]
+ },
+ "landscape2": {
+  "lora": "z_aesthetic_animedigitalartcosyartworkdogsmileinterestingcolors",
+  "scale": 1.0,
+  "prompt": "z aesthetic, The Three Kings walk through a foggy forest at moonlight, Trending artstation, digital art",
+  "top": [
+   [
+    "z_aesthetic_animedigitalartcosyartworkdogsmileinterestingcolors",
+    7.5,
+    "name"
+   ],
+   [
+    "z_art",
+    3.9,
+    "keyword"
+   ]
+  ]
+ },
+ "landscape3": {
+  "lora": "steampunkanimerealisticsyberpunk_e10",
+  "scale": 1.0,
+  "prompt": "steampunk workshop exterior in the middle of the lush forest with a smoking chimney on the metal rooftop, by Wadim Kashin, featured in artstation, octane render, cinematic, elegant, intricate, 8k",
+  "top": [
+   [
+    "steampunkanimerealisticsyberpunk_e10",
+    4.5,
+    "name"
+   ],
+   [
+    "orcs",
+    1.5,
+    "keyword"
+   ]
+  ]
+ },
+ "landscape4": {
+  "lora": "atomic_heart_noir_moody_war",
+  "scale": 1.0,
+  "prompt": "a dramatic photo of a mountain made of cotton candy. moody and melancholy. with a little bit of cyan and pink.",
+  "top": [
+   [
+    "atomic_heart_noir_moody_war",
+    7.2,
+    "name"
+   ],
+   [
+    "z_dark_aesthetic_girl_anime_realistic_cartoon",
+    2.7,
+    "keyword"
+   ]
+  ]
+ },
+ "landscape5": {
+  "lora": null,
+  "scale": null,
+  "prompt": "cinestill of a large blonde labradoodle skiing down a snowy mountain, sports photography, action shot",
+  "top": []
+ },
+ "landscape6": {
+  "lora": "mecha_zimage",
+  "scale": 1.0,
+  "prompt": "mecha anime, detailed, detailed sharp focus, goblincore forest, mushrooms, frogs, snails, bones, bird skulls, shiny rocks, artwork by Victor Adame Minguez + Yuumei + Tom Lovell + Sandro Botticelli,",
+  "top": [
+   [
+    "mecha_zimage",
+    3.0,
+    "name"
+   ],
+   [
+    "orcs",
+    3.0,
+    "keyword"
+   ]
+  ]
+ },
+ "text0": {
+  "lora": "vintage_travel_poster",
+  "scale": 1.0,
+  "prompt": "vintage travel poster, elaborate movie poster for a slice of white bread, photorealistic",
+  "top": [
+   [
+    "vintage_travel_poster",
+    1.8,
+    "name"
+   ]
+  ]
+ },
+ "text1": {
+  "lora": "app_logo_maker",
+  "scale": 0.8,
+  "prompt": "applogo, a logo for zeus, logo, corporate, 1 9 9 0 s, a wireframe diagram by soami, pixabay, international typographic style, logo, stockphoto, dynamic composition, vector logo, white background",
+  "top": [
+   [
+    "app_logo_maker",
+    3.9,
+    "name"
+   ],
+   [
+    "flat_anime",
+    3.0,
+    "name"
+   ]
+  ]
+ },
+ "text2": {
+  "lora": "z_aesthetic_animedigitalartcosyartworkdogsmileinterestingcolors",
+  "scale": 1.0,
+  "prompt": "z aesthetic, medical poster by wolff ollins and greg ruthowski, graphic design, behance, gradient light blue and white color scheme, aesthetic flat, 8 k, hd resolution",
+  "top": [
+   [
+    "z_aesthetic_animedigitalartcosyartworkdogsmileinterestingcolors",
+    8.7,
+    "trigger"
+   ],
+   [
+    "aesthetic_base",
+    8.1,
+    "trigger"
+   ]
+  ]
+ },
+ "text3": {
+  "lora": "flat_anime",
+  "scale": 1.0,
+  "prompt": "flat anime style, daiquiri glass shaped like a spiraling tornado! logo for daiquiri! superflat, anime, 8 0 s, style of patrick nagel, art deco, sharp, detailed, clean lines, 8 k",
+  "top": [
+   [
+    "flat_anime",
+    19.5,
+    "trigger"
+   ],
+   [
+    "flat2",
+    14.1,
+    "name"
+   ]
+  ]
+ },
+ "text4": {
+  "lora": "colorful_pop_art",
+  "scale": 1.0,
+  "prompt": "colorful pop art, intense colorful illustration, Nature scenes from Vietnam. Icon! Logo! Propaganda. pop art. poster. Trending on ArtStation.",
+  "top": [
+   [
+    "colorful_pop_art",
+    7.5,
+    "name"
+   ],
+   [
+    "app_logo_maker",
+    5.7,
+    "name"
+   ]
+  ]
+ },
+ "text5": {
+  "lora": "z_aesthetic_animedigitalartcosyartworkdogsmileinterestingcolors",
+  "scale": 1.0,
+  "prompt": "z aesthetic, Penguin with money movie poster, godfather, symmetrical, dark environment, smoke, realistic, highly detailed, digital art, trending on artstation,",
+  "top": [
+   [
+    "z_aesthetic_animedigitalartcosyartworkdogsmileinterestingcolors",
+    6.9,
+    "name"
+   ],
+   [
+    "medieval_landscape_environment",
+    4.2,
+    "name"
+   ]
+  ]
+ },
+ "text6": {
+  "lora": "tshirt_comic",
+  "scale": 1.0,
+  "prompt": "tshirt design, comic style, centered, \u201cheavy metal rock band tee shirt with the word FEMBOY in a hard to read white font on black fabric\u201d",
+  "top": [
+   [
+    "tshirt_comic",
+    2.1,
+    "keyword"
+   ]
+  ]
+ },
+ "character0": {
+  "lora": "knight_stylism",
+  "scale": 1.0,
+  "prompt": "knight stylism, intense detail, blonde female knight in heavy blue and white armor, rabbits, high fantasy, flowers and trees, intricate detail, digital painting, artstation, concept art, smooth, sharp focus, illustration, art by yoshitaka amano and monia merlo and wlop",
+  "top": [
+   [
+    "knight_stylism",
+    12.3,
+    "name"
+   ],
+   [
+    "samdoesarts",
+    7.8,
+    "keyword"
+   ]
+  ]
+ },
+ "character1": {
+  "lora": "flat2",
+  "scale": 1.0,
+  "prompt": "friendly robot in front of a clean white sci-fi dome in a pleasant urban setting, peaceful, majestic, a sense of hope, in style of apex legends, art station, ultra hd, soft light, overhead sun, ultra hd, art station",
+  "top": [
+   [
+    "flat2",
+    5.4,
+    "name"
+   ],
+   [
+    "colorful_pop_art",
+    4.2,
+    "name"
+   ]
+  ]
+ },
+ "character2": {
+  "lora": "steampunkanimerealisticsyberpunk_e10",
+  "scale": 1.0,
+  "prompt": "cyberpunk japanese merchant in their shop, Industrial Scifi, detailed illustration, character design, by Martin Grip and Moebius",
+  "top": [
+   [
+    "steampunkanimerealisticsyberpunk_e10",
+    7.2,
+    "name"
+   ],
+   [
+    "knight_stylism",
+    3.9,
+    "keyword"
+   ]
+  ]
+ },
+ "character3": {
+  "lora": "knight_stylism",
+  "scale": 1.0,
+  "prompt": "knight stylism, intense detail, A lone knight in front of a stone tomb with a sturdy shield and shiny sword by nixeu",
+  "top": [
+   [
+    "knight_stylism",
+    9.9,
+    "name"
+   ]
+  ]
+ },
+ "character4": {
+  "lora": "z_aesthetic_animedigitalartcosyartworkdogsmileinterestingcolors",
+  "scale": 1.0,
+  "prompt": "z aesthetic, A cute blue rhino wearing adventurer's clothing, highly detailed, digital painting, artstation, concept art, smooth, sharp focus, studio light, by Justin Gerard,",
+  "top": [
+   [
+    "z_aesthetic_animedigitalartcosyartworkdogsmileinterestingcolors",
+    6.0,
+    "name"
+   ],
+   [
+    "samdoesarts",
+    5.1,
+    "keyword"
+   ]
+  ]
+ },
+ "character5": {
+  "lora": "knight_stylism",
+  "scale": 1.0,
+  "prompt": "knight stylism, intense detail, detailed painting of a regal ferret dressed in knight armor staring ahead, holding a mug of ale, castle interior",
+  "top": [
+   [
+    "knight_stylism",
+    11.1,
+    "name"
+   ],
+   [
+    "inkwash",
+    3.0,
+    "name"
+   ]
+  ]
+ },
+ "character6": {
+  "lora": "samdoesarts",
+  "scale": 1.0,
+  "prompt": "samdoesarts style, comic cartoon, old male paladin with an helmet, character, deep focus, d & d, fantasy, full body, intricate, elegant, highly detailed, digital painting, artstation, concept art, matte, sharp focus, illustration, art by artgerm and greg rutkowski and alphonse mucha",
+  "top": [
+   [
+    "samdoesarts",
+    9.0,
+    "keyword"
+   ],
+   [
+    "knight_stylism",
+    7.8,
+    "keyword"
+   ]
+  ]
+ }
+}
