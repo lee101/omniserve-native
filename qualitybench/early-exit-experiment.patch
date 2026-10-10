@@ -1,0 +1,66 @@
+diff --git a/src/runtime/denoiser.hpp b/src/runtime/denoiser.hpp
+index 416859e..e1efc22 100644
+--- a/src/runtime/denoiser.hpp
++++ b/src/runtime/denoiser.hpp
+@@ -1762,10 +1762,23 @@ static sd::Tensor<float> sample_sefi_euler(SefiFlowDenoiser* sefi,
+     return x;
+ }
+ 
++// Adaptive early exit (extra_sample_args "exit_tol=F,exit_sigma=F,exit_patience=N"): once the x0
++// prediction moves less than exit_tol (relative L2) for exit_patience consecutive steps below
++// exit_sigma, the remaining steps are collapsed into one jump to the current x0 estimate.
+ static sd::Tensor<float> sample_euler(denoise_cb_t model,
+                                       sd::Tensor<float> x,
+-                                      const std::vector<float>& sigmas) {
++                                      const std::vector<float>& sigmas,
++                                      const KeyValueArgs& extra_args = {}) {
++    float exit_tol = 0.0f, exit_sigma = 0.5f;
++    int exit_patience = 2;
++    for (const auto& [key, value] : extra_args) {
++        if (key == "exit_tol") parse_strict_float(value, exit_tol);
++        else if (key == "exit_sigma") parse_strict_float(value, exit_sigma);
++        else if (key == "exit_patience") parse_strict_int(value, exit_patience);
++    }
+     int steps = static_cast<int>(sigmas.size()) - 1;
++    std::vector<float> prev;
++    int calm = 0;
+     for (int i = 0; i < steps; i++) {
+         float sigma       = sigmas[i];
+         auto denoised_opt = model(x, sigma, i + 1);
+@@ -1773,7 +1786,26 @@ static sd::Tensor<float> sample_euler(denoise_cb_t model,
+             return {};
+         }
+         sd::Tensor<float> denoised = std::move(denoised_opt.pred);
+-        sd::Tensor<float> d        = (x - denoised) / sigma;
++        if (exit_tol > 0.0f && i + 1 < steps) {
++            const std::vector<float>& cur = denoised.values();
++            if (!prev.empty() && sigma <= exit_sigma) {
++                double num = 0.0, den = 0.0;
++                for (size_t k = 0; k < cur.size(); ++k) {
++                    double diff = (double)cur[k] - prev[k];
++                    num += diff * diff;
++                    den += (double)cur[k] * cur[k];
++                }
++                double rel = std::sqrt(num / (den + 1e-12));
++                fprintf(stderr, "x0delta %d %.4f %.5f\n", i + 1, sigma, rel);
++                calm = rel < exit_tol ? calm + 1 : 0;
++                if (calm >= exit_patience) {
++                    fprintf(stderr, "early_exit %d/%d %.4f\n", i + 1, steps, sigma);
++                    return denoised;
++                }
++            }
++            prev = cur;
++        }
++        sd::Tensor<float> d = (x - denoised) / sigma;
+         x += d * (sigmas[i + 1] - sigma);
+     }
+     return x;
+@@ -3011,7 +3043,7 @@ static sd::Tensor<float> sample_k_diffusion(sample_method_t method,
+         case EULER_A_SAMPLE_METHOD:
+             return sample_euler_ancestral(model, std::move(x), sigmas, *noise_sampler, is_flow_denoiser, eta);
+         case EULER_SAMPLE_METHOD:
+-            return sample_euler(model, std::move(x), sigmas);
++            return sample_euler(model, std::move(x), sigmas, extra_args);
+         case HEUN_SAMPLE_METHOD:
+             return sample_heun(model, std::move(x), sigmas);
+         case DPM2_SAMPLE_METHOD:

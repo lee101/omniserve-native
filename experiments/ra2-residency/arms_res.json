@@ -1,0 +1,36 @@
+{
+ "prod": {
+  "env": {
+   "OMNISERVE_NATIVE_SD_LEASE_MB": "10240",
+   "OMNISERVE_NATIVE_SD_EDIT_LEASE_MB": "11264"
+  },
+  "need_mib": 10000
+ },
+ "te_cpu": {
+  "env": {
+   "OMNISERVE_NATIVE_SD_PARAMS_BACKEND": "te=cpu",
+   "OMNISERVE_NATIVE_SD_EAGER_LOAD": "1",
+   "OMNISERVE_NATIVE_SD_LEASE_MB": "10240",
+   "OMNISERVE_NATIVE_SD_EDIT_LEASE_MB": "11264"
+  },
+  "need_mib": 12000
+ },
+ "dit_cpu": {
+  "env": {
+   "OMNISERVE_NATIVE_SD_PARAMS_BACKEND": "diffusion=cpu",
+   "OMNISERVE_NATIVE_SD_EAGER_LOAD": "1",
+   "OMNISERVE_NATIVE_SD_LEASE_MB": "10240",
+   "OMNISERVE_NATIVE_SD_EDIT_LEASE_MB": "11264"
+  },
+  "need_mib": 13000
+ },
+ "resident": {
+  "env": {
+   "OMNISERVE_NATIVE_SD_PARAMS_BACKEND": "",
+   "OMNISERVE_NATIVE_SD_EAGER_LOAD": "1",
+   "OMNISERVE_NATIVE_SD_LEASE_MB": "10240",
+   "OMNISERVE_NATIVE_SD_EDIT_LEASE_MB": "11264"
+  },
+  "need_mib": 15000
+ }
+}

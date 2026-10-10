@@ -31,6 +31,7 @@ import ctypes
 import hashlib
 import io
 import json
+import math
 import os
 import sys
 import threading
@@ -50,6 +51,11 @@ ALLOWED_INPUTS = {
     "workload", "kind", "profile", "prompt", "negative_prompt", "width", "height",
     "size", "steps", "num_inference_steps", "guidance_scale", "seed", "output_format",
     "image_base64", "strength", "n",
+    # Gateway tier controls (src/backend_sd.c): handled below.
+    "turbo", "notch", "cache_threshold", "cache_end",
+    # Fields the gateway and callers send that this worker has no use for; accepted so a
+    # relayed request is not rejected for carrying them.
+    "teleport", "teleport_start_step", "cache", "model", "response_format", "quality",
 }
 
 DIT_REPO = os.getenv("RA2_DIT_REPO", "netwrck/ra2")
@@ -88,6 +94,15 @@ THREADS = int(os.getenv("RA2_THREADS", "-1"))
 MAX_SIDE = int(os.getenv("RA2_MAX_SIDE", "2048"))
 MAX_BATCH = int(os.getenv("RA2_MAX_BATCH", "1"))
 WEBP_QUALITY = int(os.getenv("RA2_WEBP_QUALITY", "85"))
+# Same tiers as the local gateway: text-to-image defaults to the distilled 6-step turbo LoRA; "turbo": false
+# runs the base model with a step floor and a looser EasyCache; every result gets the Nyquist notch.
+TURBO = os.getenv("RA2_TURBO", "1").lower() not in {"0", "false", "no", "off"}
+TURBO_NODES = [float(v) for v in os.getenv("RA2_TURBO_NODES", "1.0,0.9375,0.875,0.75,0.5,0.25").split(",") if v.strip()]
+TURBO_LORA_REPO = os.getenv("RA2_TURBO_LORA_REPO", "Viggle/Qwen-Image-2.1-viggle-turbo")
+TURBO_LORA_FILE = os.getenv("RA2_TURBO_LORA_FILE", "Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r256.safetensors")
+MIN_STEPS = int(os.getenv("RA2_MIN_STEPS", "30"))
+HQ_CACHE_THRESHOLD = float(os.getenv("RA2_HQ_CACHE_THRESHOLD", "0.15"))
+NOTCH = os.getenv("RA2_NOTCH", "1").lower() not in {"0", "false", "no", "off"}
 JPEG_QUALITY = int(os.getenv("RA2_JPEG_QUALITY", "92"))
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or None
 
@@ -214,6 +229,14 @@ class SdHiresParams(ctypes.Structure):
         ("upscale_tile_size", ctypes.c_int),
         ("custom_sigmas", ctypes.POINTER(ctypes.c_float)),
         ("custom_sigmas_count", ctypes.c_int),
+    ]
+
+
+class SdLora(ctypes.Structure):
+    _fields_ = [
+        ("is_high_noise", ctypes.c_bool),
+        ("multiplier", ctypes.c_float),
+        ("path", ctypes.c_char_p),
     ]
 
 
@@ -519,6 +542,11 @@ def ensure_models() -> dict[str, Path]:
         "mmproj": _download(TEXT_ENCODER_REPO, MMPROJ_FILE, root),
         "vae": _download_url(VAE_URL, VAE_FILE, root) if VAE_URL else _download(VAE_REPO, VAE_FILE, root),
     }
+    if TURBO:
+        try:
+            models["turbo_lora"] = _download(TURBO_LORA_REPO, TURBO_LORA_FILE, root)
+        except Exception as error:  # noqa: BLE001 - serve the base tier rather than fail the worker
+            print(f"[qwen-image] turbo LoRA unavailable, base tier only: {error}", flush=True)
     _state["models"] = models
     _state["models_dir"] = root
     return models
@@ -731,6 +759,26 @@ def build_params(values: dict, models: dict[str, Path]) -> tuple[SdImgGenParams,
             if not 0.0 < params.strength <= 1.0:
                 raise ValueError("strength must be in (0, 1]")
 
+    is_edit = source is not None
+    turbo = (TURBO and models.get("turbo_lora") and not is_edit and values.get("turbo", True) is not False)
+    if turbo:
+        seq = (width // 16) * (height // 16)
+        mu = 0.5 + (seq - 256.0) * (0.9 - 0.5) / (8192.0 - 256.0)
+        shift = math.exp(mu)
+        sigmas = [shift / (shift + (1.0 / node - 1.0)) for node in TURBO_NODES] + [0.0]
+        array = (ctypes.c_float * len(sigmas))(*sigmas)
+        lora = (SdLora * 1)(SdLora(False, 1.0, own(str(models["turbo_lora"]))))
+        keep.extend([array, lora])
+        params.sample_params.sample_steps = len(TURBO_NODES)
+        params.sample_params.custom_sigmas = ctypes.cast(array, ctypes.POINTER(ctypes.c_float))
+        params.sample_params.custom_sigmas_count = len(sigmas)
+        params.sample_params.guidance.txt_cfg = 1.0
+        params.loras = ctypes.cast(lora, ctypes.c_void_p)
+        params.lora_count = 1
+    elif not is_edit and params.sample_params.sample_steps < MIN_STEPS:
+        params.sample_params.sample_steps = MIN_STEPS
+    _state["turbo"] = bool(turbo)
+
     if VAE_TILING:
         params.vae_tiling_params.enabled = True
         params.vae_tiling_params.tile_size_x = VAE_TILE
@@ -738,6 +786,8 @@ def build_params(values: dict, models: dict[str, Path]) -> tuple[SdImgGenParams,
         params.vae_tiling_params.target_overlap = VAE_TILE_OVERLAP
 
     mode = CACHE_MODE.strip().lower()
+    if turbo:
+        mode = "off"
     if mode and mode not in {"off", "none", "disabled"}:
         if mode not in SD_CACHE_MODES:
             raise ValueError(f"RA2_CACHE_MODE {mode!r} is not one of {', '.join(sorted(SD_CACHE_MODES))}")
@@ -745,7 +795,13 @@ def build_params(values: dict, models: dict[str, Path]) -> tuple[SdImgGenParams,
         params.cache.start_percent = CACHE_START
         params.cache.end_percent = CACHE_END
         if mode == "easycache":
-            params.cache.reuse_threshold = CACHE_THRESHOLD
+            threshold = HQ_CACHE_THRESHOLD if not is_edit else CACHE_THRESHOLD
+            if values.get("cache_threshold") is not None:
+                threshold = float(values["cache_threshold"])
+            if values.get("cache_end") is not None:
+                params.cache.end_percent = float(values["cache_end"])
+            params.cache.reuse_threshold = threshold
+            _state["cache_threshold"] = threshold
         elif mode == "taylorseer":
             params.cache.taylorseer_skip_interval = int(os.getenv("RA2_TAYLORSEER_SKIP", "2"))
         elif mode == "spectrum":
@@ -757,7 +813,32 @@ def build_params(values: dict, models: dict[str, Path]) -> tuple[SdImgGenParams,
     return params, keep
 
 
-def encode(images, count: int, output_format: str) -> list[dict]:
+_NOTCH_TAPS = (1, -6, 15, 44, 15, -6, 1)
+
+
+def nyquist_notch(picture):
+    """(delta - b) along x then y, b = [-1 6 -15 20 -15 6 -1] / 64: removes the 2 px VAE lattice.
+
+    Matches `notch_rgb` in src/backend_sd.c. Needs numpy; without it the image is returned untouched.
+    """
+    try:
+        import numpy as np
+    except ModuleNotFoundError:
+        return picture
+    from PIL import Image
+
+    a = np.asarray(picture.convert("RGB"), dtype=np.int32)
+    h, w, _ = a.shape
+    if w < 7 or h < 7:
+        return picture
+    p = np.pad(a, ((0, 0), (3, 3), (0, 0)), mode="edge")
+    x = sum(_NOTCH_TAPS[i] * p[:, i:i + w] for i in range(7))
+    p = np.pad(x, ((3, 3), (0, 0), (0, 0)), mode="edge")
+    y = sum(_NOTCH_TAPS[i] * p[i:i + h] for i in range(7))
+    return Image.fromarray(np.clip((y + 2048) >> 12, 0, 255).astype(np.uint8))
+
+
+def encode(images, count: int, output_format: str, notch: bool = False) -> list[dict]:
     from PIL import Image
 
     pillow_format, content_type = FORMATS[output_format]
@@ -773,6 +854,8 @@ def encode(images, count: int, output_format: str) -> list[dict]:
             picture = Image.frombytes("RGBA", (image.width, image.height), raw).convert("RGB")
         else:
             picture = Image.frombytes(mode, (image.width, image.height), raw)
+        if notch:
+            picture = nyquist_notch(picture)
         buffer = io.BytesIO()
         options = {"quality": WEBP_QUALITY} if output_format == "webp" else (
             {"quality": JPEG_QUALITY} if output_format == "jpeg" else {})
@@ -810,7 +893,8 @@ def generate(values: dict) -> dict:
         raise RuntimeError("stable-diffusion.cpp failed to generate an image")
     try:
         started = time.monotonic()
-        encoded = encode(images, count.value, output_format)
+        notch = NOTCH if values.get("notch") is None else bool(values["notch"])
+        encoded = encode(images, count.value, output_format, notch)
         encode_ms = int((time.monotonic() - started) * 1000)
     finally:
         lib.lib.free_sd_images(images, count.value)
@@ -826,7 +910,7 @@ def generate(values: dict) -> dict:
     } for index, item in enumerate(encoded)]
     if params.cache.mode == SD_CACHE_MODES["easycache"]:
         for item in data:
-            item["denoiser_cache"] = {"requested": "easycache", "approximate": True, "threshold": CACHE_THRESHOLD}
+            item["denoiser_cache"] = {"requested": "easycache", "approximate": True, "threshold": _state.get("cache_threshold", CACHE_THRESHOLD)}
     return {
         "created": created,
         "model": MODEL,
@@ -844,6 +928,7 @@ def generate(values: dict) -> dict:
             "format": pillow_format,
             "cache_mode": CACHE_MODE,
             "reference_edit": bool(params.ref_images_count),
+            "turbo": _state.get("turbo", False),
         },
     }
 

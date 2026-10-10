@@ -16,6 +16,7 @@
 
 #include "ovram.h"
 #include "obroker.h"
+#include "oresidency.h"
 
 #include <math.h>
 #include <limits.h>
@@ -81,6 +82,7 @@ typedef struct {
     oscale *scale;
     ocapacity *capacity;
     ovram *vram;
+    ores *residency; /* demand-driven image-model residency arbiter, beside the ledger */
     /* Box-wide broker in another process (the :8791 gateway). When set, this
      * gateway's image lane leases there instead of from its own ovram, so
      * co-resident gateways arbitrate one ledger rather than two. */
@@ -1865,6 +1867,84 @@ static void image_gpu_release(app_state *app, const char *id, bool remote) {
     else if (app->vram) ovram_release(app->vram, id);
 }
 
+/* Demand-driven residency client (OMNISERVE_NATIVE_SD_RESIDENCY=demand): every tick
+ * the image lane reports its request count and state to the arbiter (in-process
+ * when this gateway hosts the ledger, else the remote broker) and rebuilds the
+ * diffusion context resident or streamed as told. See oresidency.h. */
+typedef struct {
+    bool enabled;
+    int resident_mb, stream_mb, resident_lease_mb, resident_edit_lease_mb, tick_ms;
+    double saved_ms;
+    int requests;
+    unsigned long long reports, unreachable;
+    char reason[48];
+} residency_client;
+
+static residency_client g_rs;
+
+static int residency_decide(app_state *app, int requests, bool resident, char *reason, size_t cap) {
+    if (app->vram_broker_url)
+        return obroker_residency(app->vram_broker_url, app->vram_owner, (int)getpid(), g_rs.resident_mb,
+                                 g_rs.stream_mb, g_rs.saved_ms, requests, resident, reason, cap);
+    if (!app->residency) return -1;
+    double free_gib = -1.0, total_gib = -1.0;
+    int free_mb = ogpu_memory_gib(&free_gib, &total_gib) && free_gib >= 0 ? (int)(free_gib * 1024.0) : -1;
+    ores_report_in in = {app->vram_owner, (int)getpid(), g_rs.resident_mb, g_rs.stream_mb,
+                         g_rs.saved_ms, requests, resident};
+    ores_decision d = ores_report(app->residency, &in, free_mb);
+    snprintf(reason, cap, "%s", d.reason);
+    return d.resident ? 1 : 0;
+}
+
+static void *residency_main(void *arg) {
+    app_state *app = arg;
+    for (;;) {
+        usleep((useconds_t)g_rs.tick_ms * 1000u);
+        int n = __atomic_exchange_n(&g_rs.requests, 0, __ATOMIC_RELAXED);
+        bool cur = osd_resident();
+        char reason[48] = {0};
+        int want = residency_decide(app, n, cur, reason, sizeof reason);
+        pthread_mutex_lock(&g_gs_lock);
+        g_rs.reports++;
+        if (want == -2) {
+            snprintf(g_rs.reason, sizeof g_rs.reason, "no_arbiter");
+        } else if (want < 0) {
+            g_rs.unreachable++;
+            snprintf(g_rs.reason, sizeof g_rs.reason, "broker_unreachable");
+        } else {
+            snprintf(g_rs.reason, sizeof g_rs.reason, "%s", reason);
+        }
+        pthread_mutex_unlock(&g_gs_lock);
+        /* An unreachable arbiter cannot account for resident bytes: stream. */
+        bool target = want == 1;
+        /* Switch only in a gap between generations; a busy lane retries next tick. */
+        if (target == cur) osd_residency_settled();
+        else if (osd_set_resident(target, false) == 1)
+            (void)residency_decide(app, 0, osd_resident(), reason, sizeof reason);
+    }
+    return NULL;
+}
+
+static size_t residency_json(app_state *app, char *out, size_t cap) {
+    char sd[160] = "null";
+    if (osd_ready()) osd_residency_json(sd, sizeof sd);
+    pthread_mutex_lock(&g_gs_lock);
+    int n = snprintf(out, cap,
+        "{\"client\":{\"enabled\":%s,\"resident_mb\":%d,\"stream_mb\":%d,\"saved_ms\":%.0f,"
+        "\"resident_lease_mb\":%d,\"reports\":%llu,\"unreachable\":%llu,\"reason\":\"%s\",\"sd\":%s},"
+        "\"broker\":",
+        g_rs.enabled ? "true" : "false", g_rs.resident_mb, g_rs.stream_mb, g_rs.saved_ms,
+        g_rs.resident_lease_mb, g_rs.reports, g_rs.unreachable, g_rs.reason, sd);
+    pthread_mutex_unlock(&g_gs_lock);
+    if (n < 0 || (size_t)n >= cap) return 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    size_t len = (size_t)n + ores_status_json(app->residency, (double)ts.tv_sec + ts.tv_nsec / 1e9,
+                                              out + n, cap - (size_t)n - 1);
+    if (len + 1 < cap) { out[len++] = '}'; out[len] = 0; }
+    return len;
+}
+
 #define OGUARD_REFUSAL "I can't help with that."
 
 static void guard_refuse_chat(ohttp_request *req, bool stream, oguard_category category) {
@@ -2560,6 +2640,11 @@ static void handle_images(ohttp_request *req, app_state *app) {
     char image_lease_id[40] = {0};
     bool image_lease_remote = false;
     int required_headroom_mb = img2img ? g_gs.sd_edit_lease_mb : g_gs.sd_lease_mb;
+    if (g_rs.enabled) {
+        __atomic_add_fetch(&g_rs.requests, 1, __ATOMIC_RELAXED);
+        /* Resident weights are already on the device; lease only the workspace. */
+        if (osd_residency_target()) required_headroom_mb = img2img ? g_rs.resident_edit_lease_mb : g_rs.resident_lease_mb;
+    }
     /* Lease figures are for 1024x1024. Activation memory scales with pixels
      * on top of a fixed part (weights streamed per layer, text encoder):
      * measured Qwen 2.1 growth ~7.7 GB at 768^2 vs ~10.3 GB at 1024^2. */
@@ -3309,7 +3394,9 @@ static void handle_gpu_status(ohttp_request *req, app_state *app) {
     if (app->vram) len += ovram_ledger_json(app->vram, body + len, cap - len - 1024);
     else len += (size_t)snprintf(body + len, cap - len, "null");
     len += (size_t)snprintf(body + len, cap - len, ",\"sched\":");
-    len += gpu_sched_json(body + len, cap - len - 2);
+    len += gpu_sched_json(body + len, cap - len - 4096);
+    len += (size_t)snprintf(body + len, cap - len, ",\"residency\":");
+    len += residency_json(app, body + len, cap - len - 2);
     snprintf(body + len, cap - len, "}");
     ohttp_respond_str(req, 200, "application/json", body);
     free(body);
@@ -3396,6 +3483,35 @@ static void handle_vram_lease(ohttp_request *req, app_state *app) {
                  "\"waited_ms\":%d}",
                  otier_name(tier), waited_ms);
     }
+    ohttp_respond_str(req, 200, "application/json", body);
+}
+
+static void handle_gpu_residency(ohttp_request *req, app_state *app) {
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    if (!app->residency) { respond_error(req, 503, "residency arbiter is not enabled"); return; }
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+    oj_tok toks[32];
+    int n = oj_parse(req->body, req->body_len, toks, 32);
+    if (n <= 0 || toks[0].type != OJ_OBJECT) { respond_error(req, 400, "body must be a JSON object"); return; }
+    char owner[32] = {0};
+    int t = oj_obj_get(req->body, toks, n, 0, "owner");
+    if (t >= 0) oj_unescape(req->body, &toks[t], owner, sizeof owner);
+    if (!owner[0]) { respond_error(req, 400, "owner is required"); return; }
+    ores_report_in in = {.owner = owner};
+    if ((t = oj_obj_get(req->body, toks, n, 0, "pid")) >= 0) in.pid = (int)oj_number(req->body, &toks[t], 0);
+    if ((t = oj_obj_get(req->body, toks, n, 0, "resident_mb")) >= 0) in.resident_mb = (int)oj_number(req->body, &toks[t], 0);
+    if ((t = oj_obj_get(req->body, toks, n, 0, "stream_mb")) >= 0) in.stream_mb = (int)oj_number(req->body, &toks[t], 0);
+    if ((t = oj_obj_get(req->body, toks, n, 0, "saved_ms")) >= 0) in.saved_ms = oj_number(req->body, &toks[t], 0);
+    if ((t = oj_obj_get(req->body, toks, n, 0, "requests")) >= 0) in.requests = (int)oj_number(req->body, &toks[t], 0);
+    if ((t = oj_obj_get(req->body, toks, n, 0, "resident")) >= 0)
+        in.resident = req->body_len > (size_t)toks[t].start && req->body[toks[t].start] == 't';
+    double free_gib = -1.0, total_gib = -1.0;
+    int free_mb = ogpu_memory_gib(&free_gib, &total_gib) && free_gib >= 0 ? (int)(free_gib * 1024.0) : -1;
+    ores_decision d = ores_report(app->residency, &in, free_mb);
+    char body[256];
+    snprintf(body, sizeof body,
+             "{\"resident\":%s,\"admitted\":%s,\"demand\":%.2f,\"benefit_ms\":%.0f,\"reason\":\"%s\"}",
+             d.resident ? "true" : "false", d.admitted ? "true" : "false", d.demand, d.benefit, d.reason);
     ohttp_respond_str(req, 200, "application/json", body);
 }
 
@@ -3502,6 +3618,7 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/v1/gpu/lease")) { handle_vram_lease(req, app); return; }
     if (ohttp_path_is(req, "/v1/gpu/renew")) { handle_vram_renew(req, app); return; }
     if (ohttp_path_is(req, "/v1/gpu/release")) { handle_vram_release(req, app); return; }
+    if (ohttp_path_is(req, "/v1/gpu/residency")) { handle_gpu_residency(req, app); return; }
     if (ohttp_path_is(req, "/v1/guard/classify")) { handle_guard_classify(req, app); return; }
     if (ohttp_path_is(req, "/admin/llm/unload") || ohttp_path_is(req, "/admin/unload")) {
         handle_llm_unload(req); return;
@@ -4003,6 +4120,19 @@ int main(int argc, char **argv) {
         const char *ttl_env = getenv("OMNISERVE_NATIVE_VRAM_LEASE_TTL_S");
         app.vram = ovram_create(keep_env ? atoi(keep_env) : 1024,
                                 ttl_env ? atof(ttl_env) : 120.0);
+        if (app.vram && env_flag("OMNISERVE_NATIVE_RESIDENCY_BROKER", 1)) {
+            ores_config rc;
+            ores_config_defaults(&rc);
+            rc.keep_free_mb = env_int("OMNISERVE_NATIVE_RESIDENCY_KEEP_FREE_MB", keep_env ? atoi(keep_env) : 1024);
+            rc.half_life_s = env_int("OMNISERVE_NATIVE_RESIDENCY_HALF_LIFE_S", 300);
+            rc.min_hold_s = env_int("OMNISERVE_NATIVE_RESIDENCY_MIN_HOLD_S", 120);
+            rc.idle_release_s = env_int("OMNISERVE_NATIVE_RESIDENCY_IDLE_RELEASE_S", 900);
+            rc.switch_ratio = env_int("OMNISERVE_NATIVE_RESIDENCY_SWITCH_PCT", 150) / 100.0;
+            rc.reserve_idle_s = env_int("OMNISERVE_NATIVE_RESIDENCY_RESERVE_IDLE_S", 180);
+            rc.hysteresis_mb = env_int("OMNISERVE_NATIVE_RESIDENCY_HYSTERESIS_MB", 1024);
+            rc.free_window_s = env_int("OMNISERVE_NATIVE_RESIDENCY_FREE_WINDOW_S", 60);
+            app.residency = ores_create(&rc);
+        }
         /* Declares memory a co-tenant will grow into but has not taken yet.
          * Memory a tenant already holds must not be listed: the driver's free
          * figure has counted it once already. Format: "name:mb,name:mb". */
@@ -4318,6 +4448,21 @@ int main(int argc, char **argv) {
     if (sd && sd[0]) {
         fprintf(stderr, "loading diffusion %s\n", sd);
         if (!osd_init(sd)) fprintf(stderr, "diffusion load failed\n");
+        const char *mode = getenv("OMNISERVE_NATIVE_SD_RESIDENCY");
+        if (osd_ready() && mode && strcmp(mode, "demand") == 0) {
+            g_rs.resident_mb = env_int("OMNISERVE_NATIVE_SD_RESIDENT_MB", 12000);
+            g_rs.stream_mb = env_int("OMNISERVE_NATIVE_SD_STREAM_MB", g_gs.sd_lease_mb);
+            g_rs.saved_ms = env_int("OMNISERVE_NATIVE_SD_RESIDENT_SAVED_MS", 5000);
+            g_rs.resident_lease_mb = env_int("OMNISERVE_NATIVE_SD_RESIDENT_LEASE_MB", 2048);
+            g_rs.resident_edit_lease_mb = env_int("OMNISERVE_NATIVE_SD_RESIDENT_EDIT_LEASE_MB", g_rs.resident_lease_mb);
+            g_rs.tick_ms = env_int("OMNISERVE_NATIVE_SD_RESIDENCY_TICK_MS", 3000);
+            if (g_rs.tick_ms < 200) g_rs.tick_ms = 200;
+            g_rs.enabled = true;
+            pthread_t residency_thread;
+            if (pthread_create(&residency_thread, NULL, residency_main, &app) == 0) pthread_detach(residency_thread);
+            fprintf(stderr, "sd: demand residency on (resident %d MB, stream %d MB, saves %.0f ms/request)\n",
+                    g_rs.resident_mb, g_rs.stream_mb, g_rs.saved_ms);
+        }
     }
 
     app.scale = oscale_create();

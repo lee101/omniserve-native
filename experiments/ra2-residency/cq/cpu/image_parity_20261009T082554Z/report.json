@@ -1,0 +1,429 @@
+{
+  "timestamp": "20261009T084250Z",
+  "reference_base": "experiments/ra2-residency/cq_ref/image_reference_20261009T080243Z",
+  "candidate_base": "http://127.0.0.1:8794",
+  "corpus": "experiments/ra2-residency/corpus_cpu512.json",
+  "semantic_available": true,
+  "semantic_error": null,
+  "latency": {
+    "timing_source": "inference_time_ms",
+    "reference_median_ms": 332149.0,
+    "candidate_median_ms": 245059.0,
+    "reference_wall_median_ms": 332212.18,
+    "candidate_wall_median_ms": 245120.598,
+    "candidate_to_reference_ratio": 0.7377983977070531,
+    "maximum_ratio": 1.5
+  },
+  "rows": [
+    {
+      "id": "product_glass_robot",
+      "category": "product",
+      "prompt": "cinematic product photo of a translucent glass robot toy on a white seamless studio background",
+      "size": "512x512",
+      "seed": 5201,
+      "reference": {
+        "transport": "b64_json",
+        "model": "qwen-image-2.1-Q4_K_M",
+        "seed": 5201,
+        "inference_time_ms": 295023,
+        "format": "webp",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": {
+          "requested": "easycache",
+          "approximate": true,
+          "threshold": 0.15
+        },
+        "http_status": 200,
+        "wall_ms": 295164.576,
+        "content_type": "application/json",
+        "encoded_bytes": 12029
+      },
+      "candidate": {
+        "transport": "b64_json",
+        "model": "qwen-image-2.1-Q4_K_M",
+        "seed": 5201,
+        "inference_time_ms": 302892,
+        "format": "webp",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null,
+        "http_status": 200,
+        "wall_ms": 303045.018,
+        "content_type": "application/json",
+        "encoded_bytes": 12134
+      },
+      "reference_payload": {
+        "cache": false,
+        "output_format": "png",
+        "prompt": "cinematic product photo of a translucent glass robot toy on a white seamless studio background",
+        "size": "512x512",
+        "seed": 5201,
+        "n": 1,
+        "turbo": false
+      },
+      "candidate_payload": {
+        "cache": false,
+        "output_format": "png",
+        "prompt": "cinematic product photo of a translucent glass robot toy on a white seamless studio background",
+        "size": "512x512",
+        "seed": 5201,
+        "n": 1
+      },
+      "economics": {
+        "reference": {
+          "monthly_gpu_cost_usd": 1000.0,
+          "megapixels": 0.262144,
+          "timing_source": "inference_time_ms",
+          "billed_ms": 295023.0,
+          "cost_per_image_usd": 0.11226141552511415,
+          "cost_per_megapixel_usd": 0.42824331483884487
+        },
+        "candidate": {
+          "monthly_gpu_cost_usd": 1000.0,
+          "megapixels": 0.262144,
+          "timing_source": "inference_time_ms",
+          "billed_ms": 302892.0,
+          "cost_per_image_usd": 0.11525570776255707,
+          "cost_per_megapixel_usd": 0.4396656332495006
+        }
+      },
+      "reference_path": "experiments/ra2-residency/cq/cpu/image_parity_20261009T082554Z/00_product_glass_robot_reference.png",
+      "candidate_path": "experiments/ra2-residency/cq/cpu/image_parity_20261009T082554Z/00_product_glass_robot_candidate.png",
+      "candidate_quality": {
+        "entropy": 4.49506881425113,
+        "stddev": 19.6474609375,
+        "sha256": "8d4f142f9a5caabce2e01d01512fa27c78c20b9318a0215c08d68502c452d5c1"
+      },
+      "pixel": {
+        "same_dimensions": true,
+        "identical": false,
+        "mse": 44.7640495300293,
+        "mae": 2.9989585876464844,
+        "psnr_db": 31.621509932664075,
+        "ssim_global": 0.9467595703850082,
+        "edge_cosine": 0.792127251625061,
+        "histogram_intersection": 0.8793716430664062
+      },
+      "semantic": {
+        "clip_image_cosine": 0.9138976335525513,
+        "clip_prompt_reference": 0.3089590072631836,
+        "clip_prompt_candidate": 0.3009091913700104,
+        "clip_prompt_delta": -0.008049815893173218,
+        "aesthetic_reference": 4.541228771209717,
+        "aesthetic_candidate": 4.588308334350586,
+        "aesthetic_delta": 0.04707956314086914
+      },
+      "failures": [],
+      "passed": true
+    },
+    {
+      "id": "portrait_hands",
+      "category": "people",
+      "prompt": "documentary portrait of a ceramic artist shaping clay on a wheel, both hands clearly visible, warm workshop light",
+      "size": "512x512",
+      "seed": 5203,
+      "reference": {
+        "transport": "b64_json",
+        "model": "qwen-image-2.1-Q4_K_M",
+        "seed": 5203,
+        "inference_time_ms": 342352,
+        "format": "webp",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": {
+          "requested": "easycache",
+          "approximate": true,
+          "threshold": 0.15
+        },
+        "http_status": 200,
+        "wall_ms": 342428.266,
+        "content_type": "application/json",
+        "encoded_bytes": 54077
+      },
+      "candidate": {
+        "transport": "b64_json",
+        "model": "qwen-image-2.1-Q4_K_M",
+        "seed": 5203,
+        "inference_time_ms": 277144,
+        "format": "webp",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null,
+        "http_status": 200,
+        "wall_ms": 277217.73,
+        "content_type": "application/json",
+        "encoded_bytes": 51646
+      },
+      "reference_payload": {
+        "cache": false,
+        "output_format": "png",
+        "prompt": "documentary portrait of a ceramic artist shaping clay on a wheel, both hands clearly visible, warm workshop light",
+        "size": "512x512",
+        "seed": 5203,
+        "n": 1,
+        "turbo": false
+      },
+      "candidate_payload": {
+        "cache": false,
+        "output_format": "png",
+        "prompt": "documentary portrait of a ceramic artist shaping clay on a wheel, both hands clearly visible, warm workshop light",
+        "size": "512x512",
+        "seed": 5203,
+        "n": 1
+      },
+      "economics": {
+        "reference": {
+          "monthly_gpu_cost_usd": 1000.0,
+          "megapixels": 0.262144,
+          "timing_source": "inference_time_ms",
+          "billed_ms": 342352.0,
+          "cost_per_image_usd": 0.1302709284627093,
+          "cost_per_megapixel_usd": 0.49694415459712715
+        },
+        "candidate": {
+          "monthly_gpu_cost_usd": 1000.0,
+          "megapixels": 0.262144,
+          "timing_source": "inference_time_ms",
+          "billed_ms": 277144.0,
+          "cost_per_image_usd": 0.10545814307458143,
+          "cost_per_megapixel_usd": 0.4022908900244958
+        }
+      },
+      "reference_path": "experiments/ra2-residency/cq/cpu/image_parity_20261009T082554Z/01_portrait_hands_reference.png",
+      "candidate_path": "experiments/ra2-residency/cq/cpu/image_parity_20261009T082554Z/01_portrait_hands_candidate.png",
+      "candidate_quality": {
+        "entropy": 7.47270710063798,
+        "stddev": 53.92361831665039,
+        "sha256": "554aa1f5e12cc0e6f8fc9a67edda0def191b329e53ee41048a25da84c2891ecd"
+      },
+      "pixel": {
+        "same_dimensions": true,
+        "identical": false,
+        "mse": 675.962890625,
+        "mae": 13.909156799316406,
+        "psnr_db": 19.831575064043285,
+        "ssim_global": 0.8876851130282821,
+        "edge_cosine": 0.7278823852539062,
+        "histogram_intersection": 0.9431559244791666
+      },
+      "semantic": {
+        "clip_image_cosine": 0.9944615960121155,
+        "clip_prompt_reference": 0.23725071549415588,
+        "clip_prompt_candidate": 0.23818925023078918,
+        "clip_prompt_delta": 0.0009385347366333008,
+        "aesthetic_reference": 5.804388523101807,
+        "aesthetic_candidate": 5.763800144195557,
+        "aesthetic_delta": -0.04058837890625
+      },
+      "failures": [],
+      "passed": true
+    },
+    {
+      "id": "typography_sign",
+      "category": "text",
+      "prompt": "minimal studio photograph of a red cube beside a white sign that reads EXACTLY: BUILD FAST, TEST DEEP",
+      "size": "512x512",
+      "seed": 5208,
+      "reference": {
+        "transport": "b64_json",
+        "model": "qwen-image-2.1-Q4_K_M",
+        "seed": 5208,
+        "inference_time_ms": 321946,
+        "format": "webp",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": {
+          "requested": "easycache",
+          "approximate": true,
+          "threshold": 0.15
+        },
+        "http_status": 200,
+        "wall_ms": 321996.094,
+        "content_type": "application/json",
+        "encoded_bytes": 11213
+      },
+      "candidate": {
+        "transport": "b64_json",
+        "model": "qwen-image-2.1-Q4_K_M",
+        "seed": 5208,
+        "inference_time_ms": 212974,
+        "format": "webp",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null,
+        "http_status": 200,
+        "wall_ms": 213023.466,
+        "content_type": "application/json",
+        "encoded_bytes": 11986
+      },
+      "reference_payload": {
+        "cache": false,
+        "output_format": "png",
+        "prompt": "minimal studio photograph of a red cube beside a white sign that reads EXACTLY: BUILD FAST, TEST DEEP",
+        "size": "512x512",
+        "seed": 5208,
+        "n": 1,
+        "turbo": false
+      },
+      "candidate_payload": {
+        "cache": false,
+        "output_format": "png",
+        "prompt": "minimal studio photograph of a red cube beside a white sign that reads EXACTLY: BUILD FAST, TEST DEEP",
+        "size": "512x512",
+        "seed": 5208,
+        "n": 1
+      },
+      "economics": {
+        "reference": {
+          "monthly_gpu_cost_usd": 1000.0,
+          "megapixels": 0.262144,
+          "timing_source": "inference_time_ms",
+          "billed_ms": 321946.0,
+          "cost_per_image_usd": 0.12250608828006088,
+          "cost_per_megapixel_usd": 0.4673236399843631
+        },
+        "candidate": {
+          "monthly_gpu_cost_usd": 1000.0,
+          "megapixels": 0.262144,
+          "timing_source": "inference_time_ms",
+          "billed_ms": 212974.0,
+          "cost_per_image_usd": 0.08104033485540335,
+          "cost_per_megapixel_usd": 0.30914434377824157
+        }
+      },
+      "reference_path": "experiments/ra2-residency/cq/cpu/image_parity_20261009T082554Z/02_typography_sign_reference.png",
+      "candidate_path": "experiments/ra2-residency/cq/cpu/image_parity_20261009T082554Z/02_typography_sign_candidate.png",
+      "candidate_quality": {
+        "entropy": 5.338221418284604,
+        "stddev": 56.458763122558594,
+        "sha256": "3543a2cd6fcf62857aede0969434607d4e440c402b0c1ee306b9a8303284ce84"
+      },
+      "pixel": {
+        "same_dimensions": true,
+        "identical": false,
+        "mse": 744.3505859375,
+        "mae": 8.578781127929688,
+        "psnr_db": 19.413028262949695,
+        "ssim_global": 0.8785132978365432,
+        "edge_cosine": 0.3333640992641449,
+        "histogram_intersection": 0.7417246500651041
+      },
+      "semantic": {
+        "clip_image_cosine": 0.7282933592796326,
+        "clip_prompt_reference": 0.36793527007102966,
+        "clip_prompt_candidate": 0.38631969690322876,
+        "clip_prompt_delta": 0.018384426832199097,
+        "aesthetic_reference": 4.337272644042969,
+        "aesthetic_candidate": 4.349813461303711,
+        "aesthetic_delta": 0.012540817260742188
+      },
+      "failures": [],
+      "passed": true
+    },
+    {
+      "id": "poster_text",
+      "category": "typography",
+      "prompt": "a vintage travel poster that says \"VISIT AUCKLAND\" in bold art deco letters, harbour bridge at sunset",
+      "size": "512x512",
+      "seed": 5209,
+      "reference": {
+        "transport": "b64_json",
+        "model": "qwen-image-2.1-Q4_K_M",
+        "seed": 5209,
+        "inference_time_ms": 430061,
+        "format": "webp",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": {
+          "requested": "easycache",
+          "approximate": true,
+          "threshold": 0.15
+        },
+        "http_status": 200,
+        "wall_ms": 430193.727,
+        "content_type": "application/json",
+        "encoded_bytes": 115725
+      },
+      "candidate": {
+        "transport": "b64_json",
+        "model": "qwen-image-2.1-Q4_K_M",
+        "seed": 5209,
+        "inference_time_ms": 204436,
+        "format": "webp",
+        "teleport": null,
+        "cache": null,
+        "denoiser_cache": null,
+        "http_status": 200,
+        "wall_ms": 204550.024,
+        "content_type": "application/json",
+        "encoded_bytes": 113410
+      },
+      "reference_payload": {
+        "cache": false,
+        "output_format": "png",
+        "prompt": "a vintage travel poster that says \"VISIT AUCKLAND\" in bold art deco letters, harbour bridge at sunset",
+        "size": "512x512",
+        "seed": 5209,
+        "n": 1,
+        "turbo": false
+      },
+      "candidate_payload": {
+        "cache": false,
+        "output_format": "png",
+        "prompt": "a vintage travel poster that says \"VISIT AUCKLAND\" in bold art deco letters, harbour bridge at sunset",
+        "size": "512x512",
+        "seed": 5209,
+        "n": 1
+      },
+      "economics": {
+        "reference": {
+          "monthly_gpu_cost_usd": 1000.0,
+          "megapixels": 0.262144,
+          "timing_source": "inference_time_ms",
+          "billed_ms": 430061.0,
+          "cost_per_image_usd": 0.1636457382039574,
+          "cost_per_megapixel_usd": 0.6242589500578208
+        },
+        "candidate": {
+          "monthly_gpu_cost_usd": 1000.0,
+          "megapixels": 0.262144,
+          "timing_source": "inference_time_ms",
+          "billed_ms": 204436.0,
+          "cost_per_image_usd": 0.07779147640791477,
+          "cost_per_megapixel_usd": 0.2967509323422042
+        }
+      },
+      "reference_path": "experiments/ra2-residency/cq/cpu/image_parity_20261009T082554Z/03_poster_text_reference.png",
+      "candidate_path": "experiments/ra2-residency/cq/cpu/image_parity_20261009T082554Z/03_poster_text_candidate.png",
+      "candidate_quality": {
+        "entropy": 7.6027697721410075,
+        "stddev": 64.21028137207031,
+        "sha256": "c1ac5c452ad8436b4510f738df48e5c56e01c85ea001701eb8a493846fa596a6"
+      },
+      "pixel": {
+        "same_dimensions": true,
+        "identical": false,
+        "mse": 858.54638671875,
+        "mae": 18.52324867248535,
+        "psnr_db": 18.793165960806398,
+        "ssim_global": 0.8979190136100218,
+        "edge_cosine": 0.7798707485198975,
+        "histogram_intersection": 0.877831776936849
+      },
+      "semantic": {
+        "clip_image_cosine": 0.9736942648887634,
+        "clip_prompt_reference": 0.3284490406513214,
+        "clip_prompt_candidate": 0.3578534722328186,
+        "clip_prompt_delta": 0.029404431581497192,
+        "aesthetic_reference": 5.498086929321289,
+        "aesthetic_candidate": 5.595229625701904,
+        "aesthetic_delta": 0.09714269638061523
+      },
+      "failures": [],
+      "passed": true
+    }
+  ],
+  "failures": [],
+  "passed": true
+}

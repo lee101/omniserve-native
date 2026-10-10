@@ -201,6 +201,16 @@ typedef struct {
     int image_height;
     float strength;
     bool cache;
+    /* Per-request quality overrides; zero values mean the server default. */
+    float cache_threshold; /* EasyCache reuse threshold */
+    float cache_end;       /* fraction of steps after which caching stops */
+    bool cache_off;        /* dense sampling */
+    int notch;             /* 0 server default, 1 on, 2 off */
+    int turbo;             /* 0 server default, 2 = force the base (non-distilled) path */
+    float flow_shift;      /* 0 server default */
+    char sampler[24];      /* sd.cpp sampler name, empty = default */
+    char scheduler[24];
+    char extra_args[96];   /* sd.cpp extra_sample_args, e.g. "exit_tol=0.02" */
     uint64_t image_hash; /* keyed hash and length of image_base64, set by osd_prepare_image when cache is on */
     size_t image_len;
     bool image_hash_valid;
@@ -228,6 +238,11 @@ typedef struct {
 } oimg_result;
 
 bool osd_init(const char *model_path);
+bool osd_resident(void);
+int osd_set_resident(bool resident, bool wait); /* 1 ok, 0 failed, -1 busy (wait=false) */
+bool osd_residency_target(void); /* pending arbiter state if any, else current */
+void osd_residency_settled(void); /* drop a pending switch: the arbiter now agrees with the current state */
+size_t osd_residency_json(char *out, size_t cap);
 bool osd_ready(void);
 const char *osd_model_name(void);
 bool osd_generate(const oimg_req *req, oimg_result *out);

@@ -1,0 +1,2 @@
+{"wall": 49.353, "inference_ms": 49019, "denoiser_cache": null, "retries": 0, "arm": "cap3s", "case": "t2i", "round": 0, "i": "warm", "seed": 1, "prompt": 0, "peak_mib": 3692, "min_free_mib": 5290, "te": 4.8, "sampling": 34.06, "vae": 10.01, "lora": 0.1, "total": 49.02}
+{"wall": 42.689, "inference_ms": 42472, "denoiser_cache": null, "retries": 0, "arm": "cap3s", "case": "t2i", "round": 0, "i": 0, "seed": 1000, "prompt": 0, "peak_mib": 3738, "min_free_mib": 5052, "te": 3.79, "sampling": 28.79, "vae": 9.73, "lora": 0.12, "total": 42.47}

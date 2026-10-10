@@ -83,6 +83,7 @@ components, and verifies the resolved file remains below that directory; the C
 request path never downloads weights. Images are WebP by default (falling back
 to PNG if libwebp is unavailable), controlled by
 `OMNISERVE_NATIVE_SD_IMAGE_FORMAT` and `OMNISERVE_NATIVE_SD_WEBP_QUALITY`.
+`OMNISERVE_NATIVE_SD_NOTCH=1` runs a Nyquist notch (separable 7-tap, ~22 ms at 1024²) on the decoded RGB before encoding; it removes the 2 px lattice the Qwen VAE leaves in fur and other fine texture. Image requests can override per call with `notch` (bool), `cache_threshold` (EasyCache reuse threshold, `0` = dense sampling) and `cache_end`; a request that sets any of them bypasses the result cache. `qualitybench/` holds the prompt set, runner and sweep scripts.
 `OMNISERVE_NATIVE_SD_MAX_BATCH` is deliberately 1 by default and may be raised
 to at most 8 only after a VRAM/latency canary.
 

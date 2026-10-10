@@ -1,0 +1,1 @@
+{"prod": {"env": {"OMNISERVE_NATIVE_SD_LEASE_MB": "4000", "OMNISERVE_NATIVE_SD_EDIT_LEASE_MB": "4000"}, "need_mib": 4000}}

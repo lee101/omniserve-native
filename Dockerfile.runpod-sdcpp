@@ -59,7 +59,7 @@ RUN NCCL_DIR=$(python -c 'import nvidia.nccl, os; print(os.path.join(os.path.dir
 # Pillow, so torch/diffusers are deliberately absent: several GB off every
 # serverless cold start, paid on the first request of every scale-up.
 RUN python -m pip install --no-cache-dir \
-        "huggingface-hub==1.27.0" hf_transfer pillow requests
+        "huggingface-hub==1.27.0" hf_transfer pillow numpy requests
 
 COPY runtime /opt/omniserve/runtime
 COPY workloads /opt/omniserve/workloads

@@ -194,6 +194,7 @@ typedef sd_ctx_t *(*fn_new_sd_ctx)(const sd_ctx_params_t *);
 typedef void (*fn_img_params_init)(sd_img_gen_params_t *);
 typedef bool (*fn_generate_image)(sd_ctx_t *, const sd_img_gen_params_t *, sd_image_t **, int *);
 typedef void (*fn_free_images)(sd_image_t *, int);
+typedef void (*fn_free_sd_ctx)(sd_ctx_t *);
 #if !OMNISERVE_SD_LATENT_API
 /* Compatibility shim for upstream stable-diffusion.cpp: the symbols are looked up
  * with dlsym and stay NULL, so latent_api_ready() reports false and every
@@ -216,7 +217,10 @@ static fn_ctx_params_init p_ctx_params_init;
 static fn_new_sd_ctx p_new_sd_ctx;
 static fn_img_params_init p_img_params_init;
 static fn_generate_image p_generate_image;
+static int (*p_str_to_sample_method)(const char *);
+static int (*p_str_to_scheduler)(const char *);
 static fn_free_images p_free_images;
+static fn_free_sd_ctx p_free_sd_ctx;
 static fn_latent_params_init p_latent_params_init;
 static fn_generate_image_with_latent p_generate_image_with_latent;
 static fn_free_latent p_free_latent;
@@ -251,7 +255,10 @@ static bool sd_lib_load(void) {
     p_new_sd_ctx = (fn_new_sd_ctx)dlsym(lib, "new_sd_ctx");
     p_img_params_init = (fn_img_params_init)dlsym(lib, "sd_img_gen_params_init");
     p_generate_image = (fn_generate_image)dlsym(lib, "generate_image");
+    *(void **)&p_str_to_sample_method = dlsym(lib, "str_to_sample_method");
+    *(void **)&p_str_to_scheduler = dlsym(lib, "str_to_scheduler");
     p_free_images = (fn_free_images)dlsym(lib, "free_sd_images");
+    p_free_sd_ctx = (fn_free_sd_ctx)dlsym(lib, "free_sd_ctx");
     p_latent_params_init = (fn_latent_params_init)dlsym(lib, "sd_latent_replay_params_init");
     p_generate_image_with_latent = (fn_generate_image_with_latent)dlsym(lib, "generate_image_with_latent");
     p_free_latent = (fn_free_latent)dlsym(lib, "free_sd_latent");
@@ -301,6 +308,44 @@ static latent_cache_entry *g_latent_cache;
 static int g_latent_cache_size;
 static unsigned long long g_latent_cache_tick;
 static size_t g_cache_bytes;
+
+/* Nyquist notch: (delta - b) along x then y with b = [-1 6 -15 20 -15 6 -1]/64,
+ * which removes the 2 px lattice the VAE leaves in fine texture and keeps DC
+ * gain 1. Separable, so two 7-tap passes; edges clamp. */
+static void notch_rgb(unsigned char *px, int w, int h, int ch) {
+    static const int k[7] = {1, -6, 15, 44, 15, -6, 1};
+    if (w < 7 || h < 7 || ch < 3) return;
+    int *tmp = malloc((size_t)w * h * 3 * sizeof *tmp);
+    if (!tmp) return;
+    for (int y = 0; y < h; ++y) {
+        const unsigned char *row = px + (size_t)y * w * ch;
+        int *out = tmp + (size_t)y * w * 3;
+        for (int x = 0; x < w; ++x) {
+            int a0 = 0, a1 = 0, a2 = 0;
+            for (int t = -3; t <= 3; ++t) {
+                int xx = x + t < 0 ? 0 : (x + t >= w ? w - 1 : x + t);
+                const unsigned char *p = row + (size_t)xx * ch;
+                a0 += k[t + 3] * p[0]; a1 += k[t + 3] * p[1]; a2 += k[t + 3] * p[2];
+            }
+            out[x * 3] = a0; out[x * 3 + 1] = a1; out[x * 3 + 2] = a2;
+        }
+    }
+    for (int y = 0; y < h; ++y) {
+        unsigned char *row = px + (size_t)y * w * ch;
+        const int *r[7];
+        for (int t = -3; t <= 3; ++t) {
+            int yy = y + t < 0 ? 0 : (y + t >= h ? h - 1 : y + t);
+            r[t + 3] = tmp + (size_t)yy * w * 3;
+        }
+        for (int i = 0; i < w * 3; ++i) {
+            int v = 0;
+            for (int t = 0; t < 7; ++t) v += k[t] * r[t][i];
+            v = (v + 2048) >> 12;
+            row[(i / 3) * ch + i % 3] = (unsigned char)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        }
+    }
+    free(tmp);
+}
 
 static double now_ms(void) {
     struct timespec ts;
@@ -363,9 +408,60 @@ static struct {
     float spectrum_stop, residual_diff;
     int teleport_start; /* -1: steps - 1 */
     size_t cache_bytes_max;
+    int turbo_n; /* >0: distilled few-step schedule, nodes in turbo_nodes */
+    float turbo_nodes[16];
+    char default_lora[1024]; /* applied to requests that carry no LoRA of their own */
+    float default_lora_scale;
+    bool notch;
+    bool teleport; /* OMNISERVE_NATIVE_SD_TELEPORT=0 ignores request teleport flags (Qwen lanes: latent capture makes a first render ~2x slower and only an exact repeat benefits) */
+    float hq_threshold; /* EasyCache threshold for non-turbo text-to-image; 0 = use the global one */
 } g_cfg;
 
+/* Distilled few-step Qwen-Image (Viggle turbo) schedule: raw nodes pushed through the
+ * pipeline's resolution-dependent exponential time shift, then a terminal 0. */
+static void turbo_sigmas(int width, int height, float *out) {
+    double seq = (double)(width / 16) * (double)(height / 16);
+    double mu = 0.5 + (seq - 256.0) * (0.9 - 0.5) / (8192.0 - 256.0);
+    double e = exp(mu);
+    for (int i = 0; i < g_cfg.turbo_n; ++i) {
+        double t = (double)g_cfg.turbo_nodes[i];
+        out[i] = (float)(e / (e + (1.0 / t - 1.0)));
+    }
+    out[g_cfg.turbo_n] = 0.0f;
+}
+
+static void turbo_cfg_load(void) {
+    const char *lora = getenv("OMNISERVE_NATIVE_SD_DEFAULT_LORA");
+    g_cfg.default_lora[0] = 0;
+    g_cfg.default_lora_scale = sd_env_float("OMNISERVE_NATIVE_SD_DEFAULT_LORA_SCALE", 1.0f, -4.0f, 4.0f);
+    if (lora && lora[0] == '/' && strlen(lora) < sizeof g_cfg.default_lora) {
+        strcpy(g_cfg.default_lora, lora);
+        fprintf(stderr, "sd: default LoRA %s scale=%.2f\n", lora, (double)g_cfg.default_lora_scale);
+    }
+    const char *spec = getenv("OMNISERVE_NATIVE_SD_TURBO_NODES");
+    g_cfg.turbo_n = 0;
+    if (!spec || !spec[0]) return;
+    float nodes[16];
+    int n = 0;
+    const char *p = spec;
+    while (*p && n < 16) {
+        char *end = NULL;
+        float v = strtof(p, &end);
+        if (end == p || !isfinite(v) || v <= 0.0f || v > 1.0f) {
+            fprintf(stderr, "sd: ignoring OMNISERVE_NATIVE_SD_TURBO_NODES=%s\n", spec);
+            return;
+        }
+        nodes[n++] = v;
+        p = end;
+        if (*p == ',') ++p;
+    }
+    memcpy(g_cfg.turbo_nodes, nodes, sizeof nodes);
+    g_cfg.turbo_n = n;
+    fprintf(stderr, "sd: turbo schedule enabled, %d steps\n", n);
+}
+
 static void sd_cfg_load(void) {
+    turbo_cfg_load();
     g_cfg.zero_guidance = sd_env_float("OMNISERVE_NATIVE_SD_ZERO_GUIDANCE", 1.0f, 0.0f, 30.0f);
     const char *tiling = getenv("OMNISERVE_NATIVE_SD_VAE_TILING");
     g_cfg.vae_tiling = tiling && tiling[0] ? (int)sd_env_flag("OMNISERVE_NATIVE_SD_VAE_TILING", false) : -1;
@@ -381,6 +477,9 @@ static void sd_cfg_load(void) {
     g_cfg.spectrum_warmup = sd_env_int("OMNISERVE_NATIVE_SD_SPECTRUM_WARMUP", 4, 1, 64);
     g_cfg.spectrum_stop = sd_env_float("OMNISERVE_NATIVE_SD_SPECTRUM_STOP", 0.9f, 0.0f, 1.0f);
     g_cfg.residual_diff = sd_env_float("OMNISERVE_NATIVE_SD_CACHE_RESIDUAL_DIFF", 0.08f, 0.0f, 10.0f);
+    g_cfg.notch = sd_env_flag("OMNISERVE_NATIVE_SD_NOTCH", false);
+    g_cfg.teleport = sd_env_flag("OMNISERVE_NATIVE_SD_TELEPORT", true);
+    g_cfg.hq_threshold = sd_env_float("OMNISERVE_NATIVE_SD_HQ_EASYCACHE_THRESHOLD", 0.0f, 0.0f, 1.0f);
     g_cfg.teleport_start = sd_env_int("OMNISERVE_NATIVE_SD_TELEPORT_START_STEP", -1, 1, 99);
     g_cfg.cache_bytes_max = (size_t)sd_env_int("OMNISERVE_NATIVE_SD_CACHE_MAX_MB", 1024, 0, 1 << 20) << 20;
     /* OMNISERVE_NATIVE_SD_CACHE_MODE selects the stable-diffusion.cpp denoiser
@@ -400,6 +499,13 @@ static void sd_cfg_load(void) {
 static bool latent_api_ready(void) {
     return p_latent_params_init && p_generate_image_with_latent && p_free_latent &&
            g_latent_cache && g_latent_cache_size > 0;
+}
+
+/* A teleport request only changes how the render runs when the library has the latent-replay API.
+ * Without it (upstream sd.cpp, the Qwen lanes) the flag must not switch off EasyCache or the result
+ * cache, or every caller that sends teleport:true pays for a dense run. */
+static bool teleport_effective(const oimg_req *req) {
+    return g_cfg.teleport && req->teleport && !req->image_pixels && req->batch_count <= 1 && req->steps > 1 && latent_api_ready();
 }
 
 /* Everything in a request that selects a cache entry and is not a plain scalar.
@@ -561,7 +667,7 @@ static bool cache_copy_encoded_result(const latent_cache_entry *entry, oimg_resu
 }
 
 bool osd_try_cached_result(const oimg_req *req, oimg_result *out) {
-    if (!g_sd || !req->cache || req->teleport || req->seed < 0 || req->batch_count > 1) return false;
+    if (!g_sd || !req->cache || teleport_effective(req) || req->seed < 0 || req->batch_count > 1) return false;
     memset(out, 0, sizeof *out);
     double started = now_ms();
     cache_key key;
@@ -611,10 +717,32 @@ static void cache_store_encoded_result(latent_cache_entry *entry, const oimg_res
     pthread_mutex_unlock(&g_cache_lock);
 }
 
-bool osd_init(const char *model_path) {
-    if (g_sd) return true;
-    if (!sd_lib_load()) return false;
-    sd_cfg_load();
+/* Residency profile: the resident build reads OMNISERVE_NATIVE_SD_RESIDENT_<X> before
+ * OMNISERVE_NATIVE_SD_<X> for the placement knobs, with resident defaults (weights on the
+ * compute backend, no streaming, eager upload so a promotion pays the PCIe copy up front). */
+static const char *sd_profile_env(const char *suffix, bool resident, const char *resident_default) {
+    char name[96];
+    if (resident) {
+        snprintf(name, sizeof name, "OMNISERVE_NATIVE_SD_RESIDENT_%s", suffix);
+        const char *v = getenv(name);
+        return v ? v : resident_default;
+    }
+    snprintf(name, sizeof name, "OMNISERVE_NATIVE_SD_%s", suffix);
+    return getenv(name);
+}
+
+static bool sd_profile_flag(const char *suffix, bool resident, bool resident_default, bool fallback) {
+    const char *v = sd_profile_env(suffix, resident, resident_default ? "1" : "0");
+    if (!v || !v[0]) return fallback;
+    return strcmp(v, "0") != 0 && strcasecmp(v, "false") != 0 && strcasecmp(v, "off") != 0;
+}
+
+static char g_model_path[1024];
+static bool g_sd_resident;
+static double g_sd_switch_ms_last;
+static unsigned long long g_sd_switches, g_sd_switch_failures;
+
+static sd_ctx_t *sd_ctx_build(const char *model_path, bool resident) {
     sd_ctx_params_t params;
     p_ctx_params_init(&params);
     const char *diffusion = getenv("OMNISERVE_NATIVE_SD_DIFFUSION_MODEL");
@@ -622,9 +750,9 @@ bool osd_init(const char *model_path) {
     const char *llm = getenv("OMNISERVE_NATIVE_SD_LLM");
     const char *llm_vision = getenv("OMNISERVE_NATIVE_SD_LLM_VISION");
     const char *taesd = getenv("OMNISERVE_NATIVE_SD_TAESD");
-    const char *max_vram = getenv("OMNISERVE_NATIVE_SD_MAX_VRAM");
-    const char *backend = getenv("OMNISERVE_NATIVE_SD_BACKEND");
-    const char *params_backend = getenv("OMNISERVE_NATIVE_SD_PARAMS_BACKEND");
+    const char *max_vram = sd_profile_env("MAX_VRAM", resident, "");
+    const char *backend = sd_profile_env("BACKEND", resident, getenv("OMNISERVE_NATIVE_SD_BACKEND"));
+    const char *params_backend = sd_profile_env("PARAMS_BACKEND", resident, "");
     if (diffusion && diffusion[0]) {
         params.diffusion_model_path = diffusion;
     } else {
@@ -641,14 +769,92 @@ bool osd_init(const char *model_path) {
     params.flash_attn = sd_env_flag("OMNISERVE_NATIVE_SD_FLASH_ATTN", true);
     params.diffusion_flash_attn = sd_env_flag("OMNISERVE_NATIVE_SD_DIFFUSION_FLASH_ATTN", true);
 #if OMNISERVE_SD_STREAM_LAYERS
-    params.stream_layers = sd_env_flag("OMNISERVE_NATIVE_SD_STREAM_LAYERS", false);
+    params.stream_layers = sd_profile_flag("STREAM_LAYERS", resident, false, false);
 #endif
     params.enable_mmap = sd_env_flag("OMNISERVE_NATIVE_SD_MMAP", true);
-    params.eager_load = sd_env_flag("OMNISERVE_NATIVE_SD_EAGER_LOAD", false);
-    params.auto_fit = sd_env_flag("OMNISERVE_NATIVE_SD_AUTO_FIT", false);
+    params.eager_load = sd_profile_flag("EAGER_LOAD", resident, true, false);
+    params.auto_fit = sd_profile_flag("AUTO_FIT", resident, false, false);
     const char *model_args = getenv("OMNISERVE_NATIVE_SD_MODEL_ARGS");
     if (model_args && model_args[0]) params.model_args = model_args;
-    g_sd = p_new_sd_ctx(&params);
+    return p_new_sd_ctx(&params);
+}
+
+bool osd_resident(void) { return g_sd_resident; }
+
+/* Caller holds g_sd_lock. The resident context is built before the streamed one is freed,
+ * so a failed promotion (OOM beside a co-tenant) leaves the streamed context serving;
+ * a demotion frees first because the resident copy is what a co-tenant is waiting for.
+ * Weights come from the page cache either way. */
+static int g_sd_want = -1; /* -1 none, else the residency the arbiter last asked for */
+
+static int sd_switch_locked(bool resident) {
+    if (g_sd_resident == resident) return 1;
+    double t0 = now_ms();
+    sd_ctx_t *next = NULL;
+    if (resident) {
+        next = sd_ctx_build(g_model_path, true);
+        if (!next) {
+            g_sd_switch_failures++;
+            __atomic_store_n(&g_sd_want, -1, __ATOMIC_RELAXED);
+            fprintf(stderr, "sd: promotion to resident failed after %.0f ms; staying streamed\n", now_ms() - t0);
+            return 0;
+        }
+        p_free_sd_ctx(g_sd);
+    } else {
+        p_free_sd_ctx(g_sd);
+        g_sd = NULL;
+        next = sd_ctx_build(g_model_path, false);
+        if (!next) {
+            fprintf(stderr, "sd: streamed rebuild failed; aborting so the unit restarts\n");
+            abort();
+        }
+    }
+    g_sd = next;
+    pthread_mutex_lock(&g_cache_lock);
+    for (int i = 0; i < g_latent_cache_size; i++)
+        if (g_latent_cache[i].latent) cache_entry_clear(&g_latent_cache[i]);
+    pthread_mutex_unlock(&g_cache_lock);
+    g_sd_resident = resident;
+    g_sd_switches++;
+    g_sd_switch_ms_last = now_ms() - t0;
+    fprintf(stderr, "sd: residency -> %s in %.0f ms\n", resident ? "resident" : "streamed", g_sd_switch_ms_last);
+    return 1;
+}
+
+/* Records the arbiter's answer and switches now if the lane is idle (wait=false returns -1
+ * when a generation holds the lane). A pending switch (either way) is also applied by the
+ * next request before it generates, so a back-to-back lane does not starve it; requests
+ * size their VRAM lease from osd_residency_target() so the lease matches that switch. */
+bool osd_residency_target(void) {
+    int want = __atomic_load_n(&g_sd_want, __ATOMIC_RELAXED);
+    return want >= 0 ? want == 1 : g_sd_resident;
+}
+
+void osd_residency_settled(void) { __atomic_store_n(&g_sd_want, -1, __ATOMIC_RELAXED); }
+
+int osd_set_resident(bool resident, bool wait) {
+    if (!g_sd || !p_free_sd_ctx) return 0;
+    __atomic_store_n(&g_sd_want, resident ? 1 : 0, __ATOMIC_RELAXED);
+    if (wait) pthread_mutex_lock(&g_sd_lock);
+    else if (pthread_mutex_trylock(&g_sd_lock) != 0) return -1;
+    int rc = sd_switch_locked(resident);
+    pthread_mutex_unlock(&g_sd_lock);
+    return rc;
+}
+
+size_t osd_residency_json(char *out, size_t cap) {
+    int n = snprintf(out, cap, "{\"resident\":%s,\"switches\":%llu,\"switch_failures\":%llu,\"switch_ms_last\":%.0f}",
+                     g_sd_resident ? "true" : "false", g_sd_switches, g_sd_switch_failures, g_sd_switch_ms_last);
+    return n > 0 && (size_t)n < cap ? (size_t)n : 0;
+}
+
+bool osd_init(const char *model_path) {
+    if (g_sd) return true;
+    if (!sd_lib_load()) return false;
+    sd_cfg_load();
+    snprintf(g_model_path, sizeof g_model_path, "%s", model_path ? model_path : "");
+    const char *diffusion = getenv("OMNISERVE_NATIVE_SD_DIFFUSION_MODEL");
+    g_sd = sd_ctx_build(model_path, false);
     if (!g_sd) return false;
     g_reference_edit = sd_env_flag("OMNISERVE_NATIVE_SD_REFERENCE_EDIT", false);
     const char *named_path = diffusion && diffusion[0] ? diffusion : model_path;
@@ -733,6 +939,27 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         params.vae_tiling_params.tile_size_y = g_cfg.tile_y;
         params.vae_tiling_params.target_overlap = g_cfg.tile_overlap;
     }
+    /* Turbo only for plain text-to-image: reference edits and requests that bring their
+     * own LoRA keep the base schedule, so edit quality is untouched. */
+    bool turbo = g_cfg.turbo_n > 0 && !req->image_pixels && !req->lora_count && req->turbo != 2;
+    float turbo_sig[17];
+    if (turbo) {
+        turbo_sigmas(params.width, params.height, turbo_sig);
+        params.sample_params.sample_steps = g_cfg.turbo_n;
+        params.sample_params.custom_sigmas = turbo_sig;
+        params.sample_params.custom_sigmas_count = g_cfg.turbo_n + 1;
+        params.sample_params.guidance.txt_cfg = 1.0f;
+    }
+    if (req->sampler[0] && p_str_to_sample_method) {
+        int method = p_str_to_sample_method(req->sampler);
+        if (method >= 0 && method < SAMPLE_METHOD_COUNT) params.sample_params.sample_method = (enum sample_method_t)method;
+    }
+    if (req->scheduler[0] && p_str_to_scheduler) {
+        int scheduler = p_str_to_scheduler(req->scheduler);
+        if (scheduler >= 0 && scheduler < SCHEDULER_COUNT) params.sample_params.scheduler = (enum scheduler_t)scheduler;
+    }
+    if (req->flow_shift > 0.0f) params.sample_params.flow_shift = req->flow_shift;
+    if (req->extra_args[0]) params.sample_params.extra_sample_args = req->extra_args;
     params.seed = req->seed;
     sd_image_t source_image = {0};
     if (req->image_pixels) {
@@ -762,18 +989,31 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         params.loras = loras;
         params.lora_count = (uint32_t)req->lora_count;
     }
+    sd_lora_t default_lora = {0};
+    if (turbo && g_cfg.default_lora[0]) {
+        default_lora.path = g_cfg.default_lora;
+        default_lora.multiplier = g_cfg.default_lora_scale;
+        params.loras = &default_lora;
+        params.lora_count = 1;
+    }
 
     out->teleport_requested = req->teleport;
     out->cache_requested = req->cache;
     /* Static per-process setting: result-cache entries never cross profiles.
      * Latent replay requires a dense trajectory, so it cannot use EasyCache. */
-    if (!req->teleport && g_cfg.cache_mode) {
+    bool overridden = req->cache_threshold > 0.0f || req->cache_end > 0.0f || req->cache_off || req->notch ||
+                      req->flow_shift > 0.0f || req->sampler[0] || req->scheduler[0] || req->extra_args[0] ||
+                      req->turbo;
+    if (!teleport_effective(req) && g_cfg.cache_mode && !req->cache_off && !turbo) {
         const char *mode = g_cfg.cache_mode;
+        float easycache_threshold = g_cfg.easycache_threshold;
+        if (!req->image_pixels && g_cfg.hq_threshold > 0.0f) easycache_threshold = g_cfg.hq_threshold;
+        if (req->cache_threshold > 0.0f) easycache_threshold = req->cache_threshold;
         params.cache.start_percent = g_cfg.cache_start;
-        params.cache.end_percent = g_cfg.cache_end;
+        params.cache.end_percent = req->cache_end > 0.0f ? req->cache_end : g_cfg.cache_end;
         if (strcmp(mode, "easycache") == 0 || strcmp(mode, "ucache") == 0) {
             params.cache.mode = strcmp(mode, "ucache") == 0 ? SD_CACHE_UCACHE : SD_CACHE_EASYCACHE;
-            params.cache.reuse_threshold = g_cfg.easycache_threshold > 0.0f ? g_cfg.easycache_threshold : 0.2f;
+            params.cache.reuse_threshold = easycache_threshold > 0.0f ? easycache_threshold : 0.2f;
             out->denoiser_cache_threshold = params.cache.reuse_threshold;
         } else if (strcmp(mode, "taylorseer") == 0) {
             params.cache.mode = SD_CACHE_TAYLORSEER;
@@ -795,14 +1035,15 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     out->teleport_capture_step = -1;
     out->teleport_resume_step = 0;
 
-    bool result_cache = req->cache && !req->teleport && req->seed >= 0 && params.batch_count == 1;
-    bool teleport_cache = req->teleport && !req->image_pixels && params.batch_count == 1 &&
-                          req->steps > 1 && latent_api_ready();
+    bool result_cache = req->cache && !teleport_effective(req) && !overridden && req->seed >= 0 && params.batch_count == 1;
+    bool teleport_cache = teleport_effective(req) && params.batch_count == 1;
     cache_key key = {0};
     if ((result_cache || teleport_cache) && !cache_key_make(req, &key)) {
         result_cache = teleport_cache = false;
     }
     pthread_mutex_lock(&g_sd_lock);
+    int want = __atomic_load_n(&g_sd_want, __ATOMIC_RELAXED);
+    if (want >= 0 && (want == 1) != g_sd_resident && p_free_sd_ctx) (void)sd_switch_locked(want == 1);
     double started = now_ms();
     sd_image_t *images = NULL;
     int image_count = 0;
@@ -904,6 +1145,10 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         out->image_lens = NULL;
         cache_key_free(&key);
         return false;
+    }
+    if (req->notch ? req->notch == 1 : g_cfg.notch) {
+        for (int i = 0; i < image_count; ++i)
+            notch_rgb(images[i].data, (int)images[i].width, (int)images[i].height, (int)images[i].channel);
     }
     bool use_webp = g_webp_enabled && p_webp_encode_rgb && p_webp_free;
     for (int i = 0; i < image_count; ++i) {
