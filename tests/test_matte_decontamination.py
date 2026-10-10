@@ -138,6 +138,31 @@ class DecontaminationTest(unittest.TestCase):
         expected = self.alpha[..., None] * host_fg + (1 - self.alpha[..., None]) * white
         self.assertLess(np.abs(composite.cpu().numpy() - expected).max(), 1e-5)
 
+    def test_device_path_waits_for_queued_torch_work(self):
+        """Inputs still being written on torch's default stream must be read after
+        that work, not raced by the library's private stream."""
+        if not omatte.device_api_available():
+            self.skipTest("libomatte.so has no CUDA device API")
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch is not installed")
+        if not torch.cuda.is_available():
+            self.skipTest("torch has no CUDA device")
+
+        host_fg = omatte.estimate_foreground(self.observed, self.alpha)
+        image0 = torch.from_numpy(self.observed).cuda()
+        alpha0 = torch.from_numpy(self.alpha).cuda()
+        for _ in range(3):
+            slow = torch.randn(4096, 4096, device="cuda")
+            for _ in range(8):
+                slow = slow @ slow * 1e-3
+            zero = slow[0, 0] * 0
+            image = image0 + zero
+            alpha = alpha0 + zero
+            device_fg = omatte.estimate_foreground_torch(image, alpha)
+            self.assertLess(np.abs(host_fg - device_fg.cpu().numpy()).max(), 1e-5)
+
     def test_recomposite_over_new_background(self):
         """A cutout placed on a white page should not show a green halo."""
         estimated = omatte.estimate_foreground(self.observed, self.alpha)

@@ -83,6 +83,7 @@ components, and verifies the resolved file remains below that directory; the C
 request path never downloads weights. Images are WebP by default (falling back
 to PNG if libwebp is unavailable), controlled by
 `OMNISERVE_NATIVE_SD_IMAGE_FORMAT` and `OMNISERVE_NATIVE_SD_WEBP_QUALITY`.
+`OMNISERVE_NATIVE_SD_NOTCH=1` runs a Nyquist notch (separable 7-tap, ~22 ms at 1024²) on the decoded RGB before encoding; it removes the 2 px lattice the Qwen VAE leaves in fur and other fine texture. Image requests can override per call with `notch` (bool), `cache_threshold` (EasyCache reuse threshold, `0` = dense sampling) and `cache_end`; a request that sets any of them bypasses the result cache. `qualitybench/` holds the prompt set, runner and sweep scripts.
 `OMNISERVE_NATIVE_SD_MAX_BATCH` is deliberately 1 by default and may be raised
 to at most 8 only after a VRAM/latency canary.
 
@@ -120,6 +121,69 @@ moving the VAE to CPU. Latent tile width and height default to 32 and are contro
 behind the image parity gate because tiling changes the decode graph.
 
 Other tuning: `OMNISERVE_NATIVE_PORT`, `BIND`, `SLOTS`, `SECRET`, `LLM_GGUF`, `LLM_SWAP_DIR`, `LLM_CONTEXTS`, `NGL`, `NGL_AUTO_KEEP_FREE_MB`, `CTX`, `BATCH`, `UBATCH` (both accept `auto`), `KV_TYPE` (`f16` default, `q8_0` halves the KV cache at no measured quality cost — see `performance/quality.md`), `FLASH_ATTN` (auto; forced on for a quantized cache because llama.cpp requires it for a quantized V), `EMBEDDING_GGUF`, `EMBEDDING_NGL` (defaults to CPU), `EMBEDDING_CTX`, `EMBEDDING_POOLING` (`mean` default, `cls` for retrieval finetunes like gte-modernbert), `EMBEDDING_THREADS`, `SD_MODEL`, `ADMISSION_TIMEOUT_S`, `UPSTREAM_TIMEOUT_MS`, `REACTORS`, `WORKERS`, and per-modality `LLM_PERMITS`, `IMAGE_PERMITS`, `TTS_PERMITS`, `STT_PERMITS`, `EMBEDDING_PERMITS`, `MULTIMODAL_PERMITS`, `ANIMATION_PERMITS`, `3D_PERMITS`, and `AUX_PERMITS`.
+
+## Command-line tools
+
+`tools/*.sh` drive the ManifoldGen API from a terminal. Each script uses the
+running server, and starts one from `MANIFOLDGEN_DIR` (default
+`/vfast/data/code/manifoldgen-site`) when nothing answers on `MANIFOLDGEN_API`
+(default `http://127.0.0.1:8116`), so a cold box still works. The bearer key
+comes from `MANIFOLDGEN_API_KEY` or, for a local server, from the `seed@manifoldgen.com`
+row in the same database the server uses.
+
+```bash
+tools/make-image.sh "a red fox in snow, photograph"      # RA2 = Qwen Image 2.1
+tools/make-voice.sh --model eleven-v3 --voice Sarah "Read this aloud."
+tools/make-music.sh --duration 90 "warm lofi hip hop at 70 bpm"
+tools/remove-background.sh photo.jpg                     # writes a real alpha cutout
+tools/start-ra2-lane.sh                                 # bring the image lane up
+tools/list-tools.sh                                      # server, lanes, prices, voices
+```
+
+| Tool | Service | Notes |
+| --- | --- | --- |
+| `make-image.sh` | `image` | `--backend ra2` (default, Qwen) / `omniserve` / `images3` / `r1`; `--count`, `--size`, `--seed`, `--steps` |
+| `make-anima.sh` | `anima` | probes `/api/anima/status` first |
+| `edit-image.sh` | `image-edit`, `/api/image-editor/edit` | `--mask` switches to masked regeneration |
+| `upscale-image.sh`, `relight-image.sh`, `extend-image.sh` | `upscale-image`, `relight`, `extend-image` | fal / OpenPaths lanes |
+| `remove-background.sh` | `/api/studio/remove-background`, `/api/image-editor/background` | `--background` returns the cutout and the replaced backdrop |
+| `make-voice.sh` | `/api/voice/generate` | `--list` prints models, voices and formats; `--local` uses the text-generator lane |
+| `make-music.sh`, `make-sfx.sh` | `music`, `sfx` | polls the audio job; `--compose` writes lyrics first |
+| `make-video.sh`, `remove-video-background.sh`, `character-animate.sh`, `character-swap.sh`, `reference-video.sh`, `make-lofi.sh` | `video` and the other H3 lanes | poll the video job |
+| `transcribe.sh`, `caption-image.sh`, `forecast.sh`, `chat.sh` | `transcription`, `caption`, `forecast`, `gemma4` | local inference lanes |
+| `manifold-service.sh` | any | `--services` lists every id and its price; otherwise `KEY VALUE` pairs go into the body verbatim |
+| `start-ra2-lane.sh` | — | starts the local Qwen image lane `:8792` that `make-image.sh` renders on; `--status`, `--foreground` |
+
+Generated files land in `results/` (created on demand), named
+`<tool>-<timestamp>.<ext>`; `-o/--out` writes wherever you point it and
+`MG_OUT_DIR` moves the default. The extension always matches the bytes actually
+returned, and the path on stdout is the authoritative one.
+
+The endpoints take `image_url` / `video_url` as an absolute public URL and reject
+base64, so a local file argument is uploaded to the site's bucket first.
+
+### The image lane
+
+`make-image.sh` needs the RA2 lane on `:8792`; ManifoldGen tries it first and
+falls through the other backends only when it is refused, so with nothing
+listening every image request ends in `service temporarily unavailable`.
+`tools/start-ra2-lane.sh` starts it and declares ready only after a real 256²
+render succeeds — `/health` and `/status` both report healthy while the first
+512² renders still fail. It loads about 11 GB of VRAM, so **run exactly one**:
+two instances exhaust the GPU and every render fails with a 500. Check with
+`tools/list-tools.sh --lanes`.
+
+`make-image.sh` retries 429/5xx and connection errors with backoff (`--retries`,
+`MG_RETRIES`). The second failure starts the lane in the background while the
+retries wait (a 502 from the API almost always means its upstream lane is down),
+the last attempt waits for it, and if the API still fails the image is rendered
+on the lane directly (`--no-fallback` disables that). With the lane already up
+one retry is enough before rendering locally. The lane warms itself with one
+1024² step before it listens (`OMNISERVE_NATIVE_SD_WARMUP`, size
+`..._WARMUP_SIZE`), so the first request is not slower than the rest. Setting
+`OMNISERVE_NATIVE_SD_TURBO_NODES` and `OMNISERVE_NATIVE_SD_DEFAULT_LORA` (the
+start script does with `RA2_TURBO=1`) makes the 6-step tier the default for
+text-to-image, `{"turbo":false}` selects the base path; off by default here.
 
 ## Local-first ASR and background fine-tuning
 

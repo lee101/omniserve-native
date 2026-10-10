@@ -14,6 +14,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <stddef.h>
 #include <unistd.h>
 
 static void set_error(char *error, size_t cap, const char *message) {
@@ -110,7 +111,15 @@ static bool resolve_cached_lora_file(const char *directory, const char *filename
 }
 
 static char *default_lora_registry_path(const char *directory) {
-    const char *slash = strrchr(directory, '/');
+    size_t directory_len = strlen(directory);
+    while (directory_len > 1 && directory[directory_len - 1] == '/') directory_len--;
+    const char *slash = NULL;
+    for (size_t i = directory_len; i-- > 0;) {
+        if (directory[i] == '/') {
+            slash = directory + i;
+            break;
+        }
+    }
     if (!slash || slash == directory) return NULL;
     size_t parent_len = (size_t)(slash - directory);
     const char suffix[] = "/lora_registry.json";
@@ -164,7 +173,8 @@ static char *registry_lora_filename(const char *directory, const char *id) {
     free(fallback);
     if (!json) return NULL;
 
-    int token_cap = 65536;
+    /* A token needs at least one byte of JSON, so json_len bounds the token count. */
+    int token_cap = json_len + 2 < 65536 ? (int)json_len + 2 : 65536;
     oj_tok *tokens = calloc((size_t)token_cap, sizeof *tokens);
     if (!tokens) {
         free(json);
@@ -247,12 +257,42 @@ void oimage_request_free(oimage_request *request) {
     memset(request, 0, sizeof *request);
 }
 
+static bool prepend_trigger(oimage_request *request, const char *trigger) {
+    size_t tl = strlen(trigger);
+    if (request->prompt && strncasecmp(request->prompt, trigger, tl) == 0) return true;
+    size_t pl = request->prompt ? strlen(request->prompt) : 0;
+    char *grown = malloc(tl + 1 + pl + 1);
+    if (!grown) return false;
+    memcpy(grown, trigger, tl);
+    grown[tl] = ' ';
+    if (pl) memcpy(grown + tl + 1, request->prompt, pl);
+    grown[tl + 1 + pl] = 0;
+    free(request->prompt);
+    request->prompt = grown;
+    request->generation.prompt = grown;
+    return true;
+}
+
 static bool add_automatic_nsfw_lora(oimage_request *request) {
     if (!request || request->generation.lora_count ||
         !onsfw_prompt_has_word(request->prompt)) {
         return true;
     }
-    const char *path = getenv("OMNISERVE_NATIVE_NSFW_LORA_PATH");
+    bool anime = onsfw_prompt_has_anime_word(request->prompt);
+    const char *kind = "NSFW";
+    const char *path = NULL;
+    const char *scale_env = "OMNISERVE_NATIVE_NSFW_LORA_SCALE";
+    double scale = 0.6;
+    if (anime) {
+        const char *anime_path = getenv("OMNISERVE_NATIVE_ANIME_NSFW_LORA_PATH");
+        if (anime_path && anime_path[0] == '/' && access(anime_path, R_OK) == 0) {
+            path = anime_path;
+            kind = "anime NSFW";
+            scale_env = "OMNISERVE_NATIVE_ANIME_NSFW_LORA_SCALE";
+            scale = 1.0;
+        }
+    }
+    if (!path) path = getenv("OMNISERVE_NATIVE_NSFW_LORA_PATH");
     if (!path || path[0] != '/' || access(path, R_OK) != 0) {
         if (path && path[0]) {
             fprintf(stderr, "[safety] prompt word match but NSFW LoRA is unavailable: %s\n",
@@ -268,8 +308,7 @@ static bool add_automatic_nsfw_lora(oimage_request *request) {
         free(owned_path);
         return false;
     }
-    double scale = 0.6;
-    const char *scale_text = getenv("OMNISERVE_NATIVE_NSFW_LORA_SCALE");
+    const char *scale_text = getenv(scale_env);
     if (scale_text && scale_text[0]) {
         char *end = NULL;
         double parsed = strtod(scale_text, &end);
@@ -282,7 +321,8 @@ static bool add_automatic_nsfw_lora(oimage_request *request) {
     request->loras = grown;
     request->generation.loras = grown;
     request->generation.lora_count = count + 1;
-    fprintf(stderr, "[safety] prompt word match: enabling NSFW LoRA scale=%.2f\n", scale);
+    if (kind[0] == 'a' && !prepend_trigger(request, "fusal style.")) return false;
+    fprintf(stderr, "[safety] prompt word match: enabling %s LoRA scale=%.2f\n", kind, scale);
     return true;
 }
 static bool parse_size(const char *json, const oj_tok *token, int *width, int *height) {
@@ -334,7 +374,7 @@ static bool token_int64(const char *json, const oj_tok *token, int64_t *value) {
     char *end = NULL;
     errno = 0;
     long long parsed = strtoll(bounded, &end, 10);
-    if (errno || end != bounded + len || parsed < INT64_MIN || parsed > INT64_MAX) return false;
+    if (errno || end != bounded + len) return false;
     *value = (int64_t)parsed;
     return true;
 }
@@ -415,6 +455,28 @@ static bool add_routed_loras(oimage_request *request, const char *json,
     snprintf(request->lora_route, sizeof request->lora_route, "%s", pick.name);
     fprintf(stderr, "[lora-route] %s: %zu lora(s), first %s@%.2f\n", pick.name,
             pick.lora_count, pick.ids[0], (double)pick.scales[0]);
+    return true;
+}
+
+static bool extra_args_bounded(const char *args) {
+    static const char key[] = "guidance_schedule=";
+    for (const char *p = args; (p = strstr(p, key)) != NULL; p += sizeof key - 1) {
+        if (p != args && p[-1] != ',') continue;
+        long total = 0;
+        const char *c = p + sizeof key - 1;
+        while (*c && *c != ',') {
+            const char *x = strchr(c, 'x');
+            if (!x) return false;
+            const char *d = x + 1;
+            long count = 0;
+            int digits = 0;
+            for (; *d >= '0' && *d <= '9'; ++d, ++digits) count = count * 10 + (*d - '0');
+            if (digits < 1 || digits > 3 || (*d && *d != '+' && *d != ',')) return false;
+            total += count;
+            if (total > 100) return false;
+            c = *d == '+' ? d + 1 : d;
+        }
+    }
     return true;
 }
 
@@ -531,6 +593,79 @@ bool oimage_request_parse(const char *json, size_t json_len, oimage_request *req
         set_error(error, error_cap, "cache must be a boolean and requires a nonnegative seed");
         oimage_request_free(request);
         return false;
+    }
+    token = oj_obj_get(json, tokens, token_count, 0, "cache_threshold");
+    if (token >= 0) {
+        double value = 0.0;
+        if (!token_finite_double(json, &tokens[token], &value) || value < 0.0 || value > 1.0) {
+            set_error(error, error_cap, "cache_threshold must be between 0 and 1");
+            oimage_request_free(request);
+            return false;
+        }
+        request->generation.cache_off = value == 0.0;
+        request->generation.cache_threshold = (float)value;
+    }
+    token = oj_obj_get(json, tokens, token_count, 0, "cache_end");
+    if (token >= 0) {
+        double value = 0.0;
+        if (!token_finite_double(json, &tokens[token], &value) || value <= 0.0 || value > 1.0) {
+            set_error(error, error_cap, "cache_end must be in (0, 1]");
+            oimage_request_free(request);
+            return false;
+        }
+        request->generation.cache_end = (float)value;
+    }
+    token = oj_obj_get(json, tokens, token_count, 0, "notch");
+    if (token >= 0) {
+        bool on = false;
+        if (!token_bool(json, &tokens[token], &on)) {
+            set_error(error, error_cap, "notch must be a boolean");
+            oimage_request_free(request);
+            return false;
+        }
+        request->generation.notch = on ? 1 : 2;
+    }
+    static const struct { const char *key; size_t off; size_t cap; } strs[] = {
+        {"sampler", offsetof(oimg_req, sampler), sizeof(((oimg_req *)0)->sampler)},
+        {"scheduler", offsetof(oimg_req, scheduler), sizeof(((oimg_req *)0)->scheduler)},
+        {"extra_sample_args", offsetof(oimg_req, extra_args), sizeof(((oimg_req *)0)->extra_args)},
+    };
+    for (size_t si = 0; si < sizeof strs / sizeof *strs; ++si) {
+        token = oj_obj_get(json, tokens, token_count, 0, strs[si].key);
+        if (token < 0) continue;
+        char *value = tokens[token].type == OJ_STRING ? oj_strdup(json, &tokens[token]) : NULL;
+        bool good = value && strlen(value) < strs[si].cap;
+        for (const char *c = value; good && *c; ++c)
+            good = (*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '_' || *c == '-' || *c == '=' || *c == ',' || *c == '.' || *c == '+';
+        if (good && strs[si].off == offsetof(oimg_req, extra_args)) good = extra_args_bounded(value);
+        if (!good) {
+            free(value);
+            set_error(error, error_cap, "sampler, scheduler and extra_sample_args must be short [a-z0-9_=,.-] strings with guidance_schedule counts totalling at most 100");
+            oimage_request_free(request);
+            return false;
+        }
+        memcpy((char *)&request->generation + strs[si].off, value, strlen(value) + 1);
+        free(value);
+    }
+    token = oj_obj_get(json, tokens, token_count, 0, "turbo");
+    if (token >= 0) {
+        bool on = false;
+        if (!token_bool(json, &tokens[token], &on)) {
+            set_error(error, error_cap, "turbo must be a boolean");
+            oimage_request_free(request);
+            return false;
+        }
+        request->generation.turbo = on ? 0 : 2;
+    }
+    token = oj_obj_get(json, tokens, token_count, 0, "flow_shift");
+    if (token >= 0) {
+        double value = 0.0;
+        if (!token_finite_double(json, &tokens[token], &value) || value < 0.1 || value > 20.0) {
+            set_error(error, error_cap, "flow_shift must be between 0.1 and 20");
+            oimage_request_free(request);
+            return false;
+        }
+        request->generation.flow_shift = (float)value;
     }
     token = oj_obj_get(json, tokens, token_count, 0, "teleport");
     if (token >= 0 && (!token_bool(json, &tokens[token], &request->generation.teleport) ||
@@ -724,6 +859,12 @@ bool oimage_request_parse(const char *json, size_t json_len, oimage_request *req
         oimage_request_free(request);
         return false;
     }
+    /* Quality floor for lanes whose clients hardcode a low step count (ra2 callers send 20);
+     * reference edits keep the requested count. */
+    static int min_steps = -1;
+    if (min_steps < 0) min_steps = image_env_int("OMNISERVE_NATIVE_SD_MIN_STEPS", 0, 0, 100);
+    if (!request->generation.image_base64 && request->generation.steps < min_steps)
+        request->generation.steps = min_steps;
     return true;
 }
 
@@ -775,7 +916,14 @@ bool oimage_openai_response(const oimg_result *result, const char *model, long l
         if (!image || !image_len || !encoded_len || encoded_total > SIZE_MAX - encoded_len) return false;
         encoded_total += encoded_len;
     }
-    const char *safe_model = model && model[0] ? model : "diffusion";
+    char safe_model[128];
+    const char *model_name = model && model[0] ? model : "diffusion";
+    size_t model_len = 0;
+    for (; *model_name && model_len + 1 < sizeof safe_model; ++model_name) {
+        unsigned char c = (unsigned char)*model_name;
+        safe_model[model_len++] = c < 32 || c == '"' || c == '\\' || c >= 127 ? '_' : (char)c;
+    }
+    safe_model[model_len] = 0;
     const char *format = result->format ? result->format : "png";
     if (encoded_total > SIZE_MAX - 4096 - count * 384) return false;
     size_t capacity = encoded_total + 4096 + count * 384;
@@ -794,6 +942,7 @@ bool oimage_openai_response(const oimg_result *result, const char *model, long l
             "%s{\"b64_json\":\"", i ? "," : "");
         if (wrote < 0 || (size_t)wrote >= capacity - used) { free(json); return false; }
         used += (size_t)wrote;
+        if (encoded_len >= capacity - used) { free(json); return false; }
         base64_encode(image, image_len, json + used);
         used += encoded_len;
         wrote = snprintf(json + used, capacity - used,

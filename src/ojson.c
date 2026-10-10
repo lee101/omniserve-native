@@ -39,6 +39,21 @@ static int parse_primitive(oj_parser *p, const char *js, size_t len, oj_tok *tok
 
 static int parse_string(oj_parser *p, const char *js, size_t len, oj_tok *toks, int max_toks) {
     int start = ++p->pos;
+    if (p->pos < (int)len) {
+        /* Vectorized fast path for the common escape-free string (large base64 payloads). */
+        const char *from = js + p->pos;
+        const char *quote = memchr(from, '"', len - (size_t)p->pos);
+        if (quote && !memchr(from, '\\', (size_t)(quote - from))) {
+            oj_tok *t = alloc_tok(p, toks, max_toks);
+            if (!t) return -1;
+            p->pos = (int)(quote - js);
+            t->type = OJ_STRING;
+            t->start = start;
+            t->end = p->pos;
+            t->parent = p->super;
+            return 0;
+        }
+    }
     for (; p->pos < (int)len; p->pos++) {
         char c = js[p->pos];
         if (c == '"') {
@@ -198,6 +213,14 @@ size_t oj_unescape(const char *js, const oj_tok *t, char *out, size_t out_cap) {
 }
 
 char *oj_strdup(const char *js, const oj_tok *t) {
+    if (t->end >= t->start && !memchr(js + t->start, '\\', (size_t)(t->end - t->start))) {
+        size_t n = (size_t)(t->end - t->start);
+        char *copy = malloc(n + 1);
+        if (!copy) return NULL;
+        memcpy(copy, js + t->start, n);
+        copy[n] = 0;
+        return copy;
+    }
     size_t cap = (size_t)(t->end - t->start) * 3 + 4;
     char *out = malloc(cap);
     if (!out) return NULL;

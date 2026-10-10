@@ -1,0 +1,252 @@
+{"server": "main", "tag": "base30_dense", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 35.4, "inf_ms": 35249, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 35.68, "inf_ms": 35537, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 36.0, "inf_ms": 35903, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 36.17, "inf_ms": 36060, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 36.51, "inf_ms": 36325, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 36.9, "inf_ms": 36748, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 37.48, "inf_ms": 37249, "cache": null}
+{"server": "main", "tag": "base20_dense", "prompt": "fox2", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 26.0, "inf_ms": 25820, "cache": null}
+{"server": "main", "tag": "base20_dense", "prompt": "witch", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 25.96, "inf_ms": 25813, "cache": null}
+{"server": "main", "tag": "base20_dense", "prompt": "trio", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 26.12, "inf_ms": 26007, "cache": null}
+{"server": "main", "tag": "base20_dense", "prompt": "duo", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 25.91, "inf_ms": 25758, "cache": null}
+{"server": "main", "tag": "base20_dense", "prompt": "quad", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 26.2, "inf_ms": 26055, "cache": null}
+{"server": "main", "tag": "base20_dense", "prompt": "landscape", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 26.71, "inf_ms": 26560, "cache": null}
+{"server": "main", "tag": "base20_dense", "prompt": "neon_sign", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 26.78, "inf_ms": 26635, "cache": null}
+{"server": "main", "tag": "base24_dense", "prompt": "fox2", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 31.11, "inf_ms": 30957, "cache": null}
+{"server": "main", "tag": "base24_dense", "prompt": "witch", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 31.51, "inf_ms": 31383, "cache": null}
+{"server": "main", "tag": "base24_dense", "prompt": "trio", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 32.79, "inf_ms": 32688, "cache": null}
+{"server": "main", "tag": "base24_dense", "prompt": "duo", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 32.15, "inf_ms": 32021, "cache": null}
+{"server": "main", "tag": "base30_ec08", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.08}, "wall": 22.69, "inf_ms": 22491, "cache": null}
+{"server": "main", "tag": "base30_ec08", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.08}, "wall": 22.7, "inf_ms": 22546, "cache": null}
+{"server": "main", "tag": "base30_ec08", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.08}, "wall": 22.68, "inf_ms": 22536, "cache": null}
+{"server": "main", "tag": "base30_ec10", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 21.15, "inf_ms": 21015, "cache": null}
+{"server": "main", "tag": "base30_ec10", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 20.42, "inf_ms": 20319, "cache": null}
+{"server": "main", "tag": "base30_ec10", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 19.93, "inf_ms": 19828, "cache": null}
+{"server": "main", "tag": "base30_ec10", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 21.11, "inf_ms": 21016, "cache": null}
+{"server": "main", "tag": "base30_ec10", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 22.34, "inf_ms": 22200, "cache": null}
+{"server": "main", "tag": "base30_ec10", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 21.44, "inf_ms": 21337, "cache": null}
+{"server": "main", "tag": "base30_ec10", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 24.6, "inf_ms": 24500, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 20.19, "inf_ms": 20060, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 20.27, "inf_ms": 20136, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 20.85, "inf_ms": 20748, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 19.85, "inf_ms": 19735, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 22.41, "inf_ms": 22237, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 21.02, "inf_ms": 20930, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 20.89, "inf_ms": 20791, "cache": null}
+{"server": "main", "tag": "base30_ec20", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 19.74, "inf_ms": 19614, "cache": null}
+{"server": "main", "tag": "base30_ec20", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 18.78, "inf_ms": 18647, "cache": null}
+{"server": "main", "tag": "base30_ec20", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 18.47, "inf_ms": 18361, "cache": null}
+{"server": "main", "tag": "base30_ec20", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 19.88, "inf_ms": 19768, "cache": null}
+{"server": "main", "tag": "base30_ec20", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 19.82, "inf_ms": 19673, "cache": null}
+{"server": "main", "tag": "base30_ec20", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 19.84, "inf_ms": 19733, "cache": null}
+{"server": "main", "tag": "base30_ec20", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 20.12, "inf_ms": 20016, "cache": null}
+{"server": "main", "tag": "base30_ec30", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 18.55, "inf_ms": 18419, "cache": null}
+{"server": "main", "tag": "base30_ec30", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 17.64, "inf_ms": 17492, "cache": null}
+{"server": "main", "tag": "base30_ec30", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 17.63, "inf_ms": 17473, "cache": null}
+{"server": "main", "tag": "base30_ec30", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 18.58, "inf_ms": 18460, "cache": null}
+{"server": "main", "tag": "base30_ec30", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 18.58, "inf_ms": 18385, "cache": null}
+{"server": "main", "tag": "base30_ec30", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 18.48, "inf_ms": 18377, "cache": null}
+{"server": "main", "tag": "base30_ec30", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 18.46, "inf_ms": 18351, "cache": null}
+{"server": "main", "tag": "base24_ec10", "prompt": "fox2", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 19.92, "inf_ms": 19802, "cache": null}
+{"server": "main", "tag": "base24_ec10", "prompt": "witch", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 18.58, "inf_ms": 18459, "cache": null}
+{"server": "main", "tag": "base24_ec10", "prompt": "trio", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 18.68, "inf_ms": 18581, "cache": null}
+{"server": "main", "tag": "base24_ec10", "prompt": "duo", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 19.8, "inf_ms": 19700, "cache": null}
+{"server": "main", "tag": "base24_ec10", "prompt": "quad", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 20.0, "inf_ms": 19845, "cache": null}
+{"server": "main", "tag": "base24_ec10", "prompt": "landscape", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 19.94, "inf_ms": 19837, "cache": null}
+{"server": "main", "tag": "base24_ec10", "prompt": "neon_sign", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 19.74, "inf_ms": 19620, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "fox2", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 17.42, "inf_ms": 17297, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "witch", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 17.36, "inf_ms": 17212, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "trio", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 17.43, "inf_ms": 17327, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "duo", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 17.34, "inf_ms": 17225, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "quad", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 18.69, "inf_ms": 18540, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "landscape", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 114.76, "inf_ms": 114655, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "neon_sign", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 17.32, "inf_ms": 17226, "cache": null}
+{"server": "main", "tag": "base24_ec20", "prompt": "fox2", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 16.22, "inf_ms": 16095, "cache": null}
+{"server": "main", "tag": "base24_ec20", "prompt": "witch", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 15.25, "inf_ms": 15043, "cache": null}
+{"server": "main", "tag": "base24_ec20", "prompt": "trio", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 16.03, "inf_ms": 15749, "cache": null}
+{"server": "main", "tag": "base24_ec20", "prompt": "duo", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 17.15, "inf_ms": 17004, "cache": null}
+{"server": "main", "tag": "base24_ec20", "prompt": "quad", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 17.46, "inf_ms": 17192, "cache": null}
+{"server": "main", "tag": "base24_ec20", "prompt": "landscape", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 17.39, "inf_ms": 17257, "cache": null}
+{"server": "main", "tag": "base24_ec20", "prompt": "neon_sign", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 17.46, "inf_ms": 17305, "cache": null}
+{"server": "main", "tag": "base20_ec10", "prompt": "fox2", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 18.65, "inf_ms": 18434, "cache": null}
+{"server": "main", "tag": "base20_ec10", "prompt": "witch", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 17.61, "inf_ms": 17415, "cache": null}
+{"server": "main", "tag": "base20_ec10", "prompt": "trio", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 17.32, "inf_ms": 17218, "cache": null}
+{"server": "main", "tag": "base20_ec10", "prompt": "duo", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 17.48, "inf_ms": 17313, "cache": null}
+{"server": "main", "tag": "base20_ec10", "prompt": "quad", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 18.63, "inf_ms": 18460, "cache": null}
+{"server": "main", "tag": "base20_ec10", "prompt": "landscape", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 18.37, "inf_ms": 18263, "cache": null}
+{"server": "main", "tag": "base20_ec10", "prompt": "neon_sign", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.1}, "wall": 18.49, "inf_ms": 18398, "cache": null}
+{"server": "main", "tag": "base20_ec15", "prompt": "fox2", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 15.95, "inf_ms": 15827, "cache": null}
+{"server": "main", "tag": "base20_ec15", "prompt": "witch", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 15.96, "inf_ms": 15818, "cache": null}
+{"server": "main", "tag": "base20_ec15", "prompt": "trio", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 16.14, "inf_ms": 16049, "cache": null}
+{"server": "main", "tag": "base20_ec15", "prompt": "duo", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 16.01, "inf_ms": 15865, "cache": null}
+{"server": "main", "tag": "base20_ec15", "prompt": "quad", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 17.46, "inf_ms": 17267, "cache": null}
+{"server": "main", "tag": "base20_ec15", "prompt": "landscape", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 16.03, "inf_ms": 15925, "cache": null}
+{"server": "main", "tag": "base20_ec15", "prompt": "neon_sign", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 17.46, "inf_ms": 17367, "cache": null}
+{"server": "main", "tag": "base20_ec20", "prompt": "fox2", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 15.8, "inf_ms": 15680, "cache": null}
+{"server": "main", "tag": "base20_ec20", "prompt": "witch", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 14.97, "inf_ms": 14827, "cache": null}
+{"server": "main", "tag": "base20_ec20", "prompt": "trio", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 14.96, "inf_ms": 14801, "cache": null}
+{"server": "main", "tag": "base20_ec20", "prompt": "duo", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 16.18, "inf_ms": 16025, "cache": null}
+{"server": "main", "tag": "base20_ec20", "prompt": "quad", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 16.23, "inf_ms": 16035, "cache": null}
+{"server": "main", "tag": "base20_ec20", "prompt": "landscape", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 16.16, "inf_ms": 16051, "cache": null}
+{"server": "main", "tag": "base20_ec20", "prompt": "neon_sign", "steps": 20, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 16.31, "inf_ms": 16214, "cache": null}
+{"server": "main", "tag": "base16_ec15", "prompt": "fox2", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 13.51, "inf_ms": 13398, "cache": null}
+{"server": "main", "tag": "base16_ec15", "prompt": "witch", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 13.54, "inf_ms": 13397, "cache": null}
+{"server": "main", "tag": "base16_ec15", "prompt": "trio", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 13.56, "inf_ms": 13457, "cache": null}
+{"server": "main", "tag": "base16_ec15", "prompt": "duo", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 15.12, "inf_ms": 14988, "cache": null}
+{"server": "main", "tag": "base16_ec15", "prompt": "quad", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 15.31, "inf_ms": 15103, "cache": null}
+{"server": "main", "tag": "base16_ec15", "prompt": "landscape", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 14.79, "inf_ms": 14682, "cache": null}
+{"server": "main", "tag": "base16_ec15", "prompt": "neon_sign", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 14.91, "inf_ms": 14817, "cache": null}
+{"server": "main", "tag": "base16_ec20", "prompt": "fox2", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 13.61, "inf_ms": 13493, "cache": null}
+{"server": "main", "tag": "base16_ec20", "prompt": "witch", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 13.78, "inf_ms": 13593, "cache": null}
+{"server": "main", "tag": "base16_ec20", "prompt": "trio", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 13.65, "inf_ms": 13530, "cache": null}
+{"server": "main", "tag": "base16_ec20", "prompt": "duo", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 13.68, "inf_ms": 13538, "cache": null}
+{"server": "main", "tag": "base16_ec20", "prompt": "quad", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 15.01, "inf_ms": 14813, "cache": null}
+{"server": "main", "tag": "base16_ec20", "prompt": "landscape", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 13.62, "inf_ms": 13513, "cache": null}
+{"server": "main", "tag": "base16_ec20", "prompt": "neon_sign", "steps": 16, "extra": {"turbo": false, "cache_threshold": 0.2}, "wall": 13.73, "inf_ms": 13627, "cache": null}
+{"server": "main", "tag": "base30_ec15_end50", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.5}, "wall": 31.95, "inf_ms": 31841, "cache": null}
+{"server": "main", "tag": "base30_ec15_end50", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.5}, "wall": 32.12, "inf_ms": 32011, "cache": null}
+{"server": "main", "tag": "base30_ec15_end50", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.5}, "wall": 32.56, "inf_ms": 32468, "cache": null}
+{"server": "main", "tag": "base30_ec15_end50", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.5}, "wall": 32.17, "inf_ms": 32074, "cache": null}
+{"server": "main", "tag": "base30_ec15_end50", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.5}, "wall": 33.64, "inf_ms": 33484, "cache": null}
+{"server": "main", "tag": "base30_ec15_end50", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.5}, "wall": 32.31, "inf_ms": 32217, "cache": null}
+{"server": "main", "tag": "base30_ec15_end50", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.5}, "wall": 32.08, "inf_ms": 31978, "cache": null}
+{"server": "main", "tag": "base30_ec15_end70", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.7}, "wall": 26.15, "inf_ms": 25991, "cache": null}
+{"server": "main", "tag": "base30_ec15_end70", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.7}, "wall": 26.0, "inf_ms": 25919, "cache": null}
+{"server": "main", "tag": "base30_ec15_end70", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.7}, "wall": 26.19, "inf_ms": 26059, "cache": null}
+{"server": "main", "tag": "base30_ec15_end70", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.7}, "wall": 26.37, "inf_ms": 26274, "cache": null}
+{"server": "main", "tag": "base30_ec15_end70", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.7}, "wall": 27.25, "inf_ms": 27119, "cache": null}
+{"server": "main", "tag": "base30_ec15_end70", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.7}, "wall": 27.38, "inf_ms": 27210, "cache": null}
+{"server": "main", "tag": "base30_ec15_end70", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.7}, "wall": 28.45, "inf_ms": 28274, "cache": null}
+{"server": "main", "tag": "base30_ec15_end85", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.85}, "wall": 23.08, "inf_ms": 22818, "cache": null}
+{"server": "main", "tag": "base30_ec15_end85", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.85}, "wall": 23.03, "inf_ms": 22841, "cache": null}
+{"server": "main", "tag": "base30_ec15_end85", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.85}, "wall": 23.07, "inf_ms": 22957, "cache": null}
+{"server": "main", "tag": "base30_ec15_end85", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.85}, "wall": 22.86, "inf_ms": 22742, "cache": null}
+{"server": "main", "tag": "base30_ec15_end85", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.85}, "wall": 24.12, "inf_ms": 23913, "cache": null}
+{"server": "main", "tag": "base30_ec15_end85", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.85}, "wall": 24.06, "inf_ms": 23910, "cache": null}
+{"server": "main", "tag": "base30_ec15_end85", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "cache_end": 0.85}, "wall": 24.1, "inf_ms": 23989, "cache": null}
+{"server": "main", "tag": "base30_ec15_nonotch", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "notch": false}, "wall": 19.9, "inf_ms": 19785, "cache": null}
+{"server": "main", "tag": "base30_ec15_nonotch", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "notch": false}, "wall": 20.14, "inf_ms": 20017, "cache": null}
+{"server": "main", "tag": "base30_ec15_nonotch", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "notch": false}, "wall": 20.14, "inf_ms": 20052, "cache": null}
+{"server": "main", "tag": "base30_ec15_nonotch", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "notch": false}, "wall": 20.18, "inf_ms": 20071, "cache": null}
+{"server": "main", "tag": "base30_ec15_nonotch", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "notch": false}, "wall": 22.54, "inf_ms": 22408, "cache": null}
+{"server": "main", "tag": "base30_ec15_nonotch", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "notch": false}, "wall": 21.04, "inf_ms": 20948, "cache": null}
+{"server": "main", "tag": "base30_ec15_nonotch", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15, "notch": false}, "wall": 21.46, "inf_ms": 21358, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "fox2", "steps": 3, "extra": {}, "wall": 68.93, "inf_ms": 68741, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "witch", "steps": 3, "extra": {}, "wall": 12.78, "inf_ms": 12657, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "trio", "steps": 3, "extra": {}, "wall": 12.7, "inf_ms": 12612, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "duo", "steps": 3, "extra": {}, "wall": 12.8, "inf_ms": 12707, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "quad", "steps": 3, "extra": {}, "wall": 12.78, "inf_ms": 12645, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "landscape", "steps": 3, "extra": {}, "wall": 12.69, "inf_ms": 12585, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "neon_sign", "steps": 3, "extra": {}, "wall": 12.76, "inf_ms": 12655, "cache": null}
+{"server": "main", "tag": "turbo6_nonotch", "prompt": "fox2", "steps": 3, "extra": {"notch": false}, "wall": 12.87, "inf_ms": 12751, "cache": null}
+{"server": "main", "tag": "turbo6_nonotch", "prompt": "witch", "steps": 3, "extra": {"notch": false}, "wall": 12.72, "inf_ms": 12636, "cache": null}
+{"server": "main", "tag": "turbo6_nonotch", "prompt": "trio", "steps": 3, "extra": {"notch": false}, "wall": 13.04, "inf_ms": 12960, "cache": null}
+{"server": "main", "tag": "turbo6_nonotch", "prompt": "duo", "steps": 3, "extra": {"notch": false}, "wall": 13.12, "inf_ms": 13027, "cache": null}
+{"server": "main", "tag": "turbo6_nonotch", "prompt": "quad", "steps": 3, "extra": {"notch": false}, "wall": 13.03, "inf_ms": 12892, "cache": null}
+{"server": "main", "tag": "turbo6_nonotch", "prompt": "landscape", "steps": 3, "extra": {"notch": false}, "wall": 13.06, "inf_ms": 12963, "cache": null}
+{"server": "main", "tag": "turbo6_nonotch", "prompt": "neon_sign", "steps": 3, "extra": {"notch": false}, "wall": 13.26, "inf_ms": 13156, "cache": null}
+{"server": "turbo_nodes4", "tag": "turbo4", "prompt": "fox2", "steps": 3, "extra": {}, "wall": 12.1, "inf_ms": 11995, "cache": null}
+{"server": "turbo_nodes4", "tag": "turbo4", "prompt": "witch", "steps": 3, "extra": {}, "wall": 9.75, "inf_ms": 9590, "cache": null}
+{"server": "turbo_nodes4", "tag": "turbo4", "prompt": "trio", "steps": 3, "extra": {}, "wall": 9.71, "inf_ms": 9614, "cache": null}
+{"server": "turbo_nodes4", "tag": "turbo4", "prompt": "duo", "steps": 3, "extra": {}, "wall": 9.78, "inf_ms": 9642, "cache": null}
+{"server": "turbo_nodes4", "tag": "turbo4", "prompt": "quad", "steps": 3, "extra": {}, "wall": 9.84, "inf_ms": 9710, "cache": null}
+{"server": "turbo_nodes4", "tag": "turbo4", "prompt": "landscape", "steps": 3, "extra": {}, "wall": 9.77, "inf_ms": 9667, "cache": null}
+{"server": "turbo_nodes4", "tag": "turbo4", "prompt": "neon_sign", "steps": 3, "extra": {}, "wall": 9.82, "inf_ms": 9714, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "fox2", "steps": 3, "extra": {}, "wall": 16.42, "inf_ms": 16280, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "witch", "steps": 3, "extra": {}, "wall": 15.46, "inf_ms": 15353, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "trio", "steps": 3, "extra": {}, "wall": 15.57, "inf_ms": 15469, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "duo", "steps": 3, "extra": {}, "wall": 15.56, "inf_ms": 15461, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "quad", "steps": 3, "extra": {}, "wall": 15.81, "inf_ms": 15676, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "landscape", "steps": 3, "extra": {}, "wall": 15.83, "inf_ms": 15725, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "neon_sign", "steps": 3, "extra": {}, "wall": 16.1, "inf_ms": 15996, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "fox2", "steps": 3, "extra": {}, "wall": 13.68, "inf_ms": 13557, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "witch", "steps": 3, "extra": {}, "wall": 12.6, "inf_ms": 12498, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "trio", "steps": 3, "extra": {}, "wall": 12.68, "inf_ms": 12590, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "duo", "steps": 3, "extra": {}, "wall": 12.71, "inf_ms": 12586, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "quad", "steps": 3, "extra": {}, "wall": 12.74, "inf_ms": 12601, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "landscape", "steps": 3, "extra": {}, "wall": 12.68, "inf_ms": 12584, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "neon_sign", "steps": 3, "extra": {}, "wall": 13.06, "inf_ms": 12964, "cache": null}
+{"server": "turbo_lora13", "tag": "turbo6_lora13", "prompt": "fox2", "steps": 3, "extra": {}, "wall": 13.26, "inf_ms": 13093, "cache": null}
+{"server": "turbo_lora13", "tag": "turbo6_lora13", "prompt": "witch", "steps": 3, "extra": {}, "wall": 12.63, "inf_ms": 12538, "cache": null}
+{"server": "turbo_lora13", "tag": "turbo6_lora13", "prompt": "trio", "steps": 3, "extra": {}, "wall": 12.56, "inf_ms": 12459, "cache": null}
+{"server": "turbo_lora13", "tag": "turbo6_lora13", "prompt": "duo", "steps": 3, "extra": {}, "wall": 12.73, "inf_ms": 12602, "cache": null}
+{"server": "turbo_lora13", "tag": "turbo6_lora13", "prompt": "quad", "steps": 3, "extra": {}, "wall": 12.83, "inf_ms": 12690, "cache": null}
+{"server": "turbo_lora13", "tag": "turbo6_lora13", "prompt": "landscape", "steps": 3, "extra": {}, "wall": 12.89, "inf_ms": 12776, "cache": null}
+{"server": "turbo_lora13", "tag": "turbo6_lora13", "prompt": "neon_sign", "steps": 3, "extra": {}, "wall": 12.91, "inf_ms": 12796, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "fox2", "steps": 3, "extra": {}, "wall": 11.51, "inf_ms": 11391, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "witch", "steps": 3, "extra": {}, "wall": 11.46, "inf_ms": 11359, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "trio", "steps": 3, "extra": {}, "wall": 11.58, "inf_ms": 11483, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "duo", "steps": 3, "extra": {}, "wall": 11.5, "inf_ms": 11394, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "quad", "steps": 3, "extra": {}, "wall": 11.77, "inf_ms": 11590, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "landscape", "steps": 3, "extra": {}, "wall": 11.58, "inf_ms": 11477, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "neon_sign", "steps": 3, "extra": {}, "wall": 11.76, "inf_ms": 11653, "cache": null}
+{"server": "premerged_q5", "tag": "premerged_q5_turbo6", "prompt": "fox2", "steps": 3, "extra": {}, "wall": 10.94, "inf_ms": 10830, "cache": null}
+{"server": "premerged_q5", "tag": "premerged_q5_turbo6", "prompt": "witch", "steps": 3, "extra": {}, "wall": 11.03, "inf_ms": 10937, "cache": null}
+{"server": "premerged_q5", "tag": "premerged_q5_turbo6", "prompt": "trio", "steps": 3, "extra": {}, "wall": 11.05, "inf_ms": 10958, "cache": null}
+{"server": "premerged_q5", "tag": "premerged_q5_turbo6", "prompt": "duo", "steps": 3, "extra": {}, "wall": 11.1, "inf_ms": 10995, "cache": null}
+{"server": "premerged_q5", "tag": "premerged_q5_turbo6", "prompt": "quad", "steps": 3, "extra": {}, "wall": 11.28, "inf_ms": 11134, "cache": null}
+{"server": "premerged_q5", "tag": "premerged_q5_turbo6", "prompt": "landscape", "steps": 3, "extra": {}, "wall": 11.23, "inf_ms": 11117, "cache": null}
+{"server": "premerged_q5", "tag": "premerged_q5_turbo6", "prompt": "neon_sign", "steps": 3, "extra": {}, "wall": 11.34, "inf_ms": 11223, "cache": null}
+{"server": "cache_ucache", "tag": "ucache30_t15", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 38.46, "inf_ms": 38351, "cache": null}
+{"server": "cache_ucache", "tag": "ucache30_t15", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 40.42, "inf_ms": 40327, "cache": null}
+{"server": "cache_ucache", "tag": "ucache30_t15", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 41.44, "inf_ms": 41344, "cache": null}
+{"server": "cache_ucache", "tag": "ucache30_t15", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 40.64, "inf_ms": 40546, "cache": null}
+{"server": "cache_ucache", "tag": "ucache30_t15", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 40.93, "inf_ms": 40761, "cache": null}
+{"server": "cache_ucache", "tag": "ucache30_t15", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 40.83, "inf_ms": 40737, "cache": null}
+{"server": "cache_ucache", "tag": "ucache30_t15", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 41.12, "inf_ms": 41021, "cache": null}
+{"server": "cache_ucache", "tag": "ucache30_t30", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 40.51, "inf_ms": 40398, "cache": null}
+{"server": "cache_ucache", "tag": "ucache30_t30", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 40.3, "inf_ms": 40212, "cache": null}
+{"server": "cache_ucache", "tag": "ucache30_t30", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 41.05, "inf_ms": 40959, "cache": null}
+{"server": "cache_ucache", "tag": "ucache30_t30", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 40.54, "inf_ms": 40447, "cache": null}
+{"server": "cache_ucache", "tag": "ucache30_t30", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 40.82, "inf_ms": 40689, "cache": null}
+{"server": "cache_ucache", "tag": "ucache30_t30", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 40.08, "inf_ms": 39991, "cache": null}
+{"server": "cache_ucache", "tag": "ucache30_t30", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.3}, "wall": 40.76, "inf_ms": 40651, "cache": null}
+{"server": "cache_taylor2", "tag": "taylor30_skip2", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 25.77, "inf_ms": 25670, "cache": null}
+{"server": "cache_taylor2", "tag": "taylor30_skip2", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 26.19, "inf_ms": 26105, "cache": null}
+{"server": "cache_taylor2", "tag": "taylor30_skip2", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 27.05, "inf_ms": 26972, "cache": null}
+{"server": "cache_taylor2", "tag": "taylor30_skip2", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 27.11, "inf_ms": 27015, "cache": null}
+{"server": "cache_taylor2", "tag": "taylor30_skip2", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 27.01, "inf_ms": 26889, "cache": null}
+{"server": "cache_taylor2", "tag": "taylor30_skip2", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 25.97, "inf_ms": 25874, "cache": null}
+{"server": "cache_taylor2", "tag": "taylor30_skip2", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 27.12, "inf_ms": 27019, "cache": null}
+{"server": "cache_taylor3", "tag": "taylor30_skip3_d2", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 25.85, "inf_ms": 25747, "cache": null}
+{"server": "cache_taylor3", "tag": "taylor30_skip3_d2", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 26.41, "inf_ms": 26329, "cache": null}
+{"server": "cache_taylor3", "tag": "taylor30_skip3_d2", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 26.9, "inf_ms": 26817, "cache": null}
+{"server": "cache_taylor3", "tag": "taylor30_skip3_d2", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 27.22, "inf_ms": 27115, "cache": null}
+{"server": "cache_taylor3", "tag": "taylor30_skip3_d2", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 26.12, "inf_ms": 25995, "cache": null}
+{"server": "cache_taylor3", "tag": "taylor30_skip3_d2", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 25.63, "inf_ms": 25518, "cache": null}
+{"server": "cache_taylor3", "tag": "taylor30_skip3_d2", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 26.23, "inf_ms": 26127, "cache": null}
+{"server": "cache_spectrum", "tag": "spectrum30", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 19.26, "inf_ms": 19123, "cache": null}
+{"server": "cache_spectrum", "tag": "spectrum30", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 19.83, "inf_ms": 19699, "cache": null}
+{"server": "cache_spectrum", "tag": "spectrum30", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 20.3, "inf_ms": 20191, "cache": null}
+{"server": "cache_spectrum", "tag": "spectrum30", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 20.77, "inf_ms": 20562, "cache": null}
+{"server": "cache_spectrum", "tag": "spectrum30", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 21.26, "inf_ms": 21070, "cache": null}
+{"server": "cache_spectrum", "tag": "spectrum30", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 20.58, "inf_ms": 20471, "cache": null}
+{"server": "cache_spectrum", "tag": "spectrum30", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 20.89, "inf_ms": 20786, "cache": null}
+{"server": "cache_dbcache", "tag": "dbcache30", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 24.84, "inf_ms": 24730, "cache": null}
+{"server": "cache_dbcache", "tag": "dbcache30", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 25.37, "inf_ms": 25284, "cache": null}
+{"server": "cache_dbcache", "tag": "dbcache30", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 26.23, "inf_ms": 26147, "cache": null}
+{"server": "cache_dbcache", "tag": "dbcache30", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 26.89, "inf_ms": 26793, "cache": null}
+{"server": "cache_dbcache", "tag": "dbcache30", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 26.82, "inf_ms": 26694, "cache": null}
+{"server": "cache_dbcache", "tag": "dbcache30", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 25.4, "inf_ms": 25306, "cache": null}
+{"server": "cache_dbcache", "tag": "dbcache30", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 27.4, "inf_ms": 27298, "cache": null}
+{"server": "cache_cachedit", "tag": "cachedit30", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 25.63, "inf_ms": 25521, "cache": null}
+{"server": "cache_cachedit", "tag": "cachedit30", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 25.78, "inf_ms": 25701, "cache": null}
+{"server": "cache_cachedit", "tag": "cachedit30", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 26.0, "inf_ms": 25917, "cache": null}
+{"server": "cache_cachedit", "tag": "cachedit30", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 26.25, "inf_ms": 26151, "cache": null}
+{"server": "cache_cachedit", "tag": "cachedit30", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 26.23, "inf_ms": 26107, "cache": null}
+{"server": "cache_cachedit", "tag": "cachedit30", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 24.85, "inf_ms": 24758, "cache": null}
+{"server": "cache_cachedit", "tag": "cachedit30", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 25.7, "inf_ms": 25600, "cache": null}
+{"server": "main", "tag": "base24_dense", "prompt": "quad", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 30.83, "inf_ms": 30669, "cache": null}
+{"server": "main", "tag": "base24_dense", "prompt": "landscape", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 30.92, "inf_ms": 30822, "cache": null}
+{"server": "main", "tag": "base24_dense", "prompt": "neon_sign", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 31.56, "inf_ms": 31459, "cache": null}
+{"server": "main", "tag": "base30_ec05", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.05}, "wall": 25.23, "inf_ms": 25118, "cache": null}
+{"server": "main", "tag": "base30_ec05", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.05}, "wall": 23.77, "inf_ms": 23665, "cache": null}
+{"server": "main", "tag": "base30_ec05", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.05}, "wall": 23.52, "inf_ms": 23421, "cache": null}
+{"server": "main", "tag": "base30_ec05", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.05}, "wall": 26.23, "inf_ms": 26135, "cache": null}
+{"server": "main", "tag": "base30_ec05", "prompt": "quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.05}, "wall": 28.88, "inf_ms": 28754, "cache": null}
+{"server": "main", "tag": "base30_ec05", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.05}, "wall": 26.62, "inf_ms": 26526, "cache": null}
+{"server": "main", "tag": "base30_ec05", "prompt": "neon_sign", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.05}, "wall": 28.89, "inf_ms": 28785, "cache": null}
+{"server": "main", "tag": "base30_ec08", "prompt": "fox2", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.08}, "wall": 22.57, "inf_ms": 22464, "cache": null}
+{"server": "main", "tag": "base30_ec08", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.08}, "wall": 22.69, "inf_ms": 22582, "cache": null}
+{"server": "main", "tag": "base30_ec08", "prompt": "trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.08}, "wall": 21.55, "inf_ms": 21456, "cache": null}
+{"server": "main", "tag": "base30_ec08", "prompt": "duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.08}, "wall": 23.91, "inf_ms": 23814, "cache": null}

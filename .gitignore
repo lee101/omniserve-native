@@ -52,3 +52,8 @@ monitoring/
 matte/.venv/
 matte/__pycache__/
 ra2-out/
+performance/qwen-image-2.1-vs-zimage-2026-09-21/
+results
+qualitybench/out/
+matte/bench/out/
+matte/bench/gs2k.png

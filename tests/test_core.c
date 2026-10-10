@@ -110,6 +110,26 @@ static void test_image_contract(void) {
         CHECK(!oimage_request_parse(bad_edits[i], strlen(bad_edits[i]),
                                    &request, error, sizeof error));
     }
+    const char *good_args[] = {
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"guidance_schedule=1x10+2x20\"}",
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"exit_tol=0.02,guidance_schedule=1x100\"}",
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"exit_tol=0.02\"}",
+    };
+    for (size_t i = 0; i < sizeof good_args / sizeof good_args[0]; ++i) {
+        CHECK(oimage_request_parse(good_args[i], strlen(good_args[i]), &request, error, sizeof error));
+        oimage_request_free(&request);
+    }
+    const char *bad_args[] = {
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"guidance_schedule=1x2000000000\"}",
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"guidance_schedule=1x999\"}",
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"guidance_schedule=1x60+2x60\"}",
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"exit_tol=0.1,guidance_schedule=1x101\"}",
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"guidance_schedule=1\"}",
+        "{\"prompt\":\"p\",\"extra_sample_args\":\"guidance_schedule=1x\"}",
+    };
+    for (size_t i = 0; i < sizeof bad_args / sizeof bad_args[0]; ++i) {
+        CHECK(!oimage_request_parse(bad_args[i], strlen(bad_args[i]), &request, error, sizeof error));
+    }
     CHECK(oimage_request_parse(body, strlen(body), &request, error, sizeof error));
     CHECK(request.generation.prompt && strcmp(request.generation.prompt, "red cube") == 0);
     CHECK(request.generation.negative_prompt && strcmp(request.generation.negative_prompt, "blur") == 0);
@@ -119,6 +139,17 @@ static void test_image_contract(void) {
     CHECK(request.generation.seed == 42);
     CHECK(request.generation.lora_count == 0);
     oimage_request_free(&request);
+
+    const char *turbo_on = "{\"prompt\":\"p\",\"turbo\":true}";
+    const char *turbo_off = "{\"prompt\":\"p\",\"turbo\":false}";
+    const char *turbo_bad = "{\"prompt\":\"p\",\"turbo\":3}";
+    CHECK(oimage_request_parse(turbo_on, strlen(turbo_on), &request, error, sizeof error));
+    CHECK(request.generation.turbo == 0);
+    oimage_request_free(&request);
+    CHECK(oimage_request_parse(turbo_off, strlen(turbo_off), &request, error, sizeof error));
+    CHECK(request.generation.turbo == 2);
+    oimage_request_free(&request);
+    CHECK(!oimage_request_parse(turbo_bad, strlen(turbo_bad), &request, error, sizeof error));
 
     const char *loras = "{\"prompt\":\"cat\",\"loras\":["
                         "{\"path\":\"/models/a.safetensors\",\"scale\":0.75},"

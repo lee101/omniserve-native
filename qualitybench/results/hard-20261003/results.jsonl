@@ -1,0 +1,88 @@
+{"server": "main", "tag": "base30_dense", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 35.23, "inf_ms": 35141, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 35.47, "inf_ms": 35380, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "w_trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 35.81, "inf_ms": 35717, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "w_duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 36.03, "inf_ms": 35931, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "m_duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 36.3, "inf_ms": 36212, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "m_trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 36.76, "inf_ms": 36669, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "m_quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 37.05, "inf_ms": 36931, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "m_shirtless", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 37.19, "inf_ms": 37083, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "m_group", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 37.51, "inf_ms": 37370, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "hands", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 37.46, "inf_ms": 37334, "cache": null}
+{"server": "main", "tag": "base30_dense", "prompt": "couple", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0}, "wall": 37.38, "inf_ms": 37279, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "landscape", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 19.22, "inf_ms": 19124, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "witch", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 18.16, "inf_ms": 18031, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "w_trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 18.2, "inf_ms": 18094, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "w_duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 18.27, "inf_ms": 18148, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "m_duo", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 18.22, "inf_ms": 18113, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "m_trio", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 18.3, "inf_ms": 18212, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "m_quad", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 20.66, "inf_ms": 20497, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "m_shirtless", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 18.27, "inf_ms": 18152, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "m_group", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 19.4, "inf_ms": 19261, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "hands", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 18.42, "inf_ms": 18286, "cache": null}
+{"server": "main", "tag": "base30_ec15", "prompt": "couple", "steps": 30, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 19.43, "inf_ms": 19330, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "landscape", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 16.05, "inf_ms": 15947, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "witch", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 16.11, "inf_ms": 15976, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "w_trio", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 16.05, "inf_ms": 15952, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "w_duo", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 16.04, "inf_ms": 15920, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "m_duo", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 16.01, "inf_ms": 15914, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "m_trio", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 16.21, "inf_ms": 16068, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "m_quad", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 17.26, "inf_ms": 17114, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "m_shirtless", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 17.16, "inf_ms": 17033, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "m_group", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 17.31, "inf_ms": 17196, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "hands", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 16.04, "inf_ms": 15926, "cache": null}
+{"server": "main", "tag": "base24_ec15", "prompt": "couple", "steps": 24, "extra": {"turbo": false, "cache_threshold": 0.15}, "wall": 17.51, "inf_ms": 17395, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "landscape", "steps": 3, "extra": {}, "wall": 13.92, "inf_ms": 13823, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "witch", "steps": 3, "extra": {}, "wall": 12.28, "inf_ms": 12179, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "w_trio", "steps": 3, "extra": {}, "wall": 12.07, "inf_ms": 11974, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "w_duo", "steps": 3, "extra": {}, "wall": 12.1, "inf_ms": 12003, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "m_duo", "steps": 3, "extra": {}, "wall": 12.09, "inf_ms": 11994, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "m_trio", "steps": 3, "extra": {}, "wall": 12.03, "inf_ms": 11922, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "m_quad", "steps": 3, "extra": {}, "wall": 12.09, "inf_ms": 11964, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "m_shirtless", "steps": 3, "extra": {}, "wall": 12.15, "inf_ms": 12015, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "m_group", "steps": 3, "extra": {}, "wall": 12.2, "inf_ms": 12049, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "hands", "steps": 3, "extra": {}, "wall": 12.08, "inf_ms": 11962, "cache": null}
+{"server": "main", "tag": "turbo6", "prompt": "couple", "steps": 3, "extra": {}, "wall": 12.14, "inf_ms": 12038, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "landscape", "steps": 3, "extra": {}, "wall": 15.62, "inf_ms": 15512, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "witch", "steps": 3, "extra": {}, "wall": 14.61, "inf_ms": 14508, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "w_trio", "steps": 3, "extra": {}, "wall": 14.57, "inf_ms": 14464, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "w_duo", "steps": 3, "extra": {}, "wall": 14.56, "inf_ms": 14460, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "m_duo", "steps": 3, "extra": {}, "wall": 14.59, "inf_ms": 14504, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "m_trio", "steps": 3, "extra": {}, "wall": 14.8, "inf_ms": 14690, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "m_quad", "steps": 3, "extra": {}, "wall": 14.74, "inf_ms": 14617, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "m_shirtless", "steps": 3, "extra": {}, "wall": 14.74, "inf_ms": 14629, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "m_group", "steps": 3, "extra": {}, "wall": 14.77, "inf_ms": 14654, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "hands", "steps": 3, "extra": {}, "wall": 14.77, "inf_ms": 14615, "cache": null}
+{"server": "turbo_nodes8", "tag": "turbo8", "prompt": "couple", "steps": 3, "extra": {}, "wall": 14.8, "inf_ms": 14693, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "landscape", "steps": 3, "extra": {}, "wall": 12.68, "inf_ms": 12589, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "witch", "steps": 3, "extra": {}, "wall": 11.6, "inf_ms": 11490, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "w_trio", "steps": 3, "extra": {}, "wall": 11.68, "inf_ms": 11585, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "w_duo", "steps": 3, "extra": {}, "wall": 11.71, "inf_ms": 11590, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "m_duo", "steps": 3, "extra": {}, "wall": 11.65, "inf_ms": 11556, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "m_trio", "steps": 3, "extra": {}, "wall": 11.66, "inf_ms": 11554, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "m_quad", "steps": 3, "extra": {}, "wall": 11.85, "inf_ms": 11688, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "m_shirtless", "steps": 3, "extra": {}, "wall": 11.81, "inf_ms": 11692, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "m_group", "steps": 3, "extra": {}, "wall": 11.92, "inf_ms": 11791, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "hands", "steps": 3, "extra": {}, "wall": 11.91, "inf_ms": 11759, "cache": null}
+{"server": "turbo_lora07", "tag": "turbo6_lora07", "prompt": "couple", "steps": 3, "extra": {}, "wall": 11.87, "inf_ms": 11718, "cache": null}
+{"server": "turbo_lora05", "tag": "turbo6_lora05", "prompt": "landscape", "steps": 3, "extra": {}, "wall": 14.07, "inf_ms": 13941, "cache": null}
+{"server": "turbo_lora05", "tag": "turbo6_lora05", "prompt": "witch", "steps": 3, "extra": {}, "wall": 11.75, "inf_ms": 11614, "cache": null}
+{"server": "turbo_lora05", "tag": "turbo6_lora05", "prompt": "w_trio", "steps": 3, "extra": {}, "wall": 11.88, "inf_ms": 11768, "cache": null}
+{"server": "turbo_lora05", "tag": "turbo6_lora05", "prompt": "w_duo", "steps": 3, "extra": {}, "wall": 11.83, "inf_ms": 11676, "cache": null}
+{"server": "turbo_lora05", "tag": "turbo6_lora05", "prompt": "m_duo", "steps": 3, "extra": {}, "wall": 11.72, "inf_ms": 11610, "cache": null}
+{"server": "turbo_lora05", "tag": "turbo6_lora05", "prompt": "m_trio", "steps": 3, "extra": {}, "wall": 11.93, "inf_ms": 11817, "cache": null}
+{"server": "turbo_lora05", "tag": "turbo6_lora05", "prompt": "m_quad", "steps": 3, "extra": {}, "wall": 11.88, "inf_ms": 11727, "cache": null}
+{"server": "turbo_lora05", "tag": "turbo6_lora05", "prompt": "m_shirtless", "steps": 3, "extra": {}, "wall": 11.86, "inf_ms": 11743, "cache": null}
+{"server": "turbo_lora05", "tag": "turbo6_lora05", "prompt": "m_group", "steps": 3, "extra": {}, "wall": 12.01, "inf_ms": 11865, "cache": null}
+{"server": "turbo_lora05", "tag": "turbo6_lora05", "prompt": "hands", "steps": 3, "extra": {}, "wall": 12.1, "inf_ms": 11955, "cache": null}
+{"server": "turbo_lora05", "tag": "turbo6_lora05", "prompt": "couple", "steps": 3, "extra": {}, "wall": 11.96, "inf_ms": 11819, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "landscape", "steps": 3, "extra": {}, "wall": 10.65, "inf_ms": 10533, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "witch", "steps": 3, "extra": {}, "wall": 10.75, "inf_ms": 10638, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "w_trio", "steps": 3, "extra": {}, "wall": 10.85, "inf_ms": 10742, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "w_duo", "steps": 3, "extra": {}, "wall": 10.72, "inf_ms": 10599, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "m_duo", "steps": 3, "extra": {}, "wall": 10.87, "inf_ms": 10763, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "m_trio", "steps": 3, "extra": {}, "wall": 10.86, "inf_ms": 10732, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "m_quad", "steps": 3, "extra": {}, "wall": 10.9, "inf_ms": 10756, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "m_shirtless", "steps": 3, "extra": {}, "wall": 10.85, "inf_ms": 10706, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "m_group", "steps": 3, "extra": {}, "wall": 10.96, "inf_ms": 10812, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "hands", "steps": 3, "extra": {}, "wall": 10.86, "inf_ms": 10721, "cache": null}
+{"server": "premerged_q6", "tag": "premerged_q6_turbo6", "prompt": "couple", "steps": 3, "extra": {}, "wall": 10.83, "inf_ms": 10717, "cache": null}
