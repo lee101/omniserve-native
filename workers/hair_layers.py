@@ -7,7 +7,9 @@ over the face so the overlay can sway them independently of back hair.
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
 from typing import Any
 
 import numpy as np
@@ -19,6 +21,8 @@ HAIR_BACKEND = os.getenv("HAIR_BACKEND", "auto")
 
 _sam2: dict[str, Any] | None = None
 _sam2_failed = False
+_sam2_lock = threading.Lock()
+logger = logging.getLogger(__name__)
 
 
 def pixel_looks_like_skin(rgb: np.ndarray) -> np.ndarray:
@@ -89,39 +93,48 @@ def load_sam2() -> dict[str, Any] | None:
     global _sam2, _sam2_failed
     if HAIR_BACKEND == "geometric":
         return None
-    if _sam2 is not None:
-        return _sam2
-    if _sam2_failed:
-        return None
-    try:
-        import torch
-        from transformers import AutoModel, AutoProcessor
-    except Exception as error:
-        print(f"sam2 import failed: {error}")
-        _sam2_failed = True
-        return None
-    model_id = SAM2_MODEL
-    device = os.getenv("BIREFNET_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-    try:
-        processor = AutoProcessor.from_pretrained(model_id)
-        model = AutoModel.from_pretrained(model_id).to(device)
-        model.eval()
-        _sam2 = {"processor": processor, "model": model, "device": device, "torch": torch}
-        print(f"hair sam2 loaded model={model_id} device={device}")
-        return _sam2
-    except Exception as error:
-        print(f"sam2 load failed: {error}")
-        _sam2_failed = True
-        return None
+    # Requests run on a thread pool: without the lock two first requests would
+    # both load the weights (and race on the globals).
+    with _sam2_lock:
+        if _sam2 is not None:
+            return _sam2
+        if _sam2_failed:
+            return None
+        try:
+            import torch
+            from transformers import AutoModel, AutoProcessor
+        except Exception as error:
+            logger.warning("sam2 import failed: %s", error)
+            _sam2_failed = True
+            return None
+        model_id = SAM2_MODEL
+        device = os.getenv("BIREFNET_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            processor = AutoProcessor.from_pretrained(model_id)
+            model = AutoModel.from_pretrained(model_id).to(device)
+            model.eval()
+            _sam2 = {"processor": processor, "model": model, "device": device, "torch": torch}
+            logger.info("hair sam2 loaded model=%s device=%s", model_id, device)
+            return _sam2
+        except Exception as error:
+            logger.warning("sam2 load failed: %s", error)
+            _sam2_failed = True
+            return None
 
 
 def sam2_hair_mask(image: Image.Image, alpha: np.ndarray) -> np.ndarray | None:
+    return sam2_hair_mask_status(image, alpha)[0]
+
+
+def sam2_hair_mask_status(image: Image.Image, alpha: np.ndarray) -> tuple[np.ndarray | None, str]:
+    """(mask, status); status says why there is no mask: unavailable, empty,
+    failed or rejected_coverage, and "ok" when there is one."""
     runtime = load_sam2()
     if runtime is None:
-        return None
+        return None, "unavailable"
     min_x, min_y, max_x, max_y, opaque = opaque_bounds(alpha)
     if opaque == 0:
-        return None
+        return None, "empty"
     box_h = max(1, max_y - min_y + 1)
     box = [float(min_x), float(min_y), float(max_x), float(min_y + int(box_h * 0.52))]
     torch = runtime["torch"]
@@ -130,7 +143,8 @@ def sam2_hair_mask(image: Image.Image, alpha: np.ndarray) -> np.ndarray | None:
     device = runtime["device"]
     rgb = image.convert("RGB")
     try:
-        inputs = processor(images=rgb, input_boxes=[[[box]]], return_tensors="pt")
+        # input_boxes nesting is [image][box][x0,y0,x1,y1] (3 levels).
+        inputs = processor(images=rgb, input_boxes=[[box]], return_tensors="pt")
         inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
         with torch.inference_mode():
             outputs = model(**inputs)
@@ -152,11 +166,13 @@ def sam2_hair_mask(image: Image.Image, alpha: np.ndarray) -> np.ndarray | None:
         mask = mask & (alpha > 24)
         coverage = float(mask.sum()) / float(opaque)
         if coverage < HAIR_MIN_COVERAGE or coverage > 0.72:
-            return None
-        return mask
+            logger.info("sam2 hair mask rejected: coverage=%.3f", coverage)
+            return None, "rejected_coverage"
+        return mask, "ok"
     except Exception as error:
-        print(f"sam2 hair mask failed: {error}")
-        return None
+        logger.warning("sam2 hair mask failed, falling back to silhouette split: %s",
+                       error, exc_info=True)
+        return None, "failed"
 
 
 def split_hair_layers(image: Image.Image) -> dict[str, Any]:
@@ -164,8 +180,9 @@ def split_hair_layers(image: Image.Image) -> dict[str, Any]:
     alpha = rgba[..., 3]
     backend = "silhouette-split"
     sam_mask = None
+    sam2_status = "disabled"
     if HAIR_BACKEND != "geometric":
-        sam_mask = sam2_hair_mask(image, alpha)
+        sam_mask, sam2_status = sam2_hair_mask_status(image, alpha)
     front, back, coverage = geometric_hair_masks(rgba)
     if sam_mask is not None:
         backend = "sam2"
@@ -187,6 +204,7 @@ def split_hair_layers(image: Image.Image) -> dict[str, Any]:
         "skipped": skipped,
         "coverage": coverage,
         "backend": backend,
+        "sam2_status": sam2_status,
         "front": None if skipped else apply_mask(rgba, front),
         "back": None if skipped else apply_mask(rgba, back),
     }
