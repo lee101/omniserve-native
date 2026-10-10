@@ -848,19 +848,35 @@ def generate_backdrop(prompt: str, width: int, height: int, init_url: str | None
     return ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
 
 
-def publish_intermediate(image: Image.Image, key_hint: str) -> str | None:
-    """Uploads a working image so the diffusion lane can fetch it by URL."""
+def publish_intermediate(image: Image.Image, key_hint: str,
+                         params: dict[str, Any] | None = None) -> str | None:
+    """Uploads a working image so the diffusion lane can fetch it by URL.
+
+    `params` must carry everything that shapes the estimated backdrop (threshold,
+    decontaminate, model, input size), or two requests that differ only in those
+    would share one cached intermediate.
+    """
     if object_store is None:
         return None
     buffer = io.BytesIO()
     image.save(buffer, format="WEBP", quality=90, method=4)
     payload = buffer.getvalue()
     try:
-        key = object_store.cache_key(key_hint, {"stage": "estimated-backdrop"}, suffix="webp")
+        key = object_store.cache_key(key_hint, {**(params or {}), "stage": "estimated-backdrop"}, suffix="webp")
         return object_store.put(key, payload, "image/webp")
     except Exception as error:  # a missing bucket downgrades to text-to-image
         print(f"backdrop upload failed: {error}")
         return None
+
+
+def _backdrop_cache_params(request: RemoveBackgroundRequest) -> dict[str, Any]:
+    return {
+        "threshold": round(request.foreground_threshold, 4),
+        "decontaminate": DECONTAMINATE if request.decontaminate is None else request.decontaminate,
+        "model": MODEL_ID,
+        "input_size": INPUT_SIZE,
+        "dtype": str(runtime.dtype),
+    }
 
 
 def resolve_backdrop(request: RemoveBackgroundRequest, estimated: Image.Image | None,
@@ -869,7 +885,8 @@ def resolve_backdrop(request: RemoveBackgroundRequest, estimated: Image.Image | 
     if request.background_prompt:
         init_url = None
         if request.background_strength > 0.0 and estimated is not None:
-            init_url = publish_intermediate(estimated, request.image_url)
+            init_url = publish_intermediate(
+                estimated, request.image_url, _backdrop_cache_params(request))
         backdrop = generate_backdrop(request.background_prompt, width, height, init_url,
                                      request.background_strength)
         if backdrop.size != (width, height):
@@ -1337,8 +1354,12 @@ def ensure_cutout_rgba(image_url: str) -> Image.Image:
     alpha = np.asarray(image.getchannel("A"))
     if alpha.size and float((alpha < 250).mean()) > 0.01:
         return image
-    content = remove_background(image.convert("RGB"), 0.0, False, output_format="png")
-    return Image.open(io.BytesIO(content)).convert("RGBA")
+    request = RemoveBackgroundRequest(
+        image_url=image_url, output_format="png", foreground_threshold=0.0,
+        decontaminate=False, cache=False,
+    )
+    produced = remove_background(image.convert("RGB"), request)
+    return Image.open(io.BytesIO(produced["cutout"])).convert("RGBA")
 
 
 def produce_hair_layers(request: HairLayersRequest) -> dict[str, Any]:
@@ -1348,7 +1369,20 @@ def produce_hair_layers(request: HairLayersRequest) -> dict[str, Any]:
     if output_format not in {"webp", "png"}:
         raise HTTPException(400, "output_format must be webp or png")
     params = request.cache_params()
+    skipped_key = None
     if CACHE_ENABLED and request.cache and object_store is not None:
+        skipped_key = object_store.cache_key(
+            request.image_url, {**params, "layer": "skipped"}, prefix="hair", suffix="json")
+        raw = object_store.get(skipped_key)
+        if raw:
+            try:
+                marker = json.loads(raw)
+                return {"cached": True, "skipped": True,
+                        "coverage": float(marker["coverage"]),
+                        "backend": marker.get("backend", "cache"),
+                        "sam2_status": marker.get("sam2_status")}
+            except (ValueError, KeyError, TypeError):
+                pass  # unreadable marker: recompute and overwrite
         front_key = object_store.cache_key(request.image_url, {**params, "layer": "front"}, prefix="hair", suffix=output_format)
         back_key = object_store.cache_key(request.image_url, {**params, "layer": "back"}, prefix="hair", suffix=output_format)
         if object_store.exists(front_key) and object_store.exists(back_key):
@@ -1371,8 +1405,18 @@ def produce_hair_layers(request: HairLayersRequest) -> dict[str, Any]:
         "skipped": bool(split["skipped"]),
         "coverage": float(split["coverage"]),
         "backend": split["backend"],
+        "sam2_status": split.get("sam2_status"),
     }
     if split["skipped"]:
+        if skipped_key is not None:
+            # Skipped is a stable answer for this input: remember it so a
+            # repeat does not cost another segmentation + SAM2 pass.
+            try:
+                object_store.put(skipped_key, json.dumps({
+                    "coverage": payload["coverage"], "backend": payload["backend"],
+                    "sam2_status": payload["sam2_status"]}).encode(), "application/json")
+            except Exception as error:
+                print(f"hair skip marker upload failed: {error}")
         return payload
 
     front_bytes, media_type = encode_image(split["front"], output_format)
