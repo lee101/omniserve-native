@@ -41,6 +41,7 @@ VAE="${RA2_VAE:-$(fast vae/qwen_image_2.1_vae_bf16.safetensors /vfast/data/model
 TEXT_ENCODER="${RA2_LLM:-$(fast Qwen3VL-8B-Instruct-Q4_K_M.gguf /vfast/data/models/qwen3vl-8b-gguf/Qwen3VL-8B-Instruct-Q4_K_M.gguf)}"
 VISION="${RA2_LLM_VISION:-$(fast mmproj-Qwen3VL-8B-Instruct-F16.gguf /vfast/data/models/qwen3vl-8b-gguf/mmproj-Qwen3VL-8B-Instruct-F16.gguf)}"
 TURBO_LORA="${RA2_TURBO_LORA:-$(fast Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r256.safetensors /vfast/data/models/qwen-image-2.1-turbo/Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r256.safetensors)}"
+ANIME_LORA="${RA2_ANIME_LORA:-$(fast fusal-qwen-image-2.1-stack-exact-r80.safetensors "")}"
 LOG="${RA2_LOG:-/tmp/ra2-lane.log}"
 
 # te=cpu is deliberately not set: with the text encoder on the CPU a 512x512
@@ -61,6 +62,8 @@ if [[ "${RA2_TURBO:-0}" == 1 && -e "$TURBO_LORA" ]]; then
   export OMNISERVE_NATIVE_SD_DEFAULT_LORA="$TURBO_LORA"
   export OMNISERVE_NATIVE_SD_TURBO_NODES="${RA2_TURBO_NODES:-1.0,0.9375,0.875,0.75,0.5,0.25}"
 fi
+# anime + NSFW prompts: Fusal LoRA on the 30-step base path (trigger "fusal style." is prepended by the server; turbo is skipped whenever a LoRA is attached)
+[[ -n "$ANIME_LORA" ]] && export OMNISERVE_NATIVE_ANIME_NSFW_LORA_PATH="$ANIME_LORA"
 export OMNISERVE_NATIVE_SD_WARMUP="${RA2_WARMUP:-1}"
 export OMNISERVE_NATIVE_SD_NOTCH="${RA2_NOTCH:-1}"
 export OMNISERVE_NATIVE_SD_ZERO_GUIDANCE="${RA2_ZERO_GUIDANCE:-1.0}"

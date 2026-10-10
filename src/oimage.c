@@ -256,12 +256,42 @@ void oimage_request_free(oimage_request *request) {
     memset(request, 0, sizeof *request);
 }
 
+static bool prepend_trigger(oimage_request *request, const char *trigger) {
+    size_t tl = strlen(trigger);
+    if (request->prompt && strncasecmp(request->prompt, trigger, tl) == 0) return true;
+    size_t pl = request->prompt ? strlen(request->prompt) : 0;
+    char *grown = malloc(tl + 1 + pl + 1);
+    if (!grown) return false;
+    memcpy(grown, trigger, tl);
+    grown[tl] = ' ';
+    if (pl) memcpy(grown + tl + 1, request->prompt, pl);
+    grown[tl + 1 + pl] = 0;
+    free(request->prompt);
+    request->prompt = grown;
+    request->generation.prompt = grown;
+    return true;
+}
+
 static bool add_automatic_nsfw_lora(oimage_request *request) {
     if (!request || request->generation.lora_count ||
         !onsfw_prompt_has_word(request->prompt)) {
         return true;
     }
-    const char *path = getenv("OMNISERVE_NATIVE_NSFW_LORA_PATH");
+    bool anime = onsfw_prompt_has_anime_word(request->prompt);
+    const char *kind = "NSFW";
+    const char *path = NULL;
+    const char *scale_env = "OMNISERVE_NATIVE_NSFW_LORA_SCALE";
+    double scale = 0.6;
+    if (anime) {
+        const char *anime_path = getenv("OMNISERVE_NATIVE_ANIME_NSFW_LORA_PATH");
+        if (anime_path && anime_path[0] == '/' && access(anime_path, R_OK) == 0) {
+            path = anime_path;
+            kind = "anime NSFW";
+            scale_env = "OMNISERVE_NATIVE_ANIME_NSFW_LORA_SCALE";
+            scale = 1.0;
+        }
+    }
+    if (!path) path = getenv("OMNISERVE_NATIVE_NSFW_LORA_PATH");
     if (!path || path[0] != '/' || access(path, R_OK) != 0) {
         if (path && path[0]) {
             fprintf(stderr, "[safety] prompt word match but NSFW LoRA is unavailable: %s\n",
@@ -277,8 +307,7 @@ static bool add_automatic_nsfw_lora(oimage_request *request) {
         free(owned_path);
         return false;
     }
-    double scale = 0.6;
-    const char *scale_text = getenv("OMNISERVE_NATIVE_NSFW_LORA_SCALE");
+    const char *scale_text = getenv(scale_env);
     if (scale_text && scale_text[0]) {
         char *end = NULL;
         double parsed = strtod(scale_text, &end);
@@ -291,7 +320,8 @@ static bool add_automatic_nsfw_lora(oimage_request *request) {
     request->loras = grown;
     request->generation.loras = grown;
     request->generation.lora_count = count + 1;
-    fprintf(stderr, "[safety] prompt word match: enabling NSFW LoRA scale=%.2f\n", scale);
+    if (kind[0] == 'a' && !prepend_trigger(request, "fusal style.")) return false;
+    fprintf(stderr, "[safety] prompt word match: enabling %s LoRA scale=%.2f\n", kind, scale);
     return true;
 }
 static bool parse_size(const char *json, const oj_tok *token, int *width, int *height) {
