@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -782,4 +783,190 @@ bool oimage_openai_response(const oimg_result *result, const char *model, long l
     *json_out = json;
     *json_len_out = used;
     return true;
+}
+
+static bool append_text(char **buf, size_t *len, size_t *cap, const char *text) {
+    size_t n = strlen(text);
+    if (*len + n + 1 > *cap) {
+        size_t next = *cap ? *cap * 2 : 1024;
+        while (next < *len + n + 1) next *= 2;
+        char *grown = realloc(*buf, next);
+        if (!grown) return false;
+        *buf = grown;
+        *cap = next;
+    }
+    memcpy(*buf + *len, text, n + 1);
+    *len += n;
+    return true;
+}
+
+static const char *mem_find(const char *hay, size_t hay_len, const char *needle, size_t needle_len) {
+    if (!needle_len || hay_len < needle_len) return NULL;
+    for (size_t i = 0; i + needle_len <= hay_len; i++)
+        if (hay[i] == needle[0] && !memcmp(hay + i, needle, needle_len)) return hay + i;
+    return NULL;
+}
+
+/* Returns the value of `key=` inside a header value (quoted or bare). */
+static bool header_param(const char *value, size_t len, const char *key,
+                         const char **out, size_t *out_len) {
+    size_t key_len = strlen(key);
+    for (size_t i = 0; i + key_len + 1 <= len; i++) {
+        if (strncasecmp(value + i, key, key_len) || value[i + key_len] != '=') continue;
+        if (i && value[i - 1] != ';' && value[i - 1] != ' ' && value[i - 1] != '\t') continue;
+        const char *v = value + i + key_len + 1;
+        const char *end = value + len;
+        if (v < end && *v == '"') {
+            const char *q = memchr(v + 1, '"', (size_t)(end - v - 1));
+            if (!q) return false;
+            *out = v + 1;
+            *out_len = (size_t)(q - v - 1);
+        } else {
+            const char *e = v;
+            while (e < end && *e != ';' && *e != ' ' && *e != '\t' && *e != '\r') e++;
+            *out = v;
+            *out_len = (size_t)(e - v);
+        }
+        return *out_len > 0;
+    }
+    return false;
+}
+
+static bool field_is_numeric(const char *name, size_t len) {
+    static const char *numeric[] = {"n", "seed", "width", "height", "steps",
+                                    "guidance_scale", "strength", "cfg_scale"};
+    for (size_t i = 0; i < sizeof numeric / sizeof numeric[0]; i++)
+        if (strlen(numeric[i]) == len && !memcmp(numeric[i], name, len)) return true;
+    return false;
+}
+
+static bool name_is(const char *name, size_t len, const char *want) {
+    return strlen(want) == len && !memcmp(name, want, len);
+}
+
+char *oimage_edit_multipart_to_json(const char *content_type, size_t content_type_len,
+                                    const char *body, size_t body_len, size_t *json_len,
+                                    char *model, size_t model_cap,
+                                    char *error, size_t error_cap) {
+    if (model && model_cap) model[0] = 0;
+    const char *boundary = NULL;
+    size_t boundary_len = 0;
+    if (!content_type || content_type_len < 19 ||
+        strncasecmp(content_type, "multipart/form-data", 19) ||
+        !header_param(content_type, content_type_len, "boundary", &boundary, &boundary_len) ||
+        boundary_len > 200) {
+        set_error(error, error_cap, "multipart/form-data with a boundary is required");
+        return NULL;
+    }
+    char delim[208];
+    size_t delim_len = (size_t)snprintf(delim, sizeof delim, "--%.*s", (int)boundary_len, boundary);
+    char *out = NULL;
+    size_t out_len = 0, out_cap = 0;
+    bool ok = append_text(&out, &out_len, &out_cap, "{");
+    bool have_image = false, have_prompt = false, first = true;
+    const char *cursor = mem_find(body, body_len, delim, delim_len);
+    while (ok && cursor) {
+        cursor += delim_len;
+        size_t rest = body_len - (size_t)(cursor - body);
+        if (rest >= 2 && cursor[0] == '-' && cursor[1] == '-') break;
+        if (rest >= 2 && cursor[0] == '\r' && cursor[1] == '\n') cursor += 2;
+        else if (rest >= 1 && cursor[0] == '\n') cursor += 1;
+        rest = body_len - (size_t)(cursor - body);
+        const char *headers_end = mem_find(cursor, rest, "\r\n\r\n", 4);
+        size_t sep = 4;
+        if (!headers_end) { headers_end = mem_find(cursor, rest, "\n\n", 2); sep = 2; }
+        if (!headers_end) break;
+        const char *name = NULL, *filename = NULL;
+        size_t name_len = 0, filename_len = 0;
+        for (const char *line = cursor; line < headers_end;) {
+            const char *eol = memchr(line, '\n', (size_t)(headers_end - line));
+            if (!eol) eol = headers_end;
+            size_t line_len = (size_t)(eol - line);
+            if (line_len >= 20 && !strncasecmp(line, "content-disposition:", 20)) {
+                header_param(line, line_len, "name", &name, &name_len);
+                if (!header_param(line, line_len, "filename", &filename, &filename_len))
+                    filename = NULL;
+            }
+            line = eol + 1;
+        }
+        const char *data = headers_end + sep;
+        const char *next = mem_find(data, body_len - (size_t)(data - body), delim, delim_len);
+        if (!next) break;
+        size_t data_len = (size_t)(next - data);
+        if (data_len >= 2 && data[data_len - 2] == '\r' && data[data_len - 1] == '\n') data_len -= 2;
+        else if (data_len >= 1 && data[data_len - 1] == '\n') data_len -= 1;
+        cursor = next;
+        if (!name || !name_len) continue;
+        bool image_field = name_is(name, name_len, "image") || name_is(name, name_len, "image[]") ||
+                           name_is(name, name_len, "image_file");
+        if (image_field) {
+            if (have_image || !data_len) continue;
+            if (data_len > (6u << 20)) {
+                set_error(error, error_cap, "image must be at most 6 MiB");
+                free(out);
+                return NULL;
+            }
+            size_t encoded = base64_size(data_len);
+            ok = append_text(&out, &out_len, &out_cap, first ? "\"image_base64\":\"" : ",\"image_base64\":\"");
+            if (ok && out_len + encoded + 2 > out_cap) {
+                size_t cap = out_len + encoded + 256;
+                char *grown = realloc(out, cap);
+                if (!grown) ok = false;
+                else { out = grown; out_cap = cap; }
+            }
+            if (ok) {
+                base64_encode((const unsigned char *)data, data_len, out + out_len);
+                out_len += encoded;
+                out[out_len] = 0;
+                ok = append_text(&out, &out_len, &out_cap, "\"");
+            }
+            have_image = true;
+            first = false;
+            continue;
+        }
+        if (filename) continue; /* masks and other files: reference edits are global */
+        if (name_is(name, name_len, "image_base64") || name_is(name, name_len, "response_format"))
+            continue;
+        if (name_is(name, name_len, "model") && model && model_cap) {
+            size_t n = data_len < model_cap - 1 ? data_len : model_cap - 1;
+            memcpy(model, data, n);
+            model[n] = 0;
+        }
+        if (name_is(name, name_len, "prompt")) have_prompt = data_len > 0;
+        ok = append_text(&out, &out_len, &out_cap, first ? "\"" : ",\"");
+        if (ok) ok = oj_escape_append(&out, &out_len, &out_cap, name, name_len);
+        if (ok) ok = append_text(&out, &out_len, &out_cap, "\":");
+        bool numeric = field_is_numeric(name, name_len) && data_len && data_len < 32;
+        if (numeric) {
+            char tmp[32], *end = NULL;
+            memcpy(tmp, data, data_len);
+            tmp[data_len] = 0;
+            double v = strtod(tmp, &end);
+            numeric = end && *end == 0 && isfinite(v);
+        }
+        if (ok && numeric) {
+            char tmp[33];
+            memcpy(tmp, data, data_len);
+            tmp[data_len] = 0;
+            ok = append_text(&out, &out_len, &out_cap, tmp);
+        } else if (ok) {
+            ok = append_text(&out, &out_len, &out_cap, "\"") &&
+                 oj_escape_append(&out, &out_len, &out_cap, data, data_len) &&
+                 append_text(&out, &out_len, &out_cap, "\"");
+        }
+        first = false;
+    }
+    if (ok) ok = append_text(&out, &out_len, &out_cap, "}");
+    if (!ok) {
+        free(out);
+        set_error(error, error_cap, "out of memory");
+        return NULL;
+    }
+    if (!have_image || !have_prompt) {
+        free(out);
+        set_error(error, error_cap, "multipart edit requires an image file and a prompt");
+        return NULL;
+    }
+    *json_len = out_len;
+    return out;
 }

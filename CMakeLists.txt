@@ -68,8 +68,8 @@ endif()
 set(LLAMA_DIR "${CMAKE_SOURCE_DIR}/../llama.cpp" CACHE PATH "llama.cpp checkout")
 set(SD_DIR "${CMAKE_SOURCE_DIR}/../stable-diffusion.cpp" CACHE PATH "stable-diffusion.cpp checkout")
 
-set(CORE_SRC src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c src/omatte.c src/onsfw.c src/oproxy.c src/osched.c
-             src/ohost.c src/ovram.c src/ospec.c
+set(CORE_SRC src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c src/omatte.c src/onsfw.c src/oproxy.c src/osched.c src/ofrontier.c
+             src/ohost.c src/ovram.c src/obroker.c src/ospec.c
              src/oscale.c src/otext.c src/otune.c src/oguard.c)
 
 add_library(onative_core STATIC ${CORE_SRC})
@@ -148,6 +148,9 @@ add_executable(onative_tests tests/test_core.c src/backend_llama.c src/docs.c)
 target_include_directories(onative_tests PRIVATE include)
 target_link_libraries(onative_tests PRIVATE onative_core)
 add_test(NAME core COMMAND onative_tests)
+add_executable(onative_frontier_tests tests/test_frontier.c)
+target_link_libraries(onative_frontier_tests PRIVATE onative_core)
+add_test(NAME frontier COMMAND onative_frontier_tests)
 add_executable(onative_guard_tests tests/test_guard.c)
 target_include_directories(onative_guard_tests PRIVATE include)
 target_link_libraries(onative_guard_tests PRIVATE onative_core)
@@ -245,6 +248,12 @@ if(Python3_Interpreter_FOUND)
         ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>"
     )
     add_test(
+        NAME auth_gate
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_auth_gate.py"
+    )
+    set_tests_properties(auth_gate PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    add_test(
         NAME multimodal_routing
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_multimodal_routing.py"
     )
@@ -276,6 +285,12 @@ if(Python3_Interpreter_FOUND)
         set_tests_properties(image_model_routing PROPERTIES
             ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
         set_tests_properties(image_overflow_routing PROPERTIES
+            ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
+        add_test(
+            NAME image_frontier_routing
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_image_frontier_routing.py"
+        )
+        set_tests_properties(image_frontier_routing PROPERTIES
             ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
     endif()
     add_test(

@@ -4,7 +4,7 @@ override CPPFLAGS += -D_POSIX_C_SOURCE=200809L -Isrc -Iinclude
 
 BIN := build/omniserve
 CORE_SRC := src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c \
-	src/omatte.c src/onsfw.c src/oproxy.c src/osched.c src/ohost.c src/ovram.c \
+	src/omatte.c src/onsfw.c src/oproxy.c src/osched.c src/ofrontier.c src/ohost.c src/ovram.c \
 	src/ospec.c src/oscale.c src/otext.c src/otune.c
 BIN_SRC := src/main.c src/docs.c src/backend_llama.c src/backend_sd.c $(CORE_SRC)
 TESTS := build/test_admission build/test_breaker build/test_wavwrap
@@ -43,6 +43,9 @@ $(JOB_TEST): build tests/test_jobs.c src/jobs.c src/jobs.h
 build/test_breaker: build tests/test_breaker.c src/breaker.c src/breaker.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_breaker.c src/breaker.c -o $@
 
+build/test_obroker: build tests/test_obroker.c src/obroker.c include/obroker.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG tests/test_obroker.c src/obroker.c -pthread -o $@
+
 $(WAVWRAP): build src/wavwrap_main.c src/wavwrap.c src/wavwrap.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) src/wavwrap_main.c src/wavwrap.c -o $@
 
@@ -75,8 +78,9 @@ $(MUSIC3C_TEST): build tests/test_music3c.c music3c/music3.c music3c/music3.h
 run: $(BIN)
 	$(BIN) --models models/models.csv
 
-test: $(TESTS) $(JOB_TEST) $(MUSIC3C_TEST) $(MUSIC3C)
+test: $(TESTS) build/test_obroker $(JOB_TEST) $(MUSIC3C_TEST) $(MUSIC3C)
 	build/test_admission
+	build/test_obroker
 	build/test_wavwrap
 	$(JOB_TEST)
 	$(MUSIC3C_TEST)

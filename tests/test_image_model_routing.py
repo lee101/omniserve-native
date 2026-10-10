@@ -102,6 +102,37 @@ def main():
             for path in ('edits', 'img2img'):
                 assert raw_post(port, '/v1/images/' + path, body)[1] == RESPONSE
                 assert Sibling.seen[-1][0] == '/worker/v1/images/' + path
+            # OpenAI multipart edits become the sibling's JSON reference edit.
+            png = b'\x89PNG\r\n\x1a\n' + bytes(range(256)) * 3
+            boundary = 'xYzBoundary'
+            parts = []
+            for name, value in (('prompt', 'make it "blue"'), ('n', '1'), ('size', '512x512'),
+                                ('model', 'gpt-image-1'), ('response_format', 'url')):
+                parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+            for name in ('image', 'mask'):
+                parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{name}.png"\r\n'
+                             'Content-Type: image/png\r\n\r\n'.encode() + png + b'\r\n')
+            multipart = b''.join(parts) + f'--{boundary}--\r\n'.encode()
+            code, response, _ = raw_post(port, '/v1/images/edits', multipart,
+                                         {'Content-Type': f'multipart/form-data; boundary={boundary}'})
+            assert (code, response) == (201, RESPONSE)
+            path, received, headers = Sibling.seen[-1]
+            assert path == '/worker/v1/images/edits' and headers['Content-Type'] == 'application/json'
+            sent = json.loads(received)
+            import base64
+            assert base64.b64decode(sent['image_base64']) == png
+            assert sent['prompt'] == 'make it "blue"' and sent['n'] == 1 and sent['size'] == '512x512'
+            assert 'response_format' not in sent and 'mask' not in sent
+            try:
+                raw_post(port, '/v1/images/edits', multipart.replace(b'name="image"', b'name="other"'),
+                         {'Content-Type': f'multipart/form-data; boundary={boundary}'})
+                raise AssertionError('expected 400 without image')
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400
+            # JSON edits without a model go to the default edit sibling unchanged.
+            plain = b'{"prompt":"x","image_base64":"aGk="}'
+            assert raw_post(port, '/v1/images/edits', plain)[1] == RESPONSE
+            assert Sibling.seen[-1][0] == '/worker/v1/images/edits' and Sibling.seen[-1][1] == plain
             # An external caller cannot forward its claimed paid tier.
             assert raw_post(port, '/v1/images/generations', body,
                             {'X-Forwarded-For': '203.0.113.1'})[0] == 201
@@ -114,10 +145,10 @@ def main():
                 payload['nested'] = {'model': 'ra2'}
                 code, response = post(port, '/v1/images/generations', payload, {'X-API-Key': CALLER_KEY})
                 assert code == 200 and 'data' in response, (code, response)
-            assert len(Sibling.seen) == 4
-            assert status(port)['image_model_upstreams']['ra2']['relay_total'] == 4
+            assert len(Sibling.seen) == 6
+            assert status(port)['image_model_upstreams']['ra2']['relay_total'] == 6
             with urllib.request.urlopen(f'http://127.0.0.1:{port}/metrics') as response:
-                assert b'omniserve_image_model_relay_total{model="ra2"} 4\n' in response.read()
+                assert b'omniserve_image_model_relay_total{model="ra2"} 6\n' in response.read()
             # A transport failure releases the shared permit too.
             Sibling.fail = True
             try:
