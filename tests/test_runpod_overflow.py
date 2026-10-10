@@ -162,5 +162,92 @@ class BreakerTests(unittest.TestCase):
         self.assertEqual(b.state()["consecutive_failures"], 0)
 
 
+class PrimaryHealthTests(unittest.TestCase):
+    def setUp(self):
+        self.mod = load({"RUNPOD_API_KEY": "k", "PRIMARY_UPSTREAM": "http://127.0.0.1:9",
+                         "PRIMARY_BREAKER_S": "60"})
+        self.replies = []
+        self.calls = 0
+
+        def fake_post(path, raw, headers):
+            self.calls += 1
+            return self.replies.pop(0)
+
+        self.mod.post_primary = fake_post
+
+    def test_client_errors_do_not_lock_the_primary_out(self):
+        for code in (403, 404):
+            self.replies.append((code, b"{}", None))
+            self.assertIsNone(self.mod.try_primary("/v1/images/generations", b"{}", "paid"))
+            state = self.mod.PRIMARY_BREAKER.state()
+            self.assertFalse(state["open"])
+            self.assertEqual(state["consecutive_failures"], 0)
+        self.replies.append((200, b"{}", None))
+        self.assertEqual(self.mod.try_primary("/v1/images/generations", b"{}", "paid"), (200, b"{}"))
+
+    def test_429_throttles_for_retry_after_without_opening_the_breaker(self):
+        self.replies.append((429, b"{}", "7"))
+        self.assertIsNone(self.mod.try_primary("/p", b"{}", ""))
+        self.assertFalse(self.mod.PRIMARY_BREAKER.state()["open"])
+        self.assertEqual(self.mod.PRIMARY_BREAKER.state()["consecutive_failures"], 0)
+        before = self.calls
+        self.assertIsNone(self.mod.try_primary("/p", b"{}", ""))  # throttled: not even attempted
+        self.assertEqual(self.calls, before)
+        self.assertGreater(self.mod._primary_throttle_until - time.monotonic(), 5)
+        self.mod._primary_throttle_until = 0.0
+        self.replies.append((200, b"ok", None))
+        self.assertEqual(self.mod.try_primary("/p", b"{}", ""), (200, b"ok"))
+
+    def test_retry_after_parsing_is_bounded(self):
+        p = self.mod.parse_retry_after
+        self.assertEqual(p("3"), 3.0)
+        self.assertEqual(p(None), self.mod.PRIMARY_THROTTLE_DEFAULT_S)
+        self.assertEqual(p("Wed, 21 Oct 2026 07:28:00 GMT"), self.mod.PRIMARY_THROTTLE_DEFAULT_S)
+        self.assertEqual(p("99999"), self.mod.PRIMARY_THROTTLE_MAX_S)
+        self.assertEqual(p("-1"), self.mod.PRIMARY_THROTTLE_DEFAULT_S)
+
+    def test_server_errors_still_open_the_breaker(self):
+        self.replies.append((530, b"", None))
+        self.assertIsNone(self.mod.try_primary("/p", b"{}", ""))
+        self.assertTrue(self.mod.PRIMARY_BREAKER.state()["open"])
+
+
+class RunJobBudgetTests(unittest.TestCase):
+    class Stub:
+        path = "/v1/images/generations"
+
+    def run_with_status(self, status):
+        mod = load({"RUNPOD_API_KEY": "k", "RUNPOD_RA2_ENDPOINTS": "ep1"})
+        calls = []
+
+        def fake(method, path, body=None, endpoint=None):
+            calls.append((method, path))
+            if path == "/run":
+                return {"id": "job1"}
+            return {"status": status} if path.startswith("/status") else {}
+
+        mod.runpod = fake
+        orig = mod.time.sleep
+        mod.time.sleep = lambda s: orig(0.01)
+        try:
+            result = mod.Handler.run_job(self.Stub(), "ep1", {"prompt": "x"}, mod.WORKLOAD, "paid",
+                                         time.monotonic(), 0.2, [])
+        finally:
+            mod.time.sleep = orig
+        return mod, result, calls
+
+    def test_budget_exhaustion_while_running_is_a_timeout_not_a_breaker_failure(self):
+        for status in ("IN_PROGRESS", "IN_QUEUE"):
+            mod, (code, obj, retry), calls = self.run_with_status(status)
+            self.assertEqual((code, retry), (504, False), status)
+            self.assertEqual(mod.breaker("ep1").state()["consecutive_failures"], 0, status)
+            self.assertIn(("POST", "/cancel/job1"), calls)
+
+    def test_failed_job_still_counts_against_the_breaker(self):
+        mod, (code, obj, retry), calls = self.run_with_status("FAILED")
+        self.assertEqual((code, retry), (502, True))
+        self.assertEqual(mod.breaker("ep1").state()["consecutive_failures"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

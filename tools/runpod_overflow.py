@@ -138,7 +138,7 @@ def pick_endpoint(tier, workload=None):
 
 
 def post_primary(path, raw, headers):
-    """POST with a short connect timeout and the long render timeout only for the response."""
+    """(status, body, Retry-After header or None). POST with a short connect timeout and the long render timeout only for the response."""
     url = urllib.parse.urlsplit(PRIMARY + path)
     cls = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
     conn = cls(url.hostname, url.port, timeout=PRIMARY_CONNECT_S)
@@ -147,14 +147,38 @@ def post_primary(path, raw, headers):
         conn.sock.settimeout(PRIMARY_TIMEOUT_S)
         conn.request("POST", url.path + ("?" + url.query if url.query else ""), body=raw, headers=headers)
         r = conn.getresponse()
-        return r.status, r.read()
+        return r.status, r.read(), r.getheader("Retry-After")
     finally:
         conn.close()
 
 
+# A 429 from the primary is "slow down", not "dead": back off for Retry-After instead of
+# tripping the (one-failure) dead-primary breaker. Requests meanwhile go to RunPod.
+PRIMARY_THROTTLE_DEFAULT_S = float(os.environ.get("PRIMARY_THROTTLE_DEFAULT_S", "5"))
+PRIMARY_THROTTLE_MAX_S = float(os.environ.get("PRIMARY_THROTTLE_MAX_S", "120"))
+_primary_throttle_until = 0.0
+
+
+def parse_retry_after(value):
+    """Seconds from a Retry-After header (delta-seconds form), bounded; default when absent/bad."""
+    try:
+        seconds = float(str(value).strip())
+    except (TypeError, ValueError):
+        return PRIMARY_THROTTLE_DEFAULT_S
+    if seconds != seconds or seconds <= 0:
+        return PRIMARY_THROTTLE_DEFAULT_S
+    return min(seconds, PRIMARY_THROTTLE_MAX_S)
+
+
 def try_primary(path, raw, tier):
-    """Return (status, body) from the primary gateway, or None to fall back."""
-    if not PRIMARY or not PRIMARY_BREAKER.allow():
+    """Return (status, body) from the primary gateway, or None to fall back.
+
+    Only a primary that is actually unhealthy (5xx, transport error) feeds the breaker. 403/404 are
+    about this request (auth, route) and 429 is throttling: the primary answered, so it is alive;
+    we still fall back for this request, but a single such reply must not lock the primary out.
+    """
+    global _primary_throttle_until
+    if not PRIMARY or time.monotonic() < _primary_throttle_until or not PRIMARY_BREAKER.allow():
         return None
     headers = {"Content-Type": "application/json", "User-Agent": UA}
     if PRIMARY_TOKEN:
@@ -162,10 +186,17 @@ def try_primary(path, raw, tier):
     if tier:
         headers["X-Omniserve-Tier"] = tier
     try:
-        code, payload = post_primary(path, raw, headers)
+        code, payload, retry_after = post_primary(path, raw, headers)
         if code < 500 and code not in (403, 404, 429):
             PRIMARY_BREAKER.record(True)
             return code, payload
+        if code < 500:
+            PRIMARY_BREAKER.record(True)  # reachable: do not count against primary health
+            if code == 429:
+                _primary_throttle_until = time.monotonic() + parse_retry_after(retry_after)
+            print(f"primary {code} (client-side/throttle, not a health failure); falling back to runpod",
+                  flush=True)
+            return None
         print(f"primary {code}; falling back to runpod", flush=True)
     except Exception as exc:
         print(f"primary unavailable ({type(exc).__name__}); falling back to runpod", flush=True)
@@ -234,8 +265,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         brk = breaker(endpoint)
         state, status, job_id = {}, "SUBMIT_FAILED", None
 
-        def done(code, obj, ok, retry):
-            brk.record(ok)
+        def done(code, obj, ok, retry, count=True):
+            if count:
+                brk.record(ok)
             ledger(workload=workload, backend="runpod", endpoint=endpoint, tier=tier or "free", status=status,
                    job_id=job_id, queue_ms=state.get("delayTime"), exec_ms=state.get("executionTime"),
                    wall_ms=(time.monotonic() - started) * 1000, quality_tier="equal",
@@ -255,7 +287,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         submitted = time.monotonic()
         status = "TIMED_OUT"
         poll_errors = 0
-        while time.monotonic() - submitted < budget_s:
+        while True:
+            if time.monotonic() - submitted >= budget_s:
+                break
             try:
                 state = runpod("GET", "/status/" + job_id, None, endpoint)
                 poll_errors = 0
@@ -281,13 +315,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 status = "QUEUE_STALL"
                 break
             time.sleep(1.0 if status == "IN_PROGRESS" else 1.5)
+        # Leaving the loop with the job still IN_QUEUE/IN_PROGRESS means our budget ran out, not
+        # that the endpoint failed: a timeout (504), not retried and not charged to the breaker.
+        budget_exhausted = status in ("TIMED_OUT", "IN_PROGRESS", "IN_QUEUE")
+        if budget_exhausted:
+            status = "TIMED_OUT"
         try:
             runpod("POST", "/cancel/" + job_id, None, endpoint)
         except Exception:
             pass
-        timed_out = status == "TIMED_OUT"
-        return done(504 if timed_out else 502, {"error": {"message": f"runpod overflow {status.lower()}"}},
-                    False, not timed_out)
+        return done(504 if budget_exhausted else 502,
+                    {"error": {"message": f"runpod overflow {status.lower()}"}},
+                    False, not budget_exhausted, count=not budget_exhausted)
 
     def do_POST(self):
         if TOKEN and self.headers.get("Authorization", "") != "Bearer " + TOKEN:
