@@ -83,6 +83,12 @@ _SIGNING_PARAMS = {
 }
 
 
+# A URL is only treated as signed when one of these is present. A bare "se" or
+# "token" parameter on an ordinary URL is content, not a signature, and
+# stripping it would make different images share a cache entry.
+_SIGNATURE_MARKERS = {"sig", "signature", "x-amz-signature", "x-goog-signature"}
+
+
 def _normalise_url(url: str) -> str:
     """Drops volatile signing parameters so a rotating signed URL for the same
     asset still hits one cache entry, while keeping every parameter that can
@@ -90,12 +96,12 @@ def _normalise_url(url: str) -> str:
     parsed = urlparse(url.strip())
     if not parsed.scheme:
         return url.strip()
+    parts = [part for part in parsed.query.split("&") if part]
+    signed = any(part.split("=")[0].lower() in _SIGNATURE_MARKERS for part in parts)
     keep = []
-    for part in parsed.query.split("&"):
-        if not part:
-            continue
+    for part in parts:
         name = part.split("=")[0].lower()
-        if name in _SIGNING_PARAMS or name.startswith("x-amz-") or name.startswith("x-goog-"):
+        if signed and (name in _SIGNING_PARAMS or name.startswith("x-amz-") or name.startswith("x-goog-")):
             continue
         keep.append(part)
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path}" + ("?" + "&".join(sorted(keep)) if keep else "")
