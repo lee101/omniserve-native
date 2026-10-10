@@ -276,6 +276,12 @@ if(Python3_Interpreter_FOUND)
         set_tests_properties(image_overflow_routing PROPERTIES
             ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
         add_test(
+            NAME residency_inert
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_residency_inert.py"
+        )
+        set_tests_properties(residency_inert PROPERTIES
+            ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
+        add_test(
             NAME image_frontier_routing
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_image_frontier_routing.py"
         )
