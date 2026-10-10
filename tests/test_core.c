@@ -359,6 +359,7 @@ static void test_openapi(void) {
         "/api/v1/audio-extraction", "/api/v1/generate",
         "/api/v1/generate-large", "/api/v1/image-caption",
         "/v1/animations/generations", "/v1/3d/generations",
+        "/v1/expression-pack",
         "/v1/images/backgrounds",
         "/v1/images/segmentations", "/v1/images/text-layers", "/v1/images/edits",
         "/v1/images/foreground-generations/jobs",

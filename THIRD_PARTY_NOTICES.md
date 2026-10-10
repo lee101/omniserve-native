@@ -10,6 +10,7 @@ model artifact:
 - stable-diffusion.cpp
 - NVIDIA CUDA, NVML, PyTorch, NeMo, and Parakeet models
 - Hugging Face Transformers, Datasets, Hub, and model repositories
+- Depth Anything V2 Small, Apache-2.0; Base, Large and Giant are not used because their weights are CC-BY-NC-4.0
 - Microsoft TRELLIS.2 and its gated DINOv3 dependency
 - BiRefNet
 - FastAPI, Uvicorn, SoundFile, jiwer, and python-multipart

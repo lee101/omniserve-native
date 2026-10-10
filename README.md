@@ -99,6 +99,7 @@ OMNISERVE_NATIVE_FORECAST_UPSTREAM=http://127.0.0.1:8101 \
 OMNISERVE_NATIVE_EMBEDDING_UPSTREAM=http://127.0.0.1:9083 \
 OMNISERVE_NATIVE_MULTIMODAL_UPSTREAM=http://127.0.0.1:9083 \
 OMNISERVE_NATIVE_ANIMATION_UPSTREAM=http://127.0.0.1:9092 \
+OMNISERVE_NATIVE_LIVEPORTRAIT_UPSTREAM=http://127.0.0.1:9095 \
 OMNISERVE_NATIVE_3D_UPSTREAM=http://127.0.0.1:9093 \
 OMNISERVE_NATIVE_AUX_UPSTREAM=http://127.0.0.1:9083 \
 OMNISERVE_NATIVE_SLOTS=4 \
@@ -152,6 +153,16 @@ checkpoint and exits rather than pausing while retaining VRAM. See
 consent, WER release gates, and Hugging Face publication.
 
 Worker APIs sometimes use different paths for the same operation. Configure `IMAGE_GENERATE_PATH`, `TTS_PATH`, `TTS_OPENAI_PATH`, `STT_FILE_PATH`, `STT_URL_PATH`, `STT_OPENAI_PATH`, and `CAPTION_PATH` (all with the `OMNISERVE_NATIVE_` prefix) to rewrite only the upstream request path while preserving the public path and query string. This avoids false-positive route support from blind same-path proxying.
+
+LivePortrait uses a dedicated `/v1/expression-pack` C lane and permit count. `workers/liveportrait_worker.py` keeps pooled upstream connections, coalesces identical in-flight portraits, and holds a bounded 24-hour pack cache. Point `OMNISERVE_NATIVE_LIVEPORTRAIT_UPSTREAM` at that worker and set its `LIVEPORTRAIT_UPSTREAM` to the local inference process or the managed fallback.
+
+Depth Anything V2 uses `POST /v1/depth-estimations` through a dedicated C lane and `workers/depth_anything_worker.py`. The default is `depth-anything/Depth-Anything-V2-Small-hf`, the strongest upstream checkpoint licensed for commercial use. It returns a 16-bit PNG depth map and an optional WebP preview. `DEPTH_RUNPOD_URL` sends requests to RunPod when the local worker is occupied. Charge 1 credit per image; a current RunPod 24 GB flex worker costs about $0.00019-$0.00031 per second, leaving room for cold-start, bandwidth, storage and failed jobs while keeping the request at $0.01 retail.
+
+Depth PNGs use compression level 1 by default (`DEPTH_PNG_COMPRESS_LEVEL`) because
+the decoded 16-bit values are identical while a 1024px encode measured 58.9 ms
+instead of 73.1 ms with Pillow's optimize pass. LivePortrait cache identity
+ignores only known volatile CDN signing parameters, so renewed signed URLs reuse
+an existing expression pack without conflating byte-changing resize/style queries.
 
 ## GPU placement is checked, not assumed
 
@@ -631,6 +642,7 @@ while headroom stays high means leases are being held, not that VRAM ran out.
 - Image: `POST /v1/images/generations`
 - Foreground image generation: `POST /v1/images/foreground-generations/jobs` combines text-to-image and BiRefNet matting in one queued stage
 - Background removal: `POST /v1/images/background-removals` or `/api/v1/birefnet`
+- Depth estimation: `POST /v1/depth-estimations` or `/api/v1/depth-anything-v2`
 - TTS: `POST /v1/audio/speech` and `/api/v1/generate_speech`
 - STT: `POST /v1/audio/transcriptions`, `/api/v1/audio/transcribe`, `/api/v1/audio-file-extraction`, and `/api/v1/audio-extraction`
 - Multimodal: `POST /api/v1/image-caption`, `/api/v1/video-question`, `/api/v1/multimodal-generate`, and `/api/v1/voice-chat`
@@ -743,6 +755,7 @@ python -m venv .venv
 HF_HOME=/nvme0n1-disk/models/huggingface \
 BIREFNET_MODEL=ZhengPeng7/BiRefNet \
 .venv/bin/python workers/birefnet_worker.py --port 9094
+.venv/bin/python workers/depth_anything_worker.py --port 9099
 
 OMNISERVE_NATIVE_BIREFNET_UPSTREAM=http://127.0.0.1:9094 \
 OMNISERVE_NATIVE_BIREFNET_PERMITS=2 \

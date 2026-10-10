@@ -21,6 +21,22 @@ PARAMS = {"format": "webp", "threshold": 0.0, "decontaminate": True, "quality": 
 
 
 class CacheKeyTest(unittest.TestCase):
+    def test_short_params_on_unsigned_urls_are_content(self):
+        base = "https://cdn.example.com/render?id=7"
+        keys = {object_store.cache_key(f"{base}&{extra}", PARAMS)
+                for extra in ("se=1", "se=2", "sp=r", "st=a", "sv=1", "sr=b", "token=x", "expires=9")}
+        self.assertEqual(len(keys), 8, "unsigned URLs differing in se/sp/... must not collide")
+
+    def test_signed_urls_still_collapse_when_only_the_signature_rotates(self):
+        one = "https://acct.blob.core.windows.net/c/a.jpg?sv=2020&se=2026-01-01&sp=r&sig=AAA"
+        two = "https://acct.blob.core.windows.net/c/a.jpg?sv=2021&se=2027-01-01&sp=r&sig=BBB"
+        self.assertEqual(object_store.cache_key(one, PARAMS), object_store.cache_key(two, PARAMS))
+        amz1 = "https://b.s3.amazonaws.com/a.jpg?X-Amz-Signature=1&X-Amz-Expires=60&v=2"
+        amz2 = "https://b.s3.amazonaws.com/a.jpg?X-Amz-Signature=2&X-Amz-Expires=90&v=2"
+        amz3 = "https://b.s3.amazonaws.com/a.jpg?X-Amz-Signature=2&X-Amz-Expires=90&v=3"
+        self.assertEqual(object_store.cache_key(amz1, PARAMS), object_store.cache_key(amz2, PARAMS))
+        self.assertNotEqual(object_store.cache_key(amz1, PARAMS), object_store.cache_key(amz3, PARAMS))
+
     def test_same_input_same_key(self):
         first = object_store.cache_key("https://cdn.example.com/a/chair.jpg", PARAMS)
         second = object_store.cache_key("https://cdn.example.com/a/chair.jpg", dict(PARAMS))
