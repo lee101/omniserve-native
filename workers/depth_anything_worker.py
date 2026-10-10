@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gc
 import io
+import logging
 import os
 import threading
 import time
@@ -31,6 +33,8 @@ OVERFLOW_URL = os.getenv("DEPTH_RUNPOD_URL", "").rstrip("/")
 OVERFLOW_KEY = os.getenv("DEPTH_RUNPOD_API_KEY", "")
 OVERFLOW_TIMEOUT = float(os.getenv("DEPTH_RUNPOD_TIMEOUT_SECONDS", "120"))
 PRICE_CREDITS = int(os.getenv("DEPTH_PRICE_CREDITS", "1"))
+IDLE_TIMEOUT_SECONDS = float(os.getenv("DEPTH_IDLE_TIMEOUT", "24"))
+log = logging.getLogger("depth_anything_worker")
 
 
 class DepthRequest(BaseModel):
@@ -49,6 +53,61 @@ class Runtime:
 runtime = Runtime()
 local_slots = threading.BoundedSemaphore(max(1, LOCAL_CONCURRENCY))
 session = requests.Session()
+_last_used = time.monotonic()
+_idle_timer: threading.Timer | None = None
+_idle_lock = threading.Lock()
+
+
+def _schedule_unload() -> None:
+    global _idle_timer
+    if IDLE_TIMEOUT_SECONDS <= 0:
+        return
+    with _idle_lock:
+        if _idle_timer is not None:
+            _idle_timer.cancel()
+        timer = threading.Timer(IDLE_TIMEOUT_SECONDS, _maybe_unload)
+        timer.daemon = True
+        _idle_timer = timer
+        timer.start()
+
+
+def _touch() -> None:
+    global _last_used
+    _last_used = time.monotonic()
+    _schedule_unload()
+
+
+def _maybe_unload() -> None:
+    if IDLE_TIMEOUT_SECONDS <= 0:
+        return
+    if time.monotonic() - _last_used < IDLE_TIMEOUT_SECONDS:
+        return
+    unload_model()
+
+
+def unload_model() -> bool:
+    if runtime.model is None and runtime.processor is None:
+        return False
+    runtime.model = None
+    runtime.processor = None
+    gc.collect()
+    try:
+        if DEVICE.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception as error:
+        log.warning("depth VRAM release failed: %s", error)
+        return False
+    return True
+
+
+def ensure_model() -> None:
+    if runtime.model is not None and runtime.processor is not None:
+        _touch()
+        return
+    load_model()
+    _touch()
 
 
 def load_model() -> None:
@@ -150,8 +209,8 @@ def encode_preview(normalized: np.ndarray) -> bytes:
 
 @torch.inference_mode()
 def infer(request: DepthRequest) -> dict[str, Any]:
-    if runtime.model is None or runtime.processor is None:
-        raise HTTPException(503, "Depth Anything V2 is not loaded")
+    ensure_model()
+    assert runtime.model is not None and runtime.processor is not None
     image = read_image(request.image_url)
     inputs = runtime.processor(images=image, return_tensors="pt")
     pixel_values = inputs["pixel_values"].to(DEVICE, dtype=runtime.dtype)
@@ -205,8 +264,9 @@ def run_overflow(request: DepthRequest) -> dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    load_model()
     yield
+    if _idle_timer is not None:
+        _idle_timer.cancel()
     session.close()
 
 
@@ -215,7 +275,7 @@ app = FastAPI(title="OmniServe Depth Anything V2", version="1.0", lifespan=lifes
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ready": runtime.model is not None, "model": MODEL_ID, "device": DEVICE, "overflow": bool(OVERFLOW_URL), "credits": PRICE_CREDITS}
+    return {"ready": runtime.model is not None, "model": MODEL_ID, "device": DEVICE, "overflow": bool(OVERFLOW_URL), "credits": PRICE_CREDITS, "idle_timeout": IDLE_TIMEOUT_SECONDS}
 
 
 @app.post("/v1/depth-estimations")
@@ -226,6 +286,7 @@ def depth_estimation(request: DepthRequest) -> dict[str, Any]:
         return infer(request)
     finally:
         local_slots.release()
+        _touch()
 
 
 if __name__ == "__main__":
