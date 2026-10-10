@@ -584,7 +584,7 @@ static bool auth_gate(ohttp_request *req, const app_state *app) {
     const char *cred = request_credential(req, &len);
     if (request_key_tier(req) >= 0 ||
         (app->secret && app->secret[0] && cred && len == strlen(app->secret) &&
-         memcmp(cred, app->secret, len) == 0)) {
+         ct_eq(cred, app->secret, len))) {
         __atomic_add_fetch(&g_auth_counts[0], 1, __ATOMIC_RELAXED);
         return true;
     }
