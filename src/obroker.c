@@ -110,13 +110,25 @@ int obroker_lease(const char *base_url, const char *owner, int pid, int mb, int 
     if (status != 200) return -1;
     if (waited_ms_out) *waited_ms_out = (int)json_int(resp, "\"waited_ms\"", 0);
     if (!json_bool(resp, "\"granted\"")) return 0;
+    /* A grant without a usable lease id is not a grant: the caller could never
+     * release it (it would sit on the VRAM until its TTL). Parse the id whole -
+     * a missing, empty, unterminated (truncated response) or oversized id all
+     * count as not granted, and release whatever complete id we did see. */
+    char lease[128];
+    size_t n = 0;
+    bool complete = false;
     const char *id = strstr(resp, "\"lease_id\":\"");
-    if (id && id_out && id_cap) {
+    if (id) {
         id += 12;
-        size_t i = 0;
-        while (id[i] && id[i] != '"' && i + 1 < id_cap) { id_out[i] = id[i]; i++; }
-        id_out[i] = 0;
+        while (id[n] && id[n] != '"' && n + 1 < sizeof lease) { lease[n] = id[n]; n++; }
+        complete = id[n] == '"';
+        lease[n] = 0;
     }
+    if (!id || !complete || n == 0 || (id_out && id_cap && n + 1 > id_cap)) {
+        if (complete && n > 0) obroker_release(base_url, lease);
+        return 0;
+    }
+    if (id_out && id_cap) memcpy(id_out, lease, n + 1);
     long granted = json_int(resp, "\"mb\"", 0);
     return granted > 0 ? (int)granted : 0;
 }
