@@ -1,0 +1,11 @@
+# sd.cpp early-exit model: exit when b + sum(w*feature) >= logit and ltaylor <= veto
+bias -43.9997021
+logit 0.449472533
+veto_ltaylor 1e+09
+min_frac 0.364
+n_steps 30
+w frac -0.00987648108
+w lsigma -4.17381536
+w ldx -5.19634766
+w ld0 -6.22515033
+w ld0_prev -1.7256398

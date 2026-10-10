@@ -2,9 +2,11 @@
 Description=Rebuild the OmniServe frontier routing table every 10 minutes
 
 [Timer]
+OnCalendar=*:0/10
 OnBootSec=2min
 OnUnitActiveSec=10min
 Persistent=true
+AccuracySec=30s
 
 [Install]
 WantedBy=timers.target
