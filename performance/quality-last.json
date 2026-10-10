@@ -28,7 +28,7 @@
     {
       "check": "gateway.vram_readable",
       "ok": true,
-      "detail": "free=29.43 GiB"
+      "detail": "free=11.31 GiB"
     },
     {
       "check": "gateway.models_listed",
@@ -44,7 +44,7 @@
     {
       "check": "embedding.reachable",
       "ok": true,
-      "detail": "http=200 dims=768 36ms"
+      "detail": "http=200 dims=768 206ms"
     },
     {
       "check": "embedding.determinism",
@@ -87,7 +87,7 @@
     {
       "check": "image.reachable",
       "ok": true,
-      "detail": "http=200 13957ms"
+      "detail": "http=200 29663ms"
     },
     {
       "check": "image.envelope",

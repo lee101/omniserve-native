@@ -68,7 +68,8 @@ class RequestValidationTests(unittest.TestCase):
 
     def test_missing_optional_model_fails_before_gpu_probe(self) -> None:
         with (
-            mock.patch.object(worker, "runtime_installed", return_value=False),
+            mock.patch.object(worker.pixal_local, "ready", return_value=False),
+            mock.patch.object(worker.remote_3d, "should_route", return_value=False),
             mock.patch.object(worker, "gpu_memory_mib") as gpu,
         ):
             status, body = self.run_validation(model=worker.MODEL_PIXAL, resolution=1024)

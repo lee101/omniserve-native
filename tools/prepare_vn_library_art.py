@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -92,7 +93,7 @@ def character_prompt(tag: str, character_name: str, project: Path, listing: dict
 
 
 def prop_prompt(name: str, project: Path, listing: dict[str, Any]) -> str:
-    title = listing.get("title") or humanize(re.sub(r"^\d\d-", "", project.name))
+    title = listing.get("title") or humanize(re.sub(r"^\d+-", "", project.name))
     return (
         f"ONE OBJECT ONLY. A solo {humanize(name)} prop from the mature visual novel {title}. "
         "Complete object, three-quarter product view, practical contemporary materials, polished painterly "
@@ -104,7 +105,7 @@ def prop_prompt(name: str, project: Path, listing: dict[str, Any]) -> str:
 
 
 def background_prompt(name: str, project: Path, listing: dict[str, Any], context: str) -> str:
-    title = listing.get("title") or humanize(re.sub(r"^\d\d-", "", project.name))
+    title = listing.get("title") or humanize(re.sub(r"^\d+-", "", project.name))
     period = listing.get("period", "")
     return (
         f"Empty, unoccupied {humanize(name)}, an establishing environment for the mature visual novel {title}. "
@@ -117,7 +118,7 @@ def background_prompt(name: str, project: Path, listing: dict[str, Any], context
     )
 
 
-def prepare_project(project: Path, apply: bool) -> dict[str, int]:
+def prepare_project(project: Path, apply: bool, model: str = "") -> dict[str, int]:
     game = project / "game"
     scripts = sorted(game.glob("*.rpy"))
     listing = read_json(project / "listing.json")
@@ -201,7 +202,8 @@ def prepare_project(project: Path, apply: bool) -> dict[str, int]:
     plan = {
         "version": 1,
         "project": project.name,
-        "generator": "OmniServe Z-Image backgrounds plus one-stage Z-Image/BiRefNet foreground jobs",
+        "generator": "OmniServe backgrounds plus one-stage OmniServe/BiRefNet foreground jobs",
+        "model": model,
         "background_size": [1280, 720],
         "background_source_size": [640, 384],
         "sprite_source_size": [512, 768],
@@ -222,18 +224,29 @@ def prepare_project(project: Path, apply: bool) -> dict[str, int]:
             "rewrites": sum(map(len, replacements.values()))}
 
 
+def discover_projects(library: Path) -> list[Path]:
+    if not library.is_dir():
+        return []
+    return sorted(
+        project for project in library.iterdir()
+        if project.is_dir() and re.fullmatch(r"\d+-[a-z0-9]+(?:-[a-z0-9]+)*", project.name)
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("library", type=Path)
     parser.add_argument("--only", default="")
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--model", default=os.getenv("OMNISERVE_IMAGE_MODEL", ""),
+                        help="stamped into art-plan.json; generate_vn_art.py routes on it")
     args = parser.parse_args()
     only = {item.strip() for item in args.only.split(",") if item.strip()}
     totals = {"projects": 0, "backgrounds": 0, "sprites": 0, "rewrites": 0}
-    for project in sorted(args.library.glob("[0-9][0-9]-*")):
+    for project in discover_projects(args.library):
         if only and project.name not in only:
             continue
-        result = prepare_project(project, args.apply)
+        result = prepare_project(project, args.apply, args.model)
         if not result["backgrounds"] and not result["sprites"] and not result["rewrites"]:
             continue
         totals["projects"] += 1

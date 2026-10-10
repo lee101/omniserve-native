@@ -75,8 +75,12 @@ def atomic_save(image: Image.Image, target: Path) -> None:
     temporary.replace(target)
 
 
-def render_background(base: str, prompt: str, seed: int, width: int, height: int) -> Image.Image:
-    image = post_image(f"{base}/v1/images/backgrounds", {
+def render_background(base: str, prompt: str, seed: int, width: int, height: int,
+                      model: str = "") -> Image.Image:
+    # Only /v1/images/generations (and /edits, /img2img) consult the body's
+    # `model`; /v1/images/backgrounds proxies to the art lane and ignores it, so
+    # a named model has to be asked for on the route that reads it.
+    payload: dict[str, Any] = {
         "prompt": prompt,
         "width": width,
         "height": height,
@@ -84,12 +88,17 @@ def render_background(base: str, prompt: str, seed: int, width: int, height: int
         "seed": seed,
         "low_priority": True,
         "teleport": True,
-    })
+    }
+    if model:
+        payload["model"] = model
+    image = post_image(f"{base}/v1/images/generations" if model else f"{base}/v1/images/backgrounds",
+                       payload)
     return ImageOps.fit(image.convert("RGB"), (width, height), method=Image.Resampling.LANCZOS)
-
 
 def render_foreground(base: str, prompt: str, seed: int, width: int, height: int,
                       timeout: int) -> Image.Image:
+    # The async cutout lane owns its own model and never reads `model`; sprites
+    # are rendered by the art worker whatever the backgrounds use.
     queued = request_json(f"{base}/v1/images/foreground-generations/jobs", "POST", {
         "prompt": prompt,
         "width": width,
@@ -211,6 +220,9 @@ def main() -> int:
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--kinds", choices=("all", "backgrounds", "sprites"), default="all")
+    parser.add_argument("--model", default=None,
+                        help="image model the gateway routes on; defaults to the art plan's, "
+                             "then OMNISERVE_IMAGE_MODEL, then the gateway's own default")
     args = parser.parse_args()
 
     manifest = json.loads(args.manifest.read_text())
@@ -223,6 +235,8 @@ def main() -> int:
     sprite_canvas = tuple(manifest.get("sprite_canvas", [620, 500]))
     background_style = manifest.get("background_style", "")
     sprite_style = manifest.get("sprite_style", "")
+    model = args.model or manifest.get("model") or os.getenv("OMNISERVE_IMAGE_MODEL", "")
+    print(f"model: {model or '<gateway default>'}", flush=True)
     failures: list[str] = []
     made = 0
 
@@ -230,6 +244,9 @@ def main() -> int:
                         if args.kinds != "sprites" and selected(item["name"], only)]
     sprite_items = [item for item in manifest.get("sprites", [])
                     if args.kinds != "backgrounds" and selected(item["name"], only)]
+    if model and sprite_items:
+        print("note: sprite cutouts ignore --model; the gateway's background-removal lane "
+              "owns its own model, so only backgrounds are routed to it", file=sys.stderr, flush=True)
     for item in background_items + sprite_items:
         if not isinstance(item.get("prompt"), str) or not item["prompt"].strip():
             parser.error(f"manifest item {item.get('name', '<unknown>')} has an empty prompt")
@@ -253,7 +270,8 @@ def main() -> int:
         for attempt in range(args.retries + 1):
             try:
                 image = render_background(base, prompt, int(item.get("seed", 0)) + attempt * 100003,
-                                          int(background_source_size[0]), int(background_source_size[1]))
+                                          int(background_source_size[0]), int(background_source_size[1]),
+                                          model)
                 image = ImageOps.fit(image, (int(background_size[0]), int(background_size[1])),
                                      method=Image.Resampling.LANCZOS)
                 validate_background(image, int(background_size[0]), int(background_size[1]))
@@ -287,7 +305,6 @@ def main() -> int:
         for attempt in range(args.retries + 1):
             try:
                 cutout = render_foreground(base, prompt, int(item.get("seed", 0)) + attempt * 100003,
-                                           int(sprite_source_size[0]), int(sprite_source_size[1]),
                                            args.timeout)
                 sprite_image = layout_sprite(
                     cutout, int(sprite_canvas[0]), int(sprite_canvas[1]),
