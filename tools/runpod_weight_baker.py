@@ -33,6 +33,9 @@ face = p.has("face_refine") and os.getenv("H3_FACE_REFINE_ENABLED", "1").lower()
 t = time.time()
 got = ensure_weights(include_ref2va=p.has("ref2va") and not lazy, include_face_refine=face, include_turbo=p.has("turbo"), quant=os.getenv("H3_QUANT"))
 print("profile", p.name, sorted(p.models), "files", len(got), "s", round(time.time() - t))
+if os.getenv("H3_ACCEL_PROFILE", "").strip().lower() == "wuli-turbo4":
+    from weights import ensure_wuli_turbo
+    print("wuli", ensure_wuli_turbo(), "s", round(time.time() - t))
 '''
 
 PIXAL_FETCH = r'''
