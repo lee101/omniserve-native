@@ -31,6 +31,16 @@ typedef struct {
     float min_probability;
     int top_k;
     float repetition_penalty;
+    /* Tokens of history the penalties look back over; 0 picks the server
+     * default, negative means the whole context. */
+    int repetition_last_n;
+    float frequency_penalty;
+    float presence_penalty;
+    /* DRY: penalises extending a sequence already seen, so speaker names and
+     * formatting survive where a per-token penalty would push them out. */
+    float dry_multiplier;
+    float dry_base;
+    int dry_allowed_length;
     int64_t seed;
     bool enable_thinking;
     const char *const *stop_sequences;
