@@ -1,4 +1,5 @@
 import importlib
+import pytest
 import json
 from pathlib import Path
 import subprocess
@@ -210,3 +211,28 @@ def test_broker_denial_happens_before_plugin_import(monkeypatch):
 
     assert imported == []
     assert runtime._loaded_modules == {}
+
+
+def test_preload_warms_workloads_before_serving(monkeypatch):
+    runtime = importlib.import_module("runtime.handler")
+    events = []
+
+    class Module:
+        def warmup(self):
+            events.append("warmup")
+
+    definition = {"name": "anime-pose-control", "module": "test.pose", "required_mib": 20}
+    monkeypatch.setattr(runtime, "_load_registry", lambda: {"anime-pose-control": definition})
+    monkeypatch.setattr(runtime, "ENFORCE_VRAM", False)
+    monkeypatch.setattr(runtime.importlib, "import_module", lambda _name: Module())
+    monkeypatch.setattr(runtime, "_acquire_vram_lease", lambda required, name: {"granted": True, "brokered": False, "mb": 0})
+    monkeypatch.setattr(runtime, "_release_vram_lease", lambda lease: events.append("release"))
+    runtime._loaded_modules.clear()
+
+    assert runtime.preload(["anime-pose-control", " "]) == ["anime-pose-control"]
+    assert events == ["warmup", "release"]
+    assert "anime-pose-control" in runtime._loaded_modules
+    assert runtime.preload(["anime-pose-control"]) == []
+    with pytest.raises(ValueError, match="unknown workload"):
+        runtime.preload(["nope"])
+    runtime._loaded_modules.clear()

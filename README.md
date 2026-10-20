@@ -1209,3 +1209,28 @@ OMNISERVE_PROXY_PROXY_IMAGE=http://127.0.0.1:8791
 Authenticated `POST /v1/music/generations` relays lyrics and musical direction
 to the local YuE2 worker with memory-aware RunPod overflow. See
 [quality, pricing, configuration and validation](performance/yue2-music.md).
+
+## Anime control workloads
+
+Four registry workloads share `workloads/anime_control_core.py` (the 28-block Anima v1.0 DiT and LLM adapter, one sampler with per-step hooks, compile cache, warmup). Each loads its own pipeline, so serve them from separate endpoints or let the registry swap them by VRAM.
+
+| workload | aliases | conditioning | extra cost per step | inputs besides prompt/size/steps/seed |
+| --- | --- | --- | --- | --- |
+| `anime-pose-control` | `pose-control`, `anime-pose` | rtmlib skeleton (CPU), VAE latent added at patch-embed, adapter LoRA merged at load | none | `reference_image`, `control_strength`, `skeleton_style`, `hands`, `face`, `feet` |
+| `anime-regional-control` | `regional-control` | ControlNet-LLLite v2 on every self-attention q/k/v input | about 1% | `region_mask` or `regions` (rectangles), `control_strength`, `control_start`, `control_end` |
+| `anime-depth-control` | `depth-control` | VACE: four extra blocks, hints added after base blocks 0/7/14/21 | about 15% | `depth_image` or `reference_image` (estimated), `control_strength`, `control_start`, `control_end`, `invert_depth` |
+| `anime-sketch-control` | `sketch-control`, `canny-control` | Canny/scribble LoRA merged at load, control latent as a second frame | about 80% (double tokens) | `reference_image` (canny) or `edge_image`, `canny_low`, `canny_high` |
+
+Common inputs: `prompt`, `negative_prompt`, `width`/`height` (multiples of 16, 512-1024, at most 1 MP), `num_inference_steps` (24), `guidance_scale` (4), `cfg_cutoff` (0.6), `seed`, `output_format`. Each returns the image plus the control map it used, and a `timings` object. Regional colours do not bind to prompt words: use spatial words ("girl on the left") for that. The sketch LoRA was trained on Anima preview 3 and works on v1.0 with strong edge adherence (a heavy edge map can override the prompt); depth and regional adapters were trained on v1.0.
+
+Speed (shared RTX 3090 Ti, denoise only, 768 px): 28 steps 8.1 s; 24 steps with `cfg_cutoff` 0.6 (guidance dropped for the last 40% of steps, batch 2 to 1) 5.7 s, same pose and composition. 1024 px runs with automatic VAE tiling on cards under 30 GB (6 GB peak). Other levers: LoRA merged once at load, batched CFG with cached prompt embeddings, fused adaLN kernels (`anima_cog`), `torch.compile`. `max-autotune` compile did not finish in 6 minutes on this card and was dropped.
+
+Start-up: set `OMNISERVE_PRELOAD=anime-pose-control` (comma separated) and `runtime/handler.py` and `runtime/cog_pod.py` load those workloads and run their `warmup()` before accepting jobs, so no request pays for compilation. `warmup()` runs one request per size in `ANIME_CONTROL_WARMUP_SIZES` (default `1024x1024,768x768`) and writes the inductor cache to `ANIMA_COMPILE_ARTIFACT_DIR` (default `/runpod-volume/anima-compile-cache`), which later processes replay. To build it ahead of time on the target GPU:
+
+```bash
+python -m workloads.anime_pose_control --precompile 1024x1024 768x768
+```
+
+A fresh process replaying the artifact serves its first request in about 25 s instead of 85-107 s. Any package that installs an inductor post-grad pass at import (torchao does) disables the FX graph cache, so the core clears those passes before compiling.
+
+Pinned sources: `circlestone-labs/Anima` anime-base-v1.0, `Claquasse/Anima-Control-Pose` preview-2 and its detector ONNX files, `Sen-sou/Anima-LLLite-Regional-Controlnet`, `TaihoC/Anima-ControlNet-VACE-Depth`, `CabalResearch/Anima-Canny-Scribble-Adjustable-Control-LoRA`, `depth-anything/Depth-Anything-V2-Small-hf`.

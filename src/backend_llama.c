@@ -349,6 +349,13 @@ unsigned long long ollm_moe_last_est_bytes(void) {
 
 #include <dlfcn.h>
 
+#define PENALTY_LAST_N_DEFAULT 256
+
+static int penalty_last_n_default(void) {
+    const char *v = getenv("OMNISERVE_NATIVE_PENALTY_LAST_N");
+    return v && v[0] ? atoi(v) : PENALTY_LAST_N_DEFAULT;
+}
+
 /* ggml's backend-device registry lives in libggml-base, which reaches this
  * binary only as a transitive dependency of libllama. Resolving through the
  * already-loaded image keeps the link line unchanged and degrades to
@@ -2086,9 +2093,25 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
     if (req->min_probability > 0.0f)
         llama_sampler_chain_add(smpl, llama_sampler_init(&probability_capture_i, &sampled));
     float repetition = req->repetition_penalty > 0 ? req->repetition_penalty : 1.0f;
-    bool penalized = repetition != 1.0f;
+    bool dry = req->dry_multiplier > 0.0f;
+    bool penalized = repetition != 1.0f || req->frequency_penalty != 0.0f ||
+                     req->presence_penalty != 0.0f || dry;
+    int last_n = 0;
     if (penalized) {
-        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(-1, repetition, 0.0f, 0.0f));
+        /* llama.cpp clamps a negative window to 0, which silently disables the
+         * sampler, so "whole context" has to be spelled out as n_ctx. */
+        last_n = req->repetition_last_n ? req->repetition_last_n : penalty_last_n_default();
+        if (last_n < 0) last_n = (int)llama_n_ctx(slot->ctx);
+        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
+            last_n, repetition, req->frequency_penalty, req->presence_penalty));
+    }
+    if (dry) {
+        static const char *breakers[] = { "\n", ":", "\"", "*" };
+        llama_sampler_chain_add(smpl, llama_sampler_init_dry(
+            g_vocab, llama_model_n_ctx_train(g_model), req->dry_multiplier,
+            req->dry_base > 0.0f ? req->dry_base : 1.75f,
+            req->dry_allowed_length > 0 ? req->dry_allowed_length : 2, -1,
+            breakers, sizeof breakers / sizeof *breakers));
     }
     llama_sampler_chain_add(smpl, llama_sampler_init_top_k(req->top_k > 0 ? req->top_k : 40));
     llama_sampler_chain_add(smpl, llama_sampler_init_top_p(req->top_p > 0 ? req->top_p : 0.92f, 1));
@@ -2102,10 +2125,11 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
         uint32_t seed = req->seed >= 0 ? (uint32_t)req->seed : LLAMA_DEFAULT_SEED;
         llama_sampler_chain_add(smpl, llama_sampler_init_dist(seed));
     }
-    /* Only the penalty sampler keeps history, so replaying the whole prompt
-     * through the chain is wasted work on the common unpenalized path. */
+    /* Only the penalty and DRY samplers keep history; DRY spans the context. */
     if (penalized) {
-        for (int i = 0; i < n_tokens; i++) llama_sampler_accept(smpl, tokens[i]);
+        int history = dry ? n_tokens : last_n;
+        for (int i = n_tokens > history ? n_tokens - history : 0; i < n_tokens; i++)
+            llama_sampler_accept(smpl, tokens[i]);
     }
 
     size_t text_cap = 4096, text_len = 0;

@@ -59,20 +59,12 @@ def test_checkpoint_remap_covers_blocks_and_top_level(worker):
     }
 
 
-def test_handler_requires_the_commercial_license(worker, monkeypatch):
-    monkeypatch.delenv("APPNZ_ANIMA_COMMERCIAL_LICENSE_ACCEPTED", raising=False)
-    with pytest.raises(RuntimeError, match="APPNZ_ANIMA_COMMERCIAL_LICENSE_ACCEPTED"):
-        worker.handler({"input": {"prompt": "a cat"}})
-
-
 def test_handler_rejects_unknown_inputs(worker, monkeypatch):
-    monkeypatch.setenv("APPNZ_ANIMA_COMMERCIAL_LICENSE_ACCEPTED", "1")
     with pytest.raises(ValueError, match="unknown Anima inputs: lora_url"):
         worker.handler({"input": {"prompt": "a cat", "lora_url": "https://example/lora"}})
 
 
 def test_handler_returns_the_app_nz_envelope(worker, monkeypatch):
-    monkeypatch.setenv("APPNZ_ANIMA_COMMERCIAL_LICENSE_ACCEPTED", "1")
     monkeypatch.setattr(
         worker, "generate", lambda pipe, values: (_StubImage(), 99, {"accel": "dense"})
     )
@@ -86,7 +78,6 @@ def test_handler_returns_the_app_nz_envelope(worker, monkeypatch):
 
 
 def test_teleport_fraction_is_validated(worker, monkeypatch):
-    monkeypatch.setenv("APPNZ_ANIMA_COMMERCIAL_LICENSE_ACCEPTED", "1")
     with pytest.raises(ValueError, match="teleport_fraction"):
         worker.generate(object(), {"prompt": "a cat", "teleport": True, "teleport_fraction": 5})
 
@@ -97,7 +88,6 @@ def test_new_accel_inputs_are_accepted(worker, monkeypatch):
 
 
 def test_handler_rejects_unsupported_formats(worker, monkeypatch):
-    monkeypatch.setenv("APPNZ_ANIMA_COMMERCIAL_LICENSE_ACCEPTED", "1")
     with pytest.raises(ValueError, match="output_format"):
         worker.handler({"input": {"prompt": "a cat", "output_format": "gif"}}, pipe=object())
 

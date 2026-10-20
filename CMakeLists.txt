@@ -177,6 +177,12 @@ set_tests_properties(guard_multiturn PROPERTIES
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
     if(TARGET onative_sd_cache_stub)
+        add_test(
+            NAME qwen_lightning
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_qwen_lightning.py"
+        )
+        set_tests_properties(qwen_lightning PROPERTIES
+            ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
         add_test(NAME image_cache_concurrency COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_SOURCE_DIR}/tests/test_image_cache_concurrency.py")
         set_tests_properties(image_cache_concurrency PROPERTIES ENVIRONMENT

@@ -82,6 +82,8 @@ FLOW_SHIFT = float(os.getenv("RA2_FLOW_SHIFT", "3.0"))
 REFERENCE_EDIT = os.getenv("RA2_REFERENCE_EDIT", "1").lower() not in {"0", "false", "no", "off"}
 VAE_TILING = os.getenv("RA2_VAE_TILING", "1").lower() not in {"0", "false", "no", "off"}
 VAE_TILE = int(os.getenv("RA2_VAE_TILE", "32"))
+VAE_TILE_X = int(os.getenv("RA2_VAE_TILE_X", str(VAE_TILE)))
+VAE_TILE_Y = int(os.getenv("RA2_VAE_TILE_Y", str(VAE_TILE)))
 VAE_TILE_OVERLAP = float(os.getenv("RA2_VAE_TILE_OVERLAP", "0.5"))
 FLASH_ATTN = os.getenv("RA2_FLASH_ATTN", "1").lower() not in {"0", "false", "no", "off"}
 MMAP = os.getenv("RA2_MMAP", "1").lower() not in {"0", "false", "no", "off"}
@@ -97,12 +99,22 @@ WEBP_QUALITY = int(os.getenv("RA2_WEBP_QUALITY", "85"))
 # Same tiers as the local gateway: text-to-image defaults to the distilled 6-step turbo LoRA; "turbo": false
 # runs the base model with a step floor and a looser EasyCache; every result gets the Nyquist notch.
 TURBO = os.getenv("RA2_TURBO", "1").lower() not in {"0", "false", "no", "off"}
-TURBO_NODES = [float(v) for v in os.getenv("RA2_TURBO_NODES", "1.0,0.9375,0.875,0.75,0.5,0.25").split(",") if v.strip()]
-TURBO_LORA_REPO = os.getenv("RA2_TURBO_LORA_REPO", "Viggle/Qwen-Image-2.1-viggle-turbo")
-TURBO_LORA_FILE = os.getenv("RA2_TURBO_LORA_FILE", "Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r256.safetensors")
+ACCEL_PROFILE = os.getenv("RA2_ACCEL_PROFILE", "viggle")
+if ACCEL_PROFILE not in {"viggle", "lightning"}:
+    raise ValueError("RA2_ACCEL_PROFILE must be viggle or lightning")
+LIGHTNING = ACCEL_PROFILE == "lightning"
+TURBO_NODES = ([1.0, 0.75, 0.5, 0.25] if LIGHTNING else
+               [float(v) for v in os.getenv("RA2_TURBO_NODES", "1.0,0.9375,0.875,0.75,0.5,0.25").split(",") if v.strip()])
+if not 1 <= len(TURBO_NODES) <= 16 or any(
+    not math.isfinite(v) or not 0 < v <= 1 or (i and v >= TURBO_NODES[i - 1])
+    for i, v in enumerate(TURBO_NODES)
+):
+    raise ValueError("RA2_TURBO_NODES must be 1..16 strictly decreasing values in (0, 1]")
+TURBO_LORA_REPO = os.getenv("RA2_TURBO_LORA_REPO", "lightx2v/Qwen-Image-2.1-Lightning" if LIGHTNING else "Viggle/Qwen-Image-2.1-viggle-turbo")
+TURBO_LORA_FILE = os.getenv("RA2_TURBO_LORA_FILE", "lightning/pytorch_lora_weights.safetensors" if LIGHTNING else "Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r256.safetensors")
 MIN_STEPS = int(os.getenv("RA2_MIN_STEPS", "30"))
 HQ_CACHE_THRESHOLD = float(os.getenv("RA2_HQ_CACHE_THRESHOLD", "0.15"))
-NOTCH = os.getenv("RA2_NOTCH", "1").lower() not in {"0", "false", "no", "off"}
+NOTCH = os.getenv("RA2_NOTCH", "0" if LIGHTNING else "1").lower() not in {"0", "false", "no", "off"}
 JPEG_QUALITY = int(os.getenv("RA2_JPEG_QUALITY", "92"))
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or None
 
@@ -508,6 +520,7 @@ def _download(repo: str, filename: str, root: Path) -> Path:
 
 def _download_url(url: str, filename: str, root: Path) -> Path:
     target = root / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
     if target.is_file() and target.stat().st_size > 0:
         return target
     import urllib.request
@@ -544,8 +557,19 @@ def ensure_models() -> dict[str, Path]:
     }
     if TURBO:
         try:
-            models["turbo_lora"] = _download(TURBO_LORA_REPO, TURBO_LORA_FILE, root)
+            if LIGHTNING and TURBO_LORA_REPO == "lightx2v/Qwen-Image-2.1-Lightning":
+                models["turbo_lora"] = _download_url(
+                    "https://huggingface.co/lightx2v/Qwen-Image-2.1-Lightning/resolve/"
+                    "6b0a1176327c01522a44276c5da67331a025b6fc/pytorch_lora_weights.safetensors",
+                    TURBO_LORA_FILE, root,
+                )
+                if hashlib.sha256(models["turbo_lora"].read_bytes()).hexdigest() != "53c69320d4163da51032f90275074028cb098556039c72b45f8dce9f0f9e34a3":
+                    raise RuntimeError("Lightning LoRA SHA-256 mismatch; remove the cached file and retry")
+            else:
+                models["turbo_lora"] = _download(TURBO_LORA_REPO, TURBO_LORA_FILE, root)
         except Exception as error:  # noqa: BLE001 - serve the base tier rather than fail the worker
+            if LIGHTNING:
+                raise RuntimeError("Lightning LoRA unavailable; refusing a misleading base-model fallback") from error
             print(f"[qwen-image] turbo LoRA unavailable, base tier only: {error}", flush=True)
     _state["models"] = models
     _state["models_dir"] = root
@@ -746,7 +770,7 @@ def build_params(values: dict, models: dict[str, Path]) -> tuple[SdImgGenParams,
         struct, buffer = _source_image(image)
         keep.append(buffer)
         keep.append(struct)
-        if REFERENCE_EDIT:
+        if REFERENCE_EDIT or LIGHTNING:
             refs = (SdImage * 1)(struct)
             keep.append(refs)
             params.ref_images = ctypes.cast(refs, ctypes.POINTER(SdImage))
@@ -760,7 +784,7 @@ def build_params(values: dict, models: dict[str, Path]) -> tuple[SdImgGenParams,
                 raise ValueError("strength must be in (0, 1]")
 
     is_edit = source is not None
-    turbo = (TURBO and models.get("turbo_lora") and not is_edit and values.get("turbo", True) is not False)
+    turbo = (TURBO and models.get("turbo_lora") and (not is_edit or LIGHTNING) and values.get("turbo", True) is not False)
     if turbo:
         seq = (width // 16) * (height // 16)
         mu = 0.5 + (seq - 256.0) * (0.9 - 0.5) / (8192.0 - 256.0)
@@ -773,6 +797,8 @@ def build_params(values: dict, models: dict[str, Path]) -> tuple[SdImgGenParams,
         params.sample_params.custom_sigmas = ctypes.cast(array, ctypes.POINTER(ctypes.c_float))
         params.sample_params.custom_sigmas_count = len(sigmas)
         params.sample_params.guidance.txt_cfg = 1.0
+        if LIGHTNING:
+            params.sample_params.sample_method = 0  # EULER_SAMPLE_METHOD in the pinned ABI.
         params.loras = ctypes.cast(lora, ctypes.c_void_p)
         params.lora_count = 1
     elif not is_edit and params.sample_params.sample_steps < MIN_STEPS:
@@ -781,8 +807,8 @@ def build_params(values: dict, models: dict[str, Path]) -> tuple[SdImgGenParams,
 
     if VAE_TILING:
         params.vae_tiling_params.enabled = True
-        params.vae_tiling_params.tile_size_x = VAE_TILE
-        params.vae_tiling_params.tile_size_y = VAE_TILE
+        params.vae_tiling_params.tile_size_x = VAE_TILE_X
+        params.vae_tiling_params.tile_size_y = VAE_TILE_Y
         params.vae_tiling_params.target_overlap = VAE_TILE_OVERLAP
 
     mode = CACHE_MODE.strip().lower()
@@ -926,7 +952,8 @@ def generate(values: dict) -> dict:
             "sample_ms": sample_ms,
             "encode_ms": encode_ms,
             "format": pillow_format,
-            "cache_mode": CACHE_MODE,
+            "cache_mode": next((name for name, mode in SD_CACHE_MODES.items() if mode == params.cache.mode), "off"),
+            "accel_profile": ACCEL_PROFILE if _state.get("turbo") else "base",
             "reference_edit": bool(params.ref_images_count),
             "turbo": _state.get("turbo", False),
         },
