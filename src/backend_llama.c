@@ -1993,7 +1993,7 @@ static bool engine_start_locked(void) {
         pthread_cond_init(&s->cond, NULL);
     }
     const char *st = getenv("OMNISERVE_NATIVE_LLM_SAMPLE_THREADS");
-    int want = st && st[0] ? atoi(st) : (g_slot_count < 8 ? g_slot_count : 8) - 1;
+    int want = st && st[0] ? atoi(st) : (g_slot_count < 16 ? g_slot_count : 16) - 1;
     if (want < 0) want = 0;
     if (want > 64) want = 64;
     if (want > 0) {
