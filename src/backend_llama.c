@@ -2035,6 +2035,35 @@ static void engine_stop_locked(void) {
     g_engine_quit = false;
 }
 
+static double engine_probe_free_mb(struct llama_context_params cp, int kv_seqs) {
+    cp.n_ctx = (unsigned)g_ctx_len * (unsigned)kv_seqs;
+    struct llama_context *c = llama_init_from_model(g_model, cp);
+    if (!c) return -1.0;
+    double free_gib = -1.0;
+    bool ok = ogpu_memory_gib(&free_gib, NULL);
+    llama_free(c);
+    return ok ? free_gib * 1024.0 : -1.0;
+}
+
+/* LLM_KV_SEQS=auto: the pool takes what the device has left after a reserve
+ * (LLM_KV_RESERVE_MB, default 1024) for neighbours. Two probe contexts give
+ * the per-context KV cost and the fixed compute buffers. */
+static int engine_auto_kv_seqs(struct llama_context_params cp) {
+    double before_gib = -1.0;
+    if (!ogpu_memory_gib(&before_gib, NULL) || before_gib <= 0.0) return g_slot_count;
+    double f1 = engine_probe_free_mb(cp, 1), f2 = engine_probe_free_mb(cp, 2);
+    double before = before_gib * 1024.0, per = f1 - f2, fixed = before - f1 - per;
+    const char *res_env = getenv("OMNISERVE_NATIVE_LLM_KV_RESERVE_MB");
+    double reserve = res_env && res_env[0] ? atof(res_env) : 1024.0;
+    if (f1 < 0.0 || f2 < 0.0 || per <= 1.0) return g_slot_count;
+    int n = (int)((before - (fixed > 0.0 ? fixed : 0.0) - reserve) / per);
+    if (n < 1) n = 1;
+    if (n > g_slot_count) n = g_slot_count;
+    fprintf(stderr, "llm: KV pool auto: %d contexts (%.0f MiB each, %.0f MiB fixed, %.0f MiB free, "
+            "%.0f MiB reserved)\n", n, per, fixed, before, reserve);
+    return n;
+}
+
 static bool engine_start_locked(void) {
     g_step = llama_batch_init(g_step_budget + g_slot_count, 0, 1);
     g_step_slots = calloc((size_t)g_slot_count + 1, sizeof *g_step_slots);
@@ -2205,10 +2234,10 @@ static bool ollm_init_locked(const char *model_path, int n_gpu_layers, int ctx_l
         /* The unified cache is a pool: sized for LLM_KV_SEQS full contexts,
          * shared by all sequences, with idle prefixes evicted when it fills. */
         const char *kv_env = getenv("OMNISERVE_NATIVE_LLM_KV_SEQS");
-        g_kv_seqs = kv_env && kv_env[0] ? atoi(kv_env) : g_slot_count;
+        bool kv_auto = kv_env && strcmp(kv_env, "auto") == 0;
+        g_kv_seqs = kv_env && kv_env[0] && !kv_auto ? atoi(kv_env) : g_slot_count;
         if (g_kv_seqs < 1) g_kv_seqs = 1;
         if (g_kv_seqs > g_slot_count) g_kv_seqs = g_slot_count;
-        cp.n_ctx = (unsigned)g_ctx_len * (unsigned)g_kv_seqs;
         cp.n_seq_max = (unsigned)g_slot_count;
         cp.n_batch = (unsigned)(g_step_budget + g_slot_count);
         if (cp.n_ubatch > cp.n_batch) cp.n_ubatch = cp.n_batch;
@@ -2218,6 +2247,8 @@ static bool ollm_init_locked(const char *model_path, int n_gpu_layers, int ctx_l
          * cells are gone, so sharing needs the full-size window cache. */
         const char *share_env = getenv("OMNISERVE_NATIVE_LLM_SHARE_PREFIX");
         g_share_prefix = cp.swa_full && !(share_env && strcmp(share_env, "0") == 0);
+        if (kv_auto) g_kv_seqs = engine_auto_kv_seqs(cp);
+        cp.n_ctx = (unsigned)g_ctx_len * (unsigned)g_kv_seqs;
         g_bctx = llama_init_from_model(g_model, cp);
         bool started = g_bctx != NULL;
         for (int i = 0; started && i < g_slot_count; i++) g_slots[i].ctx = g_bctx;
@@ -3870,4 +3901,7 @@ const char *osd_model_name(void) { return "none"; }
 bool osd_generate(const oimg_req *req, oimg_result *out) { (void)req; (void)out; return false; }
 bool osd_try_cached_result(const oimg_req *req, oimg_result *out) { (void)req; (void)out; return false; }
 void osd_result_free(oimg_result *r) { (void)r; }
+bool osd_resident(void) { return false; }
+int osd_set_resident(bool resident, bool wait) { (void)resident; (void)wait; return 0; }
+void osd_residency_settled(void) {}
 #endif
