@@ -1018,7 +1018,8 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  "\"drafted\":%llu,\"accepted\":%llu,\"acceptance\":%.3f,"
                  "\"calls_saved\":%llu},"
                  "\"batching\":{\"enabled\":%s,\"seqs\":%d,\"step_tokens\":%d,"
-                 "\"steps\":%llu,\"rows\":%llu,\"tokens\":%llu,\"shared_prefix_tokens\":%llu},"
+                 "\"steps\":%llu,\"rows\":%llu,\"tokens\":%llu,\"shared_prefix_tokens\":%llu,"
+                 "\"kv_seqs\":%d,\"kv_evictions\":%llu,\"kv_preemptions\":%llu,\"kv_requeues\":%llu},"
                  "\"overflow\":{\"image\":%s,\"image_path\":\"%s\",\"tiers\":%u,"
                  "\"saturated\":%llu,\"local_failed\":%llu,"
                  "\"frontier\":%s,\"frontier_kept_local\":%llu,"
@@ -1032,6 +1033,7 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  placement.batched ? "true" : "false", placement.batch_seqs,
                  placement.step_tokens, placement.engine_steps, placement.engine_rows,
                  placement.engine_tokens, placement.shared_prefix_tokens,
+                 placement.kv_seqs, placement.kv_evictions, placement.kv_preemptions, placement.kv_requeues,
                  app->image_overflow ? "true" : "false",
                  overflow_path_label(),
                  app->overflow_tier_mask,

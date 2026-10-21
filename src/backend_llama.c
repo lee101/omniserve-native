@@ -1396,6 +1396,9 @@ enum { OSEQ_IDLE = 0, OSEQ_PREFILL, OSEQ_DECODE, OSEQ_DONE };
 static bool g_batched;
 static bool g_share_prefix;
 static unsigned long long g_shared_tokens;
+static int g_kv_seqs;
+static unsigned long long g_kv_evictions, g_kv_preemptions, g_kv_requeues;
+static bool g_prefill_hold; /* pool full: decode only until a sequence ends */
 static struct llama_context *g_bctx;
 static int32_t g_n_vocab;
 static int g_step_budget;
@@ -1599,6 +1602,7 @@ static void step_add(int *n, llama_token tok, llama_pos pos, llama_seq_id seq, b
 }
 
 static void engine_finish_locked(ollm_slot *s, bool failed) {
+    g_prefill_hold = false;
     s->state = OSEQ_DONE;
     s->has_next = false;
     if (failed) s->failed = true;
@@ -1654,6 +1658,7 @@ static int engine_build_locked(int *rows_out) {
      * batch cannot starve new arrivals of their first token. */
     int budget = g_step_budget - n;
     if (budget < g_step_budget / 4) budget = g_step_budget / 4;
+    if (g_prefill_hold && n > 0) budget = 0;
     while (budget > 0) {
         ollm_slot *pick = NULL;
         for (int i = 0; i < g_slot_count; i++) {
@@ -1690,6 +1695,24 @@ static bool engine_has_work_locked(void) {
     return false;
 }
 
+/* Frees the least recently used idle prefix (not busy, not a pending fork
+ * source) when the pool cannot place a step. */
+static bool engine_evict_idle(void) {
+    pthread_mutex_lock(&g_slot_lock);
+    ollm_slot *victim = NULL;
+    for (int i = 0; i < g_slot_count; i++) {
+        ollm_slot *s = &g_slots[i];
+        if (s->busy || s->pins > 0 || s->cached_count <= 0) continue;
+        if (!victim || s->last_used < victim->last_used) victim = s;
+    }
+    if (victim) victim->cached_count = 0;
+    pthread_mutex_unlock(&g_slot_lock);
+    if (!victim) return false;
+    llama_memory_seq_rm(llama_get_memory(g_bctx), victim->seq, -1, -1);
+    g_kv_evictions++;
+    return true;
+}
+
 static void *engine_main(void *arg) {
     (void)arg;
     pthread_mutex_lock(&g_engine_lock);
@@ -1704,6 +1727,27 @@ static void *engine_main(void *arg) {
 
         double t_dec = now_ms();
         int rc = llama_decode(g_bctx, g_step);
+        while (rc == 1 && engine_evict_idle()) rc = llama_decode(g_bctx, g_step);
+        /* Still full with every idle prefix gone. A prompt still prefilling
+         * has streamed nothing, so the youngest one goes back to the queue
+         * with its cells freed; only a decode-only step fails a request. */
+        ollm_slot *preempt = NULL;
+        bool requeue = false;
+        if (rc == 1) {
+            for (int r = 0; r < rows; r++) {
+                ollm_slot *s = g_step_slots[r];
+                bool pf = s->state == OSEQ_PREFILL;
+                if (!preempt || (pf && !requeue) || (pf == requeue && s->order > preempt->order)) {
+                    preempt = s;
+                    requeue = pf;
+                }
+            }
+            llama_memory_seq_rm(llama_get_memory(g_bctx), preempt->seq, -1, -1);
+            pthread_mutex_lock(&g_slot_lock);
+            preempt->cached_count = 0;
+            pthread_mutex_unlock(&g_slot_lock);
+            if (!requeue) fprintf(stderr, "engine: KV pool full, failing the youngest request\n");
+        }
         if (g_engine_trace) llama_synchronize(g_bctx);
         double t_samp = now_ms();
         int jobs = 0;
@@ -1747,6 +1791,19 @@ static void *engine_main(void *arg) {
         }
 
         pthread_mutex_lock(&g_engine_lock);
+        if (preempt) {
+            for (int r = 0; r < rows; r++) g_step_slots[r]->in_step = false;
+            if (requeue) {
+                g_kv_requeues++;
+                preempt->prompt_done = 0;
+                preempt->n_past = 0;
+                g_prefill_hold = true;
+            } else {
+                g_kv_preemptions++;
+                engine_finish_locked(preempt, true);
+            }
+            continue;
+        }
         g_engine_steps++;
         g_engine_rows += (unsigned long long)jobs;
         g_engine_tokens += (unsigned long long)n;
@@ -2145,7 +2202,13 @@ static bool ollm_init_locked(const char *model_path, int n_gpu_layers, int ctx_l
                                                 : (g_batch_size < 512 ? g_batch_size : 512);
         if (g_step_budget < 16) g_step_budget = 16;
         const char *swa_env = getenv("OMNISERVE_NATIVE_LLM_SWA_FULL");
-        cp.n_ctx = (unsigned)g_ctx_len * (unsigned)g_slot_count;
+        /* The unified cache is a pool: sized for LLM_KV_SEQS full contexts,
+         * shared by all sequences, with idle prefixes evicted when it fills. */
+        const char *kv_env = getenv("OMNISERVE_NATIVE_LLM_KV_SEQS");
+        g_kv_seqs = kv_env && kv_env[0] ? atoi(kv_env) : g_slot_count;
+        if (g_kv_seqs < 1) g_kv_seqs = 1;
+        if (g_kv_seqs > g_slot_count) g_kv_seqs = g_slot_count;
+        cp.n_ctx = (unsigned)g_ctx_len * (unsigned)g_kv_seqs;
         cp.n_seq_max = (unsigned)g_slot_count;
         cp.n_batch = (unsigned)(g_step_budget + g_slot_count);
         if (cp.n_ubatch > cp.n_batch) cp.n_ubatch = cp.n_batch;
@@ -2240,6 +2303,10 @@ void ollm_placement_snapshot(ollm_placement *out) {
     out->engine_rows = g_engine_rows;
     out->engine_tokens = g_engine_tokens;
     out->shared_prefix_tokens = g_shared_tokens;
+    out->kv_seqs = g_batched ? g_kv_seqs : 0;
+    out->kv_evictions = g_kv_evictions;
+    out->kv_preemptions = g_kv_preemptions;
+    out->kv_requeues = g_kv_requeues;
     pthread_mutex_unlock(&g_engine_lock);
 }
 

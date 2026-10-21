@@ -101,6 +101,10 @@ typedef struct {
     unsigned long long engine_rows;
     unsigned long long engine_tokens;
     unsigned long long shared_prefix_tokens; /* prompt tokens forked, not prefilled */
+    int kv_seqs;                             /* full contexts the KV pool holds */
+    unsigned long long kv_evictions;         /* idle prefixes dropped for space */
+    unsigned long long kv_preemptions;       /* requests failed with the pool full */
+    unsigned long long kv_requeues;          /* prefills restarted with the pool full */
 } ollm_placement;
 
 /* Contexts this device class can keep resident beside the weights. Advisory:
