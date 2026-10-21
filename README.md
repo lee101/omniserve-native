@@ -124,20 +124,27 @@ Other tuning: `OMNISERVE_NATIVE_PORT`, `BIND`, `SLOTS`, `SECRET`, `LLM_GGUF`, `L
 ### LLM continuous batching
 
 The embedded LLM runs every request as a sequence in one shared context.
-`LLM_CONTEXTS` is the number of sequences (16 on a 5090 serving
-gemma-roleplay-v2 q8_0); an engine thread decodes one token for each running
+`LLM_CONTEXTS` is the number of sequences (32 on the prod 5090 serving
+gemma-roleplay-v2 q8_0) and `LLM_KV_SEQS` the number of full contexts the
+shared KV pool holds (6 there); when the pool fills, idle cached prefixes are
+evicted, then the youngest prefill is requeued, and only a decode-only step
+fails a request. An engine thread decodes one token for each running
 sequence per step, mixes in prefill chunks up to `LLM_STEP_TOKENS` (512), and
 streams tokens back through per-request rings. Concurrency is admitted by the
 `SLOTS` pool, where `LLM_PERMITS` is the weight of one request, so `PERMITS=1`
-is what lets several requests share a step. `LLM_BATCHED=0` restores one
+is what lets several requests share a step; `LLM_BACKGROUND_PERMITS` lets
+background-tier LLM requests join the batch instead of taking the whole pool.
+`LLM_BATCHED=0` restores one
 context per slot; speculative decoding (`SPEC_DRAFT`, `SPEC_MTP_GGUF`) keeps
 that path. `LLM_SHARE_PREFIX=0` disables forking a shared prompt prefix (a
 character persona) from another sequence's cache, `LLM_SWA_FULL=0` shrinks the
 sliding-window cache at the cost of prefix reuse and forks, `LLM_PREFILTER=0`
-samples over the full vocabulary instead of the exact top-(k + penalty window)
-cut, `LLM_SAMPLE_THREADS` sizes the sampling pool, and `LLM_ENGINE_TRACE=1`
-logs per-step decode/sample time. `/status` reports `batching` counters
-(steps, rows, tokens, shared_prefix_tokens). Measurements and rollout:
+samples over the full vocabulary instead of the exact top-(k + distinct
+history + max_new) cut (exact under penalties and DRY), `LLM_SAMPLE_THREADS`
+sizes the sampling pool, and `LLM_ENGINE_TRACE=1` logs decode time by step kind
+and sampling time every 512 steps. `/status` reports `batching` counters
+(steps, rows, tokens, shared_prefix_tokens, kv_evictions, kv_requeues,
+kv_preemptions). Measurements and rollout:
 `performance/llm-continuous-batching-2026-10-21.md`; drop-in:
 `systemd/omniserve-native-llm-batching.conf`.
 

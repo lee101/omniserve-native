@@ -127,14 +127,67 @@ then only lands when the window cells survived. Prod's 5090 had about
    lanes.
 4. Rollback: remove the drop-in, or set `OMNISERVE_NATIVE_LLM_BATCHED=0`.
 
+## Prod (RTX 5090, 2026-10-21)
+
+Deployed as `deploy-prod-20261021-llmbatch7` from branch `llm-batching-prod`
+(prod's `penalty-window` commit `a420862` plus this work), with
+`systemd/omniserve-native-llm-batching.conf`. Same bench, same box, minutes
+apart, live co-tenants on the GPU; old prod is `deploy-prod-20261014-dry` with
+its drop-ins (2 contexts, `LLM_PERMITS=2`, `SLOTS=8`):
+
+| Streams | Old prod tok/s | Batched tok/s | Gain | TTFT p50 old -> new |
+| ---: | ---: | ---: | ---: | --- |
+| 1 | 78 | 142-151 | 1.9x | 209 -> 15-31 ms |
+| 4 | 105 | 394 | 3.8x | 981 -> 30 ms |
+| 8 | 130 | 621-642 | 4.9x | 2481 -> 32 ms |
+| 16 | 143 | 798-901 | 6.3x | 5590 -> 37 ms |
+| 32 | (143) | 1085-1174 | 8.2x | -> 210-230 ms |
+
+What the 5090 needed beyond the 3090 Ti work (its host is a 2016 Broadwell
+Xeon on PCIe 3.0, so CPU per token matters more than GPU):
+
+- DRY was on in prod (`DRY_MULTIPLIER=0.8`). `llama_sampler_init_dry`
+  detokenizes the whole 262k vocabulary once per sequence breaker, ~180 ms per
+  request: that was nearly all of prod's 200 ms TTFT. It is now built once per
+  parameter set and cloned.
+- The top-k cut used to fall back to the full vocabulary under DRY. Penalties
+  and DRY only lower logits of tokens already in the history, so the cut is
+  top_k + distinct history tokens + max_new, still exact (32/32 seeded
+  outputs identical to full-vocab sampling with prod's DRY settings).
+- The radix histogram gather (scatter-heavy) became a sampled-threshold
+  compare pass: 0.39 -> 0.14 ms per row here, sampling 3.95 -> 0.9 ms per
+  step at ~13 rows on prod. One sampling thread per sequence up to 16.
+- Background-tier LLM requests took the whole admission pool (one at a time,
+  blocking everything); they now take `LLM_BACKGROUND_PERMITS` and batch.
+- `SLOTS` 8 -> 32 with every other modality's permits scaled 4x, so only the
+  LLM's admission widened; `WORKERS=96` since each stream holds a worker.
+- KV pool decoupled from the sequence count (`LLM_KV_SEQS`): 32 sequences
+  share 6 contexts' worth of cells (714 MiB KV + 305 MiB compute, vs 797 MiB
+  for the old 2 contexts). No evictions in the 32-stream bench: forked
+  personas share cells.
+
+Prod engine trace at ~13 rows: steady 12.8 ms decode, 25-29% of steps
+"reshaped" (row count or KV size changed, so llama.cpp runs them without a
+CUDA graph, +3.5-4.5 ms), sampling ~0.9 ms. At 32 rows ~2 ms of each step is
+the logits copy over PCIe 3.0.
+
+Image lane: the broker refuses z-image requests needing 4096 MB headroom
+because a 3584 MB lease is held once the diffusion model is loaded (it looks
+like resident weights counted against free memory twice); the old process
+had already logged 10,868 such denials in 6 days. The batched LLM adds
+~220 MiB over the old 2 contexts.
+
 ## Not done
 
 - 5090 numbers. Prod is the only 5090 and has no room for a second copy of
   the model beside the live services. The 3090 Ti results transfer by
   mechanism (bandwidth-bound decode), not by measurement.
-- GPU-side sampling (llama.cpp backend samplers) to avoid copying 1 MB of
-  logits per row to the host. At 16 rows the copy and the sampling together
-  are about 5% of a step.
+- GPU-side top-k (llama.cpp backend samplers) to avoid copying 1 MB of
+  logits per row over PCIe 3.0. With CUDA 12.9's CCCL there is no
+  `DeviceTopK`, so each row would pay a full 262k argsort, about what the copy
+  costs; worth it with CUDA 13.
+- Fewer graph-less steps: llama.cpp keeps one CUDA graph and re-warms it on
+  every shape change.
 - Speculative decoding inside the batched engine. The ggml-org E4B MTP head
   (`mtp-gemma-4-E4B-it-Q8_0`, 94 MiB) is on disk. DeepInfer reports MTP only
   pays at ≥48 sequences per rank, so the priority is single-stream latency,
