@@ -84,7 +84,7 @@ template is created.
 ## Live run 2026-10-21 (image `ghcr.io/lee101/omniserve-llm:20261021a`)
 
 Endpoint `k5k2rka63edkxp` (`omniserve-llm-overflow`), registry auth
-`cmsi7jlxe006trzd95954dxpd` (`appnz-ghcr-lee101-v2`).
+`<registry-auth-id>` (`appnz-ghcr-lee101-v2`).
 
 | | result |
 | --- | --- |
@@ -109,7 +109,7 @@ RUNPOD_API_KEY=...
 HF_TOKEN=...
 RUNPOD_LLM_ENDPOINT_ID=k5k2rka63edkxp
 POD_IMAGE=ghcr.io/lee101/omniserve-llm:20261021a
-REGISTRY_AUTH_ID=cmsi7jlxe006trzd95954dxpd
+REGISTRY_AUTH_ID=<registry-auth-id>
 # optional: MAX_PODS=1 MAX_USD_HR=2.0 POD_PROMOTE_CONCURRENCY=8 POD_DEMOTE_CONCURRENCY=2
 #           POD_IDLE_S=1200 POD_TTL_S=21600 POD_CAPACITY=32 POD_CLOUD=SECURE,COMMUNITY
 #           REMOTE_ENV_JSON='{"OMNISERVE_NATIVE_LLM_CONTEXTS":"32"}' SERVERLESS_SECRET=...
