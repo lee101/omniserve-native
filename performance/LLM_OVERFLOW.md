@@ -5,7 +5,7 @@ client ─► omniserve-native :8791 (embedded batched LLM)
             │ local LLM saturated
             ▼ OMNISERVE_NATIVE_LLM_OVERFLOW_UPSTREAM=http://127.0.0.1:18796  (same path + body, plain http)
           llm_overflow.py :18796
-            ├─ ready pod with in-flight < POD_CAPACITY   https://{podId}-8000.proxy.runpod.net   Bearer <per-pod secret>
+            ├─ ready pod with in-flight < POD_CAPACITY   https://{podId}-8000.proxy.runpod.net   secret: <per-pod secret>
             └─ else LB serverless endpoint                https://{ENDPOINT_ID}.api.runpod.ai     Bearer $RUNPOD_API_KEY
 ```
 
@@ -17,7 +17,8 @@ LLM-only mode, `$PORT`=8000, `/ping` 204 loading / 200 ready).
 - Proxies `POST /v1/chat/completions` and `/v1/completions`; `GET /health`, `GET /status`
   (router, per-backend in-flight/failovers, scaler EWMAs, spend, last decisions, non-secret config).
 - Responses stream through unbuffered (SSE chunk by chunk); status and `Content-Type` pass
-  through, plus `X-Overflow-Backend: pod:<name>|serverless:serverless`.
+  through, plus `X-Overflow-Backend: pod:<name>|serverless:serverless`. Upstream requests carry
+  `Accept-Encoding: identity` (RunPod's LB gzips otherwise, which also buffers SSE).
 - Caller credentials (`Authorization`, `X-API-Key`, `X-Rapid-API-Key`, `secret`, `Cookie`) are
   dropped; the backend's own auth is added. `X-Omniserve-Tier` and other headers pass.
 - Order: least-loaded ready pod under capacity → serverless. Before any byte reaches the
@@ -54,7 +55,7 @@ for itself. Draining pods stop taking new requests and are terminated when empty
 
 Pods: `POST /v2/pods` per GPU in `POD_GPU_TYPES` × `POD_CLOUD` until one returns 201
 (skipping types whose catalog price would break the cap; 402/429 stop the round), name
-`POD_NAME_PREFIX` + random hex, env `HF_TOKEN`, `PORT`, `OMNISERVE_NATIVE_SECRET` =
+`POD_NAME_PREFIX` + random hex, `registry` `REGISTRY_AUTH_ID`, env `HF_TOKEN`, `PORT`, `OMNISERVE_NATIVE_SECRET` =
 HMAC(`POD_SECRET_KEY` or the RunPod key, pod name) plus `REMOTE_ENV_JSON`, port `8000/http`,
 `minCudaVersion` `POD_MIN_CUDA`. Ready = `/ping` 200 through the proxy URL. Every
 `RECONCILE_S` the sidecar lists `/v2/pods`, adopts prefixed pods it does not know (so a
@@ -75,8 +76,29 @@ uv run --no-project --with aiohttp tools/llm_overflow.py pods   # pods owned by 
 `type: LOAD_BALANCER`, `scaling: {type: REQUEST_COUNT, requestCount: 24}`,
 `workers: {min: 0, max: 2, idleTimeout: 90}`, `gpu.pools` ADA_24, ADA_32_PRO, AMPERE_48,
 ADA_48_PRO with `minCudaVersion: 12.9`, `ports: [8000/http]`, env `PORT`/`PORT_HEALTH`=8000,
-`HF_TOKEN` (from env or `~/.cache/huggingface/token`), `flashboot: FLASHBOOT`. v2 takes the
-image inline, so no separate template is created.
+`HF_TOKEN` (from env or `~/.cache/huggingface/token`), `flashboot: FLASHBOOT`,
+`gpu.excludedTypes` the RTX PRO 6000 MIG 2g.48gb slice (it sits in ADA_48_PRO and was picked
+first), `registry: $REGISTRY_AUTH_ID` (private GHCR). v2 takes the image inline, so no separate
+template is created.
+
+## Live run 2026-10-21 (image `ghcr.io/lee101/omniserve-llm:20261021a`)
+
+Endpoint `k5k2rka63edkxp` (`omniserve-llm-overflow`), registry auth
+`cmsi7jlxe006trzd95954dxpd` (`appnz-ghcr-lee101-v2`).
+
+| | result |
+| --- | --- |
+| serverless, fresh worker (image pre-pulled, 8 GB HF download + load) | TTFT 56 s |
+| serverless, FlashBoot resume after scale to 0 running | TTFT 2.1-2.2 s |
+| serverless warm, 1 stream (RTX 4090) | 93-120 tok/s decode, TTFT 0.3 s |
+| serverless warm, 16 / 32 streams (one 4090) | 704 / 690 tok/s aggregate, 43-103 tok/s per stream, TTFT p50 0.29 s |
+| scale to 0 running | 90 s after the last request (idleTimeout) |
+| pod RTX A6000 SECURE ($0.59/hr; COMMUNITY had no placement) | create → `/ping` 200 in 151 s |
+| pod, 1 / 16 streams | 94 tok/s / 492 tok/s aggregate, TTFT 0.6-0.8 s via proxy |
+| sidecar kill -9 + restart | pod adopted, secret re-derived, routing resumed; SIGTERM with `--terminate-on-exit` terminated it |
+
+RunPod lists `idle`/`initializing`/`throttled` workers beyond `workers.max` (pre-pulled hosts
+per release); only `running` is billed.
 
 ## Prod
 
@@ -85,8 +107,9 @@ image inline, so no separate template is created.
 ```bash
 RUNPOD_API_KEY=...
 HF_TOKEN=...
-RUNPOD_LLM_ENDPOINT_ID=<from setup>
-POD_IMAGE=lee101/omniserve-llm:<tag>
+RUNPOD_LLM_ENDPOINT_ID=k5k2rka63edkxp
+POD_IMAGE=ghcr.io/lee101/omniserve-llm:20261021a
+REGISTRY_AUTH_ID=cmsi7jlxe006trzd95954dxpd
 # optional: MAX_PODS=1 MAX_USD_HR=2.0 POD_PROMOTE_CONCURRENCY=8 POD_DEMOTE_CONCURRENCY=2
 #           POD_IDLE_S=1200 POD_TTL_S=21600 POD_CAPACITY=32 POD_CLOUD=SECURE,COMMUNITY
 #           REMOTE_ENV_JSON='{"OMNISERVE_NATIVE_LLM_CONTEXTS":"32"}' SERVERLESS_SECRET=...
@@ -109,7 +132,8 @@ Rollback: unset `OMNISERVE_NATIVE_LLM_OVERFLOW_UPSTREAM` on the gateway, stop th
 | --- | --- | --- |
 | `BIND`/`PORT` | 127.0.0.1 / 18796 | listen |
 | `RUNPOD_LLM_ENDPOINT_ID` / `SERVERLESS_URL` | - | LB endpoint (URL overrides id) |
-| `SERVERLESS_SECRET` | - | set on the endpoint as `OMNISERVE_NATIVE_SECRET` and sent as `X-API-Key` |
+| `SERVERLESS_SECRET` | - | set on the endpoint as `OMNISERVE_NATIVE_SECRET` and sent as `secret:` |
+| `REGISTRY_AUTH_ID` | - | RunPod container registry credential for pods and the endpoint |
 | `OVERFLOW_DEADLINE_S` / `SERVERLESS_RETRY_S` | 90 / 6 | serverless cold-start retry budget |
 | `CONNECT_TIMEOUT_S` / `READ_TIMEOUT_S` | 10 / 330 | per attempt; read = idle gap between chunks |
 | `POD_CAPACITY` / `MAX_PODS` / `MAX_USD_HR` | 32 / 1 / 2.0 | |

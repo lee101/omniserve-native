@@ -226,6 +226,13 @@ overflow (see `performance/LLM_OVERFLOW.md`). Workers run `Dockerfile.llm`:
 the same binary, LLM-only, KV pool auto-sized to the GPU (`LLM_KV_SEQS=auto`),
 model pulled from a private HF repo at start.
 
+Live on prod (`llmbatch11`, sidecar `omniserve-llm-overflow.service`, serverless
+endpoint `k5k2rka63edkxp` on RTX 4090-class workers): 48 paid-tier streams ran
+at 1,646 tok/s with p50/p95 TTFT 109/360 ms and 0 errors, 134 of 288 requests
+relayed (11.5x the old prod ceiling of 143 tok/s). From a scaled-to-zero
+endpoint the first overflow requests wait for a worker (p95 TTFT 29 s in that
+run; 2 s FlashBoot resume, 56 s for a fresh host).
+
 ## Not done
 
 - 5090 numbers. Prod is the only 5090 and has no room for a second copy of

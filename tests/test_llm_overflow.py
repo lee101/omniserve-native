@@ -135,6 +135,7 @@ def test_streaming_passthrough_unbuffered_and_auth_swapped():
             assert rest.endswith(b"data: [DONE]\n\n")
             h = pod.calls[0]["headers"]
             assert h["secret"] == "podsecret"
+            assert h["Accept-Encoding"] == "identity"
             assert "Authorization" not in h and "X-API-Key" not in h and h["X-Omniserve-Tier"] == "paid"
             assert json.loads(pod.calls[0]["body"]) == BODY and pod.calls[0]["path"] == "/v1/chat/completions"
             assert sl.calls == [] and rig.pod.gauge.n == 0 and rig.router.total.n == 0
