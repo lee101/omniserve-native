@@ -79,7 +79,7 @@ def _acquire_vram_lease(required_mib: int) -> dict:
     try:
         response = requests.post(
             f"{RVM_VRAM_BROKER_URL}/v1/gpu/lease",
-            json={"owner": "rvm", "mb": required_mib, "min_mb": required_mib,
+            json={"owner": "rvm", "pid": os.getpid(), "mb": required_mib, "min_mb": required_mib,
                   "tier": "background", "ttl_s": RVM_VRAM_LEASE_TTL_SECONDS},
             timeout=(2, 5),
         )

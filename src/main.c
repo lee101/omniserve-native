@@ -2713,11 +2713,16 @@ static void handle_images(ohttp_request *req, app_state *app) {
         respond_error(req, 503, lease_error);
         return;
     }
+    /* A granted lease already reserved the workspace; the point check is only
+     * for an unbrokered device, and asks for the same pixel-scaled figure. */
     double free_gib = -1.0;
     double total_gib = -1.0;
     char headroom_error[160];
-    if (ogpu_memory_gib(&free_gib, &total_gib) &&
-        !oimage_gpu_headroom_ok(free_gib, headroom_error, sizeof headroom_error)) {
+    if (!image_lease_id[0] && required_headroom_mb > 0 && ogpu_memory_gib(&free_gib, &total_gib) &&
+        free_gib * 1024.0 < (double)required_headroom_mb) {
+        snprintf(headroom_error, sizeof headroom_error,
+                 "image generation needs at least %d MB free GPU memory; only %.0f MB is free",
+                 required_headroom_mb, free_gib * 1024.0);
         image_gpu_release(app, image_lease_id, image_lease_remote);
         osched_release_n(app->sched, tier, permits);
         oimage_request_free(&image_request);
