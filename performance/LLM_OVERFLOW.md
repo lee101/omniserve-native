@@ -30,6 +30,23 @@ LLM-only mode, `$PORT`=8000, `/ping` 204 loading / 200 ready).
   `Retry-After: 5`.
 - A pod is taken out of routing after `POD_FAILS_UNREADY` consecutive failures and comes back
   on the next good `/ping`.
+- Cold reject (`COLD_REJECT=1`): with no ready pod and no serverless success or 200 `/ping` in
+  the last `WARM_TTL_S` (60 s, under the endpoint's 90 s idleTimeout), the router answers 429
+  `overflow_cold` at once and pings the endpoint (at most every `COLD_PING_S`). The gateway
+  swallows a 429/503 from the router before writing anything and serves the request from its
+  local queue, which frees a sequence within seconds, instead of holding the caller through a
+  2-60 s cold start. 429 keeps these out of the gateway's circuit breaker.
+
+Gateway trigger: relay when every sequence is busy (`LLM_OVERFLOW_ACTIVE`, default the batch
+size), or when no slot is free and `LLM_OVERFLOW_QUEUE` (4) LLM requests already wait locally;
+otherwise queue locally with tier priority (images and background LLM work hold slots while
+sequences are free). `/status` `batching.waiting` is that queue.
+
+| prod, 48 streams | tok/s | TTFT p50 / p95 | relayed |
+| --- | ---: | ---: | ---: |
+| 2026-10-21, endpoint cold | 334 | 57 ms / 29 s | 20 |
+| 2026-10-22 cold reject, endpoint cold | 1210 | 876 ms / 1.06 s | 0 (256 local, endpoint woken) |
+| same, next run (worker warming) | 1280 | 311 ms / 1.8 s | 60 |
 
 ## Scaler (every `SCALE_INTERVAL_S`)
 
@@ -146,5 +163,6 @@ Rollback: unset `OMNISERVE_NATIVE_LLM_OVERFLOW_UPSTREAM` on the gateway, stop th
 | `POD_NAME_PREFIX` | omniserve-llm-overflow- | ownership tag for adoption |
 | `POD_SECRET_KEY` | RunPod key | HMAC master for per-pod secrets |
 | `WARM_CONCURRENCY` / `WARM_INTERVAL_S` | 2 / 60 | |
+| `COLD_REJECT` / `WARM_TTL_S` / `COLD_PING_S` | 1 / 60 / 15 | 429 when nothing is warm; see Router |
 
 Tests: `uv run --no-project --with pytest --with aiohttp pytest tests/test_llm_overflow.py -q`.

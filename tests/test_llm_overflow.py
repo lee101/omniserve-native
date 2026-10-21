@@ -73,7 +73,7 @@ async def start(app):
 
 def cfg(**kw):
     base = dict(HF_TOKEN="hf_test", RUNPOD_API_KEY="rk_test", SERVERLESS_RETRY_S=0.05, OVERFLOW_DEADLINE_S=1.0,
-                POD_SECRET_KEY="k", CONNECT_TIMEOUT_S=2.0)
+                POD_SECRET_KEY="k", CONNECT_TIMEOUT_S=2.0, COLD_REJECT=0)
     return lo.Cfg(env={}, **{**base, **kw})
 
 
@@ -178,6 +178,42 @@ def test_503_when_nothing_works():
         async with Rig() as rig:
             async with rig.post() as r:
                 assert r.status == 503
+    asyncio.run(go())
+
+
+def test_cold_serverless_rejected_then_woken():
+    async def go():
+        sl = Fake(sse())
+        async with Rig(None, sl, COLD_REJECT=1, COLD_PING_S=60.0) as rig:
+            for _ in range(2):
+                async with rig.post() as r:
+                    assert r.status == 429 and r.headers["Retry-After"] == "2"
+                    assert (await r.json())["error"]["type"] == "overflow_cold"
+            for _ in range(50):
+                if rig.router.warm():
+                    break
+                await asyncio.sleep(0.02)
+            assert [c["path"] for c in sl.calls] == ["/ping"] and rig.router.cold_rejects == 2
+            async with rig.post() as r:
+                assert r.status == 200 and r.headers["X-Overflow-Backend"] == "serverless:serverless"
+                await r.read()
+    asyncio.run(go())
+
+
+def test_cold_reject_skipped_with_ready_pod_and_after_serverless_success():
+    async def go():
+        pod, sl = Fake(sse()), Fake(sse())
+        async with Rig(pod, sl, COLD_REJECT=1) as rig:
+            async with rig.post() as r:
+                assert r.status == 200 and r.headers["X-Overflow-Backend"] == "pod:omniserve-llm-overflow-aa"
+                await r.read()
+            assert rig.router.cold_rejects == 0
+        async with Rig(None, sl, COLD_REJECT=1) as rig:
+            rig.router.mark_warm()
+            async with rig.post() as r:
+                assert r.status == 200
+                await r.read()
+            assert rig.router.warm_until > lo.time.time() + 30
     asyncio.run(go())
 
 
