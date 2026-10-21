@@ -1412,8 +1412,11 @@ static unsigned long long g_engine_steps;
 static unsigned long long g_engine_rows;
 static unsigned long long g_engine_tokens;
 static bool g_engine_trace;
-static int g_trace_n;
-static double g_trace_dec, g_trace_samp, g_trace_gap, g_trace_last;
+/* Per 512 steps, by step kind: decode-only with the previous step's shape
+ * (CUDA graph replays), decode-only reshaped, and mixed with prefill. */
+static int g_trace_n, g_trace_prev_n;
+static double g_trace_samp, g_trace_gap, g_trace_last;
+static double g_trace_cnt[3], g_trace_dec[3], g_trace_rows[3], g_trace_tok[3];
 
 static pthread_t *g_samp_threads;
 static int g_samp_count;
@@ -1712,15 +1715,30 @@ static void *engine_main(void *arg) {
         }
         if (g_engine_trace) {
             double t_end = now_ms();
-            g_trace_dec += t_samp - t_dec;
+            int kind = n > jobs ? 2 : n == g_trace_prev_n ? 0 : 1;
+            g_trace_prev_n = n;
+            g_trace_cnt[kind] += 1;
+            g_trace_dec[kind] += t_samp - t_dec;
+            g_trace_rows[kind] += jobs;
+            g_trace_tok[kind] += n;
             g_trace_samp += t_end - t_samp;
             g_trace_gap += g_trace_last > 0 ? t_dec - g_trace_last : 0;
             g_trace_last = t_end;
-            if (++g_trace_n == 256) {
-                fprintf(stderr, "engine: rows=%d tokens=%d decode=%.2fms sample=%.2fms gap=%.3fms\n",
-                        jobs, n, g_trace_dec / 256, g_trace_samp / 256, g_trace_gap / 256);
+            if (++g_trace_n == 512) {
+                double c[3];
+                for (int k = 0; k < 3; k++) c[k] = g_trace_cnt[k] > 0 ? g_trace_cnt[k] : 1;
+                fprintf(stderr, "engine: steady %.0f rows=%.1f dec=%.2fms | reshaped %.0f rows=%.1f "
+                        "dec=%.2fms | mixed %.0f tok=%.0f dec=%.2fms | sample=%.2fms gap=%.3fms\n",
+                        g_trace_cnt[0], g_trace_rows[0] / c[0], g_trace_dec[0] / c[0],
+                        g_trace_cnt[1], g_trace_rows[1] / c[1], g_trace_dec[1] / c[1],
+                        g_trace_cnt[2], g_trace_tok[2] / c[2], g_trace_dec[2] / c[2],
+                        g_trace_samp / 512, g_trace_gap / 512);
                 g_trace_n = 0;
-                g_trace_dec = g_trace_samp = g_trace_gap = 0;
+                g_trace_samp = g_trace_gap = 0;
+                memset(g_trace_cnt, 0, sizeof g_trace_cnt);
+                memset(g_trace_dec, 0, sizeof g_trace_dec);
+                memset(g_trace_rows, 0, sizeof g_trace_rows);
+                memset(g_trace_tok, 0, sizeof g_trace_tok);
             }
         }
 
