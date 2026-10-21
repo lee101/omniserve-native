@@ -1429,11 +1429,6 @@ static int g_samp_next;
 static int g_samp_finished;
 static bool g_samp_quit;
 
-static int logit_desc(const void *a, const void *b) {
-    float x = ((const llama_token_data *)a)->logit, y = ((const llama_token_data *)b)->logit;
-    return (x < y) - (x > y);
-}
-
 /* Moves the k largest logits to the front, unordered: three-way quickselect,
  * linear on average and safe on the long runs of equal logits a softcap makes. */
 static void select_top(llama_token_data *d, size_t n, size_t k) {
@@ -1458,45 +1453,56 @@ static void select_top(llama_token_data *d, size_t n, size_t k) {
     }
 }
 
-static inline uint32_t logit_key(float f) {
-    uint32_t u;
-    memcpy(&u, &f, sizeof u);
-    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-}
-
-/* Sort-free top-k over the raw row (the DeepInfer sampler's radix select): one
- * pass histograms the top 12 bits of an order-preserving key, a second pass
- * copies only the tokens at or above the bucket holding the k-th largest. The
- * full vocabulary is never materialized as token data. Returns the number of
- * candidates written, >= k, sorted descending and trimmed to k. */
-enum { OLLM_RADIX_BUCKETS = 4096, OLLM_RADIX_SHIFT = 20 };
+/* Exact top-k superset without sorting the row: the threshold is the r-th
+ * largest of a strided sample, sized so ~2k tokens clear it, and one compare
+ * pass (eight lanes at a time, almost all rejected) collects every token at or
+ * above it. At least k collected means the set holds the true top k, ties
+ * included; fewer means the sample guessed high, so it retries lower. Tokens
+ * come out in id order, unsorted: penalties and DRY reorder them anyway. */
+enum { OLLM_TOPK_SAMPLE = 2048 };
 static size_t gather_top(const float *logits, int32_t n_vocab, size_t k,
                          llama_token_data *out, size_t cap) {
-    uint32_t hist[OLLM_RADIX_BUCKETS];
-    memset(hist, 0, sizeof hist);
-    for (int32_t i = 0; i < n_vocab; i++) hist[logit_key(logits[i]) >> OLLM_RADIX_SHIFT]++;
-    size_t seen = 0;
-    int bucket = OLLM_RADIX_BUCKETS - 1;
-    for (; bucket > 0; bucket--) {
-        seen += hist[bucket];
-        if (seen >= k) break;
-    }
-    const uint32_t floor_key = (uint32_t)bucket << OLLM_RADIX_SHIFT;
-    size_t n = 0;
-    for (int32_t i = 0; i < n_vocab && n < cap; i++) {
-        if (logit_key(logits[i]) >= floor_key) {
-            out[n].id = i;
-            out[n].logit = logits[i];
-            out[n].p = 0.0f;
-            n++;
+    float sample[OLLM_TOPK_SAMPLE];
+    llama_token_data sd[OLLM_TOPK_SAMPLE];
+    const int32_t stride = n_vocab / OLLM_TOPK_SAMPLE > 0 ? n_vocab / OLLM_TOPK_SAMPLE : 1;
+    int ns = 0;
+    for (int32_t i = 0; i < n_vocab && ns < OLLM_TOPK_SAMPLE; i += stride) sample[ns++] = logits[i];
+    size_t rank = (size_t)((double)k * ns / n_vocab * 2.0) + 8;
+    for (;;) {
+        float thr = -INFINITY;
+        if (rank < (size_t)ns) {
+            for (int i = 0; i < ns; i++) sd[i].logit = sample[i];
+            select_top(sd, (size_t)ns, rank);
+            thr = sd[0].logit;
+            for (size_t i = 1; i < rank; i++) thr = sd[i].logit < thr ? sd[i].logit : thr;
         }
+        size_t n = 0;
+        int32_t i = 0;
+        for (; i + 8 <= n_vocab; i += 8) {
+            const float *v = logits + i;
+            int hit = 0;
+            for (int j = 0; j < 8; j++) hit |= v[j] >= thr;
+            if (!hit) continue;
+            for (int j = 0; j < 8 && n < cap; j++) {
+                if (v[j] >= thr) {
+                    out[n].id = i + j;
+                    out[n].logit = v[j];
+                    out[n].p = 0.0f;
+                    n++;
+                }
+            }
+        }
+        for (; i < n_vocab && n < cap; i++) {
+            if (logits[i] >= thr) {
+                out[n].id = i;
+                out[n].logit = logits[i];
+                out[n].p = 0.0f;
+                n++;
+            }
+        }
+        if (n >= k || thr == -INFINITY) return n;
+        rank *= 4;
     }
-    if (n > k) {
-        select_top(out, n, k);
-        n = k;
-    }
-    qsort(out, n, sizeof *out, logit_desc);
-    return n;
 }
 
 /* llama_sampler_sample over a raw row, with the exact top-(k+window) cut when
@@ -1504,10 +1510,8 @@ static size_t gather_top(const float *logits, int32_t n_vocab, size_t k,
 static llama_token sample_row(struct llama_sampler *smpl, const float *logits, int prefilter_k,
                               llama_token_data *cand) {
     size_t n = 0;
-    bool sorted = false;
     if (prefilter_k > 0 && prefilter_k < g_n_vocab) {
         n = gather_top(logits, g_n_vocab, (size_t)prefilter_k, cand, (size_t)g_n_vocab);
-        sorted = true;
     } else {
         for (int32_t i = 0; i < g_n_vocab; i++) {
             cand[i].id = i;
@@ -1516,7 +1520,7 @@ static llama_token sample_row(struct llama_sampler *smpl, const float *logits, i
         }
         n = (size_t)g_n_vocab;
     }
-    llama_token_data_array cur = { cand, n, -1, sorted };
+    llama_token_data_array cur = { cand, n, -1, false };
     llama_sampler_apply(smpl, &cur);
     llama_token tok = cur.selected >= 0 && cur.selected < (int64_t)cur.size
         ? cur.data[cur.selected].id : cand[0].id;
