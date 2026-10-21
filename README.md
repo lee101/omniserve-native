@@ -12,7 +12,7 @@ and external runtimes retain their own licenses.
 - `src/oscale.c` — pure cost/priority decision engine for rented overflow capacity (paid-only, scale-to-zero, spend caps, hard TTL)
 - `src/ocapacity.c` — controller thread: samples admission pressure, asks oscale, warms cogs through app.nz on loopback
 - `src/otune.c` — per-device batch/KV/flash-attention profiles (blackwell, hopper, ada, ampere, turing, cpu)
-- `src/backend_llama.c` — embedded libllama (CUDA sm_120), prefix-aware parallel context pool, chunked long-prompt prefill, Gemma 4/Qwen chat formatting, streaming token callback, and encoder-only embeddings with an independent CPU/GPU placement policy
+- `src/backend_llama.c` — embedded libllama (CUDA sm_120), continuous-batching engine (one context, N sequences, chunked prefill mixed into decode steps, radix top-k sampling, prefix forks across sequences), Gemma 4/Qwen chat formatting, streaming token callback, and encoder-only embeddings with an independent CPU/GPU placement policy
 - `src/backend_sd.c` — embedded stable-diffusion.cpp (`-DWITH_SD=ON`), allocation-efficient PNG output
 - `/docs` + `/openapi.json` — self-contained API docs (text-generator.io pattern: static spec, human page)
 
@@ -120,6 +120,26 @@ moving the VAE to CPU. Latent tile width and height default to 32 and are contro
 behind the image parity gate because tiling changes the decode graph.
 
 Other tuning: `OMNISERVE_NATIVE_PORT`, `BIND`, `SLOTS`, `SECRET`, `LLM_GGUF`, `LLM_SWAP_DIR`, `LLM_CONTEXTS`, `NGL`, `NGL_AUTO_KEEP_FREE_MB`, `CTX`, `BATCH`, `UBATCH` (both accept `auto`), `KV_TYPE` (`f16` default, `q8_0` halves the KV cache at no measured quality cost — see `performance/quality.md`), `FLASH_ATTN` (auto; forced on for a quantized cache because llama.cpp requires it for a quantized V), `EMBEDDING_GGUF`, `EMBEDDING_NGL` (defaults to CPU), `EMBEDDING_CTX`, `EMBEDDING_POOLING` (`mean` default, `cls` for retrieval finetunes like gte-modernbert), `EMBEDDING_THREADS`, `SD_MODEL`, `ADMISSION_TIMEOUT_S`, `UPSTREAM_TIMEOUT_MS`, `REACTORS`, `WORKERS`, and per-modality `LLM_PERMITS`, `IMAGE_PERMITS`, `TTS_PERMITS`, `STT_PERMITS`, `EMBEDDING_PERMITS`, `MULTIMODAL_PERMITS`, `ANIMATION_PERMITS`, `3D_PERMITS`, and `AUX_PERMITS`.
+
+### LLM continuous batching
+
+The embedded LLM runs every request as a sequence in one shared context.
+`LLM_CONTEXTS` is the number of sequences (16 on a 5090 serving
+gemma-roleplay-v2 q8_0); an engine thread decodes one token for each running
+sequence per step, mixes in prefill chunks up to `LLM_STEP_TOKENS` (512), and
+streams tokens back through per-request rings. Concurrency is admitted by the
+`SLOTS` pool, where `LLM_PERMITS` is the weight of one request, so `PERMITS=1`
+is what lets several requests share a step. `LLM_BATCHED=0` restores one
+context per slot; speculative decoding (`SPEC_DRAFT`, `SPEC_MTP_GGUF`) keeps
+that path. `LLM_SHARE_PREFIX=0` disables forking a shared prompt prefix (a
+character persona) from another sequence's cache, `LLM_SWA_FULL=0` shrinks the
+sliding-window cache at the cost of prefix reuse and forks, `LLM_PREFILTER=0`
+samples over the full vocabulary instead of the exact top-(k + penalty window)
+cut, `LLM_SAMPLE_THREADS` sizes the sampling pool, and `LLM_ENGINE_TRACE=1`
+logs per-step decode/sample time. `/status` reports `batching` counters
+(steps, rows, tokens, shared_prefix_tokens). Measurements and rollout:
+`performance/llm-continuous-batching-2026-10-21.md`; drop-in:
+`systemd/omniserve-native-llm-batching.conf`.
 
 ## Local-first ASR and background fine-tuning
 
