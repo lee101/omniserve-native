@@ -28,6 +28,7 @@ typedef struct waiter {
     otier tier;
     otier prio;
     int permits;
+    bool shared;
     long seq;
     struct timespec queued_at;
     pthread_cond_t cond;
@@ -166,12 +167,12 @@ void osched_set_background(osched *s, double timeout_s, double max_wait_s) {
     pthread_mutex_unlock(&s->lock);
 }
 
-static bool fits_locked(const osched *s, otier tier, int permits) {
+static bool fits_locked(const osched *s, otier tier, int permits, bool shared) {
     /* Background work reserves the whole device: it is the lane that swaps
      * embedded models out, so it cannot share with a request that expects them
-     * loaded. */
-    return tier == TIER_BACKGROUND ? (s->active == 0 && s->used_slots == 0)
-                                   : (s->used_slots + permits <= s->slots);
+     * loaded. Shared background (batched LLM decode) only queues last. */
+    return tier == TIER_BACKGROUND && !shared ? (s->active == 0 && s->used_slots == 0)
+                                              : (s->used_slots + permits <= s->slots);
 }
 
 /* Hands slots to the front of the queue and wakes only those waiters.
@@ -184,7 +185,7 @@ static void promote_locked(osched *s) {
     age_locked(s);
     while (s->waiters) {
         waiter *head = s->waiters;
-        if (!fits_locked(s, head->tier, head->permits)) break;
+        if (!fits_locked(s, head->tier, head->permits, head->shared)) break;
         s->waiters = head->next;
         s->active++;
         s->used_slots += head->permits;
@@ -203,7 +204,7 @@ bool osched_try_acquire_n(osched *s, otier tier, int permits) {
      * is the admission point for callers that have somewhere else to go, and
      * jumping the queue would let them take the slot the waiter has already
      * paid for in latency. */
-    if (s->waiters || !fits_locked(s, tier, permits)) {
+    if (s->waiters || !fits_locked(s, tier, permits, false)) {
         pthread_mutex_unlock(&s->lock);
         return false;
     }
@@ -214,12 +215,12 @@ bool osched_try_acquire_n(osched *s, otier tier, int permits) {
     return true;
 }
 
-bool osched_acquire_n(osched *s, otier tier, int permits) {
+static bool acquire(osched *s, otier tier, int permits, bool shared) {
     if (!s || tier < TIER_PAID || tier > TIER_BACKGROUND || permits <= 0 || permits > s->slots) {
         return false;
     }
     pthread_mutex_lock(&s->lock);
-    if (!s->waiters && fits_locked(s, tier, permits)) {
+    if (!s->waiters && fits_locked(s, tier, permits, shared)) {
         s->active++;
         s->used_slots += permits;
         s->served[tier]++;
@@ -243,6 +244,7 @@ bool osched_acquire_n(osched *s, otier tier, int permits) {
     me.tier = tier;
     me.prio = tier;
     me.permits = permits;
+    me.shared = shared;
     me.seq = ++s->seq;
     clock_gettime(CLOCK_MONOTONIC, &me.queued_at);
     if (pthread_cond_init(&me.cond, &s->condattr) != 0) {
@@ -280,6 +282,14 @@ bool osched_acquire_n(osched *s, otier tier, int permits) {
     pthread_mutex_unlock(&s->lock);
     pthread_cond_destroy(&me.cond);
     return true;
+}
+
+bool osched_acquire_n(osched *s, otier tier, int permits) {
+    return acquire(s, tier, permits, false);
+}
+
+bool osched_acquire_shared_n(osched *s, otier tier, int permits) {
+    return acquire(s, tier, permits, true);
 }
 
 bool osched_acquire(osched *s, otier tier) {

@@ -63,6 +63,7 @@ typedef struct {
     int music_timeout_ms;
     int h3_timeout_ms;
     int llm_permits;
+    int llm_background_permits; /* 0: background takes the whole pool */
     int image_permits;
     int h3_permits;
     int art_permits;
@@ -2037,6 +2038,24 @@ static void parse_sampling(const char *js, const oj_tok *toks, int n, int root,
     if (t >= 0) out->seed = (int64_t)oj_number(js, &toks[t], out->seed);
 }
 
+/* Background LLM requests take the whole pool unless
+ * OMNISERVE_NATIVE_LLM_BACKGROUND_PERMITS is set: the batched engine decodes
+ * them alongside interactive sequences, so they only need to queue last. */
+static bool llm_admit(app_state *app, otier tier, int *permits) {
+    if (tier != TIER_BACKGROUND) {
+        *permits = app->llm_permits;
+        return osched_acquire_n(app->sched, tier, *permits);
+    }
+    int cap = osched_capacity(app->sched);
+    int bg = app->llm_background_permits;
+    if (bg > 0 && bg < cap) {
+        *permits = bg;
+        return osched_acquire_shared_n(app->sched, tier, bg);
+    }
+    *permits = cap;
+    return osched_acquire_n(app->sched, tier, cap);
+}
+
 static void handle_chat(ohttp_request *req, app_state *app) {
     if (!llm_ensure_loaded(app, request_tier(req))) {
         respond_error(req, 503, "no LLM model loaded; start with OMNISERVE_NATIVE_LLM_GGUF");
@@ -2130,8 +2149,8 @@ static void handle_chat(ohttp_request *req, app_state *app) {
     if (t >= 0) stream = oj_bool(req->body, &toks[t], false);
 
     otier tier = request_tier(req);
-    int permits = tier == TIER_BACKGROUND ? osched_capacity(app->sched) : app->llm_permits;
-    if (!osched_acquire_n(app->sched, tier, permits)) {
+    int permits = 0;
+    if (!llm_admit(app, tier, &permits)) {
         for (int i = 0; i < owned_n; i++) free(owned[i]);
         free(toks);
         respond_error(req, 503, "admission timeout; retry");
@@ -2319,8 +2338,8 @@ static void handle_completion(ohttp_request *req, app_state *app, bool legacy, b
     }
 
     otier tier = request_tier(req);
-    int permits = tier == TIER_BACKGROUND ? osched_capacity(app->sched) : app->llm_permits;
-    if (!osched_acquire_n(app->sched, tier, permits)) {
+    int permits = 0;
+    if (!llm_admit(app, tier, &permits)) {
         free(system_owned);
         free(prompt);
         for (int i = 0; i < stop_owned_n; i++) free(stop_owned[i]);
@@ -4102,6 +4121,7 @@ int main(int argc, char **argv) {
     if (slots < 1) slots = 1;
     if (slots > 64) slots = 64;
     app.llm_permits = configured_permits("OMNISERVE_NATIVE_LLM_PERMITS", 1, slots);
+    app.llm_background_permits = env_int("OMNISERVE_NATIVE_LLM_BACKGROUND_PERMITS", 0);
     app.image_permits = configured_permits("OMNISERVE_NATIVE_IMAGE_PERMITS", slots, slots);
     /* app.nz owns H3's local/remote admission. Zero means this long-lived
      * relay must not pin an OmniServe GPU slot while RunPod is executing. */

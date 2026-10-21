@@ -21,6 +21,9 @@ void osched_release(osched *s, otier tier);
 /* Weighted permits let latency-friendly text/audio calls share configured GPU
  * capacity while diffusion/video reserve the entire device. */
 bool osched_acquire_n(osched *s, otier tier, int permits);
+/* Background tier that queues behind every other tier but, unlike plain
+ * background, does not need the device idle to start. */
+bool osched_acquire_shared_n(osched *s, otier tier, int permits);
 void osched_release_n(osched *s, otier tier, int permits);
 
 /* Non-blocking admission for callers with an alternative, so a saturated local

@@ -31,6 +31,9 @@ TURNS = [
 ]
 
 
+HEADERS = {"Content-Type": "application/json"}
+
+
 def one_request(host, port, i, max_tokens, temperature, seed):
     turn = TURNS[i % len(TURNS)]
     body = json.dumps({
@@ -48,7 +51,7 @@ def one_request(host, port, i, max_tokens, temperature, seed):
     })
     conn = http.client.HTTPConnection(host, port, timeout=600)
     t0 = time.perf_counter()
-    conn.request("POST", "/v1/chat/completions", body, {"Content-Type": "application/json"})
+    conn.request("POST", "/v1/chat/completions", body, HEADERS)
     resp = conn.getresponse()
     if resp.status != 200:
         raise RuntimeError(f"status {resp.status}: {resp.read()[:200]!r}")
@@ -139,7 +142,11 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--label", default="")
+    ap.add_argument("--header", action="append", default=[], help="Name: value, repeatable")
     args = ap.parse_args()
+    for h in args.header:
+        k, _, v = h.partition(":")
+        HEADERS[k.strip()] = v.strip()
     fixed = args.requests
     for conc in [int(c) for c in args.conc.split(",")]:
         args.requests = fixed or max(4, 2 * conc)
