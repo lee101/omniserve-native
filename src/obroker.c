@@ -139,3 +139,32 @@ bool obroker_release(const char *base_url, const char *lease_id) {
     snprintf(body, sizeof body, "{\"lease_id\":\"%s\"}", lease_id);
     return post_json(base_url, "/v1/gpu/release", body, 3000, NULL, 0) == 200;
 }
+
+int obroker_residency(const char *base_url, const char *owner, int pid, int resident_mb,
+                      int stream_mb, double saved_ms, int requests, bool resident,
+                      char *reason, size_t reason_cap) {
+    if (reason && reason_cap) reason[0] = 0;
+    char safe_owner[32];
+    size_t k = 0;
+    for (const char *p = owner ? owner : "anon"; *p && k + 1 < sizeof safe_owner; p++) {
+        safe_owner[k++] = (*p == '"' || *p == '\\' || (unsigned char)*p < 0x20) ? '_' : *p;
+    }
+    safe_owner[k] = 0;
+    char body[320];
+    snprintf(body, sizeof body,
+             "{\"owner\":\"%s\",\"pid\":%d,\"resident_mb\":%d,\"stream_mb\":%d,"
+             "\"saved_ms\":%.0f,\"requests\":%d,\"resident\":%s}",
+             safe_owner, pid, resident_mb, stream_mb, saved_ms, requests, resident ? "true" : "false");
+    char resp[512];
+    int status = post_json(base_url, "/v1/gpu/residency", body, 3000, resp, sizeof resp);
+    if (status == 404 || status == 503) return -2;
+    if (status != 200) return -1;
+    const char *r = strstr(resp, "\"reason\":\"");
+    if (r && reason && reason_cap) {
+        r += 10;
+        size_t i = 0;
+        while (r[i] && r[i] != '"' && i + 1 < reason_cap) { reason[i] = r[i]; i++; }
+        reason[i] = 0;
+    }
+    return json_bool(resp, "\"resident\"") ? 1 : 0;
+}

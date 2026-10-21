@@ -1,0 +1,28 @@
+{
+ "cpu": {
+  "env": {
+   "CUDA_VISIBLE_DEVICES": "",
+   "OMNISERVE_NATIVE_VRAM_BROKER_URL": "",
+   "OMNISERVE_NATIVE_SD_LEASE_MB": "0",
+   "OMNISERVE_NATIVE_SD_EDIT_LEASE_MB": "0",
+   "OMNISERVE_NATIVE_SD_MIN_FREE_MB": "0",
+   "OMNISERVE_NATIVE_SD_THREADS": "32",
+   "OMNISERVE_NATIVE_SD_PARAMS_BACKEND": ""
+  },
+  "need_mib": 0
+ },
+ "cpu_merged_q5": {
+  "env": {
+   "CUDA_VISIBLE_DEVICES": "",
+   "OMNISERVE_NATIVE_VRAM_BROKER_URL": "",
+   "OMNISERVE_NATIVE_SD_LEASE_MB": "0",
+   "OMNISERVE_NATIVE_SD_EDIT_LEASE_MB": "0",
+   "OMNISERVE_NATIVE_SD_MIN_FREE_MB": "0",
+   "OMNISERVE_NATIVE_SD_THREADS": "32",
+   "OMNISERVE_NATIVE_SD_PARAMS_BACKEND": "",
+   "OMNISERVE_NATIVE_SD_DIFFUSION_MODEL": "/nvme0n1-disk/models/omniserve-native/qwen-image-2.1-turbo/Qwen-Image-2.1-viggle-turbo-v0.3-6step-Q5_K_M.gguf",
+   "OMNISERVE_NATIVE_SD_DEFAULT_LORA": ""
+  },
+  "need_mib": 0
+ }
+}

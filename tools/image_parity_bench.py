@@ -307,6 +307,10 @@ def main() -> int:
                         help="override the corpus step count for the reference")
     parser.add_argument("--candidate-steps", type=int,
                         help="override the corpus step count for the candidate")
+    parser.add_argument("--reference-extra", type=json.loads, default={},
+                        help="JSON object merged into every reference payload, e.g. '{\"turbo\":false}'")
+    parser.add_argument("--candidate-extra", type=json.loads, default={},
+                        help="JSON object merged into every candidate payload")
     parser.add_argument("--monthly-gpu-cost", type=float, default=1000.0,
                         help="amortized GPU host cost used for per-megapixel economics")
     parser.add_argument("--semantic-module-dir", type=Path,
@@ -349,8 +353,8 @@ def main() -> int:
         captured_rows = {row["id"]: row for row in manifest["rows"]}
     for index, case in enumerate(cases):
         payload = {**defaults, **{key: case[key] for key in ("prompt", "size", "seed")}, "n": 1}
-        reference_payload = {**payload}
-        candidate_payload = {**payload}
+        reference_payload = {**payload, **args.reference_extra}
+        candidate_payload = {**payload, **args.candidate_extra}
         if args.reference_steps is not None:
             reference_payload["steps"] = args.reference_steps
         if args.candidate_steps is not None:

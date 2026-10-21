@@ -31,6 +31,16 @@ typedef struct {
     float min_probability;
     int top_k;
     float repetition_penalty;
+    /* Tokens of history the penalties look back over; 0 picks the server
+     * default, negative means the whole context. */
+    int repetition_last_n;
+    float frequency_penalty;
+    float presence_penalty;
+    /* DRY: penalises extending a sequence already seen, so speaker names and
+     * formatting survive where a per-token penalty would push them out. */
+    float dry_multiplier;
+    float dry_base;
+    int dry_allowed_length;
     int64_t seed;
     bool enable_thinking;
     const char *const *stop_sequences;
@@ -82,6 +92,19 @@ typedef struct {
     int cpu_expert_layers;
     char tensor_override[512];
     unsigned long long est_gpu_bytes;
+    /* Continuous batching: sequences sharing one context, the per-step token
+     * budget, and engine counters (rows/steps is the mean decode batch). */
+    bool batched;
+    int batch_seqs;
+    int step_tokens;
+    unsigned long long engine_steps;
+    unsigned long long engine_rows;
+    unsigned long long engine_tokens;
+    unsigned long long shared_prefix_tokens; /* prompt tokens forked, not prefilled */
+    int kv_seqs;                             /* full contexts the KV pool holds */
+    unsigned long long kv_evictions;         /* idle prefixes dropped for space */
+    unsigned long long kv_preemptions;       /* requests failed with the pool full */
+    unsigned long long kv_requeues;          /* prefills restarted with the pool full */
 } ollm_placement;
 
 /* Contexts this device class can keep resident beside the weights. Advisory:
@@ -238,6 +261,11 @@ typedef struct {
 } oimg_result;
 
 bool osd_init(const char *model_path);
+bool osd_resident(void);
+int osd_set_resident(bool resident, bool wait); /* 1 ok, 0 failed, -1 busy (wait=false) */
+bool osd_residency_target(void); /* pending arbiter state if any, else current */
+void osd_residency_settled(void); /* drop a pending switch: the arbiter now agrees with the current state */
+size_t osd_residency_json(char *out, size_t cap);
 bool osd_ready(void);
 const char *osd_model_name(void);
 bool osd_generate(const oimg_req *req, oimg_result *out);

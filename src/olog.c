@@ -202,6 +202,11 @@ void olog_request(const ohttp_request *req, int status, double duration_ms) {
 
     bool internal = internal_fn ? internal_fn(req)
                                 : (ohttp_req_peer_is_loopback(req) && hdr_len == 0);
+    /* Residency heartbeats arrive every few seconds per image gateway; only failures are news. */
+    static const char heartbeat[] = "/v1/gpu/residency";
+    if (internal && status == 200 && req->path_len == sizeof heartbeat - 1 &&
+        memcmp(req->path, heartbeat, sizeof heartbeat - 1) == 0)
+        return;
     char method[16];
     size_t method_len = escape_into(method, sizeof method - 1, req->method,
                                     req->method_len, NULL);

@@ -628,6 +628,23 @@ static void test_sched_timeout(void) {
     osched_destroy(s);
 }
 
+static void test_sched_shared_background(void) {
+    osched *s = osched_create(4, 1);
+    CHECK(osched_acquire_n(s, TIER_FREE, 1));
+    CHECK(!osched_acquire_n(s, TIER_BACKGROUND, 2));
+    CHECK(osched_acquire_shared_n(s, TIER_BACKGROUND, 2));
+    CHECK(!osched_acquire_shared_n(s, TIER_BACKGROUND, 2));
+    osched_stats st;
+    osched_snapshot(s, &st);
+    CHECK(st.used_slots == 3);
+    CHECK(st.served[TIER_BACKGROUND] == 1);
+    osched_release_n(s, TIER_BACKGROUND, 2);
+    osched_release_n(s, TIER_FREE, 1);
+    CHECK(osched_acquire_n(s, TIER_BACKGROUND, 2));
+    osched_release_n(s, TIER_BACKGROUND, 2);
+    osched_destroy(s);
+}
+
 static void test_sched_weighted_capacity(void) {
     osched *s = osched_create(3, 1);
     CHECK(osched_capacity(s) == 3);
@@ -2365,6 +2382,7 @@ int main(void) {
     test_sched_timeout_releases_the_queue();
     test_sched_saturation();
     test_sched_weighted_capacity();
+    test_sched_shared_background();
     test_scale_defaults_to_zero();
     test_scale_only_for_eligible_tiers();
     test_scale_prefers_local_capacity();

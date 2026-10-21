@@ -16,6 +16,7 @@
 
 #include "ovram.h"
 #include "obroker.h"
+#include "oresidency.h"
 
 #include <math.h>
 #include <limits.h>
@@ -64,6 +65,7 @@ typedef struct {
     int music_timeout_ms;
     int h3_timeout_ms;
     int llm_permits;
+    int llm_background_permits; /* 0: background takes the whole pool */
     int image_permits;
     int h3_permits;
     int art_permits;
@@ -85,6 +87,7 @@ typedef struct {
     oscale *scale;
     ocapacity *capacity;
     ovram *vram;
+    ores *residency; /* demand-driven image-model residency arbiter, beside the ledger */
     /* Box-wide broker in another process (the :8791 gateway). When set, this
      * gateway's image lane leases there instead of from its own ovram, so
      * co-resident gateways arbitrate one ledger rather than two. */
@@ -788,10 +791,16 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
             "# TYPE omniserve_llm_spec_calls_saved_total counter\n"
             "omniserve_llm_spec_calls_saved_total %llu\n"
             "omniserve_llm_spec_rounds_total %llu\n"
-            "omniserve_llm_spec_draft_max %d\n",
+            "omniserve_llm_spec_draft_max %d\n"
+            "# HELP omniserve_llm_engine_steps_total Batched decode steps, sampled rows, and tokens.\n"
+            "# TYPE omniserve_llm_engine_steps_total counter\n"
+            "omniserve_llm_engine_steps_total %llu\n"
+            "omniserve_llm_engine_rows_total %llu\n"
+            "omniserve_llm_engine_tokens_total %llu\n",
             spec_placement.spec_drafted, spec_placement.spec_accepted,
             spec_placement.spec_saved_calls, spec_placement.spec_rounds,
-            spec_placement.spec_draft_max);
+            spec_placement.spec_draft_max, spec_placement.engine_steps,
+            spec_placement.engine_rows, spec_placement.engine_tokens);
     }
 
     if (len < sizeof body) {
@@ -1013,6 +1022,9 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  "\"speculation\":{\"source\":\"%s\",\"draft_max\":%d,\"rounds\":%llu,"
                  "\"drafted\":%llu,\"accepted\":%llu,\"acceptance\":%.3f,"
                  "\"calls_saved\":%llu},"
+                 "\"batching\":{\"enabled\":%s,\"seqs\":%d,\"step_tokens\":%d,"
+                 "\"steps\":%llu,\"rows\":%llu,\"tokens\":%llu,\"shared_prefix_tokens\":%llu,"
+                 "\"kv_seqs\":%d,\"kv_evictions\":%llu,\"kv_preemptions\":%llu,\"kv_requeues\":%llu},"
                  "\"overflow\":{\"image\":%s,\"image_path\":\"%s\",\"tiers\":%u,"
                  "\"saturated\":%llu,\"local_failed\":%llu,"
                  "\"frontier\":%s,\"frontier_kept_local\":%llu,"
@@ -1023,6 +1035,10 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  placement.spec_source, placement.spec_draft_max, placement.spec_rounds,
                  placement.spec_drafted, placement.spec_accepted, acceptance,
                  placement.spec_saved_calls,
+                 placement.batched ? "true" : "false", placement.batch_seqs,
+                 placement.step_tokens, placement.engine_steps, placement.engine_rows,
+                 placement.engine_tokens, placement.shared_prefix_tokens,
+                 placement.kv_seqs, placement.kv_evictions, placement.kv_preemptions, placement.kv_requeues,
                  app->image_overflow ? "true" : "false",
                  overflow_path_label(),
                  app->overflow_tier_mask,
@@ -1877,6 +1893,84 @@ static void image_gpu_release(app_state *app, const char *id, bool remote) {
     else if (app->vram) ovram_release(app->vram, id);
 }
 
+/* Demand-driven residency client (OMNISERVE_NATIVE_SD_RESIDENCY=demand): every tick
+ * the image lane reports its request count and state to the arbiter (in-process
+ * when this gateway hosts the ledger, else the remote broker) and rebuilds the
+ * diffusion context resident or streamed as told. See oresidency.h. */
+typedef struct {
+    bool enabled;
+    int resident_mb, stream_mb, resident_lease_mb, resident_edit_lease_mb, tick_ms;
+    double saved_ms;
+    int requests;
+    unsigned long long reports, unreachable;
+    char reason[48];
+} residency_client;
+
+static residency_client g_rs;
+
+static int residency_decide(app_state *app, int requests, bool resident, char *reason, size_t cap) {
+    if (app->vram_broker_url)
+        return obroker_residency(app->vram_broker_url, app->vram_owner, (int)getpid(), g_rs.resident_mb,
+                                 g_rs.stream_mb, g_rs.saved_ms, requests, resident, reason, cap);
+    if (!app->residency) return -1;
+    double free_gib = -1.0, total_gib = -1.0;
+    int free_mb = ogpu_memory_gib(&free_gib, &total_gib) && free_gib >= 0 ? (int)(free_gib * 1024.0) : -1;
+    ores_report_in in = {app->vram_owner, (int)getpid(), g_rs.resident_mb, g_rs.stream_mb,
+                         g_rs.saved_ms, requests, resident};
+    ores_decision d = ores_report(app->residency, &in, free_mb);
+    snprintf(reason, cap, "%s", d.reason);
+    return d.resident ? 1 : 0;
+}
+
+static void *residency_main(void *arg) {
+    app_state *app = arg;
+    for (;;) {
+        usleep((useconds_t)g_rs.tick_ms * 1000u);
+        int n = __atomic_exchange_n(&g_rs.requests, 0, __ATOMIC_RELAXED);
+        bool cur = osd_resident();
+        char reason[48] = {0};
+        int want = residency_decide(app, n, cur, reason, sizeof reason);
+        pthread_mutex_lock(&g_gs_lock);
+        g_rs.reports++;
+        if (want == -2) {
+            snprintf(g_rs.reason, sizeof g_rs.reason, "no_arbiter");
+        } else if (want < 0) {
+            g_rs.unreachable++;
+            snprintf(g_rs.reason, sizeof g_rs.reason, "broker_unreachable");
+        } else {
+            snprintf(g_rs.reason, sizeof g_rs.reason, "%s", reason);
+        }
+        pthread_mutex_unlock(&g_gs_lock);
+        /* An unreachable arbiter cannot account for resident bytes: stream. */
+        bool target = want == 1;
+        /* Switch only in a gap between generations; a busy lane retries next tick. */
+        if (target == cur) osd_residency_settled();
+        else if (osd_set_resident(target, false) == 1)
+            (void)residency_decide(app, 0, osd_resident(), reason, sizeof reason);
+    }
+    return NULL;
+}
+
+static size_t residency_json(app_state *app, char *out, size_t cap) {
+    char sd[160] = "null";
+    if (osd_ready()) osd_residency_json(sd, sizeof sd);
+    pthread_mutex_lock(&g_gs_lock);
+    int n = snprintf(out, cap,
+        "{\"client\":{\"enabled\":%s,\"resident_mb\":%d,\"stream_mb\":%d,\"saved_ms\":%.0f,"
+        "\"resident_lease_mb\":%d,\"reports\":%llu,\"unreachable\":%llu,\"reason\":\"%s\",\"sd\":%s},"
+        "\"broker\":",
+        g_rs.enabled ? "true" : "false", g_rs.resident_mb, g_rs.stream_mb, g_rs.saved_ms,
+        g_rs.resident_lease_mb, g_rs.reports, g_rs.unreachable, g_rs.reason, sd);
+    pthread_mutex_unlock(&g_gs_lock);
+    if (n < 0 || (size_t)n >= cap) return 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    size_t len = (size_t)n + ores_status_json(app->residency, (double)ts.tv_sec + ts.tv_nsec / 1e9,
+                                              out + n, cap - (size_t)n - 1);
+    if (len + 1 < cap) { out[len++] = '}'; out[len] = 0; }
+    return len;
+}
+
 #define OGUARD_REFUSAL "I can't help with that."
 
 static void guard_refuse_chat(ohttp_request *req, bool stream, oguard_category category) {
@@ -1921,6 +2015,59 @@ static void guard_refuse_completion(ohttp_request *req, bool legacy, oguard_cate
             OGUARD_REFUSAL, ollm_model_name());
     }
     ohttp_respond_h(req, 200, "application/json", body, n > 0 ? (size_t)n : 0, hdr);
+}
+
+static void parse_sampling(const char *js, const oj_tok *toks, int n, int root,
+                           ochat_req *out, bool legacy) {
+    const char *dry_env = getenv("OMNISERVE_NATIVE_DRY_MULTIPLIER");
+    if (dry_env && dry_env[0]) out->dry_multiplier = (float)atof(dry_env);
+    int t = oj_obj_get(js, toks, n, root, legacy ? "max_length" : "max_tokens");
+    if (t >= 0) out->max_tokens = (int)oj_number(js, &toks[t], out->max_tokens);
+    t = oj_obj_get(js, toks, n, root, "temperature");
+    if (t >= 0) out->temperature = (float)oj_number(js, &toks[t], out->temperature);
+    t = oj_obj_get(js, toks, n, root, "top_p");
+    if (t >= 0) out->top_p = (float)oj_number(js, &toks[t], out->top_p);
+    t = oj_obj_get(js, toks, n, root, "min_p");
+    if (t >= 0) out->min_p = (float)oj_number(js, &toks[t], out->min_p);
+    t = oj_obj_get(js, toks, n, root, "min_probability");
+    if (t >= 0) out->min_probability = (float)oj_number(js, &toks[t], out->min_probability);
+    t = oj_obj_get(js, toks, n, root, "top_k");
+    if (t >= 0) out->top_k = (int)oj_number(js, &toks[t], out->top_k);
+    t = oj_obj_get(js, toks, n, root, "repetition_penalty");
+    if (t >= 0) out->repetition_penalty = (float)oj_number(js, &toks[t], out->repetition_penalty);
+    t = oj_obj_get(js, toks, n, root, "repetition_last_n");
+    if (t < 0) t = oj_obj_get(js, toks, n, root, "repeat_last_n");
+    if (t >= 0) out->repetition_last_n = (int)oj_number(js, &toks[t], out->repetition_last_n);
+    t = oj_obj_get(js, toks, n, root, "frequency_penalty");
+    if (t >= 0) out->frequency_penalty = (float)oj_number(js, &toks[t], out->frequency_penalty);
+    t = oj_obj_get(js, toks, n, root, "presence_penalty");
+    if (t >= 0) out->presence_penalty = (float)oj_number(js, &toks[t], out->presence_penalty);
+    t = oj_obj_get(js, toks, n, root, "dry_multiplier");
+    if (t >= 0) out->dry_multiplier = (float)oj_number(js, &toks[t], out->dry_multiplier);
+    t = oj_obj_get(js, toks, n, root, "dry_base");
+    if (t >= 0) out->dry_base = (float)oj_number(js, &toks[t], out->dry_base);
+    t = oj_obj_get(js, toks, n, root, "dry_allowed_length");
+    if (t >= 0) out->dry_allowed_length = (int)oj_number(js, &toks[t], out->dry_allowed_length);
+    t = oj_obj_get(js, toks, n, root, "seed");
+    if (t >= 0) out->seed = (int64_t)oj_number(js, &toks[t], out->seed);
+}
+
+/* Background LLM requests take the whole pool unless
+ * OMNISERVE_NATIVE_LLM_BACKGROUND_PERMITS is set: the batched engine decodes
+ * them alongside interactive sequences, so they only need to queue last. */
+static bool llm_admit(app_state *app, otier tier, int *permits) {
+    if (tier != TIER_BACKGROUND) {
+        *permits = app->llm_permits;
+        return osched_acquire_n(app->sched, tier, *permits);
+    }
+    int cap = osched_capacity(app->sched);
+    int bg = app->llm_background_permits;
+    if (bg > 0 && bg < cap) {
+        *permits = bg;
+        return osched_acquire_shared_n(app->sched, tier, bg);
+    }
+    *permits = cap;
+    return osched_acquire_n(app->sched, tier, cap);
 }
 
 static void handle_chat(ohttp_request *req, app_state *app) {
@@ -2004,23 +2151,8 @@ static void handle_chat(ohttp_request *req, app_state *app) {
                        .temperature = 0.8f, .top_p = 0.92f, .top_k = 40,
                        .repetition_penalty = 1.0f, .seed = -1,
                        .enable_thinking = thinking_default };
-    int t = oj_obj_get(req->body, toks, n, 0, "max_tokens");
-    if (t >= 0) creq.max_tokens = (int)oj_number(req->body, &toks[t], 512);
-    t = oj_obj_get(req->body, toks, n, 0, "temperature");
-    if (t >= 0) creq.temperature = (float)oj_number(req->body, &toks[t], 0.8);
-    t = oj_obj_get(req->body, toks, n, 0, "top_p");
-    if (t >= 0) creq.top_p = (float)oj_number(req->body, &toks[t], 0.92);
-    t = oj_obj_get(req->body, toks, n, 0, "min_p");
-    if (t >= 0) creq.min_p = (float)oj_number(req->body, &toks[t], 0.0);
-    t = oj_obj_get(req->body, toks, n, 0, "min_probability");
-    if (t >= 0) creq.min_probability = (float)oj_number(req->body, &toks[t], 0.0);
-    t = oj_obj_get(req->body, toks, n, 0, "top_k");
-    if (t >= 0) creq.top_k = (int)oj_number(req->body, &toks[t], 40);
-    t = oj_obj_get(req->body, toks, n, 0, "repetition_penalty");
-    if (t >= 0) creq.repetition_penalty = (float)oj_number(req->body, &toks[t], 1.0);
-    t = oj_obj_get(req->body, toks, n, 0, "seed");
-    if (t >= 0) creq.seed = (int64_t)oj_number(req->body, &toks[t], -1);
-    t = oj_obj_get(req->body, toks, n, 0, "enable_thinking");
+    parse_sampling(req->body, toks, n, 0, &creq, false);
+    int t = oj_obj_get(req->body, toks, n, 0, "enable_thinking");
     if (t >= 0) creq.enable_thinking = oj_bool(req->body, &toks[t], thinking_default);
     const char *stop_values[16];
     creq.stop_count = parse_stop_values(req->body, toks, n, 0, "stop", stop_values,
@@ -2031,8 +2163,8 @@ static void handle_chat(ohttp_request *req, app_state *app) {
     if (t >= 0) stream = oj_bool(req->body, &toks[t], false);
 
     otier tier = request_tier(req);
-    int permits = tier == TIER_BACKGROUND ? osched_capacity(app->sched) : app->llm_permits;
-    if (!osched_acquire_n(app->sched, tier, permits)) {
+    int permits = 0;
+    if (!llm_admit(app, tier, &permits)) {
         for (int i = 0; i < owned_n; i++) free(owned[i]);
         free(toks);
         respond_error(req, 503, "admission timeout; retry");
@@ -2132,26 +2264,6 @@ static bool append_literal(char **buf, size_t *len, size_t *cap, const char *tex
     return true;
 }
 
-static void parse_sampling(const char *js, const oj_tok *toks, int n, int root,
-                           ochat_req *out, bool legacy) {
-    int t = oj_obj_get(js, toks, n, root, legacy ? "max_length" : "max_tokens");
-    if (t >= 0) out->max_tokens = (int)oj_number(js, &toks[t], out->max_tokens);
-    t = oj_obj_get(js, toks, n, root, "temperature");
-    if (t >= 0) out->temperature = (float)oj_number(js, &toks[t], out->temperature);
-    t = oj_obj_get(js, toks, n, root, "top_p");
-    if (t >= 0) out->top_p = (float)oj_number(js, &toks[t], out->top_p);
-    t = oj_obj_get(js, toks, n, root, "min_p");
-    if (t >= 0) out->min_p = (float)oj_number(js, &toks[t], out->min_p);
-    t = oj_obj_get(js, toks, n, root, "min_probability");
-    if (t >= 0) out->min_probability = (float)oj_number(js, &toks[t], out->min_probability);
-    t = oj_obj_get(js, toks, n, root, "top_k");
-    if (t >= 0) out->top_k = (int)oj_number(js, &toks[t], out->top_k);
-    t = oj_obj_get(js, toks, n, root, "repetition_penalty");
-    if (t >= 0) out->repetition_penalty = (float)oj_number(js, &toks[t], out->repetition_penalty);
-    t = oj_obj_get(js, toks, n, root, "seed");
-    if (t >= 0) out->seed = (int64_t)oj_number(js, &toks[t], out->seed);
-}
-
 static void handle_completion(ohttp_request *req, app_state *app, bool legacy, bool autocomplete) {
     if (!llm_ensure_loaded(app, request_tier(req))) {
         respond_error(req, 503, "no LLM model loaded or configured upstream");
@@ -2240,8 +2352,8 @@ static void handle_completion(ohttp_request *req, app_state *app, bool legacy, b
     }
 
     otier tier = request_tier(req);
-    int permits = tier == TIER_BACKGROUND ? osched_capacity(app->sched) : app->llm_permits;
-    if (!osched_acquire_n(app->sched, tier, permits)) {
+    int permits = 0;
+    if (!llm_admit(app, tier, &permits)) {
         free(system_owned);
         free(prompt);
         for (int i = 0; i < stop_owned_n; i++) free(stop_owned[i]);
@@ -2572,6 +2684,11 @@ static void handle_images(ohttp_request *req, app_state *app) {
     char image_lease_id[40] = {0};
     bool image_lease_remote = false;
     int required_headroom_mb = img2img ? g_gs.sd_edit_lease_mb : g_gs.sd_lease_mb;
+    if (g_rs.enabled) {
+        __atomic_add_fetch(&g_rs.requests, 1, __ATOMIC_RELAXED);
+        /* Resident weights are already on the device; lease only the workspace. */
+        if (osd_residency_target()) required_headroom_mb = img2img ? g_rs.resident_edit_lease_mb : g_rs.resident_lease_mb;
+    }
     /* Lease figures are for 1024x1024. Activation memory scales with pixels
      * on top of a fixed part (weights streamed per layer, text encoder):
      * measured Qwen 2.1 growth ~7.7 GB at 768^2 vs ~10.3 GB at 1024^2. */
@@ -3321,7 +3438,9 @@ static void handle_gpu_status(ohttp_request *req, app_state *app) {
     if (app->vram) len += ovram_ledger_json(app->vram, body + len, cap - len - 1024);
     else len += (size_t)snprintf(body + len, cap - len, "null");
     len += (size_t)snprintf(body + len, cap - len, ",\"sched\":");
-    len += gpu_sched_json(body + len, cap - len - 2);
+    len += gpu_sched_json(body + len, cap - len - 4096);
+    len += (size_t)snprintf(body + len, cap - len, ",\"residency\":");
+    len += residency_json(app, body + len, cap - len - 2);
     snprintf(body + len, cap - len, "}");
     ohttp_respond_str(req, 200, "application/json", body);
     free(body);
@@ -3408,6 +3527,35 @@ static void handle_vram_lease(ohttp_request *req, app_state *app) {
                  "\"waited_ms\":%d}",
                  otier_name(tier), waited_ms);
     }
+    ohttp_respond_str(req, 200, "application/json", body);
+}
+
+static void handle_gpu_residency(ohttp_request *req, app_state *app) {
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    if (!app->residency) { respond_error(req, 503, "residency arbiter is not enabled"); return; }
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+    oj_tok toks[32];
+    int n = oj_parse(req->body, req->body_len, toks, 32);
+    if (n <= 0 || toks[0].type != OJ_OBJECT) { respond_error(req, 400, "body must be a JSON object"); return; }
+    char owner[32] = {0};
+    int t = oj_obj_get(req->body, toks, n, 0, "owner");
+    if (t >= 0) oj_unescape(req->body, &toks[t], owner, sizeof owner);
+    if (!owner[0]) { respond_error(req, 400, "owner is required"); return; }
+    ores_report_in in = {.owner = owner};
+    if ((t = oj_obj_get(req->body, toks, n, 0, "pid")) >= 0) in.pid = (int)oj_number(req->body, &toks[t], 0);
+    if ((t = oj_obj_get(req->body, toks, n, 0, "resident_mb")) >= 0) in.resident_mb = (int)oj_number(req->body, &toks[t], 0);
+    if ((t = oj_obj_get(req->body, toks, n, 0, "stream_mb")) >= 0) in.stream_mb = (int)oj_number(req->body, &toks[t], 0);
+    if ((t = oj_obj_get(req->body, toks, n, 0, "saved_ms")) >= 0) in.saved_ms = oj_number(req->body, &toks[t], 0);
+    if ((t = oj_obj_get(req->body, toks, n, 0, "requests")) >= 0) in.requests = (int)oj_number(req->body, &toks[t], 0);
+    if ((t = oj_obj_get(req->body, toks, n, 0, "resident")) >= 0)
+        in.resident = req->body_len > (size_t)toks[t].start && req->body[toks[t].start] == 't';
+    double free_gib = -1.0, total_gib = -1.0;
+    int free_mb = ogpu_memory_gib(&free_gib, &total_gib) && free_gib >= 0 ? (int)(free_gib * 1024.0) : -1;
+    ores_decision d = ores_report(app->residency, &in, free_mb);
+    char body[256];
+    snprintf(body, sizeof body,
+             "{\"resident\":%s,\"admitted\":%s,\"demand\":%.2f,\"benefit_ms\":%.0f,\"reason\":\"%s\"}",
+             d.resident ? "true" : "false", d.admitted ? "true" : "false", d.demand, d.benefit, d.reason);
     ohttp_respond_str(req, 200, "application/json", body);
 }
 
@@ -3514,6 +3662,7 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/v1/gpu/lease")) { handle_vram_lease(req, app); return; }
     if (ohttp_path_is(req, "/v1/gpu/renew")) { handle_vram_renew(req, app); return; }
     if (ohttp_path_is(req, "/v1/gpu/release")) { handle_vram_release(req, app); return; }
+    if (ohttp_path_is(req, "/v1/gpu/residency")) { handle_gpu_residency(req, app); return; }
     if (ohttp_path_is(req, "/v1/guard/classify")) { handle_guard_classify(req, app); return; }
     if (ohttp_path_is(req, "/admin/llm/unload") || ohttp_path_is(req, "/admin/unload")) {
         handle_llm_unload(req); return;
@@ -4015,6 +4164,7 @@ int main(int argc, char **argv) {
     if (slots < 1) slots = 1;
     if (slots > 64) slots = 64;
     app.llm_permits = configured_permits("OMNISERVE_NATIVE_LLM_PERMITS", 1, slots);
+    app.llm_background_permits = env_int("OMNISERVE_NATIVE_LLM_BACKGROUND_PERMITS", 0);
     app.image_permits = configured_permits("OMNISERVE_NATIVE_IMAGE_PERMITS", slots, slots);
     /* app.nz owns H3's local/remote admission. Zero means this long-lived
      * relay must not pin an OmniServe GPU slot while RunPod is executing. */
@@ -4046,6 +4196,19 @@ int main(int argc, char **argv) {
         const char *ttl_env = getenv("OMNISERVE_NATIVE_VRAM_LEASE_TTL_S");
         app.vram = ovram_create(keep_env ? atoi(keep_env) : 1024,
                                 ttl_env ? atof(ttl_env) : 120.0);
+        if (app.vram && env_flag("OMNISERVE_NATIVE_RESIDENCY_BROKER", 1)) {
+            ores_config rc;
+            ores_config_defaults(&rc);
+            rc.keep_free_mb = env_int("OMNISERVE_NATIVE_RESIDENCY_KEEP_FREE_MB", keep_env ? atoi(keep_env) : 1024);
+            rc.half_life_s = env_int("OMNISERVE_NATIVE_RESIDENCY_HALF_LIFE_S", 300);
+            rc.min_hold_s = env_int("OMNISERVE_NATIVE_RESIDENCY_MIN_HOLD_S", 120);
+            rc.idle_release_s = env_int("OMNISERVE_NATIVE_RESIDENCY_IDLE_RELEASE_S", 900);
+            rc.switch_ratio = env_int("OMNISERVE_NATIVE_RESIDENCY_SWITCH_PCT", 150) / 100.0;
+            rc.reserve_idle_s = env_int("OMNISERVE_NATIVE_RESIDENCY_RESERVE_IDLE_S", 180);
+            rc.hysteresis_mb = env_int("OMNISERVE_NATIVE_RESIDENCY_HYSTERESIS_MB", 1024);
+            rc.free_window_s = env_int("OMNISERVE_NATIVE_RESIDENCY_FREE_WINDOW_S", 60);
+            app.residency = ores_create(&rc);
+        }
         /* Declares memory a co-tenant will grow into but has not taken yet.
          * Memory a tenant already holds must not be listed: the driver's free
          * figure has counted it once already. Format: "name:mb,name:mb". */
@@ -4367,6 +4530,21 @@ int main(int argc, char **argv) {
     if (sd && sd[0]) {
         fprintf(stderr, "loading diffusion %s\n", sd);
         if (!osd_init(sd)) fprintf(stderr, "diffusion load failed\n");
+        const char *mode = getenv("OMNISERVE_NATIVE_SD_RESIDENCY");
+        if (osd_ready() && mode && strcmp(mode, "demand") == 0) {
+            g_rs.resident_mb = env_int("OMNISERVE_NATIVE_SD_RESIDENT_MB", 12000);
+            g_rs.stream_mb = env_int("OMNISERVE_NATIVE_SD_STREAM_MB", g_gs.sd_lease_mb);
+            g_rs.saved_ms = env_int("OMNISERVE_NATIVE_SD_RESIDENT_SAVED_MS", 5000);
+            g_rs.resident_lease_mb = env_int("OMNISERVE_NATIVE_SD_RESIDENT_LEASE_MB", 2048);
+            g_rs.resident_edit_lease_mb = env_int("OMNISERVE_NATIVE_SD_RESIDENT_EDIT_LEASE_MB", g_rs.resident_lease_mb);
+            g_rs.tick_ms = env_int("OMNISERVE_NATIVE_SD_RESIDENCY_TICK_MS", 3000);
+            if (g_rs.tick_ms < 200) g_rs.tick_ms = 200;
+            g_rs.enabled = true;
+            pthread_t residency_thread;
+            if (pthread_create(&residency_thread, NULL, residency_main, &app) == 0) pthread_detach(residency_thread);
+            fprintf(stderr, "sd: demand residency on (resident %d MB, stream %d MB, saves %.0f ms/request)\n",
+                    g_rs.resident_mb, g_rs.stream_mb, g_rs.saved_ms);
+        }
     }
 
     app.scale = oscale_create();

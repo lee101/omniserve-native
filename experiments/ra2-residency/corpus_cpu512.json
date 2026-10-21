@@ -1,0 +1,45 @@
+{
+ "version": 1,
+ "defaults": {
+  "cache": false,
+  "output_format": "png"
+ },
+ "gates": {
+  "clip_image_cosine_min": 0.7,
+  "clip_prompt_delta_min": -0.04,
+  "aesthetic_delta_min": -0.75,
+  "candidate_entropy_min": 3.0,
+  "candidate_stddev_min": 8.0,
+  "median_latency_ratio_max": 1.5
+ },
+ "cases": [
+  {
+   "id": "product_glass_robot",
+   "category": "product",
+   "prompt": "cinematic product photo of a translucent glass robot toy on a white seamless studio background",
+   "size": "512x512",
+   "seed": 5201
+  },
+  {
+   "id": "portrait_hands",
+   "category": "people",
+   "prompt": "documentary portrait of a ceramic artist shaping clay on a wheel, both hands clearly visible, warm workshop light",
+   "size": "512x512",
+   "seed": 5203
+  },
+  {
+   "id": "typography_sign",
+   "category": "text",
+   "prompt": "minimal studio photograph of a red cube beside a white sign that reads EXACTLY: BUILD FAST, TEST DEEP",
+   "size": "512x512",
+   "seed": 5208
+  },
+  {
+   "id": "poster_text",
+   "category": "typography",
+   "prompt": "a vintage travel poster that says \"VISIT AUCKLAND\" in bold art deco letters, harbour bridge at sunset",
+   "size": "512x512",
+   "seed": 5209
+  }
+ ]
+}

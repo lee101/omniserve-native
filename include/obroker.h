@@ -18,4 +18,11 @@ int obroker_lease(const char *base_url, const char *owner, int pid, int mb, int 
                   int *waited_ms_out);
 bool obroker_release(const char *base_url, const char *lease_id);
 
+/* Residency claim (see oresidency.h). Returns 1 resident, 0 streamed, -1 when the
+ * broker could not be reached, -2 when it has no residency arbiter (older binary or
+ * disabled). reason (optional) receives the broker's reason. */
+int obroker_residency(const char *base_url, const char *owner, int pid, int resident_mb,
+                      int stream_mb, double saved_ms, int requests, bool resident,
+                      char *reason, size_t reason_cap);
+
 #endif

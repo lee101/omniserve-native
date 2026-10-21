@@ -69,7 +69,7 @@ set(LLAMA_DIR "${CMAKE_SOURCE_DIR}/../llama.cpp" CACHE PATH "llama.cpp checkout"
 set(SD_DIR "${CMAKE_SOURCE_DIR}/../stable-diffusion.cpp" CACHE PATH "stable-diffusion.cpp checkout")
 
 set(CORE_SRC src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c src/olora_route.c src/omatte.c src/onsfw.c src/oproxy.c src/osched.c src/ofrontier.c
-             src/ohost.c src/ovram.c src/obroker.c src/ospec.c
+             src/ohost.c src/ovram.c src/obroker.c src/oresidency.c src/ospec.c
              src/oscale.c src/otext.c src/otune.c src/oguard.c)
 
 add_library(onative_core STATIC ${CORE_SRC})
@@ -111,30 +111,35 @@ if(WITH_SD AND EXISTS "${SD_DIR}/build/bin/libstable-diffusion.so")
     # Upstream stable-diffusion.cpp lacks the exact-prompt latent replay API carried by
     # the production fork; detect it so backend_sd.c can fall back to dense generation.
     file(READ "${SD_DIR}/include/stable-diffusion.h" _sd_header)
-    set(_sd_feature_defs)
     if(_sd_header MATCHES "stream_layers")
-        list(APPEND _sd_feature_defs OMNISERVE_SD_STREAM_LAYERS=1)
+        set(_sd_stream_layers 1)
     else()
-        list(APPEND _sd_feature_defs OMNISERVE_SD_STREAM_LAYERS=0)
+        set(_sd_stream_layers 0)
     endif()
     if(_sd_header MATCHES "sd_latent_replay_params_t")
-        list(APPEND _sd_feature_defs OMNISERVE_SD_LATENT_API=1)
+        set(_sd_latent_api 1)
     else()
-        list(APPEND _sd_feature_defs OMNISERVE_SD_LATENT_API=0)
+        set(_sd_latent_api 0)
     endif()
-    target_compile_definitions(omniserve-native PRIVATE ${_sd_feature_defs})
+    target_compile_definitions(omniserve-native PRIVATE
+        OMNISERVE_SD_STREAM_LAYERS=${_sd_stream_layers}
+        OMNISERVE_SD_LATENT_API=${_sd_latent_api})
     # SYSTEM so the vendored stb/sd headers do not trip our own strict warning
     # set; they are third-party code and are not ours to fix.
     target_include_directories(omniserve-native SYSTEM BEFORE PRIVATE "${SD_DIR}/ggml/examples")
     target_include_directories(omniserve-native SYSTEM PRIVATE "${SD_DIR}/include")
     target_include_directories(omniserve-native SYSTEM PRIVATE "${SD_DIR}/thirdparty")
     add_executable(onative_image_decode_tests tests/test_image_decode.c src/backend_sd.c)
-    target_compile_definitions(onative_image_decode_tests PRIVATE USE_SD ${_sd_feature_defs})
+    target_compile_definitions(onative_image_decode_tests PRIVATE USE_SD
+        OMNISERVE_SD_STREAM_LAYERS=${_sd_stream_layers}
+        OMNISERVE_SD_LATENT_API=${_sd_latent_api})
     target_include_directories(onative_image_decode_tests SYSTEM PRIVATE
         "${SD_DIR}/ggml/examples" "${SD_DIR}/include" "${SD_DIR}/thirdparty")
     target_link_libraries(onative_image_decode_tests PRIVATE onative_core)
     add_executable(onative_image_bench tests/bench_image.c src/backend_sd.c)
-    target_compile_definitions(onative_image_bench PRIVATE USE_SD ${_sd_feature_defs})
+    target_compile_definitions(onative_image_bench PRIVATE USE_SD
+        OMNISERVE_SD_STREAM_LAYERS=${_sd_stream_layers}
+        OMNISERVE_SD_LATENT_API=${_sd_latent_api})
     target_include_directories(onative_image_bench SYSTEM PRIVATE
         "${SD_DIR}/ggml/examples" "${SD_DIR}/include" "${SD_DIR}/thirdparty")
     target_link_libraries(onative_image_bench PRIVATE onative_core)
@@ -153,6 +158,9 @@ add_test(NAME core COMMAND onative_tests)
 add_executable(onative_frontier_tests tests/test_frontier.c)
 target_link_libraries(onative_frontier_tests PRIVATE onative_core)
 add_test(NAME frontier COMMAND onative_frontier_tests)
+add_executable(onative_residency_tests tests/test_residency.c)
+target_link_libraries(onative_residency_tests PRIVATE onative_core)
+add_test(NAME residency COMMAND onative_residency_tests)
 add_executable(onative_guard_tests tests/test_guard.c)
 target_include_directories(onative_guard_tests PRIVATE include)
 target_link_libraries(onative_guard_tests PRIVATE onative_core)
@@ -229,27 +237,6 @@ if(Python3_Interpreter_FOUND)
     set_tests_properties(key_tiers PROPERTIES
         ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
     add_test(
-        NAME liveportrait_route
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_liveportrait_route.py"
-    )
-    set_tests_properties(liveportrait_route PROPERTIES
-        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
-    add_test(
-        NAME liveportrait_worker
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_liveportrait_worker.py"
-    )
-    add_test(
-        NAME depth_worker
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_depth_worker.py"
-    )
-    add_test(
-        NAME depth_route
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_depth_route.py"
-    )
-    set_tests_properties(depth_route PROPERTIES
-        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>"
-    )
-    add_test(
         NAME auth_gate
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_auth_gate.py"
     )
@@ -287,6 +274,12 @@ if(Python3_Interpreter_FOUND)
         set_tests_properties(image_model_routing PROPERTIES
             ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
         set_tests_properties(image_overflow_routing PROPERTIES
+            ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
+        add_test(
+            NAME residency_inert
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_residency_inert.py"
+        )
+        set_tests_properties(residency_inert PROPERTIES
             ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>;OMNISERVE_SD_STUB=$<TARGET_FILE:onative_sd_cache_stub>")
         add_test(
             NAME image_frontier_routing

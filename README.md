@@ -12,7 +12,7 @@ and external runtimes retain their own licenses.
 - `src/oscale.c` — pure cost/priority decision engine for rented overflow capacity (paid-only, scale-to-zero, spend caps, hard TTL)
 - `src/ocapacity.c` — controller thread: samples admission pressure, asks oscale, warms cogs through app.nz on loopback
 - `src/otune.c` — per-device batch/KV/flash-attention profiles (blackwell, hopper, ada, ampere, turing, cpu)
-- `src/backend_llama.c` — embedded libllama (CUDA sm_120), prefix-aware parallel context pool, chunked long-prompt prefill, Gemma 4/Qwen chat formatting, streaming token callback, and encoder-only embeddings with an independent CPU/GPU placement policy
+- `src/backend_llama.c` — embedded libllama (CUDA sm_120), continuous-batching engine (one context, N sequences, chunked prefill mixed into decode steps, radix top-k sampling, prefix forks across sequences), Gemma 4/Qwen chat formatting, streaming token callback, and encoder-only embeddings with an independent CPU/GPU placement policy
 - `src/backend_sd.c` — embedded stable-diffusion.cpp (`-DWITH_SD=ON`), allocation-efficient PNG output
 - `/docs` + `/openapi.json` — self-contained API docs (text-generator.io pattern: static spec, human page)
 
@@ -184,6 +184,33 @@ one retry is enough before rendering locally. The lane warms itself with one
 `OMNISERVE_NATIVE_SD_TURBO_NODES` and `OMNISERVE_NATIVE_SD_DEFAULT_LORA` (the
 start script does with `RA2_TURBO=1`) makes the 6-step tier the default for
 text-to-image, `{"turbo":false}` selects the base path; off by default here.
+
+### LLM continuous batching
+
+The embedded LLM runs every request as a sequence in one shared context.
+`LLM_CONTEXTS` is the number of sequences (32 on the prod 5090 serving
+gemma-roleplay-v2 q8_0) and `LLM_KV_SEQS` the number of full contexts the
+shared KV pool holds (6 there); when the pool fills, idle cached prefixes are
+evicted, then the youngest prefill is requeued, and only a decode-only step
+fails a request. An engine thread decodes one token for each running
+sequence per step, mixes in prefill chunks up to `LLM_STEP_TOKENS` (512), and
+streams tokens back through per-request rings. Concurrency is admitted by the
+`SLOTS` pool, where `LLM_PERMITS` is the weight of one request, so `PERMITS=1`
+is what lets several requests share a step; `LLM_BACKGROUND_PERMITS` lets
+background-tier LLM requests join the batch instead of taking the whole pool.
+`LLM_BATCHED=0` restores one
+context per slot; speculative decoding (`SPEC_DRAFT`, `SPEC_MTP_GGUF`) keeps
+that path. `LLM_SHARE_PREFIX=0` disables forking a shared prompt prefix (a
+character persona) from another sequence's cache, `LLM_SWA_FULL=0` shrinks the
+sliding-window cache at the cost of prefix reuse and forks, `LLM_PREFILTER=0`
+samples over the full vocabulary instead of the exact top-(k + distinct
+history + max_new) cut (exact under penalties and DRY), `LLM_SAMPLE_THREADS`
+sizes the sampling pool, and `LLM_ENGINE_TRACE=1` logs decode time by step kind
+and sampling time every 512 steps. `/status` reports `batching` counters
+(steps, rows, tokens, shared_prefix_tokens, kv_evictions, kv_requeues,
+kv_preemptions). Measurements and rollout:
+`performance/llm-continuous-batching-2026-10-21.md`; drop-in:
+`systemd/omniserve-native-llm-batching.conf`.
 
 ## Local-first ASR and background fine-tuning
 
