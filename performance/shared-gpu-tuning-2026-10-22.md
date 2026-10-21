@@ -67,6 +67,17 @@ peak) grows 1664 -> 2600 MB, so `SD_MIN_FREE_MB` 2304 -> 3200. 0 broker denials 
 Per-image timing is logged as
 `[image] tier WxH s= l= tp= hit= q= lease= lock= gen= enc= ok=`.
 
+## Public chat path caps
+
+Public `/v1/chat/completions` goes gateway -> text-generator compat worker (:9083, auth and
+billing; `CHAT_COMPAT_PROXY=1`) -> back to the gateway with `X-Omniserve-Internal: local`.
+- The compat worker held its GPU semaphore (`INFERENCE_CONCURRENCY=2`) for every proxied chat,
+  so public chat ran 2 at a time in front of a 32-sequence engine. Patched in text-generator
+  (`VLLM_PROXY_CONCURRENCY`, default 64, own semaphore; local-model eviction still takes the GPU
+  gate; requests pool 64; default thread pool +32 since each stream parks a thread per chunk).
+- The outer gateway hop held an LLM slot and the inner request another: 2 of 32 slots per
+  chat. `CHAT_COMPAT_PERMITS=0` (prod) leaves admission to the inner request.
+
 ## Not done
 
 - Implicit-GEMM conv for the VAE: im2col still materialises ~1 GB per full-res conv
