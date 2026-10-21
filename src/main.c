@@ -785,10 +785,16 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
             "# TYPE omniserve_llm_spec_calls_saved_total counter\n"
             "omniserve_llm_spec_calls_saved_total %llu\n"
             "omniserve_llm_spec_rounds_total %llu\n"
-            "omniserve_llm_spec_draft_max %d\n",
+            "omniserve_llm_spec_draft_max %d\n"
+            "# HELP omniserve_llm_engine_steps_total Batched decode steps, sampled rows, and tokens.\n"
+            "# TYPE omniserve_llm_engine_steps_total counter\n"
+            "omniserve_llm_engine_steps_total %llu\n"
+            "omniserve_llm_engine_rows_total %llu\n"
+            "omniserve_llm_engine_tokens_total %llu\n",
             spec_placement.spec_drafted, spec_placement.spec_accepted,
             spec_placement.spec_saved_calls, spec_placement.spec_rounds,
-            spec_placement.spec_draft_max);
+            spec_placement.spec_draft_max, spec_placement.engine_steps,
+            spec_placement.engine_rows, spec_placement.engine_tokens);
     }
 
     if (len < sizeof body) {
@@ -1010,6 +1016,8 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  "\"speculation\":{\"source\":\"%s\",\"draft_max\":%d,\"rounds\":%llu,"
                  "\"drafted\":%llu,\"accepted\":%llu,\"acceptance\":%.3f,"
                  "\"calls_saved\":%llu},"
+                 "\"batching\":{\"enabled\":%s,\"seqs\":%d,\"step_tokens\":%d,"
+                 "\"steps\":%llu,\"rows\":%llu,\"tokens\":%llu,\"shared_prefix_tokens\":%llu},"
                  "\"overflow\":{\"image\":%s,\"image_path\":\"%s\",\"tiers\":%u,"
                  "\"saturated\":%llu,\"local_failed\":%llu,"
                  "\"frontier\":%s,\"frontier_kept_local\":%llu,"
@@ -1020,6 +1028,9 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  placement.spec_source, placement.spec_draft_max, placement.spec_rounds,
                  placement.spec_drafted, placement.spec_accepted, acceptance,
                  placement.spec_saved_calls,
+                 placement.batched ? "true" : "false", placement.batch_seqs,
+                 placement.step_tokens, placement.engine_steps, placement.engine_rows,
+                 placement.engine_tokens, placement.shared_prefix_tokens,
                  app->image_overflow ? "true" : "false",
                  overflow_path_label(),
                  app->overflow_tier_mask,
