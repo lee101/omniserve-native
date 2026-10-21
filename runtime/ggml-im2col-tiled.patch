@@ -1,0 +1,81 @@
+diff --git a/src/ggml-cuda/im2col.cu b/src/ggml-cuda/im2col.cu
+index 28c79ab4..d4ecc4e8 100644
+--- a/src/ggml-cuda/im2col.cu
++++ b/src/ggml-cuda/im2col.cu
+@@ -43,6 +43,56 @@ static  __global__ void im2col_kernel(
+     GGML_UNUSED(KH);
+ }
+ 
++#define IM2COL_TILE_OW 32
++#define IM2COL_TILE_SMEM_FLOATS 6144
++
++// One block per (output row, IM2COL_TILE_OW pixels, tc channels): input rows are staged in shared memory
++// with coalesced reads along IW, then each pixel's IC*KH*KW run is written contiguously.
++template <typename T>
++static __global__ void im2col_tiled_kernel(
++        const float * __restrict__ x, T * __restrict__ dst,
++        int IC, int IW, int IH, int OH, int OW, int KW, int KH, int64_t IC_IH_IW, int64_t IH_IW, int64_t IC_KH_KW,
++        int tc, int span, int s0, int s1, int p0, int p1, int d0, int d1) {
++    extern __shared__ float tile[];
++    const int ow0 = blockIdx.x * IM2COL_TILE_OW;
++    const int in  = blockIdx.y / OH;
++    const int ioh = blockIdx.y - in * OH;
++    const int ic0 = blockIdx.z * tc;
++    const int nc  = min(tc, IC - ic0);
++    const int iw0 = ow0 * s0 - p0;
++
++    const int n_load = nc * KH * span;
++    for (int idx = threadIdx.x; idx < n_load; idx += blockDim.x) {
++        const int j   = idx % span;
++        const int r   = idx / span;
++        const int ikh = r % KH;
++        const int c   = r / KH;
++        const int iih = ioh * s1 + ikh * d1 - p1;
++        const int iiw = iw0 + j;
++        float v = 0.0f;
++        if (iih >= 0 && iih < IH && iiw >= 0 && iiw < IW) {
++            v = x[(int64_t)(ic0 + c) * IC_IH_IW + (int64_t)in * IH_IW + (int64_t)iih * IW + iiw];
++        }
++        tile[idx] = v;
++    }
++    __syncthreads();
++
++    const int KH_KW = KH * KW;
++    const int row   = nc * KH_KW;
++    const int now   = min(IM2COL_TILE_OW, OW - ow0);
++    const int n_out = now * row;
++    for (int idx = threadIdx.x; idx < n_out; idx += blockDim.x) {
++        const int col = idx % row;
++        const int ow  = idx / row;
++        const int c   = col / KH_KW;
++        const int rr  = col - c * KH_KW;
++        const int ikh = rr / KW;
++        const int ikw = rr - ikh * KW;
++        const int64_t offset_dst = ((int64_t)(in * OH + ioh) * OW + ow0 + ow) * IC_KH_KW + (int64_t)ic0 * KH_KW + col;
++        dst[offset_dst] = tile[(c * KH + ikh) * span + ow * s0 + ikw * d0];
++    }
++}
++
+ // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
+ template <typename T>
+ static void im2col_cuda(const float * x, T* dst,
+@@ -50,6 +100,19 @@ static void im2col_cuda(const float * x, T* dst,
+     int64_t N, int64_t IC_IH_IW, int64_t IH_IW,
+     int s0,int s1,int p0,int p1,int d0,int d1, cudaStream_t stream) {
+     const int64_t IC_KH_KW = IC * KH * KW;
++    const int64_t span = (int64_t)(IM2COL_TILE_OW - 1) * s0 + (KW - 1) * d0 + 1;
++    const int64_t tc = IM2COL_TILE_SMEM_FLOATS / (KH * span);
++    if (tc >= 1 && N * OH <= MAX_GRIDDIM_Y && IW < INT32_MAX && IH < INT32_MAX && IC < INT32_MAX) {
++        const int64_t tcc = MIN(tc, IC);
++        dim3 grid((OW + IM2COL_TILE_OW - 1) / IM2COL_TILE_OW, N * OH, (IC + tcc - 1) / tcc);
++        if (grid.z <= MAX_GRIDDIM_Z) {
++            const size_t smem = (size_t)tcc * KH * span * sizeof(float);
++            im2col_tiled_kernel<<<grid, CUDA_IM2COL_BLOCK_SIZE, smem, stream>>>(
++                x, dst, (int)IC, (int)IW, (int)IH, (int)OH, (int)OW, (int)KW, (int)KH, IC_IH_IW, IH_IW, IC_KH_KW,
++                (int)tcc, (int)span, s0, s1, p0, p1, d0, d1);
++            return;
++        }
++    }
+     const int64_t num_blocks = (IC_KH_KW + CUDA_IM2COL_BLOCK_SIZE - 1) / CUDA_IM2COL_BLOCK_SIZE;
+     const int64_t N_OH = N * OH;
+     const int64_t KH_KW = KW*KH;
