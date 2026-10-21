@@ -1846,19 +1846,81 @@ static int engine_release(ollm_slot *s) {
  * to the top (top_k + window) logits is exact whenever every step before top_k
  * can only lower a logit: at most `window` distinct tokens are penalized, so
  * at least top_k untouched tokens in the cut outrank anything outside it. */
+/* Penalties and DRY only lower logits, and only of tokens already in their
+ * history, so the post-penalty top_k lies within the pre-penalty top
+ * (top_k + distinct history tokens). History grows by at most max_new. */
+/* llama_sampler_init_dry detokenizes the whole vocabulary once per sequence
+ * breaker (~1M calls for Gemma's 262k), so it is built once per parameter set
+ * and cloned; a clone shares the processed breakers and starts empty. */
+#define DRY_CACHE 8
+static struct {
+    float mult, base;
+    int allowed;
+    struct llama_sampler *s;
+} g_dry_cache[DRY_CACHE];
+static pthread_mutex_t g_dry_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void dry_cache_clear(void) {
+    pthread_mutex_lock(&g_dry_lock);
+    for (int i = 0; i < DRY_CACHE; i++) {
+        if (g_dry_cache[i].s) llama_sampler_free(g_dry_cache[i].s);
+        g_dry_cache[i].s = NULL;
+    }
+    pthread_mutex_unlock(&g_dry_lock);
+}
+
+static struct llama_sampler *dry_sampler(float mult, float base, int allowed) {
+    static const char *breakers[] = { "\n", ":", "\"", "*" };
+    pthread_mutex_lock(&g_dry_lock);
+    int slot = -1;
+    for (int i = 0; i < DRY_CACHE; i++) {
+        if (g_dry_cache[i].s && g_dry_cache[i].mult == mult && g_dry_cache[i].base == base &&
+            g_dry_cache[i].allowed == allowed) {
+            struct llama_sampler *c = llama_sampler_clone(g_dry_cache[i].s);
+            pthread_mutex_unlock(&g_dry_lock);
+            return c;
+        }
+        if (slot < 0 && !g_dry_cache[i].s) slot = i;
+    }
+    struct llama_sampler *t = llama_sampler_init_dry(g_vocab, llama_model_n_ctx_train(g_model),
+                                                     mult, base, allowed, -1, breakers,
+                                                     sizeof breakers / sizeof *breakers);
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_dry_lock);
+        return t;
+    }
+    g_dry_cache[slot].mult = mult;
+    g_dry_cache[slot].base = base;
+    g_dry_cache[slot].allowed = allowed;
+    g_dry_cache[slot].s = t;
+    struct llama_sampler *c = llama_sampler_clone(t);
+    pthread_mutex_unlock(&g_dry_lock);
+    return c;
+}
+
 static int engine_prefilter_k(const ochat_req *req, bool penalized, bool dry, int last_n,
-                              int top_k) {
+                              int top_k, const llama_token *tokens, int n_tokens, int max_new) {
     static int enabled = -1;
     if (enabled < 0) {
         const char *env = getenv("OMNISERVE_NATIVE_LLM_PREFILTER");
         enabled = !(env && strcmp(env, "0") == 0);
     }
-    if (!enabled || dry || req->min_probability > 0.0f || top_k <= 0) return 0;
-    int window = 0;
+    if (!enabled || req->min_probability > 0.0f || top_k <= 0) return 0;
+    long window = 0;
     if (penalized) {
         if (req->repetition_penalty > 0.0f && req->repetition_penalty < 1.0f) return 0;
         if (req->frequency_penalty < 0.0f || req->presence_penalty < 0.0f) return 0;
-        window = last_n;
+        int hist = dry || last_n > n_tokens ? n_tokens : last_n;
+        uint8_t *seen = calloc((size_t)g_n_vocab / 8 + 1, 1);
+        if (!seen) return 0;
+        for (int i = n_tokens - hist; i < n_tokens; i++) {
+            llama_token t = tokens[i];
+            if (t < 0 || t >= g_n_vocab || (seen[t >> 3] & (1u << (t & 7)))) continue;
+            seen[t >> 3] |= (uint8_t)(1u << (t & 7));
+            window++;
+        }
+        free(seen);
+        window += max_new;
     }
     long k = (long)top_k + window;
     if (k > 8192 || k >= g_n_vocab) return 0;
@@ -2797,12 +2859,9 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
             last_n, repetition, req->frequency_penalty, req->presence_penalty));
     }
     if (dry) {
-        static const char *breakers[] = { "\n", ":", "\"", "*" };
-        llama_sampler_chain_add(smpl, llama_sampler_init_dry(
-            g_vocab, llama_model_n_ctx_train(g_model), req->dry_multiplier,
+        llama_sampler_chain_add(smpl, dry_sampler(req->dry_multiplier,
             req->dry_base > 0.0f ? req->dry_base : 1.75f,
-            req->dry_allowed_length > 0 ? req->dry_allowed_length : 2, -1,
-            breakers, sizeof breakers / sizeof *breakers));
+            req->dry_allowed_length > 0 ? req->dry_allowed_length : 2));
     }
     int top_k = req->top_k > 0 ? req->top_k : 40;
     llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
@@ -2884,7 +2943,8 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
     llama_token round_tokens[17];
     float round_probs[17];
     int round_count = 0, round_pos = 0;
-    int prefilter_k = engine_prefilter_k(req, penalized, dry, last_n, top_k);
+    int prefilter_k = engine_prefilter_k(req, penalized, dry, last_n, top_k, tokens, n_tokens,
+                                         max_new);
     if (!g_batched) slot->prefilter_k = prefilter_k;
     if (g_batched) {
         /* Publish the prompt now; the engine advances cached_count as prefill
@@ -3123,6 +3183,7 @@ void ollm_result_free(ochat_result *r) {
 
 static void ollm_shutdown_locked(void) {
     bool had_model = g_model != NULL;
+    dry_cache_clear();
     spec_mtp_free_locked();
     if (g_batched) {
         engine_stop_locked();
