@@ -2738,10 +2738,14 @@ static void handle_images(ohttp_request *req, app_state *app) {
             }
             frontier_queue_ms = frontier_now_ms() - queued;
         }
-    } else if (!osched_acquire_n(app->sched, tier, permits)) {
-        oimage_request_free(&image_request);
-        respond_error(req, 503, "admission timeout; retry");
-        return;
+    } else {
+        double queued = frontier_now_ms();
+        if (!osched_acquire_n(app->sched, tier, permits)) {
+            oimage_request_free(&image_request);
+            respond_error(req, 503, "admission timeout; retry");
+            return;
+        }
+        frontier_queue_ms = frontier_now_ms() - queued;
     }
     /* Keep the scratch budget visible to every broker-aware GPU tenant until
      * generation finishes.  A point-in-time cudaMemGetInfo check alone still
@@ -2820,6 +2824,11 @@ static void handle_images(ohttp_request *req, app_state *app) {
     }
     ok = osd_generate(&image_request.generation, &result);
     image_gpu_release(app, image_lease_id, image_lease_remote);
+    fprintf(stderr, "[image] %s %dx%d s=%d l=%zu tp=%d hit=%d q=%.0f lease=%d lock=%.0f gen=%.0f enc=%.0f ok=%d\n",
+            otier_name(tier), image_request.generation.width, image_request.generation.height,
+            image_request.generation.steps, image_request.generation.lora_count,
+            (int)result.teleport_used, (int)(result.cache_hit || result.teleport_result_cache_hit),
+            frontier_queue_ms, image_waited_ms, result.lock_ms, result.elapsed_ms, result.encode_ms, (int)ok);
     osched_release_n(app->sched, tier, permits);
     ofrontier_log(app->frontier, tier, "local", frontier_queue_ms > 0 ? "queued" : "admitted",
                   frontier_queue_ms, frontier_now_ms() - exec_started, frontier_wait_ms, ok ? 200 : 500);

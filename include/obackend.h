@@ -248,6 +248,8 @@ typedef struct {
     const char *format;
     bool images_malloc_owned;
     double elapsed_ms;
+    double lock_ms;
+    double encode_ms;
     bool teleport_requested;
     bool cache_requested;
     bool cache_hit;

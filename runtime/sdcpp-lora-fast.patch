@@ -1,0 +1,218 @@
+diff --git a/src/model/adapter/lora.hpp b/src/model/adapter/lora.hpp
+index 0b75917..9ee58d8 100644
+--- a/src/model/adapter/lora.hpp
++++ b/src/model/adapter/lora.hpp
+@@ -87,8 +87,15 @@ struct LoraModel : public GGMLRunner {
+         for (const auto& pair : tensors_to_create) {
+             const auto& name   = pair.first;
+             const auto& ts     = pair.second;
++            ggml_type type     = ts.type;
++            // F32 factors keep the rank-r products on cuBLAS SGEMM; BF16/F16 ones convert the full
++            // activation to the weight type and back on every linear, which costs more than the GEMMs.
++            if (fast_linear_enabled() && (type == GGML_TYPE_BF16 || type == GGML_TYPE_F16) && ts.n_dims == 2 &&
++                (ends_with(name, ".lora_down") || ends_with(name, ".lora_up") || ends_with(name, ".lora_mid"))) {
++                type = GGML_TYPE_F32;
++            }
+             ggml_tensor* real  = ggml_new_tensor(params_ctx,
+-                                                 ts.type,
++                                                 type,
+                                                  ts.n_dims,
+                                                  ts.ne);
+             lora_tensors[name] = real;
+@@ -552,6 +559,47 @@ struct LoraModel : public GGMLRunner {
+         return diff;
+     }
+ 
++    static bool fast_linear_enabled() {
++        static const bool enabled = [] {
++            const char* env = getenv("SD_LORA_FAST_LINEAR");
++            return env == nullptr || strcmp(env, "0") != 0;
++        }();
++        return enabled;
++    }
++
++    struct LinearPiece {
++        ggml_tensor* down;
++        ggml_tensor* up;
++        float scale;
++    };
++
++    // Pieces of one fused weight (qkv split into q/k/v) share x: one GEMM through the stacked
++    // downs, then one through a block-diagonal up, so the diff comes out already concatenated.
++    // The scale lands on the rank-r up factor instead of the full output, and the linear's
++    // activation pre-scale is skipped: it guards q8_1 fp16 sums in MMQ, which SGEMM does not use.
++    static ggml_tensor* linear_pieces_forward(ggml_context* ctx, ggml_tensor* x, const std::vector<LinearPiece>& pieces) {
++        int64_t rank_total = 0;
++        for (const auto& piece : pieces) {
++            rank_total += piece.down->ne[1];
++        }
++        ggml_tensor* down = pieces[0].down;
++        ggml_tensor* up   = ggml_scale(ctx, pieces[0].up, pieces[0].scale);
++        if (pieces.size() > 1) {
++            int64_t offset = pieces[0].down->ne[1];
++            up             = ggml_pad_ext(ctx, up, 0, (int)(rank_total - offset), 0, 0, 0, 0, 0, 0);
++            for (size_t i = 1; i < pieces.size(); ++i) {
++                int64_t rank          = pieces[i].down->ne[1];
++                ggml_tensor* up_piece = ggml_scale(ctx, pieces[i].up, pieces[i].scale);
++                up_piece              = ggml_pad_ext(ctx, up_piece, (int)offset, (int)(rank_total - offset - rank), 0, 0, 0, 0, 0, 0);
++                down                  = ggml_concat(ctx, down, pieces[i].down, 1);
++                up                    = ggml_concat(ctx, up, up_piece, 1);
++                offset += rank;
++            }
++        }
++        ggml_tensor* lx = ggml_ext_linear(ctx, x, down, nullptr);
++        return ggml_ext_linear(ctx, lx, up, nullptr);
++    }
++
+     ggml_tensor* get_out_diff(ggml_context* ctx,
+                               ggml_backend_t backend,
+                               ggml_tensor* x,
+@@ -559,6 +607,15 @@ struct LoraModel : public GGMLRunner {
+                               const std::string& model_tensor_name) {
+         ggml_tensor* out_diff = nullptr;
+         int index             = 0;
++        std::vector<LinearPiece> pieces;
++        auto flush_pieces     = [&]() {
++            if (pieces.empty()) {
++                return;
++            }
++            ggml_tensor* curr_out_diff = linear_pieces_forward(ctx, x, pieces);
++            out_diff                   = out_diff == nullptr ? curr_out_diff : ggml_concat(ctx, out_diff, curr_out_diff, 0);
++            pieces.clear();
++        };
+         while (true) {
+             std::string key;
+             if (index == 0) {
+@@ -574,6 +631,7 @@ struct LoraModel : public GGMLRunner {
+             auto iter   = lora_tensors.find(lokr_w1_name);
+             auto iter_a = lora_tensors.find(lokr_w1_a_name);
+             if (iter != lora_tensors.end() || iter_a != lora_tensors.end()) {
++                flush_pieces();
+                 std::string lokr_w1_b_name = "lora." + key + ".lokr_w1_b";
+                 std::string lokr_w2_name   = "lora." + key + ".lokr_w2";
+                 std::string lokr_w2_a_name = "lora." + key + ".lokr_w2_a";
+@@ -732,6 +790,14 @@ struct LoraModel : public GGMLRunner {
+             }
+             scale_value *= multiplier;
+ 
++            if (!is_conv2d && lora_mid == nullptr && lora_down->type == GGML_TYPE_F32 && lora_up->type == GGML_TYPE_F32 &&
++                ggml_n_dims(lora_down) == 2 && ggml_n_dims(lora_up) == 2) {
++                pieces.push_back({lora_down, lora_up, scale_value});
++                index++;
++                continue;
++            }
++            flush_pieces();
++
+             ggml_tensor* lx;
+             if (!is_conv2d) {
+                 lx = ggml_ext_linear(ctx, x, lora_down, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
+@@ -796,6 +862,7 @@ struct LoraModel : public GGMLRunner {
+ 
+             index++;
+         }
++        flush_pieces();
+         return out_diff;
+     }
+ 
+diff --git a/src/name_conversion.cpp b/src/name_conversion.cpp
+index 904e12e..c29aeb6 100644
+--- a/src/name_conversion.cpp
++++ b/src/name_conversion.cpp
+@@ -1,3 +1,4 @@
++#include <cstring>
+ #include <map>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -1106,8 +1107,18 @@ std::string convert_pmid_v2_name(const std::string& name) {
+     return name;
+ }
+ 
++// Kohya/PEFT Z-Image LoRA keys (feed_forward_wN, adaLN_modulation, unprefixed layers.N) only
++// partially matched before; opt in because fully applied LoRAs change established outputs.
++static bool zimage_lora_name_fix() {
++    static const bool enabled = [] {
++        const char* env = getenv("SD_ZIMAGE_LORA_NAME_FIX");
++        return env != nullptr && strcmp(env, "0") != 0;
++    }();
++    return enabled;
++}
++
+ std::string convert_sep_to_dot(std::string name) {
+-    const std::vector<std::string> protected_tokens = {
++    std::vector<std::string> protected_tokens = {
+         "self_attn",
+         "out_proj",
+         "q_proj",
+@@ -1182,6 +1193,9 @@ std::string convert_sep_to_dot(std::string name) {
+         "cross_attn",
+         "output_proj",
+     };
++    if (zimage_lora_name_fix()) {
++        protected_tokens.insert(protected_tokens.end(), {"feed_forward", "adaLN_modulation", "context_refiner", "noise_refiner"});
++    }
+ 
+     // record the positions of underscores that should NOT be replaced
+     std::unordered_set<size_t> protected_positions;
+@@ -1385,6 +1399,11 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
+ 
+         // LOG_DEBUG("name %s %d", name.c_str(), version);
+ 
++        if (zimage_lora_name_fix() && sd_version_is_z_image(version) &&
++            (starts_with(name, "layers.") || starts_with(name, "context_refiner.") || starts_with(name, "noise_refiner."))) {
++            name = "diffusion_model." + name;
++        }
++
+         if (sd_version_is_unet(version) || is_underline || is_lycoris_underline) {
+             name = convert_sep_to_dot(name);
+         }
+diff --git a/src/stable-diffusion.cpp b/src/stable-diffusion.cpp
+index 7930f0d..38fa965 100644
+--- a/src/stable-diffusion.cpp
++++ b/src/stable-diffusion.cpp
+@@ -1857,6 +1857,7 @@ public:
+             }
+ 
+             lora->preprocess_lora_tensors(model_tensor_names);
++            LOG_DEBUG("runtime lora %s: %zu tensors for module %d", lora_spec.path.c_str(), lora->lora_tensors.size(), (int)module);
+             runtime_lora_models.push_back(lora);
+             module_lora_models.push_back(std::move(lora));
+         }
+@@ -1878,6 +1879,30 @@ public:
+         model_manager->set_loras(loras, version);
+     }
+ 
++    // Same LoRA files with new multipliers: the scale is baked in at graph build, so the
++    // loaded tensors are reused instead of re-reading every file.
++    bool rescale_runtime_loras(const std::vector<ModelManager::LoraSpec>& loras) {
++        if (loras.empty() || active_runtime_lora_specs.size() != loras.size()) return false;
++        std::set<std::string> paths;
++        for (size_t i = 0; i < loras.size(); ++i) {
++            const auto& active = active_runtime_lora_specs[i];
++            if (active.path != loras[i].path || active.is_high_noise != loras[i].is_high_noise ||
++                active.tensor_name_prefix_filter != loras[i].tensor_name_prefix_filter ||
++                !paths.insert(loras[i].path).second) {
++                return false;
++            }
++        }
++        for (auto& lora_model : runtime_lora_models) {
++            for (const auto& spec : loras) {
++                if (spec.path == lora_model->file_path) {
++                    lora_model->multiplier = spec.multiplier;
++                }
++            }
++        }
++        active_runtime_lora_specs = loras;
++        return true;
++    }
++
+     void apply_loras_at_runtime(const std::vector<ModelManager::LoraSpec>& loras) {
+         bool same_loras = active_runtime_lora_specs.size() == loras.size();
+         if (same_loras) {
+@@ -1893,6 +1918,7 @@ public:
+             }
+         }
+         if (same_loras) return;
++        if (rescale_runtime_loras(loras)) return;
+         if (model_manager != nullptr) {
+             model_manager->set_loras({}, version);
+         }

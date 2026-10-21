@@ -1,0 +1,34 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 69d7ae806..8d65637c9 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1463,10 +1463,28 @@ struct ggml_backend_cuda_context {
+ 
+     ~ggml_backend_cuda_context();
+ 
++    static int ggml_cuda_stream_priority() {
++        static const int priority = [] {
++            const char * env = getenv("GGML_CUDA_STREAM_PRIORITY");
++            int least = 0, greatest = 0;
++            if (env == nullptr || cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess) {
++                return 0;
++            }
++            if (strcmp(env, "high") == 0) {
++                return greatest;
++            }
++            if (strcmp(env, "low") == 0) {
++                return least;
++            }
++            return atoi(env);
++        }();
++        return priority;
++    }
++
+     cudaStream_t stream(int device, int stream) {
+         if (streams[device][stream] == nullptr) {
+             ggml_cuda_set_device(device);
+-            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
++            CUDA_CHECK(cudaStreamCreateWithPriority(&streams[device][stream], cudaStreamNonBlocking, ggml_cuda_stream_priority()));
+         }
+         return streams[device][stream];
+     }

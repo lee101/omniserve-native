@@ -1062,7 +1062,9 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     if ((result_cache || teleport_cache) && !cache_key_make(req, &key)) {
         result_cache = teleport_cache = false;
     }
+    double lock_started = now_ms();
     pthread_mutex_lock(&g_sd_lock);
+    out->lock_ms = now_ms() - lock_started;
     int want = __atomic_load_n(&g_sd_want, __ATOMIC_RELAXED);
     if (want >= 0 && (want == 1) != g_sd_resident && p_free_sd_ctx) (void)sd_switch_locked(want == 1);
     double started = now_ms();
@@ -1171,6 +1173,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         for (int i = 0; i < image_count; ++i)
             notch_rgb(images[i].data, (int)images[i].width, (int)images[i].height, (int)images[i].channel);
     }
+    double encode_started = now_ms();
     bool use_webp = g_webp_enabled && p_webp_encode_rgb && p_webp_free;
     for (int i = 0; i < image_count; ++i) {
         if (use_webp && (images[i].channel == 3 || (images[i].channel == 4 && p_webp_encode_rgba))) {
@@ -1210,6 +1213,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         }
     }
     p_free_images(images, image_count);
+    out->encode_ms = now_ms() - encode_started;
     out->image_count = (size_t)image_count;
     out->png = out->images[0];
     out->png_len = out->image_lens[0];
