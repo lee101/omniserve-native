@@ -768,6 +768,8 @@ static sd_ctx_t *sd_ctx_build(const char *model_path, bool resident) {
     params.n_threads = sd_env_int("OMNISERVE_NATIVE_SD_THREADS", -1, 1, 256);
     params.flash_attn = sd_env_flag("OMNISERVE_NATIVE_SD_FLASH_ATTN", true);
     params.diffusion_flash_attn = sd_env_flag("OMNISERVE_NATIVE_SD_DIFFUSION_FLASH_ATTN", true);
+    params.diffusion_conv_direct = sd_env_flag("OMNISERVE_NATIVE_SD_DIFFUSION_CONV_DIRECT", false);
+    params.vae_conv_direct = sd_env_flag("OMNISERVE_NATIVE_SD_VAE_CONV_DIRECT", false);
 #if OMNISERVE_SD_STREAM_LAYERS
     params.stream_layers = sd_profile_flag("STREAM_LAYERS", resident, false, false);
 #endif

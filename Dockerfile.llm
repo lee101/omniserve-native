@@ -16,6 +16,7 @@ COPY include /src/include
 COPY src /src/src
 COPY tests /src/tests
 COPY cuda /src/cuda
+COPY tools/guard_sweep.c tools/omatte_cli.c tools/bench_http.c /src/tools/
 RUN cmake -S /src -B /src/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DWITH_LLAMA=ON -DWITH_SD=OFF -DONATIVE_NATIVE_ARCH=OFF \
        -DLLAMA_DIR=/llama.cpp \
     && cmake --build /src/build --target omniserve-native -j"$(nproc)"
