@@ -4,11 +4,13 @@ FROM nvidia/cuda:12.9.1-devel-ubuntu24.04 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends git cmake ninja-build build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 ARG LLAMA_COMMIT=571d0d540
+COPY runtime/llama-cuda-graph-key.patch /tmp/llama.patch
 RUN git clone --filter=blob:none https://github.com/ggml-org/llama.cpp /llama.cpp && cd /llama.cpp && git checkout $LLAMA_COMMIT \
+    && git apply /tmp/llama.patch \
     && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="86;89;90;120" \
        -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON \
        -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=OFF \
-    && cmake --build build -j"$(nproc)"
+    && cmake --build build --target llama -j"$(nproc)"
 COPY CMakeLists.txt /src/CMakeLists.txt
 COPY include /src/include
 COPY src /src/src

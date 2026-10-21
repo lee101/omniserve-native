@@ -5,3 +5,4 @@
 !tests
 !cuda
 !runtime/llm_entrypoint.sh
+!runtime/llama-cuda-graph-key.patch
