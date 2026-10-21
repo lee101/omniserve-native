@@ -1,0 +1,39 @@
+diff --git a/src/name_conversion.cpp b/src/name_conversion.cpp
+index 904e12e..bdd3041 100644
+--- a/src/name_conversion.cpp
++++ b/src/name_conversion.cpp
+@@ -1181,6 +1181,10 @@ std::string convert_sep_to_dot(std::string name) {
+         "x_embedder",
+         "cross_attn",
+         "output_proj",
++        "feed_forward",
++        "adaLN_modulation",
++        "context_refiner",
++        "noise_refiner",
+     };
+ 
+     // record the positions of underscores that should NOT be replaced
+@@ -1385,6 +1389,11 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
+ 
+         // LOG_DEBUG("name %s %d", name.c_str(), version);
+ 
++        if (sd_version_is_z_image(version) &&
++            (starts_with(name, "layers.") || starts_with(name, "context_refiner.") || starts_with(name, "noise_refiner."))) {
++            name = "diffusion_model." + name;
++        }
++
+         if (sd_version_is_unet(version) || is_underline || is_lycoris_underline) {
+             name = convert_sep_to_dot(name);
+         }
+diff --git a/src/stable-diffusion.cpp b/src/stable-diffusion.cpp
+index 7930f0d..f96ca4d 100644
+--- a/src/stable-diffusion.cpp
++++ b/src/stable-diffusion.cpp
+@@ -1857,6 +1857,7 @@ public:
+             }
+ 
+             lora->preprocess_lora_tensors(model_tensor_names);
++            LOG_DEBUG("runtime lora %s: %zu tensors for module %d", lora_spec.path.c_str(), lora->lora_tensors.size(), (int)module);
+             runtime_lora_models.push_back(lora);
+             module_lora_models.push_back(std::move(lora));
+         }
