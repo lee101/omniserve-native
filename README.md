@@ -146,7 +146,9 @@ and sampling time every 512 steps. `/status` reports `batching` counters
 (steps, rows, tokens, shared_prefix_tokens, kv_evictions, kv_requeues,
 kv_preemptions). Measurements and rollout:
 `performance/llm-continuous-batching-2026-10-21.md`; drop-in:
-`systemd/omniserve-native-llm-batching.conf`.
+`systemd/omniserve-native-llm-batching.conf`. Sharing the GPU with Z-Image
+(LLM CUDA stream priority, LoRA fast path, tiled im2col):
+`performance/shared-gpu-tuning-2026-10-22.md`.
 
 ## Local-first ASR and background fine-tuning
 
