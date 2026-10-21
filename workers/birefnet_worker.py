@@ -357,7 +357,7 @@ def _acquire_model_vram_lease() -> dict[str, Any]:
     try:
         response = requests.post(
             f"{VRAM_BROKER_URL}/v1/gpu/lease",
-            json={"owner": "birefnet", "mb": VRAM_LEASE_MIB, "min_mb": VRAM_LEASE_MIB,
+            json={"owner": "birefnet", "pid": os.getpid(), "mb": VRAM_LEASE_MIB, "min_mb": VRAM_LEASE_MIB,
                   "tier": "background", "ttl_s": VRAM_LEASE_TTL_SECONDS},
             timeout=(2, 5),
         )

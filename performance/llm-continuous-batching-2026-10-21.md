@@ -177,6 +177,55 @@ like resident weights counted against free memory twice); the old process
 had already logged 10,868 such denials in 6 days. The batched LLM adds
 ~220 MiB over the old 2 contexts.
 
+## Image lane, diffusion and overflow (2026-10-21, later)
+
+Image VRAM accounting. Prod refused most background images (10,868 denials
+in the 6 days before): BiRefNet leased 3,584 MB with no pid, so the broker
+never credited the weights it had already loaded and charged them twice; the
+resident Z-Image path asked for 4,096 MB of headroom although a 1024x1024
+generation grows the gateway by 1,666 MB (measured on the 5090); and the point
+check re-demanded `SD_MIN_FREE_MB` after a lease had already reserved the
+space. Fixed: workers lease with their pid, a granted lease skips the point
+check, and the workspace is 2,304 MB scaled by pixels
+(`systemd/omniserve-native-image-lease.conf`). Free- and background-tier
+images now succeed right after a restart; broker denials since: 0.
+
+Diffusion batching does not pay here. Z-Image Turbo (6B DiT, Q4_K) is
+compute-bound even at 512x512 (1,024 tokens, ~12 TFLOP per step against
+~3.5 GB of weights): `n=2` and two concurrent requests both take exactly 2x
+one image (3090 Ti: 512^2 2.27 -> 4.57 s, 1024^2 10.2 -> 20.4 s), and the
+denoise runs at ~60 TFLOPS sustained. Breakdown at 1024^2: conditioning
+0.02 s, 9 steps 8.48 s, tiled VAE decode 1.50 s. Measured levers:
+
+| Change | 512^2 | 1024^2 | Cost |
+| --- | ---: | ---: | --- |
+| sd.cpp with CUDA graphs | -6% | -4% | none, bit-identical; deployed |
+| Q8_0 DiT instead of Q4_K | -8% | -6% | +2.7 GB VRAM; not deployed |
+| untiled VAE (or 128 tiles) | | -8% (1.50 -> 0.68 s decode) | +7.2 GB peak; not deployed |
+| direct-conv VAE | +134% | +275% | slower; off |
+
+On the 5090 the graphs build measured within noise (512^2 1.42 vs 1.45 s).
+More image throughput means more GPUs, i.e. overflow.
+
+LLM CUDA graphs. `runtime/llama-cuda-graph-key.patch` keys llama.cpp's CUDA
+graph cache on the graph's shapes and pointers instead of its first node, so
+each batch shape keeps its own captured graph: 0 warm-up resets in a
+16-stream run (was one per row-count change). Reshaped steps still cost ~6 ms
+on prod because llama.cpp rebuilds and re-splits the host graph when the
+ubatch shape changes; caching graph results per shape is the next step. Prod
+links a private patched build (`/sdb-disk/code/llama.cpp-omniserve`), so the
+shared llama.cpp other services use is untouched.
+
+Overflow. When 32 local sequences are busy (or no slot is free) the gateway
+relays chat/completions for `LLM_OVERFLOW_TIERS` to `LLM_OVERFLOW_UPSTREAM`,
+the `tools/llm_overflow.py` sidecar (the gateway proxy has no TLS); a relay
+that fails before any bytes falls back to the local queue. The sidecar routes
+to a dedicated RunPod pod while one has capacity, else to a scale-to-zero
+load-balancing serverless endpoint, and starts a pod only for sustained
+overflow (see `performance/LLM_OVERFLOW.md`). Workers run `Dockerfile.llm`:
+the same binary, LLM-only, KV pool auto-sized to the GPU (`LLM_KV_SEQS=auto`),
+model pulled from a private HF repo at start.
+
 ## Not done
 
 - 5090 numbers. Prod is the only 5090 and has no room for a second copy of

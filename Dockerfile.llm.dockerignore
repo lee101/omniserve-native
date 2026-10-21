@@ -1,0 +1,11 @@
+*
+!CMakeLists.txt
+!include
+!src
+!tests
+!cuda
+!runtime/llm_entrypoint.sh
+!runtime/llama-cuda-graph-key.patch
+!tools/guard_sweep.c
+!tools/omatte_cli.c
+!tools/bench_http.c

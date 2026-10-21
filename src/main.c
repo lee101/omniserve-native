@@ -100,6 +100,10 @@ typedef struct {
     oproxy_target *image_overflow;
     oproxy_target *depth_overflow;
     oproxy_target *stt_overflow;
+    oproxy_target *llm_overflow;   /* RunPod router sidecar for the embedded LLM */
+    unsigned llm_overflow_tier_mask;
+    int llm_overflow_active;       /* local in-flight LLM requests that count as saturated */
+    unsigned long long llm_overflow_relayed, llm_overflow_fallback;
     oproxy_target *tts_overflow;
     /* Credential and time budget for the image lane's remote. The key is what
      * makes the relay strip the caller's own: without one, nothing proves this
@@ -116,6 +120,8 @@ typedef struct {
     bool frontier_routing;
     unsigned long long frontier_kept_local;
 } app_state;
+
+static int g_llm_inflight; /* local embedded-LLM requests admitted and not yet released */
 
 extern const char *DOCS_HTML;
 extern const char *OPENAPI_JSON;
@@ -816,7 +822,7 @@ static void handle_metrics(ohttp_request *req, app_state *app) {
     }
     const struct { const char *name; oproxy_target *target; } remotes[] = {
         {"image_overflow", app->image_overflow}, {"stt_overflow", app->stt_overflow},
-        {"tts_overflow", app->tts_overflow},
+        {"tts_overflow", app->tts_overflow}, {"llm_overflow", app->llm_overflow},
     };
     for (size_t i = 0; i < sizeof remotes / sizeof remotes[0] && len < sizeof body; i++) {
         if (!remotes[i].target) continue;
@@ -1024,7 +1030,8 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  "\"calls_saved\":%llu},"
                  "\"batching\":{\"enabled\":%s,\"seqs\":%d,\"step_tokens\":%d,"
                  "\"steps\":%llu,\"rows\":%llu,\"tokens\":%llu,\"shared_prefix_tokens\":%llu,"
-                 "\"kv_seqs\":%d,\"kv_evictions\":%llu,\"kv_preemptions\":%llu,\"kv_requeues\":%llu},"
+                 "\"kv_seqs\":%d,\"kv_evictions\":%llu,\"kv_preemptions\":%llu,\"kv_requeues\":%llu,"
+                 "\"inflight\":%d,\"overflow_relayed\":%llu,\"overflow_fallback\":%llu},"
                  "\"overflow\":{\"image\":%s,\"image_path\":\"%s\",\"tiers\":%u,"
                  "\"saturated\":%llu,\"local_failed\":%llu,"
                  "\"frontier\":%s,\"frontier_kept_local\":%llu,"
@@ -1039,6 +1046,8 @@ static void handle_status(ohttp_request *req, app_state *app) {
                  placement.step_tokens, placement.engine_steps, placement.engine_rows,
                  placement.engine_tokens, placement.shared_prefix_tokens,
                  placement.kv_seqs, placement.kv_evictions, placement.kv_preemptions, placement.kv_requeues,
+                 __atomic_load_n(&g_llm_inflight, __ATOMIC_RELAXED), app->llm_overflow_relayed,
+                 app->llm_overflow_fallback,
                  app->image_overflow ? "true" : "false",
                  overflow_path_label(),
                  app->overflow_tier_mask,
@@ -2055,7 +2064,12 @@ static void parse_sampling(const char *js, const oj_tok *toks, int n, int root,
 /* Background LLM requests take the whole pool unless
  * OMNISERVE_NATIVE_LLM_BACKGROUND_PERMITS is set: the batched engine decodes
  * them alongside interactive sequences, so they only need to queue last. */
-static bool llm_admit(app_state *app, otier tier, int *permits) {
+static void llm_release(app_state *app, otier tier, int permits) {
+    __atomic_sub_fetch(&g_llm_inflight, 1, __ATOMIC_RELAXED);
+    osched_release_n(app->sched, tier, permits);
+}
+
+static bool llm_admit_local(app_state *app, otier tier, int *permits) {
     if (tier != TIER_BACKGROUND) {
         *permits = app->llm_permits;
         return osched_acquire_n(app->sched, tier, *permits);
@@ -2068,6 +2082,56 @@ static bool llm_admit(app_state *app, otier tier, int *permits) {
     }
     *permits = cap;
     return osched_acquire_n(app->sched, tier, cap);
+}
+
+/* Relays the request to the overflow router when the local LLM is saturated:
+ * LLM_OVERFLOW_ACTIVE requests in flight (0: every sequence busy), or no slot
+ * free without queueing. Returns true when the response was handled remotely.
+ * A relay that fails before writing anything falls back to the local queue. */
+static bool llm_overflow_relay(ohttp_request *req, app_state *app, otier tier, int *permits) {
+    oproxy_target *remote = app->llm_overflow;
+    if (!remote || !(app->llm_overflow_tier_mask & (1u << (unsigned)tier)) ||
+        oproxy_target_open_ms(remote) > 0)
+        return false;
+    ollm_placement pl;
+    ollm_placement_snapshot(&pl);
+    int limit = app->llm_overflow_active > 0 ? app->llm_overflow_active
+                : (pl.batched ? pl.batch_seqs : app->llm_permits > 0 ? osched_capacity(app->sched) / app->llm_permits : 1);
+    if (__atomic_load_n(&g_llm_inflight, __ATOMIC_RELAXED) < limit &&
+        tier != TIER_BACKGROUND && osched_try_acquire_n(app->sched, tier, app->llm_permits)) {
+        *permits = app->llm_permits;
+        __atomic_add_fetch(&g_llm_inflight, 1, __ATOMIC_RELAXED);
+        return false;
+    }
+    if (!oproxy_target_allow(remote)) return false;
+    char auth[1024];
+    oproxy_header headers[17];
+    int header_n = build_relay_headers(app, req, remote, -1, headers, 17, auth, sizeof auth);
+    if (header_n < 0) return false;
+    size_t ct_len = 0;
+    const char *ct = ohttp_req_header(req, "Content-Type", &ct_len);
+    if (!ct) { ct = "application/json"; ct_len = strlen(ct); }
+    char error[256];
+    oproxy_result result;
+    bool ok = oproxy_target_relay(remote, req->method, req->method_len, req->path, req->path_len,
+                                  req->query, req->query_len, req->body, req->body_len, ct, ct_len,
+                                  headers, header_n, app->upstream_timeout_ms, proxy_sink_raw, req,
+                                  &result, error, sizeof error);
+    if (ok || result.response_started) {
+        __atomic_add_fetch(&app->llm_overflow_relayed, 1, __ATOMIC_RELAXED);
+        if (!ok) ohttp_force_close(req);
+        else if (result.downstream_close) ohttp_force_close(req);
+        return true;
+    }
+    __atomic_add_fetch(&app->llm_overflow_fallback, 1, __ATOMIC_RELAXED);
+    fprintf(stderr, "llm overflow failed (%s); serving locally\n", error);
+    return false;
+}
+
+static bool llm_admit(app_state *app, otier tier, int *permits) {
+    if (!llm_admit_local(app, tier, permits)) return false;
+    __atomic_add_fetch(&g_llm_inflight, 1, __ATOMIC_RELAXED);
+    return true;
 }
 
 static void handle_chat(ohttp_request *req, app_state *app) {
@@ -2164,10 +2228,11 @@ static void handle_chat(ohttp_request *req, app_state *app) {
 
     otier tier = request_tier(req);
     int permits = 0;
-    if (!llm_admit(app, tier, &permits)) {
+    bool relayed = llm_overflow_relay(req, app, tier, &permits);
+    if (relayed || (!permits && !llm_admit(app, tier, &permits))) {
         for (int i = 0; i < owned_n; i++) free(owned[i]);
         free(toks);
-        respond_error(req, 503, "admission timeout; retry");
+        if (!relayed) respond_error(req, 503, "admission timeout; retry");
         return;
     }
 
@@ -2195,7 +2260,7 @@ static void handle_chat(ohttp_request *req, app_state *app) {
             char *body = malloc(cap);
             if (!body) {
                 ollm_result_free(&result);
-                osched_release_n(app->sched, tier, permits);
+                llm_release(app, tier, permits);
                 for (int i = 0; i < owned_n; i++) free(owned[i]);
                 free(toks);
                 respond_error(req, 500, "allocation failed");
@@ -2208,7 +2273,7 @@ static void handle_chat(ohttp_request *req, app_state *app) {
             if (!oj_escape_append(&body, &blen, &cap, result.text, strlen(result.text))) {
                 free(body);
                 ollm_result_free(&result);
-                osched_release_n(app->sched, tier, permits);
+                llm_release(app, tier, permits);
                 for (int i = 0; i < owned_n; i++) free(owned[i]);
                 free(toks);
                 respond_error(req, 500, "allocation failed");
@@ -2228,7 +2293,7 @@ static void handle_chat(ohttp_request *req, app_state *app) {
                 if (!grown) {
                     free(body);
                     ollm_result_free(&result);
-                    osched_release_n(app->sched, tier, permits);
+                    llm_release(app, tier, permits);
                     for (int i = 0; i < owned_n; i++) free(owned[i]);
                     free(toks);
                     respond_error(req, 500, "allocation failed");
@@ -2243,7 +2308,7 @@ static void handle_chat(ohttp_request *req, app_state *app) {
             ollm_result_free(&result);
         }
     }
-    osched_release_n(app->sched, tier, permits);
+    llm_release(app, tier, permits);
     for (int i = 0; i < owned_n; i++) free(owned[i]);
     free(toks);
 }
@@ -2353,11 +2418,12 @@ static void handle_completion(ohttp_request *req, app_state *app, bool legacy, b
 
     otier tier = request_tier(req);
     int permits = 0;
-    if (!llm_admit(app, tier, &permits)) {
+    bool relayed = llm_overflow_relay(req, app, tier, &permits);
+    if (relayed || (!permits && !llm_admit(app, tier, &permits))) {
         free(system_owned);
         free(prompt);
         for (int i = 0; i < stop_owned_n; i++) free(stop_owned[i]);
-        respond_error(req, 503, "admission timeout; retry");
+        if (!relayed) respond_error(req, 503, "admission timeout; retry");
         return;
     }
 
@@ -2421,7 +2487,7 @@ static void handle_completion(ohttp_request *req, app_state *app, bool legacy, b
             ok = append_literal(&body, &body_len, &body_cap, tail);
         }
     }
-    osched_release_n(app->sched, tier, permits);
+    llm_release(app, tier, permits);
     free(system_owned);
     free(prompt);
     for (int i = 0; i < stop_owned_n; i++) free(stop_owned[i]);
@@ -2725,11 +2791,16 @@ static void handle_images(ohttp_request *req, app_state *app) {
         respond_error(req, 503, lease_error);
         return;
     }
+    /* A granted lease already reserved the workspace; the point check is only
+     * for an unbrokered device, and asks for the same pixel-scaled figure. */
     double free_gib = -1.0;
     double total_gib = -1.0;
     char headroom_error[160];
-    if (ogpu_memory_gib(&free_gib, &total_gib) &&
-        !oimage_gpu_headroom_ok(free_gib, headroom_error, sizeof headroom_error)) {
+    if (!image_lease_id[0] && required_headroom_mb > 0 && ogpu_memory_gib(&free_gib, &total_gib) &&
+        free_gib * 1024.0 < (double)required_headroom_mb) {
+        snprintf(headroom_error, sizeof headroom_error,
+                 "image generation needs at least %d MB free GPU memory; only %.0f MB is free",
+                 required_headroom_mb, free_gib * 1024.0);
         image_gpu_release(app, image_lease_id, image_lease_remote);
         osched_release_n(app->sched, tier, permits);
         oimage_request_free(&image_request);
@@ -3650,6 +3721,12 @@ static void route(ohttp_request *req, void *user) {
     if (!auth_gate(req, app)) return;
     if (ohttp_path_is(req, "/health") || ohttp_path_is(req, "/healthz") ||
         ohttp_path_is(req, "/liveness_check")) { handle_health(req); return; }
+    if (ohttp_path_is(req, "/ping")) {
+        /* RunPod load-balancing health: 204 while loading, 200 when ready. */
+        if (ollm_ready()) ohttp_respond_str(req, 200, "application/json", "{\"status\":\"ok\"}");
+        else ohttp_respond_str(req, 204, "application/json", "");
+        return;
+    }
     if (ohttp_path_is(req, "/readyz") || ohttp_path_is(req, "/readiness_check")) {
         handle_readyz(req); return;
     }
@@ -4365,6 +4442,8 @@ int main(int argc, char **argv) {
     CREATE_UPSTREAM(depth_overflow, depth_overflow_url, "depth overflow");
     CREATE_UPSTREAM(stt_overflow, stt_overflow_url, "STT overflow");
     CREATE_UPSTREAM(tts_overflow, tts_overflow_url, "TTS overflow");
+    const char *llm_overflow_url = getenv("OMNISERVE_NATIVE_LLM_OVERFLOW_UPSTREAM");
+    CREATE_UPSTREAM(llm_overflow, llm_overflow_url, "LLM overflow");
     const char *model_upstreams = getenv("OMNISERVE_NATIVE_IMAGE_MODEL_UPSTREAMS");
     if (model_upstreams && model_upstreams[0]) {
         char *entries = strdup(model_upstreams);
@@ -4419,6 +4498,22 @@ int main(int argc, char **argv) {
         }
         app.overflow_tier_mask = mask;
     }
+    app.llm_overflow_tier_mask = app.overflow_tier_mask;
+    {
+        const char *tiers = getenv("OMNISERVE_NATIVE_LLM_OVERFLOW_TIERS");
+        if (tiers && tiers[0]) {
+            char buf[128];
+            unsigned mask = 0;
+            snprintf(buf, sizeof buf, "%s", tiers);
+            for (char *save = NULL, *tok = strtok_r(buf, ",", &save); tok;
+                 tok = strtok_r(NULL, ",", &save)) {
+                while (*tok == ' ') tok++;
+                mask |= OSCALE_TIER_BIT(otier_parse(tok, (int)strlen(tok)));
+            }
+            app.llm_overflow_tier_mask = mask;
+        }
+    }
+    app.llm_overflow_active = env_int("OMNISERVE_NATIVE_LLM_OVERFLOW_ACTIVE", 0);
     const char *upstream_timeout = getenv("OMNISERVE_NATIVE_UPSTREAM_TIMEOUT_MS");
     app.upstream_timeout_ms = upstream_timeout ? atoi(upstream_timeout) : 600000;
     app.music_timeout_ms = 1530000;

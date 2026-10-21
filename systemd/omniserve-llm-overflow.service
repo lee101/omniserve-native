@@ -1,0 +1,25 @@
+[Unit]
+Description=OmniServe LLM overflow router + RunPod pod/serverless autoscaler (127.0.0.1:18796)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/nvme0n1-disk/code/omniserve-native-llmbatch
+# RUNPOD_API_KEY, HF_TOKEN, RUNPOD_LLM_ENDPOINT_ID, POD_IMAGE (+ optional policy overrides).
+# chmod 600, root-owned; the sidecar never writes secrets to disk.
+EnvironmentFile=/etc/omniserve-llm-overflow.env
+Environment=PYTHONUNBUFFERED=1
+# System python3 has aiohttp on prod; alternative:
+# ExecStart=/home/administrator/.local/bin/uv run --no-project --with aiohttp tools/llm_overflow.py serve
+ExecStart=/usr/bin/python3 tools/llm_overflow.py serve
+# SIGTERM leaves pods running (adopted on restart, they idle out). Add
+# --terminate-on-exit to ExecStart to kill them on stop instead.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
