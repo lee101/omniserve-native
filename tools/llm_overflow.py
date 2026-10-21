@@ -38,7 +38,7 @@ PATHS = ("/v1/chat/completions", "/v1/completions")
 STRIP = {"authorization", "x-api-key", "x-rapid-api-key", "secret", "cookie", "host", "content-length",
          "connection", "keep-alive", "transfer-encoding", "te", "upgrade", "proxy-authorization",
          "proxy-connection", "accept-encoding", "expect"}
-PASS = {"content-type", "cache-control", "x-request-id", "x-runpod-worker-id", "retry-after"}
+PASS = {"content-type", "content-encoding", "cache-control", "x-request-id", "x-runpod-worker-id", "retry-after"}
 RETRY_STATUS = {401, 403, 404, 408, 429}
 LIVE = {"PROVISIONING", "STARTING", "RUNNING"}
 
@@ -155,7 +155,7 @@ class Router:
         self.cfg, self.session, self.clock = cfg, session, clock
         self.total = Gauge(clock)
         self.pods = {}
-        self.requests = self.unavailable = 0
+        self.requests = self.unavailable = self.client_gone = 0
         self.serverless = None
         if cfg.SERVERLESS_URL:
             auth = {"Authorization": "Bearer " + cfg.RUNPOD_API_KEY} if cfg.RUNPOD_API_KEY else {}
@@ -172,6 +172,7 @@ class Router:
             return web.json_response({"error": {"message": "unsupported path"}}, status=404)
         body = await request.read()
         headers = {k: v for k, v in request.headers.items() if k.lower() not in STRIP}
+        headers["Accept-Encoding"] = "identity"
         started = time.monotonic()
         self.requests += 1
         self.total.add(1)
@@ -229,7 +230,11 @@ class Router:
                 b.fails = 0
                 try:
                     async for chunk in r.content.iter_any():
-                        await resp.write(chunk)
+                        try:
+                            await resp.write(chunk)
+                        except (ConnectionError, aiohttp.ClientConnectionResetError):
+                            self.client_gone += 1
+                            return resp
                     await resp.write_eof()
                 except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
                     b.stream_errors += 1
@@ -261,6 +266,7 @@ class Router:
 
     def state(self):
         return {"inflight": self.total.n, "requests": self.requests, "unavailable": self.unavailable,
+                "client_gone": self.client_gone,
                 "serverless": self.serverless.state() if self.serverless else None,
                 "pods": [p.state() for p in self.pods.values()]}
 
