@@ -92,6 +92,15 @@ typedef struct {
     int cpu_expert_layers;
     char tensor_override[512];
     unsigned long long est_gpu_bytes;
+    /* Continuous batching: sequences sharing one context, the per-step token
+     * budget, and engine counters (rows/steps is the mean decode batch). */
+    bool batched;
+    int batch_seqs;
+    int step_tokens;
+    unsigned long long engine_steps;
+    unsigned long long engine_rows;
+    unsigned long long engine_tokens;
+    unsigned long long shared_prefix_tokens; /* prompt tokens forked, not prefilled */
 } ollm_placement;
 
 /* Contexts this device class can keep resident beside the weights. Advisory:
