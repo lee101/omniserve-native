@@ -2072,6 +2072,23 @@ static bool llm_admit_local(app_state *app, otier tier, int *permits) {
     return osched_acquire_n(app->sched, tier, cap);
 }
 
+/* The overflow router answers 429 (remote cold) or 503 (nothing warm) before any body:
+ * those are swallowed so the caller falls back to the local queue. */
+typedef struct {
+    ohttp_request *req;
+    int state; /* 0 undecided, 1 relaying, 2 swallowed */
+} overflow_sink_ctx;
+
+static bool overflow_sink(const void *data, size_t len, void *user) {
+    overflow_sink_ctx *s = user;
+    if (s->state == 0) {
+        const char *p = data;
+        s->state = len >= 12 && memcmp(p, "HTTP/1.", 7) == 0 &&
+                   (memcmp(p + 9, "429", 3) == 0 || memcmp(p + 9, "503", 3) == 0) ? 2 : 1;
+    }
+    return s->state == 2 || ohttp_raw_write(s->req, data, len);
+}
+
 /* Relays the request to the overflow router when the local LLM is saturated:
  * LLM_OVERFLOW_ACTIVE requests in flight (0: every sequence busy), or no slot
  * free without queueing. Returns true when the response was handled remotely.
@@ -2085,10 +2102,13 @@ static bool llm_overflow_relay(ohttp_request *req, app_state *app, otier tier, i
     ollm_placement_snapshot(&pl);
     int limit = app->llm_overflow_active > 0 ? app->llm_overflow_active
                 : (pl.batched ? pl.batch_seqs : app->llm_permits > 0 ? osched_capacity(app->sched) / app->llm_permits : 1);
-    if (__atomic_load_n(&g_llm_inflight, __ATOMIC_RELAXED) < limit &&
-        tier != TIER_BACKGROUND && osched_try_acquire_n(app->sched, tier, app->llm_permits)) {
-        *permits = app->llm_permits;
-        __atomic_add_fetch(&g_llm_inflight, 1, __ATOMIC_RELAXED);
+    /* Free sequences but no free slot means the pool is held by images or background LLM
+     * work: queue locally (tier priority gets the next release) rather than relay. */
+    if (__atomic_load_n(&g_llm_inflight, __ATOMIC_RELAXED) < limit && tier != TIER_BACKGROUND) {
+        if (osched_try_acquire_n(app->sched, tier, app->llm_permits)) {
+            *permits = app->llm_permits;
+            __atomic_add_fetch(&g_llm_inflight, 1, __ATOMIC_RELAXED);
+        }
         return false;
     }
     if (!oproxy_target_allow(remote)) return false;
@@ -2101,10 +2121,15 @@ static bool llm_overflow_relay(ohttp_request *req, app_state *app, otier tier, i
     if (!ct) { ct = "application/json"; ct_len = strlen(ct); }
     char error[256];
     oproxy_result result;
+    overflow_sink_ctx sink = { .req = req };
     bool ok = oproxy_target_relay(remote, req->method, req->method_len, req->path, req->path_len,
                                   req->query, req->query_len, req->body, req->body_len, ct, ct_len,
-                                  headers, header_n, app->upstream_timeout_ms, proxy_sink_raw, req,
+                                  headers, header_n, app->upstream_timeout_ms, overflow_sink, &sink,
                                   &result, error, sizeof error);
+    if (sink.state == 2) {
+        __atomic_add_fetch(&app->llm_overflow_fallback, 1, __ATOMIC_RELAXED);
+        return false;
+    }
     if (ok || result.response_started) {
         __atomic_add_fetch(&app->llm_overflow_relayed, 1, __ATOMIC_RELAXED);
         if (!ok) ohttp_force_close(req);

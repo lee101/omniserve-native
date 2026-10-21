@@ -33,6 +33,7 @@ DEFAULTS = dict(
     POD_NAME_PREFIX="omniserve-llm-overflow-", POD_URL_TEMPLATE="https://{id}-{port}.proxy.runpod.net",
     POD_SECRET_KEY="", HF_TOKEN="", REMOTE_ENV_JSON="{}", REGISTRY_AUTH_ID="",
     WARM_CONCURRENCY=2.0, WARM_INTERVAL_S=60.0,
+    COLD_REJECT=1, WARM_TTL_S=60.0, COLD_PING_S=15.0,
 )
 PATHS = ("/v1/chat/completions", "/v1/completions")
 STRIP = {"authorization", "x-api-key", "x-rapid-api-key", "secret", "cookie", "host", "content-length",
@@ -155,7 +156,8 @@ class Router:
         self.cfg, self.session, self.clock = cfg, session, clock
         self.total = Gauge(clock)
         self.pods = {}
-        self.requests = self.unavailable = self.client_gone = 0
+        self.requests = self.unavailable = self.client_gone = self.cold_rejects = 0
+        self.warm_until = self.last_wake = -math.inf
         self.serverless = None
         if cfg.SERVERLESS_URL:
             auth = {"Authorization": "Bearer " + cfg.RUNPOD_API_KEY} if cfg.RUNPOD_API_KEY else {}
@@ -167,9 +169,40 @@ class Router:
         pods = [p for p in self.pods.values() if p.ready and not p.draining and p.gauge.n < p.capacity]
         return sorted(pods, key=lambda p: p.gauge.n / p.capacity)
 
+    def warm(self):
+        return self.clock() < self.warm_until
+
+    def mark_warm(self):
+        self.warm_until = self.clock() + self.cfg.WARM_TTL_S
+
+    def wake(self):
+        if self.serverless is None or self.clock() - self.last_wake < self.cfg.COLD_PING_S:
+            return
+        self.last_wake = self.clock()
+        asyncio.ensure_future(self.ping_serverless(self.cfg.OVERFLOW_DEADLINE_S))
+
+    async def ping_serverless(self, timeout_s):
+        sl = self.serverless
+        try:
+            async with self.session.get(sl.url + "/ping", headers=sl.auth,
+                                        timeout=aiohttp.ClientTimeout(total=timeout_s)) as r:
+                await r.read()
+                if r.status == 200:
+                    self.mark_warm()
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            pass
+
     async def handle(self, request):
         if request.path not in PATHS:
             return web.json_response({"error": {"message": "unsupported path"}}, status=404)
+        # A cold serverless start (2-60 s) is slower than the caller's local queue, which frees
+        # a sequence within seconds: answer 429 so the gateway serves locally, and wake the
+        # endpoint so overflow that persists finds a warm worker.
+        if self.cfg.COLD_REJECT and not self.free_pods() and not self.warm():
+            self.cold_rejects += 1
+            self.wake()
+            return web.json_response({"error": {"message": "overflow capacity is cold", "type": "overflow_cold"}},
+                                     status=429, headers={"Retry-After": "2"})
         body = await request.read()
         headers = {k: v for k, v in request.headers.items() if k.lower() not in STRIP}
         headers["Accept-Encoding"] = "identity"
@@ -223,6 +256,8 @@ class Router:
                         return "no_workers" if b"no worker" in raw.lower() else str(r.status)
                     b.fails = 0
                     return web.Response(status=r.status, body=raw, headers=self.out_headers(r, b))
+                if b.kind == "serverless":
+                    self.mark_warm()
                 resp = web.StreamResponse(status=r.status, headers=self.out_headers(r, b))
                 if r.content_length is not None:
                     resp.content_length = r.content_length
@@ -266,7 +301,8 @@ class Router:
 
     def state(self):
         return {"inflight": self.total.n, "requests": self.requests, "unavailable": self.unavailable,
-                "client_gone": self.client_gone,
+                "client_gone": self.client_gone, "cold_rejects": self.cold_rejects,
+                "serverless_warm_s": max(0, round(self.warm_until - self.clock())) if self.warm() else 0,
                 "serverless": self.serverless.state() if self.serverless else None,
                 "pods": [p.state() for p in self.pods.values()]}
 
@@ -526,12 +562,7 @@ class Scaler:
         asyncio.ensure_future(self._warm(sl))
 
     async def _warm(self, sl):
-        try:
-            async with self.router.session.get(sl.url + "/ping", headers=sl.auth,
-                                               timeout=aiohttp.ClientTimeout(total=30)) as r:
-                await r.read()
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-            pass
+        await self.router.ping_serverless(30)
 
     def state(self):
         return {"short_concurrency": round(self.short.v, 2), "long_concurrency": round(self.long.v, 2),
