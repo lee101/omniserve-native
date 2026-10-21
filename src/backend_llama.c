@@ -1496,13 +1496,14 @@ static size_t gather_top(const float *logits, int32_t n_vocab, size_t k,
     return n;
 }
 
-static void engine_sample_one(ollm_slot *s) {
-    const float *logits = s->logits_row;
-    llama_token_data *cand = s->cand;
+/* llama_sampler_sample over a raw row, with the exact top-(k+window) cut when
+ * prefilter_k is set. cand holds n_vocab entries. */
+static llama_token sample_row(struct llama_sampler *smpl, const float *logits, int prefilter_k,
+                              llama_token_data *cand) {
     size_t n = 0;
     bool sorted = false;
-    if (s->prefilter_k > 0 && s->prefilter_k < g_n_vocab) {
-        n = gather_top(logits, g_n_vocab, (size_t)s->prefilter_k, cand, (size_t)g_n_vocab);
+    if (prefilter_k > 0 && prefilter_k < g_n_vocab) {
+        n = gather_top(logits, g_n_vocab, (size_t)prefilter_k, cand, (size_t)g_n_vocab);
         sorted = true;
     } else {
         for (int32_t i = 0; i < g_n_vocab; i++) {
@@ -1513,11 +1514,25 @@ static void engine_sample_one(ollm_slot *s) {
         n = (size_t)g_n_vocab;
     }
     llama_token_data_array cur = { cand, n, -1, sorted };
-    llama_sampler_apply(s->smpl, &cur);
+    llama_sampler_apply(smpl, &cur);
     llama_token tok = cur.selected >= 0 && cur.selected < (int64_t)cur.size
         ? cur.data[cur.selected].id : cand[0].id;
-    llama_sampler_accept(s->smpl, tok);
-    s->next = tok;
+    llama_sampler_accept(smpl, tok);
+    return tok;
+}
+
+static void engine_sample_one(ollm_slot *s) {
+    s->next = sample_row(s->smpl, s->logits_row, s->prefilter_k, s->cand);
+}
+
+/* The per-slot (speculative) path's sampler: same cut, same chain. */
+static llama_token slot_sample(ollm_slot *slot, struct llama_sampler *smpl,
+                               struct llama_context *ctx, int32_t idx) {
+    if (slot->cand && slot->prefilter_k > 0) {
+        const float *logits = llama_get_logits_ith(ctx, idx);
+        if (logits) return sample_row(smpl, logits, slot->prefilter_k, slot->cand);
+    }
+    return llama_sampler_sample(smpl, ctx, idx);
 }
 
 static void samp_drain(void) {
@@ -1833,7 +1848,12 @@ static int engine_release(ollm_slot *s) {
  * at least top_k untouched tokens in the cut outrank anything outside it. */
 static int engine_prefilter_k(const ochat_req *req, bool penalized, bool dry, int last_n,
                               int top_k) {
-    if (dry || req->min_probability > 0.0f || top_k <= 0) return 0;
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("OMNISERVE_NATIVE_LLM_PREFILTER");
+        enabled = !(env && strcmp(env, "0") == 0);
+    }
+    if (!enabled || dry || req->min_probability > 0.0f || top_k <= 0) return 0;
     int window = 0;
     if (penalized) {
         if (req->repetition_penalty > 0.0f && req->repetition_penalty < 1.0f) return 0;
@@ -1875,7 +1895,6 @@ static void engine_stop_locked(void) {
 }
 
 static bool engine_start_locked(void) {
-    g_n_vocab = llama_vocab_n_tokens(g_vocab);
     g_step = llama_batch_init(g_step_budget + g_slot_count, 0, 1);
     g_step_slots = calloc((size_t)g_slot_count + 1, sizeof *g_step_slots);
     g_sample_jobs = calloc((size_t)g_slot_count + 1, sizeof *g_sample_jobs);
@@ -1930,6 +1949,7 @@ static bool ollm_init_locked(const char *model_path, int n_gpu_layers, int ctx_l
         return false;
     }
     g_vocab = llama_model_get_vocab(g_model);
+    g_n_vocab = llama_vocab_n_tokens(g_vocab);
 
     g_ctx_len = ctx_len > 0 ? ctx_len : 8192;
     /* Batch geometry that saturates a 5090 stalls a T4, so the defaults follow
@@ -2074,8 +2094,12 @@ static bool ollm_init_locked(const char *model_path, int n_gpu_layers, int ctx_l
     }
     for (int i = 0; !g_batched && i < g_slot_count; i++) {
         g_slots[i].ctx = llama_init_from_model(g_model, cp);
-        if (!g_slots[i].ctx) {
-            for (int j = 0; j < i; j++) llama_free(g_slots[j].ctx);
+        g_slots[i].cand = malloc((size_t)g_n_vocab * sizeof *g_slots[i].cand);
+        if (!g_slots[i].ctx || !g_slots[i].cand) {
+            for (int j = 0; j <= i; j++) {
+                if (g_slots[j].ctx) llama_free(g_slots[j].ctx);
+                free(g_slots[j].cand);
+            }
             free(g_slots);
             g_slots = NULL;
             g_slot_count = 0;
@@ -2331,7 +2355,7 @@ static int decode_round(ollm_slot *slot, struct llama_sampler *smpl,
     /* Straight after the prefill there is nothing to decode: the logits for the
      * next token are already the ones the prompt left behind. */
     if (previous == LLAMA_TOKEN_NULL) {
-        out_tokens[0] = llama_sampler_sample(smpl, ctx, -1);
+        out_tokens[0] = slot_sample(slot, smpl, ctx, -1);
         out_probs[0] = sampled->probability;
         return 1;
     }
@@ -2358,7 +2382,7 @@ static int decode_round(ollm_slot *slot, struct llama_sampler *smpl,
         if (llama_decode(ctx, one) != 0) return 0;
         spec_mtp_process(slot, 1);
         (*n_past)++;
-        out_tokens[0] = llama_sampler_sample(smpl, ctx, -1);
+        out_tokens[0] = slot_sample(slot, smpl, ctx, -1);
         out_probs[0] = sampled->probability;
         if (gov) ospec_governor_observe(gov, 0, 0);
         return 1;
@@ -2393,7 +2417,7 @@ static int decode_round(ollm_slot *slot, struct llama_sampler *smpl,
     int produced = 0;
     int matched = 0;
     for (int i = 0; i <= draft_len && produced < out_cap; i++) {
-        llama_token tok = llama_sampler_sample(smpl, ctx, i);
+        llama_token tok = slot_sample(slot, smpl, ctx, i);
         out_tokens[produced] = tok;
         out_probs[produced] = sampled->probability;
         produced++;
@@ -2860,6 +2884,8 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
     llama_token round_tokens[17];
     float round_probs[17];
     int round_count = 0, round_pos = 0;
+    int prefilter_k = engine_prefilter_k(req, penalized, dry, last_n, top_k);
+    if (!g_batched) slot->prefilter_k = prefilter_k;
     if (g_batched) {
         /* Publish the prompt now; the engine advances cached_count as prefill
          * lands, so concurrent requests can fork the part already computed. */
@@ -2869,7 +2895,7 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
         slot->cached_count = visible < slot->cached_count ? visible : slot->cached_count;
         pthread_mutex_unlock(&g_slot_lock);
         engine_submit(slot, tokens, n_tokens, cached_tokens, max_new, smpl, &sampled,
-                      engine_prefilter_k(req, penalized, dry, last_n, top_k));
+                      prefilter_k);
     }
 
     for (int i = 0; i < max_new; i++) {
@@ -3102,7 +3128,6 @@ static void ollm_shutdown_locked(void) {
         engine_stop_locked();
         for (int i = 0; i < g_slot_count; i++) {
             g_slots[i].ctx = NULL;
-            free(g_slots[i].cand);
             pthread_cond_destroy(&g_slots[i].cond);
         }
         if (g_bctx) llama_free(g_bctx);
@@ -3113,6 +3138,7 @@ static void ollm_shutdown_locked(void) {
     for (int i = 0; i < g_slot_count; i++) {
         if (g_slots[i].ctx) llama_free(g_slots[i].ctx);
         free(g_slots[i].cached_tokens);
+        free(g_slots[i].cand);
     }
     free(g_slots);
     g_slots = NULL;
