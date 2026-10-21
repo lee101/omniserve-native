@@ -134,8 +134,8 @@ def test_streaming_passthrough_unbuffered_and_auth_swapped():
                 rest = await r.read()
             assert rest.endswith(b"data: [DONE]\n\n")
             h = pod.calls[0]["headers"]
-            assert h["Authorization"] == "Bearer podsecret"
-            assert "X-API-Key" not in h and h["X-Omniserve-Tier"] == "paid"
+            assert h["secret"] == "podsecret"
+            assert "Authorization" not in h and "X-API-Key" not in h and h["X-Omniserve-Tier"] == "paid"
             assert json.loads(pod.calls[0]["body"]) == BODY and pod.calls[0]["path"] == "/v1/chat/completions"
             assert sl.calls == [] and rig.pod.gauge.n == 0 and rig.router.total.n == 0
     asyncio.run(go())
@@ -393,7 +393,7 @@ def test_adopts_existing_pods_and_ignores_foreign():
             await rig.run(15, 0)
             assert list(rig.router.pods) == ["mine1"]
             p = rig.router.pods["mine1"]
-            assert p.ready and p.auth["Authorization"] == "Bearer " + lo.pod_secret(rig.cfg, ours["name"])
+            assert p.ready and p.auth == {"secret": lo.pod_secret(rig.cfg, ours["name"])}
             await rig.run(1200, 12)
             assert rig.api.created == [] and rig.api.terminated == []
     asyncio.run(go())

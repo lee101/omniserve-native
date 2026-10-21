@@ -31,7 +31,7 @@ DEFAULTS = dict(
     POD_GPU_TYPES="NVIDIA GeForce RTX 4090,NVIDIA GeForce RTX 5090,NVIDIA L40S,NVIDIA A40,NVIDIA RTX A6000",
     POD_CLOUD="SECURE", POD_PORT=8000, POD_DISK_GB=40, POD_MIN_CUDA="12.9",
     POD_NAME_PREFIX="omniserve-llm-overflow-", POD_URL_TEMPLATE="https://{id}-{port}.proxy.runpod.net",
-    POD_SECRET_KEY="", HF_TOKEN="", REMOTE_ENV_JSON="{}",
+    POD_SECRET_KEY="", HF_TOKEN="", REMOTE_ENV_JSON="{}", REGISTRY_AUTH_ID="",
     WARM_CONCURRENCY=2.0, WARM_INTERVAL_S=60.0,
 )
 PATHS = ("/v1/chat/completions", "/v1/completions")
@@ -118,7 +118,7 @@ class Backend:
 class Pod(Backend):
     def __init__(self, cfg, clock, id, name, secret, gpu="", cost=0.0, created=None, status="PROVISIONING"):
         url = cfg.POD_URL_TEMPLATE.format(id=id, port=cfg.POD_PORT)
-        super().__init__("pod", name, url, {"Authorization": "Bearer " + secret}, cfg.POD_CAPACITY, clock)
+        super().__init__("pod", name, url, {"secret": secret}, cfg.POD_CAPACITY, clock)
         self.id, self.gpu, self.cost, self.status = id, gpu, cost, status
         self.created = clock() if created is None else created
         self.ready = False
@@ -160,7 +160,7 @@ class Router:
         if cfg.SERVERLESS_URL:
             auth = {"Authorization": "Bearer " + cfg.RUNPOD_API_KEY} if cfg.RUNPOD_API_KEY else {}
             if cfg.SERVERLESS_SECRET:
-                auth["X-API-Key"] = cfg.SERVERLESS_SECRET
+                auth["secret"] = cfg.SERVERLESS_SECRET
             self.serverless = Backend("serverless", "serverless", cfg.SERVERLESS_URL, auth, 0, clock)
 
     def free_pods(self):
@@ -483,6 +483,8 @@ class Scaler:
                     gcfg["minCudaVersion"] = cfg.POD_MIN_CUDA
                 body = {"name": name, "image": cfg.POD_IMAGE, "cloud": cloud, "gpu": gcfg,
                         "disk": cfg.POD_DISK_GB, "ports": [f"{cfg.POD_PORT}/http"], "env": env}
+                if cfg.REGISTRY_AUTH_ID:
+                    body["registry"] = cfg.REGISTRY_AUTH_ID
                 try:
                     d = await self.api.create_pod(body)
                 except RunPodError as e:
@@ -580,10 +582,15 @@ def endpoint_body(a, cfg):
     gpu = {"pools": a.pools.split(","), "count": 1}
     if a.min_cuda:
         gpu["minCudaVersion"] = a.min_cuda
-    return {"name": a.name, "type": "LOAD_BALANCER", "image": a.image, "gpu": gpu,
+    if a.exclude_types:
+        gpu["excludedTypes"] = a.exclude_types.split(",")
+    body = {"name": a.name, "type": "LOAD_BALANCER", "image": a.image, "gpu": gpu,
             "workers": {"min": 0, "max": a.workers_max, "idleTimeout": a.idle_timeout},
             "scaling": {"type": "REQUEST_COUNT", "requestCount": a.request_count},
             "ports": [f"{a.port}/http"], "env": env, "disk": a.disk, "flashboot": a.flashboot}
+    if cfg.REGISTRY_AUTH_ID:
+        body["registry"] = cfg.REGISTRY_AUTH_ID
+    return body
 
 
 def redact(body):
@@ -635,6 +642,8 @@ def main():
     st.add_argument("--request-count", type=int, default=24, help="in-flight requests per worker before scaling out")
     st.add_argument("--pools", default="ADA_24,ADA_32_PRO,AMPERE_48,ADA_48_PRO")
     st.add_argument("--min-cuda", default="12.9")
+    st.add_argument("--exclude-types", default="NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb",
+                    help="GPU type ids to drop from the pools (MIG slices are a fraction of the card)")
     st.add_argument("--port", type=int, default=8000)
     st.add_argument("--disk", type=int, default=30)
     st.add_argument("--flashboot", default="FLASHBOOT", choices=["OFF", "FLASHBOOT", "PRIORITY_FLASHBOOT"])
