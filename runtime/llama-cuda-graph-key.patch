@@ -1,0 +1,27 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 4aaa4f367..e53bef9e2 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2528,8 +2528,21 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+     return use_cuda_graph;
+ }
+ 
++// One cached CUDA graph per graph shape, not per first node: a batched decoder
++// alternates between row counts and KV sizes, and keying on nodes[0] alone made
++// every alternation re-warm and run uncaptured.
+ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+-    return cgraph->nodes[0];
++    uint64_t h = 1469598103934665603ULL ^ (uint64_t) (uintptr_t) cgraph->nodes[0];
++    auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ULL; };
++    mix((uint64_t) cgraph->n_nodes);
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const ggml_tensor * t = cgraph->nodes[i];
++        mix((uint64_t) t->op);
++        for (int d = 0; d < GGML_MAX_DIMS; d++) mix((uint64_t) t->ne[d]);
++        mix((uint64_t) (uintptr_t) t->data);
++        for (int j = 0; j < GGML_MAX_SRC && t->src[j]; j++) mix((uint64_t) (uintptr_t) t->src[j]->data);
++    }
++    return (const void *) (uintptr_t) (h | 1);
+ }
+ 
+ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {

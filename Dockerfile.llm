@@ -1,0 +1,51 @@
+# LLM-only omniserve-native for RunPod overflow: one image serves both a
+# load-balancing serverless endpoint (PORT, /ping) and a dedicated pod.
+FROM nvidia/cuda:12.9.1-devel-ubuntu24.04 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends git cmake ninja-build build-essential ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ARG LLAMA_COMMIT=571d0d540
+RUN git clone --filter=blob:none https://github.com/ggml-org/llama.cpp /llama.cpp && cd /llama.cpp && git checkout $LLAMA_COMMIT \
+    && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="86;89;90;120" \
+       -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON \
+       -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=OFF \
+    && cmake --build build -j"$(nproc)"
+COPY CMakeLists.txt /src/CMakeLists.txt
+COPY include /src/include
+COPY src /src/src
+COPY tests /src/tests
+COPY cuda /src/cuda
+RUN cmake -S /src -B /src/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DWITH_LLAMA=ON -DWITH_SD=OFF -DONATIVE_NATIVE_ARCH=OFF \
+       -DLLAMA_DIR=/llama.cpp \
+    && cmake --build /src/build --target omniserve-native -j"$(nproc)"
+
+FROM nvidia/cuda:12.9.1-runtime-ubuntu24.04
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 python3 python3-pip ca-certificates curl \
+    && pip install --no-cache-dir --break-system-packages "huggingface-hub[hf_xet]==1.27.0" \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /llama.cpp/build/bin/*.so* /llama.cpp/build/bin/
+COPY --from=build /src/build/omniserve-native /usr/local/bin/omniserve-native
+COPY runtime/llm_entrypoint.sh /usr/local/bin/llm_entrypoint.sh
+ENV PORT=8000 \
+    OMNISERVE_NATIVE_BIND=0.0.0.0 \
+    OMNISERVE_NATIVE_NGL=99 \
+    OMNISERVE_NATIVE_CTX=4096 \
+    OMNISERVE_NATIVE_KV_TYPE=q8_0 \
+    OMNISERVE_NATIVE_BATCH=1024 \
+    OMNISERVE_NATIVE_UBATCH=256 \
+    OMNISERVE_NATIVE_SLOTS=64 \
+    OMNISERVE_NATIVE_LLM_CONTEXTS=64 \
+    OMNISERVE_NATIVE_LLM_PERMITS=1 \
+    OMNISERVE_NATIVE_LLM_KV_SEQS=auto \
+    OMNISERVE_NATIVE_LLM_KV_RESERVE_MB=1024 \
+    OMNISERVE_NATIVE_LLM_BATCHED=1 \
+    OMNISERVE_NATIVE_LLM_SHARE_PREFIX=1 \
+    OMNISERVE_NATIVE_WORKERS=160 \
+    OMNISERVE_NATIVE_GUARD=0 \
+    OMNISERVE_NATIVE_VRAM_BROKER=0 \
+    OMNISERVE_NATIVE_RAM_PREFETCH_ENABLED=0 \
+    OMNISERVE_NATIVE_DRY_MULTIPLIER=0.8 \
+    OMNISERVE_NATIVE_PENALTY_LAST_N=0 \
+    LLM_REPO=lee101/gemma-roleplay-v2-gguf \
+    LLM_FILE=gemma-roleplay-v2-q8_0.gguf
+EXPOSE 8000
+ENTRYPOINT ["/usr/local/bin/llm_entrypoint.sh"]
