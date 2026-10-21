@@ -99,6 +99,7 @@ typedef struct {
     unsigned llm_overflow_tier_mask;
     int llm_overflow_active;       /* local in-flight LLM requests that count as saturated */
     int llm_overflow_queue;        /* LLM requests queued for a slot before relaying with sequences free */
+    int chat_compat_permits;       /* slots the outer compat-proxy hop holds per chat */
     unsigned long long llm_overflow_relayed, llm_overflow_fallback;
     oproxy_target *tts_overflow;
     /* Credential and time budget for the image lane's remote. The key is what
@@ -3804,7 +3805,9 @@ static void route(ohttp_request *req, void *user) {
             handle_proxy(req, app, target, app->multimodal_permits, "application/json");
         } else if (app->aux_upstream && env_flag("OMNISERVE_NATIVE_CHAT_COMPAT_PROXY", 0) &&
             !request_forces_local_model(req)) {
-            handle_proxy(req, app, app->aux_upstream, app->llm_permits, "application/json");
+            /* A compat layer that proxies back here (X-Omniserve-Internal: local) is admitted
+             * by that inner request; CHAT_COMPAT_PERMITS=0 stops each chat holding two slots. */
+            handle_proxy(req, app, app->aux_upstream, app->chat_compat_permits, "application/json");
         } else if (app->llm_upstream) {
             handle_proxy(req, app, app->llm_upstream, app->llm_permits, "application/json");
         } else {
@@ -4242,6 +4245,7 @@ int main(int argc, char **argv) {
     if (slots < 1) slots = 1;
     if (slots > 64) slots = 64;
     app.llm_permits = configured_permits("OMNISERVE_NATIVE_LLM_PERMITS", 1, slots);
+    app.chat_compat_permits = env_int("OMNISERVE_NATIVE_CHAT_COMPAT_PERMITS", app.llm_permits);
     app.llm_background_permits = env_int("OMNISERVE_NATIVE_LLM_BACKGROUND_PERMITS", 0);
     app.image_permits = configured_permits("OMNISERVE_NATIVE_IMAGE_PERMITS", slots, slots);
     /* app.nz owns H3's local/remote admission. Zero means this long-lived
