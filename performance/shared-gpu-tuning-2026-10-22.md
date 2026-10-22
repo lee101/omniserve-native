@@ -96,11 +96,33 @@ billing; `CHAT_COMPAT_PROXY=1`) -> back to the gateway with `X-Omniserve-Interna
 - The outer gateway hop held an LLM slot and the inner request another: 2 of 32 slots per
   chat. `CHAT_COMPAT_PERMITS=0` (prod) leaves admission to the inner request.
 
+## LoRA diff add fused into the up-GEMM (`runtime/ggml-cuda-gemm-add-fuse.patch`)
+
+`out = add_inplace(W x, up (down x))`: when an F32 x F32 MUL_MAT feeds only an ADD of its shape, ggml-cuda
+runs one SGEMM with beta=1 straight into the ADD's destination (no diff tensor, no add pass). Outputs stay
+within the run-to-run hash set of the unfused path. 3090 Ti 1024^2 9 steps the_look 0.8: 10.6 -> 10.2 s
+median; plain images unchanged. `GGML_CUDA_FUSE_GEMM_ADD=0` reverts.
+
+## VAE convs on cuDNN (`runtime/ggml-cuda-cudnn-conv.patch`)
+
+`OMNISERVE_NATIVE_SD_VAE_CONV_DIRECT=1` makes sd.cpp emit GGML_OP_CONV_2D; with `GGML_CUDA_CUDNN_CONV=1`
+ggml-cuda runs it through cuDNN (dlopen'd, F16 x/w/y, heuristic algo cached per shape, created during the
+CUDA-graph warmup run) instead of ggml's naive direct kernel. Per-tile (80^2 latent) conv time in a torch
+microbench: cuDNN F16 60 ms vs im2col+GEMM 98 ms. 3090 Ti 1024^2: 9.08-9.35 -> 8.78-8.83 s, VAE output
+57 dB PSNR vs the im2col path (max pixel diff <= 8), generation peak VRAM 10428 -> 9668 MB.
+`GGML_CUDA_CUDNN_CONV_F32ACC=1` (60 dB) costs ~0.2 s.
+
+Prod: pinned copy of the nvidia-cudnn-cu12 9.10.2 wheel in `omniserve-native-deploy/cudnn-9.10.2`
+(`GGML_CUDA_CUDNN_LIB`). The first deploy pointed at `~/.local/.../nvidia/cudnn`, whose `libcudnn_ops.so.9`
+is truncated (55.7 of 127.9 MB, an interrupted pip install): the loader SIGBUSes mapping it, which took the
+gateway down twice before rollback. The pinned copy is md5-checked against an intact wheel.
+
+## Z-Image Q8_0 DiT: rejected on prod
+
++2.7 GB resident. On the shared 5090 the broker then refused 5 of 6 1024^2 images ("needs at least 3200 MB
+free"), so prod stays on Q4_K.
+
 ## Not done
 
-- Implicit-GEMM conv for the VAE: im2col still materialises ~1 GB per full-res conv
-  (~4% of an image).
-- LoRA diff add (269 ms/4 steps) needs a GEMM with beta=1 or an add->rms_norm fusion.
-- Z-Image Q8_0 DiT: -6-8% but +2.7 GB resident next to the Qwen edit sibling.
 - MTP speculation in the batched engine: the prod model is a gemma-4-E4B finetune and the
   E4B head fits, but single-stream chat is already ~146 tok/s.
