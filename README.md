@@ -136,7 +136,13 @@ is what lets several requests share a step; `LLM_BACKGROUND_PERMITS` lets
 background-tier LLM requests join the batch instead of taking the whole pool.
 `LLM_BATCHED=0` restores one
 context per slot; speculative decoding (`SPEC_DRAFT`, `SPEC_MTP_GGUF`) keeps
-that path. `LLM_SHARE_PREFIX=0` disables forking a shared prompt prefix (a
+that path. `LLM_MTP` (a Gemma-4 MTP head GGUF) turns on MTP drafting inside the
+engine: while at most `LLM_MTP_MAX_ACTIVE` (4) sequences are live, one draft
+context over the shared target KV drafts `LLM_MTP_DRAFT` (2) greedy tokens per
+decoding sequence, the drafts ride in the next step as verify rows, and each
+sequence's own sampler chain (penalties, DRY included) accepts a draft only by
+sampling it; rejected rows are removed from the KV. Exact output distribution;
+`performance/llm-mtp-2026-10-22.md` has numbers. `LLM_SHARE_PREFIX=0` disables forking a shared prompt prefix (a
 character persona) from another sequence's cache, `LLM_SWA_FULL=0` shrinks the
 sliding-window cache at the cost of prefix reuse and forks, `LLM_PREFILTER=0`
 samples over the full vocabulary instead of the exact top-(k + distinct

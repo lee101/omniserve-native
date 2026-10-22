@@ -409,6 +409,7 @@ enum { OLLM_VERIFY_BATCH_CAP = 17 };
 enum { OLLM_RING = 64 };
 enum { OLLM_SHARE_MIN = 32 };
 enum { OLLM_MTP_DRAFT_CAP = 2 };
+enum { OLLM_MTP_BATCH_DRAFT_MAX = 8 };
 typedef struct ollm_slot_s {
     struct llama_context *ctx;
     /* MTP draft context sharing this slot's target context: one per parallel
@@ -478,6 +479,24 @@ typedef struct ollm_slot_s {
     int ring_head;
     int ring_count;
     pthread_cond_t cond;
+    /* MTP in the batched engine: drafts riding behind `next` in this step,
+     * their verify rows' logits, and the run the sampler produced from them.
+     * h_row is the row of the last target decode (h_dec) whose hidden state
+     * pairs with `next`. */
+    int draft_cap;
+    int n_draft;
+    int draft_row;
+    int draft_row_prev;
+    int matched;
+    int n_out;
+    int h_row;
+    unsigned long long h_dec;
+    int req_drafted;
+    int req_accepted;
+    llama_token draft[OLLM_MTP_BATCH_DRAFT_MAX];
+    llama_token out_tok[OLLM_MTP_BATCH_DRAFT_MAX + 1];
+    float out_p[OLLM_MTP_BATCH_DRAFT_MAX + 1];
+    const float *vrows[OLLM_MTP_BATCH_DRAFT_MAX + 1];
 } ollm_slot;
 static ollm_slot *g_slots;
 static int g_slot_count;
@@ -515,14 +534,18 @@ static bool spec_mtp_active(void) {
     return g_spec_mtp_model != NULL && g_spec_mtp_cfg.draft_max > 0;
 }
 
+static struct llama_context *g_mtp_ctx;
+static int g_mtp_draft;
+
 static const char *spec_source_name(void) {
-    if (spec_mtp_active()) return "mtp";
+    if (spec_mtp_active() || g_mtp_ctx) return "mtp";
     if (g_spec_draft_max > 0) return "prompt-lookup";
     return "off";
 }
 
 static int spec_effective_max(void) {
     if (spec_mtp_active()) return g_spec_mtp_cfg.draft_max;
+    if (g_mtp_ctx) return g_mtp_draft;
     return g_spec_draft_max;
 }
 
@@ -1395,6 +1418,22 @@ enum { OSEQ_IDLE = 0, OSEQ_PREFILL, OSEQ_DECODE, OSEQ_DONE };
 
 static bool g_batched;
 static bool g_share_prefix;
+/* MTP drafting in the engine (OMNISERVE_NATIVE_LLM_MTP): one draft context
+ * over the shared target KV drafts for every eligible sequence at once, and
+ * the drafts ride in the next target step as extra verify rows. Only while at
+ * most g_mtp_max_active sequences are live: a wide batch is compute-bound and
+ * verify rows would cost what they save. */
+static struct llama_model *g_mtp_model;
+static int g_mtp_max_active;
+static int32_t g_mtp_embd;
+static struct llama_batch g_mtp_batch;
+static struct llama_sampler **g_mtp_greedy;
+static ollm_slot **g_mtp_rows;
+static bool g_mtp_go;
+static int g_step_ndec;
+static unsigned long long g_bdecodes = 1;
+static double g_trace_draft, g_trace_draft_call;
+static int g_trace_extra, g_trace_draft_steps;
 static unsigned long long g_shared_tokens;
 static int g_kv_seqs;
 static unsigned long long g_kv_evictions, g_kv_preemptions, g_kv_requeues;
@@ -1531,8 +1570,25 @@ static llama_token sample_row(struct llama_sampler *smpl, const float *logits, i
     return tok;
 }
 
+/* With drafts the rows are sampled in order exactly as sequential decoding
+ * would, each token accepted into the chain; a draft only lets the next row's
+ * logits stand because the sampler chose the drafted token itself. */
 static void engine_sample_one(ollm_slot *s) {
-    s->next = sample_row(s->smpl, s->logits_row, s->prefilter_k, s->cand);
+    if (s->n_draft <= 0) {
+        s->next = sample_row(s->smpl, s->logits_row, s->prefilter_k, s->cand);
+        return;
+    }
+    int n = 0, m = 0;
+    for (int i = 0; i <= s->n_draft; i++) {
+        llama_token tok = sample_row(s->smpl, s->vrows[i], s->prefilter_k, s->cand);
+        s->out_tok[n] = tok;
+        s->out_p[n++] = s->capture ? s->capture->probability : 1.0f;
+        if (i == s->n_draft || tok != s->draft[i] || llama_vocab_is_eog(g_vocab, tok)) break;
+        m++;
+    }
+    s->n_out = n;
+    s->matched = m;
+    s->next = s->out_tok[n - 1];
 }
 
 /* The per-slot (speculative) path's sampler: same cut, same chain. */
@@ -1614,12 +1670,15 @@ static void engine_finish_locked(ollm_slot *s, bool failed) {
  * admitted is chunked, so at most one prompt is ever half-done per step. */
 static int engine_build_locked(int *rows_out) {
     llama_memory_t mem = llama_get_memory(g_bctx);
-    int n = 0, rows = 0;
+    int n = 0, rows = 0, active = 0;
     for (int i = 0; i < g_slot_count; i++) {
         ollm_slot *s = &g_slots[i];
         s->step_chunk = 0;
         s->row = -1;
+        s->n_draft = 0;
+        s->draft_cap = 0;
         if (s->state == OSEQ_IDLE || s->state == OSEQ_DONE) continue;
+        active++;
         if (s->stop) {
             engine_finish_locked(s, false);
             continue;
@@ -1652,8 +1711,16 @@ static int engine_build_locked(int *rows_out) {
             step_add(&n, s->next, (llama_pos)s->n_past, s->seq, true);
             s->in_step = true;
             g_step_slots[rows++] = s;
+            if (g_mtp_ctx && s->h_dec == g_bdecodes && s->h_row >= 0) {
+                int cap = g_mtp_draft;
+                if (cap > OLLM_RING - s->ring_count - 1) cap = OLLM_RING - s->ring_count - 1;
+                if (cap > s->max_new - s->produced - 1) cap = s->max_new - s->produced - 1;
+                s->draft_cap = cap > 0 ? cap : 0;
+            }
         }
     }
+    g_step_ndec = rows;
+    g_mtp_go = g_mtp_ctx && rows > 0 && active <= g_mtp_max_active;
     /* A quarter of the budget is always left for prefill so a full decode
      * batch cannot starve new arrivals of their first token. */
     int budget = g_step_budget - n;
@@ -1713,6 +1780,104 @@ static bool engine_evict_idle(void) {
     return true;
 }
 
+static llama_token argmax_row(const float *logits, int32_t n) {
+    int32_t best = 0;
+    float bv = logits[0];
+    for (int32_t i = 1; i < n; i++) {
+        if (logits[i] > bv) {
+            bv = logits[i];
+            best = i;
+        }
+    }
+    return best;
+}
+
+/* Drafts greedily for every eligible decode row of the step just built, one
+ * MTP decode per draft position across all of them (Gemma-4's head reads the
+ * target KV and keeps every draft at the position of `next`), then splices the
+ * drafts in behind their rows so each sequence's verify rows stay contiguous
+ * and ahead of the prefill. Returns the new token count. */
+static int engine_mtp_draft(int n, int rows) {
+    if (!g_mtp_go) return n;
+    int nd = 0;
+    for (int r = 0; r < g_step_ndec; r++) {
+        ollm_slot *s = g_step_slots[r];
+        if (s->draft_cap > 0) g_mtp_rows[nd++] = s;
+    }
+    if (nd == 0) return n;
+    const size_t rb = (size_t)g_mtp_embd * sizeof(float);
+    for (int j = 0; j < g_mtp_draft; j++) {
+        int b = 0;
+        for (int i = 0; i < nd; i++) {
+            ollm_slot *s = g_mtp_rows[i];
+            s->draft_row = -1;
+            if (s->n_draft != j || j >= s->draft_cap) continue;
+            const float *h = j == 0 ? ollama_get_nextn_ith(g_bctx, s->h_row)
+                                    : ollama_get_nextn_ith(g_mtp_ctx, s->draft_row_prev);
+            if (!h) continue;
+            g_mtp_batch.token[b] = j == 0 ? s->next : s->draft[j - 1];
+            memcpy(g_mtp_batch.embd + (size_t)b * g_mtp_embd, h, rb);
+            g_mtp_batch.pos[b] = (llama_pos)s->n_past;
+            g_mtp_batch.n_seq_id[b] = 1;
+            g_mtp_batch.seq_id[b][0] = s->seq;
+            g_mtp_batch.logits[b] = 1;
+            s->draft_row = b++;
+        }
+        if (b == 0) break;
+        g_mtp_batch.n_tokens = b;
+        double t0 = g_engine_trace ? now_ms() : 0.0;
+        if (llama_decode(g_mtp_ctx, g_mtp_batch) != 0) break;
+        if (g_engine_trace) {
+            g_trace_draft_call += now_ms() - t0;
+            g_trace_draft_steps++;
+        }
+        for (int i = 0; i < nd; i++) {
+            ollm_slot *s = g_mtp_rows[i];
+            if (s->draft_row < 0) continue;
+            llama_token t = LLAMA_TOKEN_NULL;
+            if (g_mtp_greedy) {
+                t = llama_get_sampled_token_ith(g_mtp_ctx, s->draft_row);
+            } else {
+                const float *lg = llama_get_logits_ith(g_mtp_ctx, s->draft_row);
+                if (lg) t = argmax_row(lg, g_n_vocab);
+            }
+            if (t < 0 || t >= g_n_vocab) continue;
+            s->draft[j] = t;
+            s->n_draft = j + 1;
+            s->draft_row_prev = s->draft_row;
+        }
+    }
+    int extra = 0;
+    for (int i = 0; i < nd; i++) extra += g_mtp_rows[i]->n_draft;
+    if (extra == 0) return n;
+    for (int i = n - 1; i >= g_step_ndec; i--) {
+        g_step.token[i + extra] = g_step.token[i];
+        g_step.pos[i + extra] = g_step.pos[i];
+        g_step.n_seq_id[i + extra] = 1;
+        g_step.seq_id[i + extra][0] = g_step.seq_id[i][0];
+        g_step.logits[i + extra] = g_step.logits[i];
+    }
+    int end = g_step_ndec + extra;
+    for (int r = g_step_ndec - 1; r >= 0; r--) {
+        ollm_slot *s = g_step_slots[r];
+        end -= 1 + s->n_draft;
+        s->row = end;
+        for (int k = 0; k <= s->n_draft; k++) {
+            int i = end + k;
+            g_step.token[i] = k == 0 ? s->next : s->draft[k - 1];
+            g_step.pos[i] = (llama_pos)(s->n_past + k);
+            g_step.n_seq_id[i] = 1;
+            g_step.seq_id[i][0] = s->seq;
+            g_step.logits[i] = 1;
+        }
+    }
+    for (int r = g_step_ndec; r < rows; r++) {
+        if (g_step_slots[r]->row >= 0) g_step_slots[r]->row += extra;
+    }
+    g_step.n_tokens = n + extra;
+    return n + extra;
+}
+
 static void *engine_main(void *arg) {
     (void)arg;
     pthread_mutex_lock(&g_engine_lock);
@@ -1725,7 +1890,11 @@ static void *engine_main(void *arg) {
         if (n == 0) continue;
         pthread_mutex_unlock(&g_engine_lock);
 
+        double t_draft = now_ms();
+        int n_base = n;
+        n = engine_mtp_draft(n, rows);
         double t_dec = now_ms();
+        g_bdecodes++;
         int rc = llama_decode(g_bctx, g_step);
         while (rc == 1 && engine_evict_idle()) rc = llama_decode(g_bctx, g_step);
         /* Still full with every idle prefix gone. A prompt still prefilling
@@ -1756,6 +1925,10 @@ static void *engine_main(void *arg) {
                 ollm_slot *s = g_step_slots[r];
                 if (s->row < 0) continue;
                 s->logits_row = llama_get_logits_ith(g_bctx, s->row);
+                for (int k = 0; k <= s->n_draft && s->n_draft > 0; k++) {
+                    s->vrows[k] = llama_get_logits_ith(g_bctx, s->row + k);
+                    if (!s->vrows[k]) s->logits_row = NULL;
+                }
                 if (s->logits_row) g_sample_jobs[jobs++] = s;
                 else rc = -1;
             }
@@ -1763,8 +1936,10 @@ static void *engine_main(void *arg) {
         }
         if (g_engine_trace) {
             double t_end = now_ms();
-            int kind = n > jobs ? 2 : n == g_trace_prev_n ? 0 : 1;
+            int kind = n_base > jobs ? 2 : n == g_trace_prev_n ? 0 : 1;
             g_trace_prev_n = n;
+            g_trace_draft += t_dec - t_draft;
+            g_trace_extra += n - n_base;
             g_trace_cnt[kind] += 1;
             g_trace_dec[kind] += t_samp - t_dec;
             g_trace_rows[kind] += jobs;
@@ -1776,13 +1951,18 @@ static void *engine_main(void *arg) {
                 double c[3];
                 for (int k = 0; k < 3; k++) c[k] = g_trace_cnt[k] > 0 ? g_trace_cnt[k] : 1;
                 fprintf(stderr, "engine: steady %.0f rows=%.1f dec=%.2fms | reshaped %.0f rows=%.1f "
-                        "dec=%.2fms | mixed %.0f tok=%.0f dec=%.2fms | sample=%.2fms gap=%.3fms\n",
+                        "dec=%.2fms | mixed %.0f tok=%.0f dec=%.2fms | sample=%.2fms gap=%.3fms "
+                        "draft=%.2fms drafts=%.2f draft_steps=%.2f draft_call=%.2fms\n",
                         g_trace_cnt[0], g_trace_rows[0] / c[0], g_trace_dec[0] / c[0],
                         g_trace_cnt[1], g_trace_rows[1] / c[1], g_trace_dec[1] / c[1],
                         g_trace_cnt[2], g_trace_tok[2] / c[2], g_trace_dec[2] / c[2],
-                        g_trace_samp / 512, g_trace_gap / 512);
+                        g_trace_samp / 512, g_trace_gap / 512, g_trace_draft / 512,
+                        g_trace_extra / 512.0, g_trace_draft_steps / 512.0, g_trace_draft_call / 512);
+                g_trace_draft_call = 0;
+                g_trace_draft_steps = 0;
                 g_trace_n = 0;
-                g_trace_samp = g_trace_gap = 0;
+                g_trace_samp = g_trace_gap = g_trace_draft = 0;
+                g_trace_extra = 0;
                 memset(g_trace_cnt, 0, sizeof g_trace_cnt);
                 memset(g_trace_dec, 0, sizeof g_trace_dec);
                 memset(g_trace_rows, 0, sizeof g_trace_rows);
@@ -1807,6 +1987,7 @@ static void *engine_main(void *arg) {
         g_engine_steps++;
         g_engine_rows += (unsigned long long)jobs;
         g_engine_tokens += (unsigned long long)n;
+        unsigned long long sp_rounds = 0, sp_drafted = 0, sp_accepted = 0;
         for (int r = 0; r < rows; r++) {
             ollm_slot *s = g_step_slots[r];
             s->in_step = false;
@@ -1814,6 +1995,7 @@ static void *engine_main(void *arg) {
                 engine_finish_locked(s, true);
                 continue;
             }
+            int matched = s->n_draft > 0 ? s->matched : 0;
             if (s->state == OSEQ_PREFILL) {
                 s->prompt_done += s->step_chunk;
                 if (g_share_prefix) {
@@ -1825,20 +2007,47 @@ static void *engine_main(void *arg) {
                 s->n_past = s->prompt_len;
                 s->state = OSEQ_DECODE;
             } else {
-                s->n_past++;
+                s->n_past += 1 + matched;
+                if (s->n_draft > matched)
+                    llama_memory_seq_rm(llama_get_memory(g_bctx), s->seq, s->n_past, -1);
             }
             if (s->row < 0) continue;
-            int slot_i = (s->ring_head + s->ring_count) % OLLM_RING;
-            s->ring[slot_i] = s->next;
-            s->ring_p[slot_i] = s->capture ? s->capture->probability : 1.0f;
-            s->ring_count++;
-            s->produced++;
+            s->h_row = s->row + matched;
+            s->h_dec = g_bdecodes;
+            if (s->n_draft > 0) {
+                sp_rounds++;
+                sp_drafted += (unsigned long long)s->n_draft;
+                sp_accepted += (unsigned long long)matched;
+                s->req_drafted += s->n_draft;
+                s->req_accepted += matched;
+                for (int k = 0; k < s->n_out; k++) {
+                    int slot_i = (s->ring_head + s->ring_count) % OLLM_RING;
+                    s->ring[slot_i] = s->out_tok[k];
+                    s->ring_p[slot_i] = s->out_p[k];
+                    s->ring_count++;
+                }
+                s->produced += s->n_out;
+            } else {
+                int slot_i = (s->ring_head + s->ring_count) % OLLM_RING;
+                s->ring[slot_i] = s->next;
+                s->ring_p[slot_i] = s->capture ? s->capture->probability : 1.0f;
+                s->ring_count++;
+                s->produced++;
+            }
             if (llama_vocab_is_eog(g_vocab, s->next) || s->produced >= s->max_new) {
                 engine_finish_locked(s, false);
             } else {
                 s->has_next = true;
                 pthread_cond_broadcast(&s->cond);
             }
+        }
+        if (sp_rounds) {
+            pthread_mutex_lock(&g_spec_lock);
+            g_spec_rounds += sp_rounds;
+            g_spec_drafted += sp_drafted;
+            g_spec_accepted += sp_accepted;
+            g_spec_saved_calls += sp_accepted;
+            pthread_mutex_unlock(&g_spec_lock);
         }
     }
     pthread_mutex_unlock(&g_engine_lock);
@@ -1866,6 +2075,11 @@ static void engine_submit(ollm_slot *s, const llama_token *prompt, int prompt_le
     s->has_next = false;
     s->ring_head = 0;
     s->ring_count = 0;
+    s->h_row = -1;
+    s->h_dec = 0;
+    s->n_draft = 0;
+    s->req_drafted = 0;
+    s->req_accepted = 0;
     s->order = ++g_engine_order;
     s->state = OSEQ_PREFILL;
     pthread_cond_signal(&g_engine_cond);
@@ -2064,8 +2278,107 @@ static int engine_auto_kv_seqs(struct llama_context_params cp) {
     return n;
 }
 
+static void engine_mtp_free(void) {
+    if (g_mtp_ctx) llama_free(g_mtp_ctx);
+    g_mtp_ctx = NULL;
+    for (int i = 0; g_mtp_greedy && i < g_slot_count; i++) llama_sampler_free(g_mtp_greedy[i]);
+    free(g_mtp_greedy);
+    g_mtp_greedy = NULL;
+    if (g_mtp_model) llama_model_free(g_mtp_model);
+    g_mtp_model = NULL;
+    if (g_mtp_batch.pos) llama_batch_free(g_mtp_batch);
+    memset(&g_mtp_batch, 0, sizeof g_mtp_batch);
+    free(g_mtp_rows);
+    g_mtp_rows = NULL;
+    g_mtp_go = false;
+}
+
+/* Draft size from OMNISERVE_NATIVE_LLM_MTP_DRAFT, 0 when no head is set; read
+ * before the target context exists because its n_batch has to hold the
+ * verify rows. */
+static int engine_mtp_draft_cfg(void) {
+    const char *path = getenv("OMNISERVE_NATIVE_LLM_MTP");
+    if (!path || !path[0]) return 0;
+    const char *d = getenv("OMNISERVE_NATIVE_LLM_MTP_DRAFT");
+    int n = d && d[0] ? atoi(d) : 2;
+    if (n < 0) n = 0;
+    if (n > OLLM_MTP_BATCH_DRAFT_MAX) n = OLLM_MTP_BATCH_DRAFT_MAX;
+    return n;
+}
+
+/* Pairs the batched target with one MTP draft context. Any failure leaves
+ * MTP off and the engine as it was. */
+static void engine_mtp_init(int n_gpu_layers, struct llama_context_params cp) {
+    engine_mtp_free();
+    if (g_mtp_draft <= 0) return;
+    const char *path = getenv("OMNISERVE_NATIVE_LLM_MTP");
+    const char *ma = getenv("OMNISERVE_NATIVE_LLM_MTP_MAX_ACTIVE");
+    g_mtp_max_active = ma && ma[0] ? atoi(ma) : 4;
+    if (g_mtp_max_active > g_slot_count) g_mtp_max_active = g_slot_count;
+    if (g_mtp_max_active <= 0 || !probe_nextn_fns()) {
+        if (g_mtp_max_active > 0) fprintf(stderr, "llm MTP: nextn API missing from libllama, off\n");
+        return;
+    }
+    struct llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = n_gpu_layers;
+    g_mtp_model = llama_model_load_from_file(path, mp);
+    const struct llama_vocab *hv = g_mtp_model ? llama_model_get_vocab(g_mtp_model) : NULL;
+    if (!g_mtp_model || llama_model_n_embd_out(g_mtp_model) != llama_model_n_embd(g_model) ||
+        !hv || llama_vocab_n_tokens(hv) != g_n_vocab) {
+        fprintf(stderr, "llm MTP: head '%s' failed to load or does not match the target, off\n",
+                path);
+        engine_mtp_free();
+        return;
+    }
+    g_mtp_embd = llama_model_n_embd_out(g_mtp_model);
+    struct llama_context_params dcp = cp;
+    dcp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    dcp.ctx_other = g_bctx;
+    dcp.n_rs_seq = 0;
+    dcp.n_seq_max = (unsigned)g_slot_count;
+    dcp.n_batch = (unsigned)g_slot_count;
+    dcp.n_ubatch = (unsigned)g_slot_count;
+    dcp.kv_unified = true;
+    /* Greedy drafting on the device: no 1 MB logits row per draft over PCIe
+     * and no host argmax. */
+    const char *bs = getenv("OMNISERVE_NATIVE_LLM_MTP_BACKEND_SAMPLE");
+    struct llama_sampler_seq_config *sc = NULL;
+    if (!(bs && strcmp(bs, "0") == 0)) {
+        g_mtp_greedy = calloc((size_t)g_slot_count, sizeof *g_mtp_greedy);
+        sc = calloc((size_t)g_slot_count, sizeof *sc);
+        for (int i = 0; g_mtp_greedy && sc && i < g_slot_count; i++) {
+            g_mtp_greedy[i] = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(g_mtp_greedy[i], llama_sampler_init_greedy());
+            sc[i].seq_id = i;
+            sc[i].sampler = g_mtp_greedy[i];
+        }
+        if (sc && g_mtp_greedy) {
+            dcp.samplers = sc;
+            dcp.n_samplers = (size_t)g_slot_count;
+        }
+    }
+    g_mtp_ctx = llama_init_from_model(g_mtp_model, dcp);
+    free(sc);
+    if (!g_mtp_ctx || ollama_get_ctx_other(g_mtp_ctx) != g_bctx) {
+        fprintf(stderr, "llm MTP: draft context failed or does not share the target KV, off\n");
+        engine_mtp_free();
+        return;
+    }
+    g_mtp_batch = llama_batch_init(g_slot_count, g_mtp_embd, 1);
+    g_mtp_batch.token = malloc((size_t)g_slot_count * sizeof *g_mtp_batch.token);
+    g_mtp_rows = calloc((size_t)g_slot_count, sizeof *g_mtp_rows);
+    if (!g_mtp_batch.token || !g_mtp_batch.embd || !g_mtp_rows) {
+        engine_mtp_free();
+        return;
+    }
+    ollama_set_nextn(g_bctx, true, true);
+    ollama_set_nextn(g_mtp_ctx, true, true);
+    fprintf(stderr, "llm MTP: head '%s' draft=%d max_active=%d n_embd=%d device_sample=%d\n", path,
+            g_mtp_draft, g_mtp_max_active, g_mtp_embd, g_mtp_greedy ? 1 : 0);
+}
+
 static bool engine_start_locked(void) {
-    g_step = llama_batch_init(g_step_budget + g_slot_count, 0, 1);
+    g_step = llama_batch_init(g_step_budget + g_slot_count * (1 + g_mtp_draft), 0, 1);
     g_step_slots = calloc((size_t)g_slot_count + 1, sizeof *g_step_slots);
     g_sample_jobs = calloc((size_t)g_slot_count + 1, sizeof *g_sample_jobs);
     if (!g_step.token || !g_step_slots || !g_sample_jobs) return false;
@@ -2239,7 +2552,8 @@ static bool ollm_init_locked(const char *model_path, int n_gpu_layers, int ctx_l
         if (g_kv_seqs < 1) g_kv_seqs = 1;
         if (g_kv_seqs > g_slot_count) g_kv_seqs = g_slot_count;
         cp.n_seq_max = (unsigned)g_slot_count;
-        cp.n_batch = (unsigned)(g_step_budget + g_slot_count);
+        g_mtp_draft = engine_mtp_draft_cfg();
+        cp.n_batch = (unsigned)(g_step_budget + g_slot_count * (1 + g_mtp_draft));
         if (cp.n_ubatch > cp.n_batch) cp.n_ubatch = cp.n_batch;
         cp.kv_unified = true;
         cp.swa_full = !(swa_env && strcmp(swa_env, "0") == 0);
@@ -2252,9 +2566,12 @@ static bool ollm_init_locked(const char *model_path, int n_gpu_layers, int ctx_l
         g_bctx = llama_init_from_model(g_model, cp);
         bool started = g_bctx != NULL;
         for (int i = 0; started && i < g_slot_count; i++) g_slots[i].ctx = g_bctx;
+        if (started) engine_mtp_init(n_gpu_layers, cp);
+        if (!g_mtp_ctx) g_mtp_draft = 0;
         if (started) started = engine_start_locked();
         if (!started) {
             engine_stop_locked();
+            engine_mtp_free();
             for (int i = 0; i < g_slot_count; i++) free(g_slots[i].cand);
             if (g_bctx) llama_free(g_bctx);
             g_bctx = NULL;
@@ -3275,13 +3592,15 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
         out->finish_reason = "cancelled";
     }
 
-    if (g_batched) {
-        int kept = engine_release(slot);
-        cache_prompt(slot, context, kept < context_len ? kept : context_len);
-    }
     spec_record(&gov);
     out->drafted_tokens = (int)gov.drafted;
     out->accepted_drafts = (int)gov.accepted;
+    if (g_batched) {
+        int kept = engine_release(slot);
+        cache_prompt(slot, context, kept < context_len ? kept : context_len);
+        out->drafted_tokens = slot->req_drafted;
+        out->accepted_drafts = slot->req_accepted;
+    }
     free(context);
     llama_sampler_free(smpl);
     free(tokens);
@@ -3307,6 +3626,8 @@ static void ollm_shutdown_locked(void) {
     spec_mtp_free_locked();
     if (g_batched) {
         engine_stop_locked();
+        engine_mtp_free();
+        g_mtp_draft = 0;
         for (int i = 0; i < g_slot_count; i++) {
             g_slots[i].ctx = NULL;
             pthread_cond_destroy(&g_slots[i].cond);
