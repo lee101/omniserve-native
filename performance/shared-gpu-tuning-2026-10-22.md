@@ -46,6 +46,24 @@ lose `feed_forward_wN`/`adaLN_modulation` keys to the underscore->dot pass (Aest
 and TartarusPixel apply 180/450 tensors), and unprefixed PEFT keys are not recognised.
 Fully applied LoRAs change established looks, so prod keeps it off.
 
+## Broken LoRAs fixed (gateway prefers converted siblings)
+
+Registry audit (54 ids) against sd.cpp's applied-tensor counts:
+- kohya `lora_unet_*` (aesthetic_base, pixel_art, cosplay_nsfw): 180/450 applied (FFN dropped).
+- PEFT `*.lora_A.default.weight` / `base_model.model.*` (z_aesthetic_anime, app_logo_maker,
+  product_screenshots): 0 applied, byte-identical to plain.
+- Not Z-Image at all: anime_artistic (SDXL, 0/792), mecha_klein (Flux Klein `double_blocks`, 0/160).
+  Need replacement files or removal from the cutedsl-site registry.
+
+`tools/zimage_lora_convert.py` had already written `<stem>.sdcpp.safetensors` copies (bitwise renames of
+the kohya tensors, alpha kept; verified 450/450 equal). `resolve_cached_lora_file` now prefers that sibling
+whenever it exists in the LoRA dir, for lora_id, lora_filename, registry and auto-route lookups. The
+registry maps app_logo_maker and product_screenshots to one shared `adapter_model.safetensors`; id-named
+symlinks (`app_logo_maker.safetensors -> app_logo_maker_adapter_model.safetensors`, same for
+product_screenshots) restore the separate adapters. Prod logs no partial-apply warnings since
+(`deploy-prod-20261022-lorafix`). Fully applied LoRAs look stronger: Tartarus at 1.0 turns dark-fantasy pixel
+art. `SD_ZIMAGE_LORA_NAME_FIX` stays off (not needed with converted files).
+
 ## VAE decode -22% (`runtime/ggml-im2col-tiled.patch`) and tile 80
 
 ggml-cuda im2col mapped threads along IC*KH*KW, so reads hopped channel planes. The
