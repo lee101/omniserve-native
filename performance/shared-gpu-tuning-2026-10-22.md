@@ -76,11 +76,11 @@ peak) grows 1664 -> 2600 MB, so `SD_MIN_FREE_MB` 2304 -> 3200. 0 broker denials 
 
 ## Prod image times (median gen ms, 8 steps)
 
-| | start | +LoRA path | +tile 80 | +im2col |
-| --- | ---: | ---: | ---: | ---: |
-| 1024x1024 LoRA | 6037 | 5437 | 5215 | 5070 |
-| 1024x1024 none | 4600 | | 4471 | 4279 |
-| 1024x768 LoRA | 4509 | | 3936 | 3696 |
+| | start | +LoRA path | +tile 80 | +im2col | +gemm-add, cuDNN VAE |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1024x1024 LoRA | 6037 | 5437 | 5215 | 4984 | 4454 |
+| 1024x1024 none | 4600 | | 4471 | 4201 | 4129 (n=5) |
+| 1024x768 LoRA | 4509 | | 3936 | 3902 | 3726 (n=1) |
 
 Per-image timing is logged as
 `[image] tier WxH s= l= tp= hit= q= lease= lock= gen= enc= ok=`.
