@@ -1,0 +1,158 @@
+diff --git a/src/ggml-cuda/conv2d.cu b/src/ggml-cuda/conv2d.cu
+index 142dd669..b0953f2e 100644
+--- a/src/ggml-cuda/conv2d.cu
++++ b/src/ggml-cuda/conv2d.cu
+@@ -1,6 +1,142 @@
+ #include "conv2d.cuh"
+ #include "convert.cuh"
+ 
++#include <dlfcn.h>
++#include <map>
++#include <mutex>
++#include <tuple>
++
++// Optional cuDNN path (GGML_CUDA_CUDNN_CONV=1, F16 kernels): dlopen'd so ggml has no build or
++// runtime dependency on cuDNN; GGML_CUDA_CUDNN_LIB overrides the library path.
++// x and w in F16, F16 accumulate (GGML_CUDA_CUDNN_CONV_F32ACC=1 for F32 accumulate), y F16 -> F32.
++namespace {
++typedef void * cdnn_handle;
++typedef void * cdnn_desc;
++struct cdnn_perf { int algo; int status; float time; size_t memory; int determinism; int math; int reserved[3]; };
++struct cdnn_api {
++    int (*create)(cdnn_handle *);
++    int (*set_stream)(cdnn_handle, cudaStream_t);
++    int (*create_tensor)(cdnn_desc *);
++    int (*set_tensor4d)(cdnn_desc, int, int, int, int, int, int);
++    int (*create_filter)(cdnn_desc *);
++    int (*set_filter4d)(cdnn_desc, int, int, int, int, int, int);
++    int (*create_conv)(cdnn_desc *);
++    int (*set_conv2d)(cdnn_desc, int, int, int, int, int, int, int, int);
++    int (*set_math)(cdnn_desc, int);
++    int (*get_algo_v7)(cdnn_handle, cdnn_desc, cdnn_desc, cdnn_desc, cdnn_desc, int, int *, cdnn_perf *);
++    int (*get_ws)(cdnn_handle, cdnn_desc, cdnn_desc, cdnn_desc, cdnn_desc, int, size_t *);
++    int (*forward)(cdnn_handle, const void *, cdnn_desc, const void *, cdnn_desc, const void *, cdnn_desc, int, void *, size_t, const void *, cdnn_desc, void *);
++    bool ok = false;
++};
++struct cdnn_plan { cdnn_desc x, w, conv, y; int algo; size_t ws; };
++
++const cdnn_api * cdnn_load() {
++    static cdnn_api api;
++    static std::once_flag once;
++    std::call_once(once, [] {
++        const char * on = getenv("GGML_CUDA_CUDNN_CONV");
++        if (!on || strcmp(on, "1") != 0) {
++            return;
++        }
++        const char * path = getenv("GGML_CUDA_CUDNN_LIB");
++        void * h = dlopen(path && path[0] ? path : "libcudnn.so.9", RTLD_NOW | RTLD_LOCAL);
++        if (!h) {
++            GGML_LOG_WARN("%s: cuDNN not loaded (%s), using the direct conv kernel\n", __func__, dlerror());
++            return;
++        }
++#define CDNN_SYM(field, name) api.field = (decltype(api.field)) dlsym(h, name); if (!api.field) { GGML_LOG_WARN("%s: missing %s\n", __func__, name); return; }
++        CDNN_SYM(create, "cudnnCreate");
++        CDNN_SYM(set_stream, "cudnnSetStream");
++        CDNN_SYM(create_tensor, "cudnnCreateTensorDescriptor");
++        CDNN_SYM(set_tensor4d, "cudnnSetTensor4dDescriptor");
++        CDNN_SYM(create_filter, "cudnnCreateFilterDescriptor");
++        CDNN_SYM(set_filter4d, "cudnnSetFilter4dDescriptor");
++        CDNN_SYM(create_conv, "cudnnCreateConvolutionDescriptor");
++        CDNN_SYM(set_conv2d, "cudnnSetConvolution2dDescriptor");
++        CDNN_SYM(set_math, "cudnnSetConvolutionMathType");
++        CDNN_SYM(get_algo_v7, "cudnnGetConvolutionForwardAlgorithm_v7");
++        CDNN_SYM(get_ws, "cudnnGetConvolutionForwardWorkspaceSize");
++        CDNN_SYM(forward, "cudnnConvolutionForward");
++#undef CDNN_SYM
++        api.ok = true;
++        GGML_LOG_INFO("%s: cuDNN conv2d enabled\n", __func__);
++    });
++    return api.ok ? &api : nullptr;
++}
++
++// CUDA graphs capture only after a direct warmup run, so handles and plans are created outside capture.
++bool cdnn_conv2d(ggml_backend_cuda_context & ctx, const float * X_D, const half * K_D, float * Y_D,
++                 int B, int IC, int IH, int IW, int OC, int KH, int KW, int OH, int OW,
++                 int ST_Y, int ST_X, int PD_Y, int PD_X, int DL_Y, int DL_X) {
++    const cdnn_api * api = cdnn_load();
++    if (!api) {
++        return false;
++    }
++    static std::mutex mu;
++    static std::map<int, cdnn_handle> handles;
++    static std::map<std::tuple<int, int, int, int, int, int, int, int, int, int, int, int, int, int>, cdnn_plan> plans;
++    static const int compute = getenv("GGML_CUDA_CUDNN_CONV_F32ACC") && strcmp(getenv("GGML_CUDA_CUDNN_CONV_F32ACC"), "1") == 0 ? 0 : 2;
++    const int device = ctx.device;
++    cdnn_handle handle;
++    cdnn_plan plan;
++    {
++        std::lock_guard<std::mutex> lock(mu);
++        auto hit = handles.find(device);
++        if (hit == handles.end()) {
++            if (api->create(&handle) != 0) {
++                return false;
++            }
++            handles[device] = handle;
++        } else {
++            handle = hit->second;
++        }
++        auto key = std::make_tuple(device, B, IC, IH, IW, OC, KH, KW, ST_Y, ST_X, PD_Y, PD_X, DL_Y, DL_X);
++        auto it  = plans.find(key);
++        if (it == plans.end()) {
++            cdnn_plan p{};
++            if (api->create_tensor(&p.x) || api->create_filter(&p.w) || api->create_conv(&p.conv) || api->create_tensor(&p.y) ||
++                api->set_tensor4d(p.x, 0, 2, B, IC, IH, IW) || api->set_filter4d(p.w, 2, 0, OC, IC, KH, KW) ||
++                api->set_conv2d(p.conv, PD_Y, PD_X, ST_Y, ST_X, DL_Y, DL_X, 1, compute) || api->set_math(p.conv, 1) ||
++                api->set_tensor4d(p.y, 0, 2, B, OC, OH, OW)) {
++                return false;
++            }
++            cdnn_perf perf[8];
++            int n = 0;
++            if (api->get_algo_v7(handle, p.x, p.w, p.conv, p.y, 8, &n, perf) != 0 || n == 0) {
++                return false;
++            }
++            p.algo = -1;
++            for (int i = 0; i < n; ++i) {
++                if (perf[i].status == 0) {
++                    p.algo = perf[i].algo;
++                    break;
++                }
++            }
++            if (p.algo < 0 || api->get_ws(handle, p.x, p.w, p.conv, p.y, p.algo, &p.ws) != 0) {
++                return false;
++            }
++            it = plans.emplace(key, p).first;
++        }
++        plan = it->second;
++    }
++    cudaStream_t st = ctx.stream();
++    const int64_t nx = (int64_t) B * IC * IH * IW;
++    const int64_t ny = (int64_t) B * OC * OH * OW;
++    ggml_cuda_pool_alloc<half> x16(ctx.pool(), nx);
++    ggml_cuda_pool_alloc<half> y16(ctx.pool(), ny);
++    ggml_cuda_pool_alloc<char> ws(ctx.pool(), plan.ws > 0 ? plan.ws : 1);
++    ggml_get_to_fp16_cuda(GGML_TYPE_F32)(X_D, x16.get(), nx, st);
++    const float alpha = 1.0f;
++    const float beta  = 0.0f;
++    if (api->set_stream(handle, st) != 0 ||
++        api->forward(handle, &alpha, plan.x, x16.get(), plan.w, K_D, plan.conv, plan.algo, ws.get(), plan.ws, &beta, plan.y, y16.get()) != 0) {
++        GGML_ABORT("cudnnConvolutionForward failed");
++    }
++    ggml_get_to_fp32_cuda(GGML_TYPE_F16)(y16.get(), Y_D, ny, st);
++    return true;
++}
++}  // namespace
++
+ struct conv_params {
+     const int64_t IW, IH;
+     const int64_t OW, OH;
+@@ -158,6 +294,10 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int64_t total  = B * OC * OH * OW;
+     conv_params   params = { IW, IH, OW, OH, KW, KH, ST_X, ST_Y, PD_X, PD_Y, DL_X, DL_Y, IC, OC, B, total };
+ 
++    if (kernel->type == GGML_TYPE_F16 &&
++        cdnn_conv2d(ctx, X_D, (const half *) K_D, Y_D, B, IC, IH, IW, OC, KH, KW, OH, OW, ST_Y, ST_X, PD_Y, PD_X, DL_Y, DL_X)) {
++        return;
++    }
+     if (kernel->type == GGML_TYPE_F16) {
+         conv2d_cuda_f16(X_D, (half *) K_D, Y_D, params, st);
+     } else {

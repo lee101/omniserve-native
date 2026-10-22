@@ -211,6 +211,17 @@ static void test_image_contract(void) {
     CHECK(request.generation.lora_count == 1);
     CHECK(strcmp(request.generation.loras[0].path, registry_lora_path) == 0);
     oimage_request_free(&request);
+    char converted_lora_path[512];
+    snprintf(converted_lora_path, sizeof converted_lora_path, "%s/Z-Image_360.sdcpp.safetensors", lora_dir);
+    lora_file = fopen(converted_lora_path, "wb");
+    CHECK(lora_file != NULL);
+    if (lora_file) fclose(lora_file);
+    CHECK(oimage_request_parse(registry_lora, strlen(registry_lora),
+                               &request, error, sizeof error));
+    CHECK(request.generation.lora_count == 1);
+    CHECK(strcmp(request.generation.loras[0].path, converted_lora_path) == 0);
+    oimage_request_free(&request);
+    unlink(converted_lora_path);
     const char *unsafe_filename = "{\"prompt\":\"cat\",\"lora_id\":\"z_style\","
                                   "\"lora_filename\":\"../secret.safetensors\"}";
     CHECK(!oimage_request_parse(unsafe_filename, strlen(unsafe_filename),

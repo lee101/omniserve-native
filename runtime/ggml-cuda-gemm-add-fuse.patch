@@ -1,0 +1,67 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index cca70592..e364ea43 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -3835,6 +3835,49 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ }
+ 
+ // try and fuse nodes and return the number of nodes to skip
++// F32 x F32 matmul feeding an ADD of the same shape (LoRA up-projection + base output):
++// one SGEMM with beta=1 accumulating into the ADD's destination instead of GEMM, then ADD.
++static bool ggml_cuda_mul_mat_f32_accumulate(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * acc, ggml_tensor * dst) {
++    static const bool enabled = [] {
++        const char * env = getenv("GGML_CUDA_FUSE_GEMM_ADD");
++        return env == nullptr || strcmp(env, "0") != 0;
++    }();
++    const ggml_tensor * src0 = mm->src[0];
++    const ggml_tensor * src1 = mm->src[1];
++    if (!enabled || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
++        acc->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
++        ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
++        src0->ne[2] != 1 || src0->ne[3] != 1 || src0->nb[0] != sizeof(float) || src1->nb[0] != sizeof(float) ||
++        !ggml_is_contiguous(acc) || !ggml_is_contiguous(dst) || !ggml_are_same_shape(mm, dst) ||
++        src1->nb[2] != src1->nb[1]*src1->ne[1] || src1->nb[3] != src1->nb[2]*src1->ne[2]) {
++        return false;
++    }
++    const int64_t n = src1->ne[1]*src1->ne[2]*src1->ne[3];
++    if (n < 32) {
++        return false;
++    }
++    cudaStream_t stream = ctx.stream();
++    float * d = (float *) dst->data;
++    if (acc->data != dst->data) {
++        const char * a0 = (const char *) acc->data, * a1 = a0 + ggml_nbytes(acc);
++        const char * s0 = (const char *) src1->data, * s1 = s0 + ggml_nbytes(src1);
++        const char * d0 = (const char *) dst->data, * d1 = d0 + ggml_nbytes(dst);
++        if ((d0 < a1 && a0 < d1) || (d0 < s1 && s0 < d1)) {
++            return false;
++        }
++        CUDA_CHECK(cudaMemcpyAsync(d, acc->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, stream));
++    }
++    const float alpha = 1.0f;
++    const float beta  = 1.0f;
++    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
++    CUBLAS_CHECK(cublasSgemm(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
++                             (int) src0->ne[1], (int) n, (int) src0->ne[0],
++                             &alpha, (const float *) src0->data, (int) (src0->nb[1]/sizeof(float)),
++                                     (const float *) src1->data, (int) (src1->nb[1]/sizeof(float)),
++                             &beta,  d, (int) src0->ne[1]));
++    return true;
++}
++
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+@@ -4172,6 +4215,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             continue;
+         }
+ 
++        if (op == GGML_OP_MUL_MAT && ggml_cuda_mul_mat_f32_accumulate(*cuda_ctx, mm_node, bias_tensor, bias_node)) {
++            fused_mul_mat_vec = true;
++            fused_node_count  = 2;
++            break;
++        }
++
+         ggml_cuda_mm_fusion_args_host fusion_data{};
+         fusion_data.x_bias = bias_tensor;
+ 
