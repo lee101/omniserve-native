@@ -122,7 +122,6 @@ gateway down twice before rollback. The pinned copy is md5-checked against an in
 +2.7 GB resident. On the shared 5090 the broker then refused 5 of 6 1024^2 images ("needs at least 3200 MB
 free"), so prod stays on Q4_K.
 
-## Not done
+## MTP speculation
 
-- MTP speculation in the batched engine: the prod model is a gemma-4-E4B finetune and the
-  E4B head fits, but single-stream chat is already ~146 tok/s.
+Live on prod (`performance/llm-mtp-2026-10-22.md`): 1 stream 155 -> 186 tok/s, 2 streams 150 -> 233.
