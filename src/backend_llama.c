@@ -3903,5 +3903,7 @@ bool osd_try_cached_result(const oimg_req *req, oimg_result *out) { (void)req; (
 void osd_result_free(oimg_result *r) { (void)r; }
 bool osd_resident(void) { return false; }
 int osd_set_resident(bool resident, bool wait) { (void)resident; (void)wait; return 0; }
+bool osd_residency_target(void) { return false; }
+size_t osd_residency_json(char *out, size_t cap) { if (cap) out[0] = 0; return 0; }
 void osd_residency_settled(void) {}
 #endif
