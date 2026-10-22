@@ -8,6 +8,11 @@ batched engine) can be compared with --against.
 
   scripts/llm_batch_parity.py --port 8795 --out /tmp/batched.json
   scripts/llm_batch_parity.py --port 8796 --out /tmp/legacy.json --against /tmp/batched.json
+
+MTP exactness: run an MTP-off and an MTP-on server (CPU: kernels are
+batch-width invariant there, so any mismatch is a logic bug) and compare:
+  scripts/llm_batch_parity.py --port 8797 --no-concurrent --limit 8 --out /tmp/off.json
+  scripts/llm_batch_parity.py --port 8798 --no-concurrent --limit 8 --against /tmp/off.json
 """
 import argparse
 import http.client
@@ -46,6 +51,14 @@ def chat(port, content, max_tokens, temperature=0.0, seed=7):
     return data["choices"][0]["message"]["content"]
 
 
+def speculation(port):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+    conn.request("GET", "/status")
+    data = json.loads(conn.getresponse().read())
+    conn.close()
+    return data.get("speculation") or {}
+
+
 def run_concurrent(port, max_tokens, fillers):
     out = [None] * len(TASKS)
     def one(i):
@@ -72,7 +85,7 @@ def prefix_ratio(a, b):
 def accuracy(outputs):
     graded = [(o, exp) for o, (_, exp) in zip(outputs, TASKS) if exp]
     ok = sum(1 for o, exp in graded if all(e in o.lower() for e in exp))
-    return ok / len(graded)
+    return ok / max(1, len(graded))
 
 
 def compare(a, b):
@@ -89,10 +102,19 @@ def main():
     ap.add_argument("--no-concurrent", action="store_true")
     ap.add_argument("--out")
     ap.add_argument("--against")
+    ap.add_argument("--limit", type=int, default=0, help="first N prompts only")
     args = ap.parse_args()
+    if args.limit:
+        del TASKS[args.limit:]
+    spec0 = speculation(args.port)
     seq = [chat(args.port, p, args.max_tokens) for p, _ in TASKS]
     seq2 = [chat(args.port, p, args.max_tokens) for p, _ in TASKS]
     report = {"seq_accuracy": accuracy(seq), "seq_repeat": compare(seq, seq2)}
+    spec1 = speculation(args.port)
+    if spec1.get("drafted", 0) > spec0.get("drafted", 0):
+        d = spec1["drafted"] - spec0["drafted"]
+        a = spec1["accepted"] - spec0["accepted"]
+        report["mtp"] = {"drafted": d, "accepted": a, "acceptance": round(a / d, 3)}
     doc = {"seq": seq}
     if not args.no_concurrent:
         conc = run_concurrent(args.port, args.max_tokens, args.fillers)
@@ -101,7 +123,7 @@ def main():
         doc["conc"] = conc
     if args.against:
         other = json.load(open(args.against))
-        report["seq_vs_other_seq"] = compare(seq, other["seq"])
+        report["seq_vs_other_seq"] = compare(seq, other["seq"][:len(seq)])
     if args.out:
         json.dump(doc, open(args.out, "w"), indent=1)
     print(json.dumps(report))
