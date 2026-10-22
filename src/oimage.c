@@ -106,6 +106,23 @@ static bool resolve_cached_lora_file(const char *directory, const char *filename
         return false;
     }
     free(path);
+    /* tools/zimage_lora_convert.py writes <stem>.sdcpp.safetensors for kohya/PEFT files sd.cpp
+       only partly applies; prefer it when present. */
+    static const char ext[] = ".safetensors";
+    static const char conv[] = ".sdcpp.safetensors";
+    size_t len = strlen(resolved_path);
+    if (len > sizeof conv - 1 && strcmp(resolved_path + len - (sizeof conv - 1), conv) != 0 &&
+        len + sizeof conv - sizeof ext < PATH_MAX) {
+        char sibling[PATH_MAX];
+        char resolved_sibling[PATH_MAX];
+        snprintf(sibling, sizeof sibling, "%.*s%s", (int)(len - (sizeof ext - 1)), resolved_path, conv);
+        if (stat(sibling, &st) == 0 && S_ISREG(st.st_mode) && realpath(sibling, resolved_sibling) &&
+            strncmp(resolved_sibling, resolved_directory, directory_len) == 0 &&
+            resolved_sibling[directory_len] == '/') {
+            *out_path = strdup(resolved_sibling);
+            return *out_path != NULL;
+        }
+    }
     *out_path = strdup(resolved_path);
     return *out_path != NULL;
 }
