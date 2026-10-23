@@ -237,6 +237,9 @@ static void sd_log_to_stderr(enum sd_log_level_t level, const char *text, void *
     }
 }
 
+/* Builds that link the image backend without the LLM one (image bench). */
+__attribute__((weak)) int ollm_engine_live(void) { return 0; }
+
 static bool sd_env_flag(const char *name, bool fallback);
 /* Called by sd.cpp between denoising steps (and VAE tiles) on the image
  * thread with no image work on the GPU: while the current image may yield and
