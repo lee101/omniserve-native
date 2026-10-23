@@ -237,6 +237,32 @@ static void sd_log_to_stderr(enum sd_log_level_t level, const char *text, void *
     }
 }
 
+static bool sd_env_flag(const char *name, bool fallback);
+/* Called by sd.cpp between denoising steps (and VAE tiles) on the image
+ * thread with no image work on the GPU: while the current image may yield and
+ * the LLM engine has live sequences, wait here, up to the image's budget. */
+static double g_yield_left_ms, g_yield_used_ms;
+static double sd_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+static void sd_progress_yield(int step, int steps, float time, void *data) {
+    (void)step;
+    (void)steps;
+    (void)time;
+    (void)data;
+    if (g_yield_left_ms <= 0.0 || ollm_engine_live() <= 0) return;
+    double t0 = sd_now_ms(), t = t0;
+    struct timespec nap = { 0, 1000000 };
+    while (ollm_engine_live() > 0 && t - t0 < g_yield_left_ms) {
+        nanosleep(&nap, NULL);
+        t = sd_now_ms();
+    }
+    g_yield_left_ms -= t - t0;
+    g_yield_used_ms += t - t0;
+}
+
 static bool sd_lib_load(void) {
     const char *path = getenv("OMNISERVE_NATIVE_SD_LIB");
     if (!path || !path[0]) {
@@ -266,6 +292,9 @@ static bool sd_lib_load(void) {
      * text printed right before GGML_ABORT. */
     typedef void (*fn_set_log_callback)(sd_log_cb_t, void *);
     fn_set_log_callback set_log = (fn_set_log_callback)dlsym(lib, "sd_set_log_callback");
+    typedef void (*fn_set_progress_callback)(void (*)(int, int, float, void *), void *);
+    fn_set_progress_callback set_progress = (fn_set_progress_callback)dlsym(lib, "sd_set_progress_callback");
+    if (set_progress && sd_env_flag("OMNISERVE_NATIVE_SD_YIELD_HOOK", true)) set_progress(sd_progress_yield, NULL);
     if (set_log) {
         g_sd_log_min = sd_env_int("OMNISERVE_NATIVE_SD_LOG_LEVEL", SD_LOG_WARN, SD_LOG_DEBUG, SD_LOG_ERROR);
         set_log(sd_log_to_stderr, NULL);
@@ -1049,6 +1078,8 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     int want = __atomic_load_n(&g_sd_want, __ATOMIC_RELAXED);
     if (want >= 0 && (want == 1) != g_sd_resident && p_free_sd_ctx) (void)sd_switch_locked(want == 1);
     double started = now_ms();
+    g_yield_left_ms = req->yield_llm_ms > 0 ? (double)req->yield_llm_ms : 0.0;
+    g_yield_used_ms = 0.0;
     sd_image_t *images = NULL;
     int image_count = 0;
     int cache_resume_step = 0;
@@ -1061,6 +1092,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         if (hit) {
             out->cache_hit = true;
             out->elapsed_ms = now_ms() - started;
+            g_yield_left_ms = 0.0;
             pthread_mutex_unlock(&g_sd_lock);
             cache_key_free(&key);
             free(loras);
@@ -1084,6 +1116,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
             out->teleport_capture_step = resume_step - 1;
             out->teleport_resume_step = resume_step;
             out->elapsed_ms = now_ms() - started;
+            g_yield_left_ms = 0.0;
             pthread_mutex_unlock(&g_sd_lock);
             cache_key_free(&key);
             free(loras);
@@ -1131,6 +1164,8 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         ok = p_generate_image(g_sd, &params, &images, &image_count);
     }
     out->elapsed_ms = now_ms() - started;
+    out->yield_ms = g_yield_used_ms;
+    g_yield_left_ms = 0.0;
     pthread_mutex_unlock(&g_sd_lock);
     free(loras);
 

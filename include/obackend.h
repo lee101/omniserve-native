@@ -156,6 +156,8 @@ void ollm_set_load_overrides(const char *tensor_override, const char *moe_cpu_ex
                              const char *spec_mtp_gguf);
 bool ollm_init(const char *model_path, int n_gpu_layers, int ctx_len, int parallel_contexts);
 bool ollm_ready(void);
+/* Sequences the batched engine is prefilling or decoding right now. */
+int ollm_engine_live(void);
 void ollm_placement_snapshot(ollm_placement *out);
 const char *ollm_model_name(void);
 bool ollm_chat(const ochat_req *req, otoken_cb on_token, void *user, ochat_result *out);
@@ -237,6 +239,10 @@ typedef struct {
     uint64_t image_hash; /* keyed hash and length of image_base64, set by osd_prepare_image when cache is on */
     size_t image_len;
     bool image_hash_valid;
+    /* Longest this image may pause between denoising steps while the LLM engine
+     * has live sequences (0 = never): a background image then leaves the GPU to
+     * a chat instead of slowing every one of its decode steps. */
+    int yield_llm_ms;
 } oimg_req;
 
 typedef struct {
@@ -260,6 +266,7 @@ typedef struct {
     bool teleport_result_cache_hit;
     int teleport_capture_step;
     int teleport_resume_step;
+    double yield_ms; /* paused for the LLM engine */
 } oimg_result;
 
 bool osd_init(const char *model_path);

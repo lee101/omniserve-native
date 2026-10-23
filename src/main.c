@@ -2668,6 +2668,20 @@ static double request_deadline_ms(const ohttp_request *req) {
     return d > 0 ? d : 0;
 }
 
+/* Image -> LLM yield budget (ms per background image); POST /admin/sd/yield
+ * with the number as the body changes it at runtime. */
+static int g_sd_yield_ms = -1;
+static int g_sd_yield_tier = TIER_BACKGROUND;
+static void sd_yield_config_init(void) {
+    if (__atomic_load_n(&g_sd_yield_ms, __ATOMIC_RELAXED) >= 0) return;
+    const char *v = getenv("OMNISERVE_NATIVE_SD_YIELD_LLM_MS");
+    int ms = v && v[0] ? atoi(v) : 0;
+    const char *t = getenv("OMNISERVE_NATIVE_SD_YIELD_MIN_TIER");
+    if (t && strcmp(t, "free") == 0) g_sd_yield_tier = TIER_FREE;
+    else if (t && strcmp(t, "sub") == 0) g_sd_yield_tier = TIER_SUB;
+    __atomic_store_n(&g_sd_yield_ms, ms > 0 ? ms : 0, __ATOMIC_RELAXED);
+}
+
 static void handle_images(ohttp_request *req, app_state *app) {
     otier tier = request_tier(req);
     /* Resolved before admission, so a saturated or unavailable local lane can
@@ -2844,13 +2858,21 @@ static void handle_images(ohttp_request *req, app_state *app) {
         g_gs.image_waits++;
         pthread_mutex_unlock(&g_gs_lock);
     }
+    {
+        /* Background images step aside for live chat decoding between their
+         * denoising steps (OMNISERVE_NATIVE_SD_YIELD_LLM_MS budget per image). */
+        sd_yield_config_init();
+        int yield_ms = __atomic_load_n(&g_sd_yield_ms, __ATOMIC_RELAXED);
+        image_request.generation.yield_llm_ms = (int)tier >= g_sd_yield_tier ? yield_ms : 0;
+    }
     ok = osd_generate(&image_request.generation, &result);
     image_gpu_release(app, image_lease_id, image_lease_remote);
-    fprintf(stderr, "[image] %s %dx%d s=%d l=%zu tp=%d hit=%d q=%.0f lease=%d lock=%.0f gen=%.0f enc=%.0f ok=%d\n",
+    fprintf(stderr, "[image] %s %dx%d s=%d l=%zu tp=%d hit=%d q=%.0f lease=%d lock=%.0f gen=%.0f enc=%.0f y=%.0f ok=%d\n",
             otier_name(tier), image_request.generation.width, image_request.generation.height,
             image_request.generation.steps, image_request.generation.lora_count,
             (int)result.teleport_used, (int)(result.cache_hit || result.teleport_result_cache_hit),
-            frontier_queue_ms, image_waited_ms, result.lock_ms, result.elapsed_ms, result.encode_ms, (int)ok);
+            frontier_queue_ms, image_waited_ms, result.lock_ms, result.elapsed_ms, result.encode_ms,
+            result.yield_ms, (int)ok);
     osched_release_n(app->sched, tier, permits);
     ofrontier_log(app->frontier, tier, "local", frontier_queue_ms > 0 ? "queued" : "admitted",
                   frontier_queue_ms, frontier_now_ms() - exec_started, frontier_wait_ms, ok ? 200 : 500);
@@ -3470,6 +3492,22 @@ static bool llm_admin_load(const llm_admin_config *config) {
     return true;
 }
 
+static void handle_sd_yield(ohttp_request *req) {
+    if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
+    sd_yield_config_init();
+    if (ohttp_method_is(req, "POST")) {
+        char buf[32] = {0};
+        size_t n = req->body_len < sizeof buf - 1 ? req->body_len : sizeof buf - 1;
+        if (req->body) memcpy(buf, req->body, n);
+        int ms = atoi(buf);
+        __atomic_store_n(&g_sd_yield_ms, ms > 0 ? ms : 0, __ATOMIC_RELAXED);
+    }
+    char out[96];
+    snprintf(out, sizeof out, "{\"yield_llm_ms\":%d,\"min_tier\":\"%s\"}",
+             __atomic_load_n(&g_sd_yield_ms, __ATOMIC_RELAXED), otier_name((otier)g_sd_yield_tier));
+    ohttp_respond_str(req, 200, "application/json", out);
+}
+
 static void handle_llm_unload(ohttp_request *req) {
     if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
     if (!request_is_internal(req)) { respond_error(req, 403, "loopback callers only"); return; }
@@ -3772,6 +3810,7 @@ static void route(ohttp_request *req, void *user) {
     if (ohttp_path_is(req, "/v1/gpu/release")) { handle_vram_release(req, app); return; }
     if (ohttp_path_is(req, "/v1/gpu/residency")) { handle_gpu_residency(req, app); return; }
     if (ohttp_path_is(req, "/v1/guard/classify")) { handle_guard_classify(req, app); return; }
+    if (ohttp_path_is(req, "/admin/sd/yield")) { handle_sd_yield(req); return; }
     if (ohttp_path_is(req, "/admin/llm/unload") || ohttp_path_is(req, "/admin/unload")) {
         handle_llm_unload(req); return;
     }
