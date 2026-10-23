@@ -263,6 +263,34 @@ static void sd_progress_yield(int step, int steps, float time, void *data) {
     g_yield_used_ms += t - t0;
 }
 
+/* Finer-grained yield inside a denoising step: with a budget and a live LLM,
+ * sd.cpp splits the step's graph after each flash-attention node (no ggml-cuda
+ * fusion crosses an attention output) and the wait runs between the pieces.
+ * Installed only while the current image has a budget, so a request without
+ * one computes exactly as before. ggml_op_desc comes from the sd library's own
+ * ggml: its tensor layout and op numbering may differ from llama.cpp's. */
+typedef const char *(*fn_ggml_op_desc)(const void *t);
+static fn_ggml_op_desc p_ggml_op_desc;
+typedef bool (*fn_eval_cb)(void *t, bool ask, void *data);
+typedef void (*fn_set_eval_cb)(fn_eval_cb cb, void *data);
+static fn_set_eval_cb p_set_eval_cb;
+static bool g_eval_cb_installed;
+static bool sd_eval_yield(void *t, bool ask, void *data) {
+    (void)data;
+    if (ask) {
+        if (g_yield_left_ms <= 0.0 || ollm_engine_live() <= 0) return false;
+        const char *d = p_ggml_op_desc(t);
+        return d && strcmp(d, "FLASH_ATTN_EXT") == 0;
+    }
+    sd_progress_yield(0, 0, 0.0f, NULL);
+    return true;
+}
+static void sd_eval_yield_arm(bool on) {
+    if (!p_set_eval_cb || !p_ggml_op_desc || on == g_eval_cb_installed) return;
+    p_set_eval_cb(on ? sd_eval_yield : NULL, NULL);
+    g_eval_cb_installed = on;
+}
+
 static bool sd_lib_load(void) {
     const char *path = getenv("OMNISERVE_NATIVE_SD_LIB");
     if (!path || !path[0]) {
@@ -294,7 +322,13 @@ static bool sd_lib_load(void) {
     fn_set_log_callback set_log = (fn_set_log_callback)dlsym(lib, "sd_set_log_callback");
     typedef void (*fn_set_progress_callback)(void (*)(int, int, float, void *), void *);
     fn_set_progress_callback set_progress = (fn_set_progress_callback)dlsym(lib, "sd_set_progress_callback");
-    if (set_progress && sd_env_flag("OMNISERVE_NATIVE_SD_YIELD_HOOK", true)) set_progress(sd_progress_yield, NULL);
+    if (set_progress && sd_env_flag("OMNISERVE_NATIVE_SD_YIELD_HOOK", true)) {
+        set_progress(sd_progress_yield, NULL);
+        if (sd_env_flag("OMNISERVE_NATIVE_SD_YIELD_IN_STEP", true)) {
+            p_set_eval_cb = (fn_set_eval_cb)dlsym(lib, "sd_set_backend_eval_callback");
+            p_ggml_op_desc = (fn_ggml_op_desc)dlsym(lib, "ggml_op_desc");
+        }
+    }
     if (set_log) {
         g_sd_log_min = sd_env_int("OMNISERVE_NATIVE_SD_LOG_LEVEL", SD_LOG_WARN, SD_LOG_DEBUG, SD_LOG_ERROR);
         set_log(sd_log_to_stderr, NULL);
@@ -1080,6 +1114,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     double started = now_ms();
     g_yield_left_ms = req->yield_llm_ms > 0 ? (double)req->yield_llm_ms : 0.0;
     g_yield_used_ms = 0.0;
+    sd_eval_yield_arm(g_yield_left_ms > 0.0);
     sd_image_t *images = NULL;
     int image_count = 0;
     int cache_resume_step = 0;
