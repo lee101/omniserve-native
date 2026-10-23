@@ -2813,6 +2813,12 @@ static void handle_images(ohttp_request *req, app_state *app) {
         pthread_mutex_lock(&g_gs_lock);
         g_gs.image_wait_denials++;
         pthread_mutex_unlock(&g_gs_lock);
+        {
+            double fg = -1.0, tg = -1.0;
+            (void)ogpu_memory_gib(&fg, &tg);
+            fprintf(stderr, "[image] lease denied tier=%s need=%d MB waited=%d ms device_free=%.0f MB\n",
+                    otier_name(tier), required_headroom_mb, image_waited_ms, fg * 1024.0);
+        }
         char lease_error[160];
         snprintf(lease_error, sizeof lease_error,
                  "image generation needs at least %d MB free GPU memory; "

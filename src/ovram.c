@@ -351,6 +351,29 @@ bool ovram_reserve(ovram *v, const char *owner, int mb) {
  * Otherwise a paid job that cannot fit until a resident is evicted would
  * starve every lower tier (head-of-line blocking) for its whole wait.
  */
+/* A waiter ahead of the caller: a higher tier, or the same tier queued earlier
+ * (self = the caller's own waiter slot, -1 for a caller that has not queued,
+ * which is therefore behind every waiter of its tier). Without the same-tier
+ * rule a caller that loops request -> request re-takes each released lease
+ * before the woken waiter can, and the waiter times out (background images:
+ * a 503 every 20 s). */
+static bool waiter_ahead_locked(const ovram *v, otier tier, int self, double self_since,
+                                double now_s, int device_free_mb) {
+    int leased_total = 0;
+    for (int i = 0; i < OVRAM_MAX_LEASES; i++) {
+        if (v->leases[i].active) leased_total += v->leases[i].mb;
+    }
+    for (int i = 0; i < OVRAM_MAX_WAITERS; i++) {
+        if (!v->waiters[i].used || i == self || v->waiters[i].tier > tier) continue;
+        if (v->waiters[i].tier == tier && self >= 0 && v->waiters[i].since >= self_since) continue;
+        if (v->block_max_s > 0 && now_s - v->waiters[i].since > v->block_max_s) continue;
+        if (device_free_mb >= 0 &&
+            v->waiters[i].need > headroom_locked(v, v->waiters[i].tier, device_free_mb) + leased_total) continue;
+        return true;
+    }
+    return false;
+}
+
 static bool higher_tier_waiting_locked(const ovram *v, otier tier, double now_s, int device_free_mb) {
     int leased_total = 0;
     for (int i = 0; i < OVRAM_MAX_LEASES; i++) {
@@ -476,7 +499,8 @@ int ovram_lease_wait(ovram *v, const char *owner, int pid, int mb, int min_mb, o
         double now = monotonic_s();
         pthread_mutex_lock(&v->lock);
         expire_locked(v, now);
-        if (!higher_tier_waiting_locked(v, tier, now, device_free)) {
+        double self_since = wslot >= 0 ? v->waiters[wslot].since : now;
+        if (!waiter_ahead_locked(v, tier, registered ? wslot : -1, self_since, now, device_free)) {
             granted = grant_locked(v, name, pid, mb, min_mb, tier, ttl_s, now, device_free,
                                    id_out, id_cap, false);
         }
