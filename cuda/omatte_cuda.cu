@@ -58,50 +58,65 @@ __device__ __forceinline__ void resize_nearest_px(float *dst, int x, int y, int 
 // One pixel of one colour class. Writes F and B in place; the caller guarantees
 // that no thread running concurrently reads what this one writes, which for the
 // checkerboard means every concurrent thread has the opposite parity.
+// D is the channel count when it is known at compile time (3 for RGB), 0 for any other. A
+// runtime-indexed b0/b1 lives in local memory; a compile-time one stays in registers.
+template <int D>
 __device__ __forceinline__ void sweep_px(const float *image, const float *alpha, float *F, float *B,
-                                         int x, int y, int h, int w, int depth,
+                                         int x, int y, int h, int w, int depth_arg,
                                          float regularization, float gradient_weight) {
+    const int depth = D ? D : depth_arg;
     const int dx[4] = {-1, 1, 0, 0};
     const int dy[4] = {0, 0, -1, 1};
 
+    // Every operation is spelled out so the compiler cannot re-contract it when the channel loop
+    // is unrolled: these are the roundings of the generic (runtime-depth) build, which is what the
+    // CPU red-black path and the recorded evals were checked against.
     const size_t index = (size_t)y * w + x;
     const float a0 = alpha[index];
-    const float a1 = 1.0f - a0;
+    const float a1 = __fsub_rn(1.0f, a0);
 
-    float a00 = a0 * a0;
-    const float a01 = a0 * a1;
-    float a11 = a1 * a1;
+    float a00 = __fmul_rn(a0, a0);
+    const float a01 = __fmul_rn(a0, a1);
+    float a11 = __fmul_rn(a1, a1);
 
     float b0[OMATTE_CUDA_MAX_DEPTH];
     float b1[OMATTE_CUDA_MAX_DEPTH];
-    for (int c = 0; c < depth; c++) {
+#pragma unroll
+    for (int c = 0; c < OMATTE_CUDA_MAX_DEPTH; c++) {
+        if (D == 0 ? c >= depth : c >= D) break;
         const float pixel = image[index * depth + c];
-        b0[c] = a0 * pixel;
-        b1[c] = a1 * pixel;
+        b0[c] = __fmul_rn(a0, pixel);
+        b1[c] = __fmul_rn(a1, pixel);
     }
 
+#pragma unroll
     for (int d = 0; d < 4; d++) {
         const int x2 = min(max(x + dx[d], 0), w - 1);
         const int y2 = min(max(y + dy[d], 0), h - 1);
         const size_t neighbour = (size_t)y2 * w + x2;
 
-        const float da = regularization + gradient_weight * fabsf(a0 - alpha[neighbour]);
-        a00 += da;
-        a11 += da;
-        for (int c = 0; c < depth; c++) {
-            b0[c] += da * F[neighbour * depth + c];
-            b1[c] += da * B[neighbour * depth + c];
+        const float da = __fmaf_rn(gradient_weight, fabsf(__fsub_rn(a0, alpha[neighbour])),
+                                   regularization);
+        a00 = __fadd_rn(a00, da);
+        a11 = __fadd_rn(a11, da);
+#pragma unroll
+        for (int c = 0; c < OMATTE_CUDA_MAX_DEPTH; c++) {
+            if (D == 0 ? c >= depth : c >= D) break;
+            b0[c] = __fmaf_rn(da, F[neighbour * depth + c], b0[c]);
+            b1[c] = __fmaf_rn(da, B[neighbour * depth + c], b1[c]);
         }
     }
 
-    const float inv_det = 1.0f / (a00 * a11 - a01 * a01);
-    const float b00 = inv_det * a11;
-    const float b01 = inv_det * -a01;
-    const float b11 = inv_det * a00;
+    const float inv_det = 1.0f / __fmaf_rn(a00, a11, -__fmul_rn(a01, a01));
+    const float b00 = __fmul_rn(inv_det, a11);
+    const float b01 = __fmul_rn(inv_det, -a01);
+    const float b11 = __fmul_rn(inv_det, a00);
 
-    for (int c = 0; c < depth; c++) {
-        float f = b00 * b0[c] + b01 * b1[c];
-        float b = b01 * b0[c] + b11 * b1[c];
+#pragma unroll
+    for (int c = 0; c < OMATTE_CUDA_MAX_DEPTH; c++) {
+        if (D == 0 ? c >= depth : c >= D) break;
+        float f = __fmaf_rn(b00, b0[c], __fmul_rn(b01, b1[c]));
+        float b = __fmaf_rn(b01, b0[c], __fmul_rn(b11, b1[c]));
         f = fminf(1.0f, fmaxf(0.0f, f));
         b = fminf(1.0f, fmaxf(0.0f, b));
         F[index * depth + c] = f;
@@ -123,6 +138,7 @@ __global__ void resize_level_kernel(float *level_image, float *level_alpha, floa
     resize_nearest_px(B, x, y, h_dst, w_dst, B_prev, h_prev, w_prev, depth);
 }
 
+template <int D>
 __global__ void sweep_kernel(const float *image, const float *alpha, float *F, float *B, int h,
                              int w, int depth, float regularization, float gradient_weight,
                              int parity) {
@@ -130,7 +146,7 @@ __global__ void sweep_kernel(const float *image, const float *alpha, float *F, f
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     if (((x + y) & 1) != parity) return;
-    sweep_px(image, alpha, F, B, x, y, h, w, depth, regularization, gradient_weight);
+    sweep_px<D>(image, alpha, F, B, x, y, h, w, depth, regularization, gradient_weight);
 }
 
 // The top of the pyramid, fused.
@@ -154,6 +170,7 @@ struct SmallLevels {
     int w[OMATTE_MAX_SMALL_LEVELS];
 };
 
+template <int D>
 __global__ void small_levels_kernel(const float *image, const float *alpha, int h_full, int w_full,
                                     int depth, float *level_image, float *level_alpha, float *F,
                                     float *B, float *F_prev, float *B_prev, SmallLevels levels,
@@ -179,7 +196,7 @@ __global__ void small_levels_kernel(const float *image, const float *alpha, int 
         for (int iter = 0; iter < n_iter; iter++) {
             for (int parity = 0; parity < 2; parity++) {
                 if (mine && ((x + y) & 1) == parity) {
-                    sweep_px(level_image, level_alpha, F, B, x, y, lh, lw, depth, regularization,
+                    sweep_px<D>(level_image, level_alpha, F, B, x, y, lh, lw, depth, regularization,
                                 gradient_weight);
                 }
                 __syncthreads();
@@ -208,6 +225,7 @@ __global__ void small_levels_kernel(const float *image, const float *alpha, int 
 // are unchanged. The previous level's answer and the level being solved swap
 // roles instead of being copied. Only the final level is written back, into
 // F_prev/B_prev where the big levels pick it up.
+template <int D>
 __global__ void small_levels_shared_kernel(const float *image, const float *alpha, int h_full,
                                            int w_full, int depth, float *F_prev, float *B_prev,
                                            SmallLevels levels, float regularization,
@@ -256,7 +274,7 @@ __global__ void small_levels_shared_kernel(const float *image, const float *alph
                 if (slot < OMATTE_FUSED_MAX_SIDE * OMATTE_FUSED_MAX_SIDE / 2) {
                     const int px = 2 * slot_col + ((slot_row + parity) & 1);
                     if (slot_row < lh && px < lw) {
-                        sweep_px(s_image, s_alpha, cur_f, cur_b, px, slot_row, lh, lw, depth,
+                        sweep_px<D>(s_image, s_alpha, cur_f, cur_b, px, slot_row, lh, lw, depth,
                                     regularization, gradient_weight);
                     }
                 }
@@ -579,9 +597,12 @@ size_t small_shared_bytes(int depth) {
             cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) !=
                 cudaSuccess ||
             (size_t)optin < need ||
-            cudaFuncSetAttribute(small_levels_shared_kernel,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 (int)need) != cudaSuccess) {
+            cudaFuncSetAttribute(small_levels_shared_kernel<3>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)need) !=
+                cudaSuccess ||
+            cudaFuncSetAttribute(small_levels_shared_kernel<0>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)need) !=
+                cudaSuccess) {
             cudaGetLastError();
             return (size_t)0;
         }
@@ -633,13 +654,19 @@ cudaError_t run_pyramid_locked(const float *d_image, const float *d_alpha, int h
     if (small.count > 0) {
         const size_t shared_bytes = small_shared_bytes(depth);
         if (shared_bytes) {
-            small_levels_shared_kernel<<<1, dim3(OMATTE_FUSED_MAX_SIDE, OMATTE_FUSED_MAX_SIDE),
-                                         shared_bytes, stream>>>(
-                d_image, d_alpha, h, w, depth, g_ws.F_prev, g_ws.B_prev, small,
-                params->regularization, params->gradient_weight, params->n_small_iterations);
+            const dim3 one_block(OMATTE_FUSED_MAX_SIDE, OMATTE_FUSED_MAX_SIDE);
+            if (depth == 3) {
+                small_levels_shared_kernel<3><<<1, one_block, shared_bytes, stream>>>(
+                    d_image, d_alpha, h, w, depth, g_ws.F_prev, g_ws.B_prev, small,
+                    params->regularization, params->gradient_weight, params->n_small_iterations);
+            } else {
+                small_levels_shared_kernel<0><<<1, one_block, shared_bytes, stream>>>(
+                    d_image, d_alpha, h, w, depth, g_ws.F_prev, g_ws.B_prev, small,
+                    params->regularization, params->gradient_weight, params->n_small_iterations);
+            }
         } else {
-            small_levels_kernel<<<1, dim3(OMATTE_FUSED_MAX_SIDE, OMATTE_FUSED_MAX_SIDE), 0,
-                                  stream>>>(d_image, d_alpha, h, w, depth, g_ws.level_image,
+            small_levels_kernel<0><<<1, dim3(OMATTE_FUSED_MAX_SIDE, OMATTE_FUSED_MAX_SIDE), 0,
+                                     stream>>>(d_image, d_alpha, h, w, depth, g_ws.level_image,
                                             g_ws.level_alpha, g_ws.F, g_ws.B, g_ws.F_prev,
                                             g_ws.B_prev, small, params->regularization,
                                             params->gradient_weight, params->n_small_iterations);
@@ -672,9 +699,15 @@ cudaError_t run_pyramid_locked(const float *d_image, const float *d_alpha, int h
 
         for (int iter = 0; iter < n_iter; iter++) {
             for (int parity = 0; parity < 2; parity++) {
-                sweep_kernel<<<grid, block, 0, stream>>>(
-                    g_ws.level_image, g_ws.level_alpha, work_f, work_b, level_h, level_w, depth,
-                    params->regularization, params->gradient_weight, parity);
+                if (depth == 3) {
+                    sweep_kernel<3><<<grid, block, 0, stream>>>(
+                        g_ws.level_image, g_ws.level_alpha, work_f, work_b, level_h, level_w,
+                        depth, params->regularization, params->gradient_weight, parity);
+                } else {
+                    sweep_kernel<0><<<grid, block, 0, stream>>>(
+                        g_ws.level_image, g_ws.level_alpha, work_f, work_b, level_h, level_w,
+                        depth, params->regularization, params->gradient_weight, parity);
+                }
             }
         }
 
