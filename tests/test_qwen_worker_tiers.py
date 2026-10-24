@@ -40,6 +40,23 @@ class Notch(unittest.TestCase):
         self.assertEqual(int(flat.min()), 120)
         self.assertEqual(int(flat.max()), 120)
 
+    def test_matches_seven_tap_reference(self):
+        rng = np.random.default_rng(3)
+        taps = q._NOTCH_TAPS
+        for shape in ((7, 7), (13, 8), (64, 33), (96, 96)):
+            a = rng.integers(0, 256, (*shape, 3), dtype=np.uint8)
+            if shape[0] == 96:
+                a = ((a > 127) * 255).astype(np.uint8)
+            i = a.astype(np.int32)
+            h, w, _ = i.shape
+            p = np.pad(i, ((0, 0), (3, 3), (0, 0)), mode="edge")
+            x = sum(taps[t] * p[:, t:t + w] for t in range(7))
+            p = np.pad(x, ((3, 3), (0, 0), (0, 0)), mode="edge")
+            y = sum(taps[t] * p[t:t + h] for t in range(7))
+            want = np.clip((y + 2048) >> 12, 0, 255).astype(np.uint8)
+            got = np.asarray(q.nyquist_notch(Image.fromarray(a)))
+            self.assertTrue(np.array_equal(want, got), shape)
+
     def test_matches_c_taps(self):
         taps = np.array(q._NOTCH_TAPS)
         self.assertEqual(int(taps.sum()), 64)  # DC gain 1 after the 64 * 64 scale
