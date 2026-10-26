@@ -6,6 +6,14 @@ relays authenticated `POST /v1/music/generations` requests to
 `POST /api/music-generator` with `model: "yue2-3b"`, followed by the returned
 `status_url`. The studio is `/tools/yue-music`, listed under Audio & Voice.
 
+NetWRCK radio shares this gateway via `OMNISERVE_YUE_URL` and
+`OMNISERVE_YUE_KEY`. Its seed briefs cover 32 genres/styles; adding briefs
+does not invoke inference. New studio/radio results are indexed with YuE2
+tags; radio also records omniserve-native provenance, while the paid studio
+currently submits directly to RunPod. See `../netwrck/docs/music-radio.md`
+for compact mobile playback controls, indexing and bounded validation.
+Generation presets, admission and exact-result caching are unchanged.
+
 ## Quality and execution
 
 The release pins YuE2 inference to `bd90e4ccae671d869b3ecaca6d7e893927d29442`,
