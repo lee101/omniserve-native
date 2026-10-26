@@ -103,7 +103,10 @@ def main(mode, base, target, src_endpoint, cuda, extra_env):
 
 if __name__ == "__main__":
     mode = sys.argv[1]
-    if mode == "h3":
+    if mode == "h3" and len(sys.argv) == 5:
+        # python3 tools/runpod_bake.py h3 BASE_IMAGE TARGET_IMAGE SOURCE_ENDPOINT_ID
+        main("h3", sys.argv[2], sys.argv[3], sys.argv[4], "13.0", [])
+    elif mode == "h3":
         main("h3", "ghcr.io/lee101/h3-cog:cu130-20261008-pinkcherry-opt-r3", "ghcr.io/lee101/h3-cog:cu130-20261009-pinkcherry-r3-baked",
              "811c0jb28shcnr", "13.0", [])
     else:
