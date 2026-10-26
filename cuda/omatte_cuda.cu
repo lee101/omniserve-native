@@ -25,6 +25,7 @@
 
 #include <cuda_runtime.h>
 #include <pthread.h>
+#include <stdlib.h>
 
 #define OMATTE_CUDA_MAX_DEPTH 4
 // Fixed so the seed reduction is deterministic: the same input always sums in
@@ -57,50 +58,65 @@ __device__ __forceinline__ void resize_nearest_px(float *dst, int x, int y, int 
 // One pixel of one colour class. Writes F and B in place; the caller guarantees
 // that no thread running concurrently reads what this one writes, which for the
 // checkerboard means every concurrent thread has the opposite parity.
+// D is the channel count when it is known at compile time (3 for RGB), 0 for any other. A
+// runtime-indexed b0/b1 lives in local memory; a compile-time one stays in registers.
+template <int D>
 __device__ __forceinline__ void sweep_px(const float *image, const float *alpha, float *F, float *B,
-                                         int x, int y, int h, int w, int depth,
+                                         int x, int y, int h, int w, int depth_arg,
                                          float regularization, float gradient_weight) {
+    const int depth = D ? D : depth_arg;
     const int dx[4] = {-1, 1, 0, 0};
     const int dy[4] = {0, 0, -1, 1};
 
+    // Every operation is spelled out so the compiler cannot re-contract it when the channel loop
+    // is unrolled: these are the roundings of the generic (runtime-depth) build, which is what the
+    // CPU red-black path and the recorded evals were checked against.
     const size_t index = (size_t)y * w + x;
     const float a0 = alpha[index];
-    const float a1 = 1.0f - a0;
+    const float a1 = __fsub_rn(1.0f, a0);
 
-    float a00 = a0 * a0;
-    const float a01 = a0 * a1;
-    float a11 = a1 * a1;
+    float a00 = __fmul_rn(a0, a0);
+    const float a01 = __fmul_rn(a0, a1);
+    float a11 = __fmul_rn(a1, a1);
 
     float b0[OMATTE_CUDA_MAX_DEPTH];
     float b1[OMATTE_CUDA_MAX_DEPTH];
-    for (int c = 0; c < depth; c++) {
+#pragma unroll
+    for (int c = 0; c < OMATTE_CUDA_MAX_DEPTH; c++) {
+        if (D == 0 ? c >= depth : c >= D) break;
         const float pixel = image[index * depth + c];
-        b0[c] = a0 * pixel;
-        b1[c] = a1 * pixel;
+        b0[c] = __fmul_rn(a0, pixel);
+        b1[c] = __fmul_rn(a1, pixel);
     }
 
+#pragma unroll
     for (int d = 0; d < 4; d++) {
         const int x2 = min(max(x + dx[d], 0), w - 1);
         const int y2 = min(max(y + dy[d], 0), h - 1);
         const size_t neighbour = (size_t)y2 * w + x2;
 
-        const float da = regularization + gradient_weight * fabsf(a0 - alpha[neighbour]);
-        a00 += da;
-        a11 += da;
-        for (int c = 0; c < depth; c++) {
-            b0[c] += da * F[neighbour * depth + c];
-            b1[c] += da * B[neighbour * depth + c];
+        const float da = __fmaf_rn(gradient_weight, fabsf(__fsub_rn(a0, alpha[neighbour])),
+                                   regularization);
+        a00 = __fadd_rn(a00, da);
+        a11 = __fadd_rn(a11, da);
+#pragma unroll
+        for (int c = 0; c < OMATTE_CUDA_MAX_DEPTH; c++) {
+            if (D == 0 ? c >= depth : c >= D) break;
+            b0[c] = __fmaf_rn(da, F[neighbour * depth + c], b0[c]);
+            b1[c] = __fmaf_rn(da, B[neighbour * depth + c], b1[c]);
         }
     }
 
-    const float inv_det = 1.0f / (a00 * a11 - a01 * a01);
-    const float b00 = inv_det * a11;
-    const float b01 = inv_det * -a01;
-    const float b11 = inv_det * a00;
+    const float inv_det = 1.0f / __fmaf_rn(a00, a11, -__fmul_rn(a01, a01));
+    const float b00 = __fmul_rn(inv_det, a11);
+    const float b01 = __fmul_rn(inv_det, -a01);
+    const float b11 = __fmul_rn(inv_det, a00);
 
-    for (int c = 0; c < depth; c++) {
-        float f = b00 * b0[c] + b01 * b1[c];
-        float b = b01 * b0[c] + b11 * b1[c];
+#pragma unroll
+    for (int c = 0; c < OMATTE_CUDA_MAX_DEPTH; c++) {
+        if (D == 0 ? c >= depth : c >= D) break;
+        float f = __fmaf_rn(b00, b0[c], __fmul_rn(b01, b1[c]));
+        float b = __fmaf_rn(b01, b0[c], __fmul_rn(b11, b1[c]));
         f = fminf(1.0f, fmaxf(0.0f, f));
         b = fminf(1.0f, fmaxf(0.0f, b));
         F[index * depth + c] = f;
@@ -108,14 +124,21 @@ __device__ __forceinline__ void sweep_px(const float *image, const float *alpha,
     }
 }
 
-__global__ void resize_nearest_kernel(float *dst, int h_dst, int w_dst, const float *src,
-                                      int h_src, int w_src, int depth) {
+// The four per-level resamples (image, alpha, F, B) as one launch.
+__global__ void resize_level_kernel(float *level_image, float *level_alpha, float *F, float *B,
+                                    int h_dst, int w_dst, const float *image, const float *alpha,
+                                    int h_full, int w_full, const float *F_prev,
+                                    const float *B_prev, int h_prev, int w_prev, int depth) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w_dst || y >= h_dst) return;
-    resize_nearest_px(dst, x, y, h_dst, w_dst, src, h_src, w_src, depth);
+    resize_nearest_px(level_image, x, y, h_dst, w_dst, image, h_full, w_full, depth);
+    resize_nearest_px(level_alpha, x, y, h_dst, w_dst, alpha, h_full, w_full, 1);
+    resize_nearest_px(F, x, y, h_dst, w_dst, F_prev, h_prev, w_prev, depth);
+    resize_nearest_px(B, x, y, h_dst, w_dst, B_prev, h_prev, w_prev, depth);
 }
 
+template <int D>
 __global__ void sweep_kernel(const float *image, const float *alpha, float *F, float *B, int h,
                              int w, int depth, float regularization, float gradient_weight,
                              int parity) {
@@ -123,7 +146,7 @@ __global__ void sweep_kernel(const float *image, const float *alpha, float *F, f
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     if (((x + y) & 1) != parity) return;
-    sweep_px(image, alpha, F, B, x, y, h, w, depth, regularization, gradient_weight);
+    sweep_px<D>(image, alpha, F, B, x, y, h, w, depth, regularization, gradient_weight);
 }
 
 // The top of the pyramid, fused.
@@ -147,6 +170,7 @@ struct SmallLevels {
     int w[OMATTE_MAX_SMALL_LEVELS];
 };
 
+template <int D>
 __global__ void small_levels_kernel(const float *image, const float *alpha, int h_full, int w_full,
                                     int depth, float *level_image, float *level_alpha, float *F,
                                     float *B, float *F_prev, float *B_prev, SmallLevels levels,
@@ -172,8 +196,8 @@ __global__ void small_levels_kernel(const float *image, const float *alpha, int 
         for (int iter = 0; iter < n_iter; iter++) {
             for (int parity = 0; parity < 2; parity++) {
                 if (mine && ((x + y) & 1) == parity) {
-                    sweep_px(level_image, level_alpha, F, B, x, y, lh, lw, depth, regularization,
-                             gradient_weight);
+                    sweep_px<D>(level_image, level_alpha, F, B, x, y, lh, lw, depth, regularization,
+                                gradient_weight);
                 }
                 __syncthreads();
             }
@@ -190,6 +214,88 @@ __global__ void small_levels_kernel(const float *image, const float *alpha, int 
         __syncthreads();
         h_prev = lh;
         w_prev = lw;
+    }
+}
+
+// The same fused pyramid top, with the whole working set in shared memory. Every
+// level fits one block, so after the first read of the full-resolution image and
+// alpha nothing needs to leave the SM: the version above bounces every sweep
+// through L2 and a barrier per colour class makes that latency the whole cost
+// (~1.9 us per phase, ~126 phases). The arithmetic, its order and the barriers
+// are unchanged. The previous level's answer and the level being solved swap
+// roles instead of being copied. Only the final level is written back, into
+// F_prev/B_prev where the big levels pick it up.
+template <int D>
+__global__ void small_levels_shared_kernel(const float *image, const float *alpha, int h_full,
+                                           int w_full, int depth, float *F_prev, float *B_prev,
+                                           SmallLevels levels, float regularization,
+                                           float gradient_weight, int n_iter) {
+    extern __shared__ float smem[];
+    const int cap = OMATTE_FUSED_MAX_SIDE * OMATTE_FUSED_MAX_SIDE;
+    float *s_image = smem;
+    float *s_alpha = s_image + cap * depth;
+    float *cur_f = s_alpha + cap;
+    float *cur_b = cur_f + cap * depth;
+    float *prev_f = cur_b + cap * depth;
+    float *prev_b = prev_f + cap * depth;
+
+    const int x = threadIdx.x;
+    const int y = threadIdx.y;
+    if (y == 0 && x < depth) {
+        prev_f[x] = F_prev[x];
+        prev_b[x] = B_prev[x];
+    }
+    __syncthreads();
+
+    int h_prev = 1;
+    int w_prev = 1;
+    for (int level = 0; level < levels.count; level++) {
+        const int lh = levels.h[level];
+        const int lw = levels.w[level];
+        const bool mine = x < lw && y < lh;
+
+        if (mine) {
+            resize_nearest_px(s_image, x, y, lh, lw, image, h_full, w_full, depth);
+            resize_nearest_px(s_alpha, x, y, lh, lw, alpha, h_full, w_full, 1);
+            resize_nearest_px(cur_f, x, y, lh, lw, prev_f, h_prev, w_prev, depth);
+            resize_nearest_px(cur_b, x, y, lh, lw, prev_b, h_prev, w_prev, depth);
+        }
+        __syncthreads();
+
+        // One colour class is half the pixels, and with the class picked by
+        // thread parity every warp runs the (issue-bound) sweep with half its
+        // lanes dead. Threads 0..511 take the 512 pixels of a class instead: two
+        // rows of 16 per warp, x stepping by two and offset by the row parity.
+        const int slot = y * OMATTE_FUSED_MAX_SIDE + x;
+        const int slot_row = slot >> 4;
+        const int slot_col = slot & 15;
+        for (int iter = 0; iter < n_iter; iter++) {
+            for (int parity = 0; parity < 2; parity++) {
+                if (slot < OMATTE_FUSED_MAX_SIDE * OMATTE_FUSED_MAX_SIDE / 2) {
+                    const int px = 2 * slot_col + ((slot_row + parity) & 1);
+                    if (slot_row < lh && px < lw) {
+                        sweep_px<D>(s_image, s_alpha, cur_f, cur_b, px, slot_row, lh, lw, depth,
+                                    regularization, gradient_weight);
+                    }
+                }
+                __syncthreads();
+            }
+        }
+
+        float *tmp = prev_f;
+        prev_f = cur_f;
+        cur_f = tmp;
+        tmp = prev_b;
+        prev_b = cur_b;
+        cur_b = tmp;
+        h_prev = lh;
+        w_prev = lw;
+    }
+
+    for (int i = y * OMATTE_FUSED_MAX_SIDE + x; i < h_prev * w_prev * depth;
+         i += OMATTE_FUSED_MAX_SIDE * OMATTE_FUSED_MAX_SIDE) {
+        F_prev[i] = prev_f[i];
+        B_prev[i] = prev_b[i];
     }
 }
 
@@ -255,27 +361,50 @@ __global__ void seed_partial_kernel(const float *__restrict__ image,
     }
 }
 
-// Folds the per-block partials into the 1x1 top of the pyramid. One block, so
-// the final sum order is fixed too.
+// Folds the per-block partials into the 1x1 top of the pyramid. Each of the ten
+// sums (F and B per channel, two counts) is one thread adding the blocks in
+// order, so the rounding is fixed and identical to a single serial walk, but the
+// ten walks run side by side and read from shared memory that a whole block
+// staged first. One thread doing all of it was ~190 us, the slowest kernel of the
+// pass bar the sweeps.
 __global__ void seed_finish_kernel(const double *partial_f, const double *partial_b,
                                    const double *partial_count, int depth, float *F_top,
                                    float *B_top) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    double f_sum[OMATTE_CUDA_MAX_DEPTH] = {0, 0, 0, 0};
-    double b_sum[OMATTE_CUDA_MAX_DEPTH] = {0, 0, 0, 0};
-    double f_count = 0.0;
-    double b_count = 0.0;
-    for (int block = 0; block < OMATTE_SEED_BLOCKS; block++) {
+    __shared__ double s_f[OMATTE_SEED_BLOCKS][OMATTE_CUDA_MAX_DEPTH];
+    __shared__ double s_b[OMATTE_SEED_BLOCKS][OMATTE_CUDA_MAX_DEPTH];
+    __shared__ double s_n[OMATTE_SEED_BLOCKS][2];
+    __shared__ double sums[2 * OMATTE_CUDA_MAX_DEPTH + 2];
+    for (int block = threadIdx.x; block < OMATTE_SEED_BLOCKS; block += blockDim.x) {
         for (int c = 0; c < depth; c++) {
-            f_sum[c] += partial_f[(size_t)block * OMATTE_CUDA_MAX_DEPTH + c];
-            b_sum[c] += partial_b[(size_t)block * OMATTE_CUDA_MAX_DEPTH + c];
+            s_f[block][c] = partial_f[(size_t)block * OMATTE_CUDA_MAX_DEPTH + c];
+            s_b[block][c] = partial_b[(size_t)block * OMATTE_CUDA_MAX_DEPTH + c];
         }
-        f_count += partial_count[block * 2 + 0];
-        b_count += partial_count[block * 2 + 1];
+        s_n[block][0] = partial_count[block * 2 + 0];
+        s_n[block][1] = partial_count[block * 2 + 1];
     }
-    for (int c = 0; c < depth; c++) {
-        F_top[c] = (float)(f_sum[c] / (f_count + 1e-5));
-        B_top[c] = (float)(b_sum[c] / (b_count + 1e-5));
+    __syncthreads();
+    const int q = threadIdx.x;
+    if (q < 2 * OMATTE_CUDA_MAX_DEPTH + 2) {
+        double sum = 0.0;
+        if (q < OMATTE_CUDA_MAX_DEPTH) {
+            for (int block = 0; block < OMATTE_SEED_BLOCKS; block++) sum += s_f[block][q < depth ? q : 0];
+            if (q >= depth) sum = 0.0;
+        } else if (q < 2 * OMATTE_CUDA_MAX_DEPTH) {
+            const int c = q - OMATTE_CUDA_MAX_DEPTH;
+            for (int block = 0; block < OMATTE_SEED_BLOCKS; block++) sum += s_b[block][c < depth ? c : 0];
+            if (c >= depth) sum = 0.0;
+        } else {
+            const int k = q - 2 * OMATTE_CUDA_MAX_DEPTH;
+            for (int block = 0; block < OMATTE_SEED_BLOCKS; block++) sum += s_n[block][k];
+        }
+        sums[q] = sum;
+    }
+    __syncthreads();
+    if (threadIdx.x < depth) {
+        const double f_count = sums[2 * OMATTE_CUDA_MAX_DEPTH];
+        const double b_count = sums[2 * OMATTE_CUDA_MAX_DEPTH + 1];
+        F_top[threadIdx.x] = (float)(sums[threadIdx.x] / (f_count + 1e-5));
+        B_top[threadIdx.x] = (float)(sums[OMATTE_CUDA_MAX_DEPTH + threadIdx.x] / (b_count + 1e-5));
     }
 }
 
@@ -325,6 +454,8 @@ void level_size(int i_level, int n_levels, int h, int w, int *out_h, int *out_w)
 // growing.
 struct Workspace {
     cudaStream_t stream = nullptr;
+    cudaEvent_t done = nullptr;   // end of the last device-path request, on whatever stream it used
+    bool done_valid = false;
     float *image = nullptr;       // full-resolution source, device copy (host API only)
     float *alpha = nullptr;
     float *level_image = nullptr;
@@ -357,6 +488,7 @@ void workspace_free_locked() {
     cudaFree(g_ws.partial_b);
     cudaFree(g_ws.partial_count);
     if (g_ws.stream) cudaStreamDestroy(g_ws.stream);
+    if (g_ws.done) cudaEventDestroy(g_ws.done);
     g_ws = Workspace();
 }
 
@@ -367,6 +499,26 @@ bool ensure_stream_locked() {
     // Non-blocking so this never serialises against the default stream, which
     // is where a co-resident torch model does its work.
     return cudaStreamCreateWithFlags(&g_ws.stream, cudaStreamNonBlocking) == cudaSuccess;
+}
+
+// Device-path requests enqueue and return without waiting, so the workspace may
+// still be in use on the previous caller's stream. Anything that touches it next
+// either orders its own stream behind that work or, when it is about to free
+// buffers, waits for it on the host.
+bool device_sync_forced() {
+    static const bool forced = [] {
+        const char *value = getenv("OMATTE_CUDA_SYNC");
+        return value && value[0] && value[0] != '0';
+    }();
+    return forced;
+}
+
+void order_behind_previous_locked(cudaStream_t stream) {
+    if (g_ws.done_valid) cudaStreamWaitEvent(stream, g_ws.done, 0);
+}
+
+void wait_previous_locked() {
+    if (g_ws.done_valid) cudaEventSynchronize(g_ws.done);
 }
 
 bool workspace_reserve_locked(size_t pixels, int depth, bool need_staging) {
@@ -413,8 +565,9 @@ bool workspace_reserve_locked(size_t pixels, int depth, bool need_staging) {
         return false;
     }
 
-    // Nothing is in flight: callers hold g_lock and every launch is stream-
-    // ordered behind the sync at the end of the previous request.
+    // The previous device-path request may still be running; its buffers are
+    // about to be freed.
+    wait_previous_locked();
     if (grow) {
         cudaFree(g_ws.level_image); g_ws.level_image = level_image;
         cudaFree(g_ws.level_alpha); g_ws.level_alpha = level_alpha;
@@ -433,11 +586,40 @@ bool workspace_reserve_locked(size_t pixels, int depth, bool need_staging) {
     return true;
 }
 
+// Dynamic shared memory for the shared-memory pyramid top, or 0 when the device
+// cannot give a block that much (the global-memory kernel is used instead).
+size_t small_shared_bytes(int depth) {
+    static size_t max_bytes = [] {
+        const size_t need = (size_t)(5 * OMATTE_CUDA_MAX_DEPTH + 1) * OMATTE_FUSED_MAX_SIDE *
+                            OMATTE_FUSED_MAX_SIDE * sizeof(float);
+        int device = 0, optin = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) !=
+                cudaSuccess ||
+            (size_t)optin < need ||
+            cudaFuncSetAttribute(small_levels_shared_kernel<3>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)need) !=
+                cudaSuccess ||
+            cudaFuncSetAttribute(small_levels_shared_kernel<0>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)need) !=
+                cudaSuccess) {
+            cudaGetLastError();
+            return (size_t)0;
+        }
+        return need;
+    }();
+    const size_t bytes = (size_t)(5 * depth + 1) * OMATTE_FUSED_MAX_SIDE * OMATTE_FUSED_MAX_SIDE *
+                         sizeof(float);
+    return bytes <= max_bytes ? bytes : 0;
+}
+
 // The pyramid itself. image/alpha are full-resolution device pointers; every
 // level resamples from them, never from the level above, exactly as the
 // reference does.
 cudaError_t run_pyramid_locked(const float *d_image, const float *d_alpha, int h, int w, int depth,
-                               const omatte_params *params, cudaStream_t stream) {
+                               const omatte_params *params, cudaStream_t stream,
+                               float *direct_f, float *direct_b, const float **result_f,
+                               const float **result_b) {
     int h_prev = 1;
     int w_prev = 1;
     const int max_dimension = h > w ? h : w;
@@ -463,11 +645,32 @@ cudaError_t run_pyramid_locked(const float *d_image, const float *d_alpha, int h
             first_big = i_level + 1;
         }
     }
+    // The previous level's answer and the buffers the next level works in swap
+    // roles instead of being copied: both pairs are full-size and the resample
+    // that reads one writes the other, so the bytes are the same with two fewer
+    // copies per level.
+    float *prev_f = g_ws.F_prev, *prev_b = g_ws.B_prev;
+    float *work_f = g_ws.F, *work_b = g_ws.B;
     if (small.count > 0) {
-        small_levels_kernel<<<1, dim3(OMATTE_FUSED_MAX_SIDE, OMATTE_FUSED_MAX_SIDE), 0, stream>>>(
-            d_image, d_alpha, h, w, depth, g_ws.level_image, g_ws.level_alpha, g_ws.F, g_ws.B,
-            g_ws.F_prev, g_ws.B_prev, small, params->regularization, params->gradient_weight,
-            params->n_small_iterations);
+        const size_t shared_bytes = small_shared_bytes(depth);
+        if (shared_bytes) {
+            const dim3 one_block(OMATTE_FUSED_MAX_SIDE, OMATTE_FUSED_MAX_SIDE);
+            if (depth == 3) {
+                small_levels_shared_kernel<3><<<1, one_block, shared_bytes, stream>>>(
+                    d_image, d_alpha, h, w, depth, g_ws.F_prev, g_ws.B_prev, small,
+                    params->regularization, params->gradient_weight, params->n_small_iterations);
+            } else {
+                small_levels_shared_kernel<0><<<1, one_block, shared_bytes, stream>>>(
+                    d_image, d_alpha, h, w, depth, g_ws.F_prev, g_ws.B_prev, small,
+                    params->regularization, params->gradient_weight, params->n_small_iterations);
+            }
+        } else {
+            small_levels_kernel<0><<<1, dim3(OMATTE_FUSED_MAX_SIDE, OMATTE_FUSED_MAX_SIDE), 0,
+                                     stream>>>(d_image, d_alpha, h, w, depth, g_ws.level_image,
+                                            g_ws.level_alpha, g_ws.F, g_ws.B, g_ws.F_prev,
+                                            g_ws.B_prev, small, params->regularization,
+                                            params->gradient_weight, params->n_small_iterations);
+        }
         h_prev = small.h[small.count - 1];
         w_prev = small.w[small.count - 1];
     }
@@ -479,14 +682,16 @@ cudaError_t run_pyramid_locked(const float *d_image, const float *d_alpha, int h
 
         const dim3 grid((level_w + block.x - 1) / block.x, (level_h + block.y - 1) / block.y);
 
-        resize_nearest_kernel<<<grid, block, 0, stream>>>(g_ws.level_image, level_h, level_w,
-                                                          d_image, h, w, depth);
-        resize_nearest_kernel<<<grid, block, 0, stream>>>(g_ws.level_alpha, level_h, level_w,
-                                                          d_alpha, h, w, 1);
-        resize_nearest_kernel<<<grid, block, 0, stream>>>(g_ws.F, level_h, level_w, g_ws.F_prev,
-                                                          h_prev, w_prev, depth);
-        resize_nearest_kernel<<<grid, block, 0, stream>>>(g_ws.B, level_h, level_w, g_ws.B_prev,
-                                                          h_prev, w_prev, depth);
+        // The last level solves straight into the caller's buffers when it has
+        // them, which removes the copy out of the workspace.
+        if (i_level == n_levels && direct_f) {
+            work_f = direct_f;
+            if (direct_b) work_b = direct_b;
+        }
+
+        resize_level_kernel<<<grid, block, 0, stream>>>(
+            g_ws.level_image, g_ws.level_alpha, work_f, work_b, level_h, level_w, d_image,
+            d_alpha, h, w, prev_f, prev_b, h_prev, w_prev, depth);
 
         const int n_iter = (level_w <= params->small_size && level_h <= params->small_size)
                                ? params->n_small_iterations
@@ -494,18 +699,35 @@ cudaError_t run_pyramid_locked(const float *d_image, const float *d_alpha, int h
 
         for (int iter = 0; iter < n_iter; iter++) {
             for (int parity = 0; parity < 2; parity++) {
-                sweep_kernel<<<grid, block, 0, stream>>>(
-                    g_ws.level_image, g_ws.level_alpha, g_ws.F, g_ws.B, level_h, level_w, depth,
-                    params->regularization, params->gradient_weight, parity);
+                if (depth == 3) {
+                    sweep_kernel<3><<<grid, block, 0, stream>>>(
+                        g_ws.level_image, g_ws.level_alpha, work_f, work_b, level_h, level_w,
+                        depth, params->regularization, params->gradient_weight, parity);
+                } else {
+                    sweep_kernel<0><<<grid, block, 0, stream>>>(
+                        g_ws.level_image, g_ws.level_alpha, work_f, work_b, level_h, level_w,
+                        depth, params->regularization, params->gradient_weight, parity);
+                }
             }
         }
 
-        const size_t level_bytes = (size_t)level_h * level_w * depth * sizeof(float);
-        cudaMemcpyAsync(g_ws.F_prev, g_ws.F, level_bytes, cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(g_ws.B_prev, g_ws.B, level_bytes, cudaMemcpyDeviceToDevice, stream);
+        if (i_level == n_levels && direct_f) {
+            prev_f = work_f;
+            if (direct_b) prev_b = work_b;
+            h_prev = level_h;
+            w_prev = level_w;
+            break;
+        }
+        float *done_f = work_f, *done_b = work_b;
+        work_f = prev_f;
+        work_b = prev_b;
+        prev_f = done_f;
+        prev_b = done_b;
         h_prev = level_h;
         w_prev = level_w;
     }
+    *result_f = prev_f;
+    *result_b = prev_b;
     return cudaGetLastError();
 }
 
@@ -525,6 +747,7 @@ extern "C" bool omatte_cuda_available(void) {
 extern "C" void omatte_cuda_release_workspace(void) {
     pthread_mutex_lock(&g_lock);
     if (g_ws.stream) cudaStreamSynchronize(g_ws.stream);
+    wait_previous_locked();
     workspace_free_locked();
     pthread_mutex_unlock(&g_lock);
 }
@@ -590,6 +813,7 @@ extern "C" int omatte_estimate_fb_cuda(const float *image, const float *alpha, i
         return -2;
     }
     cudaStream_t stream = g_ws.stream;
+    order_behind_previous_locked(stream);
 
     cudaError_t status = cudaMemcpyAsync(g_ws.image, image, colour_bytes, cudaMemcpyHostToDevice,
                                          stream);
@@ -604,14 +828,16 @@ extern "C" int omatte_estimate_fb_cuda(const float *image, const float *alpha, i
         status = cudaMemcpyAsync(g_ws.B_prev, b_mean, depth * sizeof(float),
                                  cudaMemcpyHostToDevice, stream);
     }
+    const float *result_f = nullptr, *result_b = nullptr;
     if (status == cudaSuccess) {
-        status = run_pyramid_locked(g_ws.image, g_ws.alpha, h, w, depth, params, stream);
+        status = run_pyramid_locked(g_ws.image, g_ws.alpha, h, w, depth, params, stream,
+                                    nullptr, nullptr, &result_f, &result_b);
     }
     if (status == cudaSuccess) {
-        status = cudaMemcpyAsync(out_f, g_ws.F, colour_bytes, cudaMemcpyDeviceToHost, stream);
+        status = cudaMemcpyAsync(out_f, result_f, colour_bytes, cudaMemcpyDeviceToHost, stream);
     }
     if (status == cudaSuccess && out_b) {
-        status = cudaMemcpyAsync(out_b, g_ws.B, colour_bytes, cudaMemcpyDeviceToHost, stream);
+        status = cudaMemcpyAsync(out_b, result_b, colour_bytes, cudaMemcpyDeviceToHost, stream);
     }
     if (status == cudaSuccess) status = cudaStreamSynchronize(stream);
     pthread_mutex_unlock(&g_lock);
@@ -622,6 +848,12 @@ extern "C" int omatte_estimate_fb_cuda_device(const float *d_image, const float 
                                               int w, int depth, const omatte_params *params,
                                               float *d_out_f, float *d_out_b, void *stream_arg) {
     if (!args_valid(d_image, d_alpha, h, w, depth, d_out_f)) return -1;
+    // The last level is solved in place in the output, so it must not alias the inputs.
+    if ((const void *)d_out_f == (const void *)d_image || (const void *)d_out_f == (const void *)d_alpha ||
+        (d_out_b && ((const void *)d_out_b == (const void *)d_image ||
+                     (const void *)d_out_b == (const void *)d_alpha || d_out_b == d_out_f))) {
+        return -1;
+    }
     if (!omatte_cuda_available()) return -3;
 
     omatte_params defaults = omatte_default_params();
@@ -636,23 +868,39 @@ extern "C" int omatte_estimate_fb_cuda_device(const float *d_image, const float 
         return -2;
     }
     cudaStream_t stream = stream_arg ? (cudaStream_t)stream_arg : g_ws.stream;
+    order_behind_previous_locked(stream);
 
     seed_partial_kernel<<<OMATTE_SEED_BLOCKS, OMATTE_SEED_THREADS, 0, stream>>>(
         d_image, d_alpha, pixels, depth, g_ws.partial_f, g_ws.partial_b, g_ws.partial_count);
-    seed_finish_kernel<<<1, 1, 0, stream>>>(g_ws.partial_f, g_ws.partial_b, g_ws.partial_count,
+    seed_finish_kernel<<<1, OMATTE_SEED_THREADS, 0, stream>>>(g_ws.partial_f, g_ws.partial_b, g_ws.partial_count,
                                             depth, g_ws.F_prev, g_ws.B_prev);
 
-    cudaError_t status = run_pyramid_locked(d_image, d_alpha, h, w, depth, params, stream);
+    const float *result_f = nullptr, *result_b = nullptr;
+    cudaError_t status = run_pyramid_locked(d_image, d_alpha, h, w, depth, params, stream, d_out_f,
+                                            d_out_b, &result_f, &result_b);
+    // A pyramid that fits the fused kernel entirely ends in the workspace.
+    if (status == cudaSuccess && result_f != d_out_f) {
+        status = cudaMemcpyAsync(d_out_f, result_f, colour_bytes, cudaMemcpyDeviceToDevice, stream);
+    }
+    if (status == cudaSuccess && d_out_b && result_b != d_out_b) {
+        status = cudaMemcpyAsync(d_out_b, result_b, colour_bytes, cudaMemcpyDeviceToDevice, stream);
+    }
+    // The workspace is shared, so the next caller must not start overwriting it
+    // while this request is still queued. That is ordered on the device with an
+    // event instead of a host wait: the caller's stream is typically torch's
+    // default stream, so cudaStreamSynchronize here also waited for every other
+    // thread's model forward queued ahead of us, with g_lock held.
     if (status == cudaSuccess) {
-        status = cudaMemcpyAsync(d_out_f, g_ws.F, colour_bytes, cudaMemcpyDeviceToDevice, stream);
+        if (!g_ws.done) status = cudaEventCreateWithFlags(&g_ws.done, cudaEventDisableTiming);
+        if (status == cudaSuccess) status = cudaEventRecord(g_ws.done, stream);
+        g_ws.done_valid = status == cudaSuccess;
     }
-    if (status == cudaSuccess && d_out_b) {
-        status = cudaMemcpyAsync(d_out_b, g_ws.B, colour_bytes, cudaMemcpyDeviceToDevice, stream);
+    // A private stream has no external ordering, so its result is returned complete; so is
+    // anything that failed part-way, so the workspace is quiescent before the next caller.
+    if (status != cudaSuccess || !stream_arg || device_sync_forced()) {
+        const cudaError_t waited = cudaStreamSynchronize(stream);
+        if (status == cudaSuccess) status = waited;
     }
-    // The workspace is shared, so the next caller must not start overwriting F
-    // and B while these copies are still queued. Waiting on this one stream is
-    // not a device sync: co-resident work on other streams is untouched.
-    if (status == cudaSuccess) status = cudaStreamSynchronize(stream);
     pthread_mutex_unlock(&g_lock);
     return status == cudaSuccess ? 0 : -2;
 }

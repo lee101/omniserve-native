@@ -827,15 +827,27 @@ def nyquist_notch(picture):
         return picture
     from PIL import Image
 
-    a = np.asarray(picture.convert("RGB"), dtype=np.int32)
+    a = np.asarray(picture.convert("RGB"))
     h, w, _ = a.shape
     if w < 7 or h < 7:
         return picture
-    p = np.pad(a, ((0, 0), (3, 3), (0, 0)), mode="edge")
-    x = sum(_NOTCH_TAPS[i] * p[:, i:i + w] for i in range(7))
-    p = np.pad(x, ((3, 3), (0, 0), (0, 0)), mode="edge")
-    y = sum(_NOTCH_TAPS[i] * p[i:i + h] for i in range(7))
-    return Image.fromarray(np.clip((y + 2048) >> 12, 0, 255).astype(np.uint8))
+    # Taps are symmetric, so mirrored pairs are added first (4 multiplies, not 7). The x pass
+    # fits int16 (-3060..22440) and runs flat over x*3+c; the y pass needs int32.
+    p = np.pad(a, ((0, 0), (3, 3), (0, 0)), mode="edge").astype(np.int16).reshape(h, (w + 6) * 3)
+    n = w * 3
+    s = [p[:, i * 3:i * 3 + n] for i in range(7)]
+    x = s[0] + s[6]
+    x -= 6 * (s[1] + s[5])
+    x += 15 * (s[2] + s[4])
+    x += 44 * s[3]
+    p = np.pad(x, ((3, 3), (0, 0)), mode="edge").astype(np.int32)
+    y = p[0:h] + p[6:6 + h]
+    y -= 6 * (p[1:1 + h] + p[5:5 + h])
+    y += 15 * (p[2:2 + h] + p[4:4 + h])
+    y += 44 * p[3:3 + h]
+    y += 2048
+    y >>= 12
+    return Image.fromarray(np.clip(y, 0, 255).astype(np.uint8).reshape(h, w, 3))
 
 
 def encode(images, count: int, output_format: str, notch: bool = False) -> list[dict]:
@@ -920,7 +932,7 @@ def generate(values: dict) -> dict:
         # and inline it as a data URL; the gateway relays the fields above.
         "outputs": encoded,
         "seed": params.seed,
-        "bytes": sum(len(base64.b64decode(item["data"])) for item in encoded),
+        "bytes": sum(len(item["data"]) // 4 * 3 - item["data"].endswith("=") - item["data"].endswith("==") for item in encoded),
         "timings": {
             "load_ms": _state.get("load_ms"),
             "sample_ms": sample_ms,

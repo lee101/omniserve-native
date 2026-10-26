@@ -378,39 +378,69 @@ static size_t g_cache_bytes;
 /* Nyquist notch: (delta - b) along x then y with b = [-1 6 -15 20 -15 6 -1]/64,
  * which removes the 2 px lattice the VAE leaves in fine texture and keeps DC
  * gain 1. Separable, so two 7-tap passes; edges clamp. */
+/* Kernel is [1 -6 15 44 15 -6 1] with mirrored taps folded (4 multiplies). The horizontal
+ * pass is int16 (range -3060..22440) over flat x*3+c so the interior vectorises; only the
+ * 3 edge pixels per side clamp. Bit-identical to the 7-tap clamped form. */
 static void notch_rgb(unsigned char *px, int w, int h, int ch) {
-    static const int k[7] = {1, -6, 15, 44, 15, -6, 1};
     if (w < 7 || h < 7 || ch < 3) return;
-    int *tmp = malloc((size_t)w * h * 3 * sizeof *tmp);
-    if (!tmp) return;
+    const size_t row3 = (size_t)w * 3;
+    int16_t *tmp = malloc((size_t)h * row3 * sizeof *tmp);
+    unsigned char *pack = ch == 3 ? NULL : malloc(row3);
+    if (!tmp || (ch != 3 && !pack)) {
+        free(tmp);
+        free(pack);
+        return;
+    }
     for (int y = 0; y < h; ++y) {
-        const unsigned char *row = px + (size_t)y * w * ch;
-        int *out = tmp + (size_t)y * w * 3;
-        for (int x = 0; x < w; ++x) {
-            int a0 = 0, a1 = 0, a2 = 0;
-            for (int t = -3; t <= 3; ++t) {
-                int xx = x + t < 0 ? 0 : (x + t >= w ? w - 1 : x + t);
-                const unsigned char *p = row + (size_t)xx * ch;
-                a0 += k[t + 3] * p[0]; a1 += k[t + 3] * p[1]; a2 += k[t + 3] * p[2];
+        const unsigned char *src = px + (size_t)y * w * ch;
+        if (ch != 3) {
+            for (int x = 0; x < w; ++x) memcpy(pack + (size_t)x * 3, src + (size_t)x * ch, 3);
+            src = pack;
+        }
+        int16_t *out = tmp + (size_t)y * row3;
+        for (size_t i = 9; i < row3 - 9; ++i)
+            out[i] = (int16_t)(src[i - 9] + src[i + 9] - 6 * (src[i - 6] + src[i + 6]) +
+                               15 * (src[i - 3] + src[i + 3]) + 44 * src[i]);
+        for (int e = 0; e < 6; ++e) {
+            const int x = e < 3 ? e : w - 6 + e;
+            for (int c = 0; c < 3; ++c) {
+                int a = 0;
+                for (int t = -3; t <= 3; ++t) {
+                    int xx = x + t < 0 ? 0 : (x + t >= w ? w - 1 : x + t);
+                    static const int k[7] = {1, -6, 15, 44, 15, -6, 1};
+                    a += k[t + 3] * src[(size_t)xx * 3 + c];
+                }
+                out[(size_t)x * 3 + c] = (int16_t)a;
             }
-            out[x * 3] = a0; out[x * 3 + 1] = a1; out[x * 3 + 2] = a2;
         }
     }
     for (int y = 0; y < h; ++y) {
-        unsigned char *row = px + (size_t)y * w * ch;
-        const int *r[7];
+        const int16_t *r[7];
         for (int t = -3; t <= 3; ++t) {
             int yy = y + t < 0 ? 0 : (y + t >= h ? h - 1 : y + t);
-            r[t + 3] = tmp + (size_t)yy * w * 3;
+            r[t + 3] = tmp + (size_t)yy * row3;
         }
-        for (int i = 0; i < w * 3; ++i) {
-            int v = 0;
-            for (int t = 0; t < 7; ++t) v += k[t] * r[t][i];
-            v = (v + 2048) >> 12;
-            row[(i / 3) * ch + i % 3] = (unsigned char)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        unsigned char *dst = px + (size_t)y * w * ch;
+        if (ch == 3) {
+            for (size_t i = 0; i < row3; ++i) {
+                int v = r[0][i] + r[6][i] - 6 * (r[1][i] + r[5][i]) + 15 * (r[2][i] + r[4][i]) +
+                        44 * r[3][i];
+                v = (v + 2048) >> 12;
+                dst[i] = (unsigned char)(v < 0 ? 0 : (v > 255 ? 255 : v));
+            }
+        } else {
+            for (int x = 0; x < w; ++x)
+                for (int c = 0; c < 3; ++c) {
+                    const size_t i = (size_t)x * 3 + c;
+                    int v = r[0][i] + r[6][i] - 6 * (r[1][i] + r[5][i]) + 15 * (r[2][i] + r[4][i]) +
+                            44 * r[3][i];
+                    v = (v + 2048) >> 12;
+                    dst[(size_t)x * ch + c] = (unsigned char)(v < 0 ? 0 : (v > 255 ? 255 : v));
+                }
         }
     }
     free(tmp);
+    free(pack);
 }
 
 static double now_ms(void) {
