@@ -2,31 +2,101 @@
   "video-matting": {
     "module": "workloads.video_matting",
     "required_mib": 2800,
-    "aliases": ["video_background_removal", "video-background-removal", "matting"]
+    "aliases": [
+      "video_background_removal",
+      "video-background-removal",
+      "matting"
+    ]
   },
   "h3-video": {
     "module": "workloads.h3_video",
     "required_mib": 43000,
-    "aliases": ["h3", "video-generation", "minimax-h3"]
+    "aliases": [
+      "h3",
+      "video-generation",
+      "minimax-h3"
+    ]
   },
   "anima-2.9b": {
     "module": "workloads.anima_image",
     "required_mib": 12800,
-    "aliases": ["anima", "anima-image", "anime-illustration"]
+    "aliases": [
+      "anima",
+      "anima-image",
+      "anime-illustration"
+    ]
   },
   "qwen-image-2.1": {
     "module": "workloads.qwen_image",
     "required_mib": 12000,
-    "aliases": ["ra2", "qwen-image", "qwen_image", "ra2-image"]
+    "aliases": [
+      "ra2",
+      "qwen-image",
+      "qwen_image",
+      "ra2-image"
+    ]
   },
   "wan-animate-2": {
     "module": "workloads.wan_animate_2",
     "required_mib": 24576,
-    "aliases": ["wan-animate", "character-animation", "character_animation"],
+    "aliases": [
+      "wan-animate",
+      "character-animation",
+      "character_animation"
+    ],
     "profiles": [
-      {"name": "small", "required_mib": 20480, "scratch_mib": 6144},
-      {"name": "balanced", "required_mib": 28672, "scratch_mib": 8192},
-      {"name": "throughput", "required_mib": 57344, "scratch_mib": 12288}
+      {
+        "name": "small",
+        "required_mib": 20480,
+        "scratch_mib": 6144
+      },
+      {
+        "name": "balanced",
+        "required_mib": 28672,
+        "scratch_mib": 8192
+      },
+      {
+        "name": "throughput",
+        "required_mib": 57344,
+        "scratch_mib": 12288
+      }
+    ]
+  },
+  "anime-pose-control": {
+    "module": "workloads.anime_pose_control",
+    "required_mib": 9600,
+    "aliases": [
+      "anime-pose-control",
+      "anime-pose",
+      "pose-control"
+    ]
+  },
+  "anime-depth-control": {
+    "module": "workloads.anime_depth_control",
+    "required_mib": 10400,
+    "aliases": [
+      "depth-control",
+      "anime-depth"
+    ]
+  },
+  "anime-sketch-control": {
+    "module": "workloads.anime_sketch_control",
+    "required_mib": 10400,
+    "aliases": [
+      "sketch-control",
+      "anime-sketch",
+      "canny-control"
+    ]
+  },
+  "anime-scene-control": {
+    "module": "workloads.anime_scene_control",
+    "required_mib": 9000,
+    "aliases": [
+      "scene-control",
+      "anime-regional-control",
+      "regional-control",
+      "anime-3dpose-control",
+      "3dpose-control"
     ]
   }
 }

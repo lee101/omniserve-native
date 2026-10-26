@@ -1,5 +1,6 @@
 #include "stable-diffusion.h"
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -11,6 +12,19 @@ void sd_img_gen_params_init(sd_img_gen_params_t *params) { memset(params, 0, siz
 bool generate_image(sd_ctx_t *ctx, const sd_img_gen_params_t *params,
                     sd_image_t **images, int *count) {
     (void)ctx;
+    const char *capture = getenv("OMNISERVE_STUB_PARAMS");
+    if (capture) {
+        FILE *file = fopen(capture, "a");
+        if (!file) return false;
+        fprintf(file, "{\"steps\":%d,\"cfg\":%.9g,\"sampler\":%d,\"refs\":%d,\"loras\":%u,\"cache\":%d,\"sigmas\":[",
+                params->sample_params.sample_steps, (double)params->sample_params.guidance.txt_cfg,
+                params->sample_params.sample_method, params->ref_images_count, params->lora_count,
+                params->cache.mode);
+        for (int i = 0; i < params->sample_params.custom_sigmas_count; ++i)
+            fprintf(file, "%s%.9g", i ? "," : "", (double)params->sample_params.custom_sigmas[i]);
+        fputs("]}\n", file);
+        fclose(file);
+    }
     const char *delay_env = getenv("OMNISERVE_STUB_DELAY_MS");
     long delay_ms = delay_env ? atol(delay_env) : 2000;
     struct timespec delay = {delay_ms / 1000, (delay_ms % 1000) * 1000000L};

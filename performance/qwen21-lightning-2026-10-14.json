@@ -1,0 +1,746 @@
+{
+  "date": "2026-10-14",
+  "hardware": "RTX 3090 Ti 24 GB, shared GPU; approximately 7.6 GiB free at startup",
+  "size": [
+    1024,
+    1024
+  ],
+  "seed": 42,
+  "sd_source_commit": "c0d6c1edb2f66733af0d4be228e96a028444e4d8",
+  "sd_library_commit": "c678dfe",
+  "lightning_revision": "6b0a1176327c01522a44276c5da67331a025b6fc",
+  "lightning_sha256": "53c69320d4163da51032f90275074028cb098556039c72b45f8dce9f0f9e34a3",
+  "q5_revision": "7959e658915f52274897fb573ffeda49de8dc16b",
+  "q5_filename": "qwen-image-2.1-UC-Q5_K_M.gguf",
+  "q5_sha256": "af0bf278cf16d204fb31c384dc82fd41dca82d976b15fe9305a60c726fd6f821",
+  "cases": {
+    "portrait": {
+      "prompt": "Editorial photograph of an attractive adult woman aged 28 wearing a red jacket, waist-up, both hands holding a ceramic coffee cup, natural skin texture, soft window light, cozy cafe background, realistic anatomy, detailed fingers.",
+      "width": 1024,
+      "height": 1024,
+      "seed": 42,
+      "steps": 30,
+      "guidance_scale": 1,
+      "cache": false,
+      "teleport": false,
+      "notch": false,
+      "output_format": "webp"
+    },
+    "couple": {
+      "prompt": "Candid full-body photograph of an attractive adult couple aged 30 walking along a beach at sunset, a man in a white linen shirt and a woman in a blue summer dress, holding hands, realistic proportions, natural skin texture, warm cinematic light.",
+      "width": 1024,
+      "height": 1024,
+      "seed": 42,
+      "steps": 30,
+      "guidance_scale": 1,
+      "cache": false,
+      "teleport": false,
+      "notch": false,
+      "output_format": "webp"
+    },
+    "text": {
+      "prompt": "A coffee shop entrance with a chalkboard reading \"Qwen Coffee, $2 per cup\".",
+      "width": 1024,
+      "height": 1024,
+      "seed": 42,
+      "steps": 30,
+      "guidance_scale": 1,
+      "cache": false,
+      "teleport": false,
+      "notch": false,
+      "output_format": "webp"
+    },
+    "edit": {
+      "prompt": "Change the red jacket to dark blue. Keep the person's identity, pose, hands, cup, background and lighting unchanged.",
+      "width": 1024,
+      "height": 1024,
+      "seed": 42,
+      "steps": 30,
+      "guidance_scale": 1,
+      "cache": false,
+      "teleport": false,
+      "notch": false,
+      "output_format": "webp",
+      "image_base64": "/vfast/data/code/qwen-image-2.1-bench/comparison/lightning-q4-final/portrait-0.png"
+    }
+  },
+  "arms": {
+    "lightning-q4-stream": {
+      "artifact_dir": "/vfast/data/code/qwen-image-2.1-bench/comparison/lightning-q4-stream",
+      "config": {
+        "BIND": "127.0.0.1",
+        "SD_MODEL": "/home/lee/models-fast/qwen-image-2.1/qwen-image-2.1-Q4_K_M.gguf",
+        "SD_DIFFUSION_MODEL": "/home/lee/models-fast/qwen-image-2.1/qwen-image-2.1-Q4_K_M.gguf",
+        "SD_LLM": "/home/lee/models-fast/qwen-image-2.1/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+        "SD_LLM_VISION": "/home/lee/models-fast/qwen-image-2.1/mmproj-Qwen3VL-8B-Instruct-F16.gguf",
+        "SD_VAE": "/home/lee/models-fast/qwen-image-2.1/vae/qwen_image_2.1_vae_bf16.safetensors",
+        "SD_PARAMS_BACKEND": "*=cpu",
+        "SD_REFERENCE_EDIT": "1",
+        "SD_VAE_TILING": "1",
+        "SD_NOTCH": "0",
+        "SD_CACHE_MODE": "off",
+        "SD_TELEPORT": "0",
+        "SD_WARMUP": "0",
+        "SD_LOG_LEVEL": "2",
+        "SD_ACCEL_PROFILE": "lightning",
+        "SD_DEFAULT_LORA": "/vfast/data/models/qwen-image-2.1-lightning/pytorch_lora_weights.safetensors"
+      },
+      "startup_s": 0.5048775402829051,
+      "case_median_s": {
+        "portrait": 9.25188059732318,
+        "couple": 9.238985957112163,
+        "text": 9.205698051955551,
+        "edit": 16.54055292578414
+      },
+      "runs": [
+        {
+          "case": "portrait",
+          "repeat": 0,
+          "wall_s": 12.017928974702954,
+          "sha256": "6d1861ee63086214e6e8cbc768fd724555254c84edf82e2929bea2b011fcd5ef",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 11911,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "portrait",
+          "repeat": 1,
+          "wall_s": 9.25188059732318,
+          "sha256": "6d1861ee63086214e6e8cbc768fd724555254c84edf82e2929bea2b011fcd5ef",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 9146,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "couple",
+          "repeat": 0,
+          "wall_s": 9.26269274810329,
+          "sha256": "8594fba13d464b03706e47d30a7bbd9cf1caea037664cde8303fa3400d0afcf8",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 9157,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "couple",
+          "repeat": 1,
+          "wall_s": 9.238985957112163,
+          "sha256": "8594fba13d464b03706e47d30a7bbd9cf1caea037664cde8303fa3400d0afcf8",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 9137,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "text",
+          "repeat": 0,
+          "wall_s": 9.267541603185236,
+          "sha256": "1fa858710ac277821d8b7e74ec358f9d3e824497966ba6d883fe9c7f4a9600d7",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 9162,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "text",
+          "repeat": 1,
+          "wall_s": 9.205698051955551,
+          "sha256": "1fa858710ac277821d8b7e74ec358f9d3e824497966ba6d883fe9c7f4a9600d7",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 9097,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "edit",
+          "repeat": 0,
+          "wall_s": 18.434279119595885,
+          "sha256": "543493fec983a5a6a4a7ac0276a29d05f4cb7b836ab0e9d83053c5b550643cab",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 18338,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "edit",
+          "repeat": 1,
+          "wall_s": 16.54055292578414,
+          "sha256": "543493fec983a5a6a4a7ac0276a29d05f4cb7b836ab0e9d83053c5b550643cab",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 16438,
+            "format": "webp"
+          }
+        }
+      ],
+      "stage_medians": {
+        "portrait": {
+          "condition_s": 0.45,
+          "sampling_s": 5.19,
+          "decode_s": 3.47,
+          "deterministic_encoded_response": true
+        },
+        "couple": {
+          "condition_s": 0.47,
+          "sampling_s": 5.14,
+          "decode_s": 3.48,
+          "deterministic_encoded_response": true
+        },
+        "text": {
+          "condition_s": 0.43,
+          "sampling_s": 5.11,
+          "decode_s": 3.51,
+          "deterministic_encoded_response": true
+        },
+        "edit": {
+          "condition_s": 1.33,
+          "sampling_s": 10.93,
+          "decode_s": 3.56,
+          "deterministic_encoded_response": true
+        }
+      }
+    },
+    "lightning-q4-final": {
+      "artifact_dir": "/vfast/data/code/qwen-image-2.1-bench/comparison/lightning-q4-final",
+      "config": {
+        "BIND": "127.0.0.1",
+        "SD_MODEL": "/home/lee/models-fast/qwen-image-2.1/qwen-image-2.1-Q4_K_M.gguf",
+        "SD_DIFFUSION_MODEL": "/home/lee/models-fast/qwen-image-2.1/qwen-image-2.1-Q4_K_M.gguf",
+        "SD_LLM": "/home/lee/models-fast/qwen-image-2.1/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+        "SD_LLM_VISION": "/home/lee/models-fast/qwen-image-2.1/mmproj-Qwen3VL-8B-Instruct-F16.gguf",
+        "SD_VAE": "/home/lee/models-fast/qwen-image-2.1/vae/qwen_image_2.1_vae_bf16.safetensors",
+        "SD_PARAMS_BACKEND": "*=cpu",
+        "SD_REFERENCE_EDIT": "1",
+        "SD_VAE_TILING": "1",
+        "SD_NOTCH": "0",
+        "SD_CACHE_MODE": "off",
+        "SD_TELEPORT": "0",
+        "SD_WARMUP": "0",
+        "SD_LOG_LEVEL": "2",
+        "SD_IMAGE_FORMAT": "webp",
+        "SD_VAE_TILE_X": "64",
+        "SD_VAE_TILE_Y": "32",
+        "SD_VAE_TILE_OVERLAP": "0.5",
+        "SD_ACCEL_PROFILE": "lightning",
+        "SD_DEFAULT_LORA": "/vfast/data/models/qwen-image-2.1-lightning/pytorch_lora_weights.safetensors"
+      },
+      "startup_s": 0.5049227341078222,
+      "case_median_s": {
+        "portrait": 8.10293683805503,
+        "couple": 8.123437403468415,
+        "text": 8.083616574527696,
+        "edit": 15.459419646067545
+      },
+      "runs": [
+        {
+          "case": "portrait",
+          "repeat": 0,
+          "wall_s": 10.81847793981433,
+          "sha256": "b557e6c21065bb63933938f45c31fb5214190e603450b306c295b255706cbd71",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 10706,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "portrait",
+          "repeat": 1,
+          "wall_s": 8.161462461110204,
+          "sha256": "b557e6c21065bb63933938f45c31fb5214190e603450b306c295b255706cbd71",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 8055,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "portrait",
+          "repeat": 2,
+          "wall_s": 8.044411214999855,
+          "sha256": "b557e6c21065bb63933938f45c31fb5214190e603450b306c295b255706cbd71",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 7931,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "couple",
+          "repeat": 0,
+          "wall_s": 8.003431145101786,
+          "sha256": "739e3c18a517516a7e076d6262b5f460356b61e3ed20bcdc72a78591513f6326",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 7901,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "couple",
+          "repeat": 1,
+          "wall_s": 8.161598774138838,
+          "sha256": "739e3c18a517516a7e076d6262b5f460356b61e3ed20bcdc72a78591513f6326",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 8057,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "couple",
+          "repeat": 2,
+          "wall_s": 8.085276032797992,
+          "sha256": "739e3c18a517516a7e076d6262b5f460356b61e3ed20bcdc72a78591513f6326",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 7982,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "text",
+          "repeat": 0,
+          "wall_s": 8.015001469757408,
+          "sha256": "5689ea4bf43354c0f784db3690f1ba378026d1231569b11d5061ac9e5aeb5346",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 7905,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "text",
+          "repeat": 1,
+          "wall_s": 8.103305082768202,
+          "sha256": "5689ea4bf43354c0f784db3690f1ba378026d1231569b11d5061ac9e5aeb5346",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 7984,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "text",
+          "repeat": 2,
+          "wall_s": 8.06392806628719,
+          "sha256": "5689ea4bf43354c0f784db3690f1ba378026d1231569b11d5061ac9e5aeb5346",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 7955,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "edit",
+          "repeat": 0,
+          "wall_s": 16.35503492411226,
+          "sha256": "7e646680c190330cf560f580fa755d4fa271a3f5964ce8eddb9d9f0d9800bdfe",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 16244,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "edit",
+          "repeat": 1,
+          "wall_s": 15.49620702303946,
+          "sha256": "7e646680c190330cf560f580fa755d4fa271a3f5964ce8eddb9d9f0d9800bdfe",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 15383,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "edit",
+          "repeat": 2,
+          "wall_s": 15.42263226909563,
+          "sha256": "7e646680c190330cf560f580fa755d4fa271a3f5964ce8eddb9d9f0d9800bdfe",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 15308,
+            "format": "webp"
+          }
+        }
+      ],
+      "stage_medians": {
+        "portrait": {
+          "condition_s": 0.49,
+          "sampling_s": 5.17,
+          "decode_s": 2.29,
+          "deterministic_encoded_response": true
+        },
+        "couple": {
+          "condition_s": 0.49,
+          "sampling_s": 5.205,
+          "decode_s": 2.285,
+          "deterministic_encoded_response": true
+        },
+        "text": {
+          "condition_s": 0.43,
+          "sampling_s": 5.215,
+          "decode_s": 2.285,
+          "deterministic_encoded_response": true
+        },
+        "edit": {
+          "condition_s": 1.35,
+          "sampling_s": 11.04,
+          "decode_s": 2.3499999999999996,
+          "deterministic_encoded_response": true
+        }
+      }
+    },
+    "lightning-q5-final": {
+      "artifact_dir": "/vfast/data/code/qwen-image-2.1-bench/comparison/lightning-q5-final",
+      "config": {
+        "BIND": "127.0.0.1",
+        "SD_MODEL": "/home/lee/models-fast/qwen-image-2.1/qwen-image-2.1-base-Q5_K_M.gguf",
+        "SD_DIFFUSION_MODEL": "/home/lee/models-fast/qwen-image-2.1/qwen-image-2.1-base-Q5_K_M.gguf",
+        "SD_LLM": "/home/lee/models-fast/qwen-image-2.1/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+        "SD_LLM_VISION": "/home/lee/models-fast/qwen-image-2.1/mmproj-Qwen3VL-8B-Instruct-F16.gguf",
+        "SD_VAE": "/home/lee/models-fast/qwen-image-2.1/vae/qwen_image_2.1_vae_bf16.safetensors",
+        "SD_PARAMS_BACKEND": "*=cpu",
+        "SD_REFERENCE_EDIT": "1",
+        "SD_VAE_TILING": "1",
+        "SD_NOTCH": "0",
+        "SD_CACHE_MODE": "off",
+        "SD_TELEPORT": "0",
+        "SD_WARMUP": "0",
+        "SD_LOG_LEVEL": "2",
+        "SD_IMAGE_FORMAT": "webp",
+        "SD_VAE_TILE_X": "64",
+        "SD_VAE_TILE_Y": "32",
+        "SD_VAE_TILE_OVERLAP": "0.5",
+        "SD_ACCEL_PROFILE": "lightning",
+        "SD_DEFAULT_LORA": "/vfast/data/models/qwen-image-2.1-lightning/pytorch_lora_weights.safetensors"
+      },
+      "startup_s": 0.5127702937461436,
+      "case_median_s": {
+        "portrait": 8.787987927906215,
+        "couple": 8.47520193317905,
+        "text": 8.532547573093325,
+        "edit": 16.226054951082915
+      },
+      "runs": [
+        {
+          "case": "portrait",
+          "repeat": 0,
+          "wall_s": 18.02628064295277,
+          "sha256": "e1c9384ddebf81cfc11fed80fbd7744607455f64d0954d80c8cf3da075ee376f",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 17934,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "portrait",
+          "repeat": 1,
+          "wall_s": 8.787987927906215,
+          "sha256": "e1c9384ddebf81cfc11fed80fbd7744607455f64d0954d80c8cf3da075ee376f",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 8694,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "couple",
+          "repeat": 0,
+          "wall_s": 8.510234892833978,
+          "sha256": "c7ab89b52ad4ff7315c94f704fffce427fb339810fc1461fa4548b2d5bec4a31",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 8409,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "couple",
+          "repeat": 1,
+          "wall_s": 8.47520193317905,
+          "sha256": "c7ab89b52ad4ff7315c94f704fffce427fb339810fc1461fa4548b2d5bec4a31",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 8373,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "text",
+          "repeat": 0,
+          "wall_s": 8.514775848947465,
+          "sha256": "a4c36fdf69e3e5b19a6bca4aae2d819108e5369e855c7a4f9d420839f28ae781",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 8420,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "text",
+          "repeat": 1,
+          "wall_s": 8.532547573093325,
+          "sha256": "a4c36fdf69e3e5b19a6bca4aae2d819108e5369e855c7a4f9d420839f28ae781",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 8434,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "edit",
+          "repeat": 0,
+          "wall_s": 17.280526500195265,
+          "sha256": "43a6909913991d248629b45bedad6e53b8832306da91b4b958a52bb94ad46eb5",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 17168,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "edit",
+          "repeat": 1,
+          "wall_s": 16.226054951082915,
+          "sha256": "43a6909913991d248629b45bedad6e53b8832306da91b4b958a52bb94ad46eb5",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 16102,
+            "format": "webp"
+          }
+        }
+      ],
+      "stage_medians": {
+        "portrait": {
+          "condition_s": 0.57,
+          "sampling_s": 5.66,
+          "decode_s": 2.43,
+          "deterministic_encoded_response": true
+        },
+        "couple": {
+          "condition_s": 0.43,
+          "sampling_s": 5.51,
+          "decode_s": 2.38,
+          "deterministic_encoded_response": true
+        },
+        "text": {
+          "condition_s": 0.42,
+          "sampling_s": 5.51,
+          "decode_s": 2.46,
+          "deterministic_encoded_response": true
+        },
+        "edit": {
+          "condition_s": 1.31,
+          "sampling_s": 11.73,
+          "decode_s": 2.45,
+          "deterministic_encoded_response": true
+        }
+      }
+    },
+    "lightning-base30": {
+      "artifact_dir": "/vfast/data/code/qwen-image-2.1-bench/comparison/lightning-base30",
+      "config": {
+        "BIND": "127.0.0.1",
+        "SD_MODEL": "/home/lee/models-fast/qwen-image-2.1/qwen-image-2.1-Q4_K_M.gguf",
+        "SD_DIFFUSION_MODEL": "/home/lee/models-fast/qwen-image-2.1/qwen-image-2.1-Q4_K_M.gguf",
+        "SD_LLM": "/home/lee/models-fast/qwen-image-2.1/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+        "SD_LLM_VISION": "/home/lee/models-fast/qwen-image-2.1/mmproj-Qwen3VL-8B-Instruct-F16.gguf",
+        "SD_VAE": "/home/lee/models-fast/qwen-image-2.1/vae/qwen_image_2.1_vae_bf16.safetensors",
+        "SD_PARAMS_BACKEND": "*=cpu",
+        "SD_REFERENCE_EDIT": "1",
+        "SD_VAE_TILING": "1",
+        "SD_NOTCH": "0",
+        "SD_CACHE_MODE": "off",
+        "SD_TELEPORT": "0",
+        "SD_WARMUP": "0",
+        "SD_LOG_LEVEL": "2",
+        "SD_IMAGE_FORMAT": "webp",
+        "SD_VAE_TILE_X": "64",
+        "SD_VAE_TILE_Y": "32",
+        "SD_VAE_TILE_OVERLAP": "0.5"
+      },
+      "startup_s": 0.5045829210430384,
+      "case_median_s": {
+        "portrait": 39.61862192675471,
+        "couple": 37.29322645114735,
+        "text": 37.82018636772409,
+        "edit": 85.7535953191109
+      },
+      "runs": [
+        {
+          "case": "portrait",
+          "repeat": 0,
+          "wall_s": 39.61862192675471,
+          "sha256": "ce0fbba0ad423a6aab00993f71a40063544e408bb155d138d300245c7dea2bc0",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 39524,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "couple",
+          "repeat": 0,
+          "wall_s": 37.29322645114735,
+          "sha256": "302893edf1a79f0727ce77645848199d1f3d788501cfbb15f24deb9d41f905c2",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 37191,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "text",
+          "repeat": 0,
+          "wall_s": 37.82018636772409,
+          "sha256": "3f8496b37f57bacf6e63d9642092519bc1c5a5a722d39cf272019c272da59e6e",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 37694,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "edit",
+          "repeat": 0,
+          "wall_s": 85.7535953191109,
+          "sha256": "c1f4340751cb53fe4bb1831b1d4a306bd02b930bf2b741b58e9ce6c7a9ebc141",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 85607,
+            "format": "webp"
+          }
+        }
+      ],
+      "stage_medians": {
+        "portrait": {
+          "condition_s": 1.44,
+          "sampling_s": 34.88,
+          "decode_s": 3.17,
+          "deterministic_encoded_response": true
+        },
+        "couple": {
+          "condition_s": 0.45,
+          "sampling_s": 34.33,
+          "decode_s": 2.39,
+          "deterministic_encoded_response": true
+        },
+        "text": {
+          "condition_s": 0.56,
+          "sampling_s": 34.69,
+          "decode_s": 2.43,
+          "deterministic_encoded_response": true
+        },
+        "edit": {
+          "condition_s": 2.51,
+          "sampling_s": 79.48,
+          "decode_s": 2.43,
+          "deterministic_encoded_response": true
+        }
+      }
+    },
+    "lightning-q4-untiled": {
+      "artifact_dir": "/vfast/data/code/qwen-image-2.1-bench/comparison/lightning-q4-untiled",
+      "config": {
+        "BIND": "127.0.0.1",
+        "SD_MODEL": "/home/lee/models-fast/qwen-image-2.1/qwen-image-2.1-Q4_K_M.gguf",
+        "SD_DIFFUSION_MODEL": "/home/lee/models-fast/qwen-image-2.1/qwen-image-2.1-Q4_K_M.gguf",
+        "SD_LLM": "/home/lee/models-fast/qwen-image-2.1/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+        "SD_LLM_VISION": "/home/lee/models-fast/qwen-image-2.1/mmproj-Qwen3VL-8B-Instruct-F16.gguf",
+        "SD_VAE": "/home/lee/models-fast/qwen-image-2.1/vae/qwen_image_2.1_vae_bf16.safetensors",
+        "SD_PARAMS_BACKEND": "*=cpu",
+        "SD_REFERENCE_EDIT": "1",
+        "SD_VAE_TILING": "0",
+        "SD_NOTCH": "0",
+        "SD_CACHE_MODE": "off",
+        "SD_TELEPORT": "0",
+        "SD_WARMUP": "0",
+        "SD_LOG_LEVEL": "2",
+        "SD_IMAGE_FORMAT": "webp",
+        "SD_VAE_TILE_X": "64",
+        "SD_VAE_TILE_Y": "32",
+        "SD_VAE_TILE_OVERLAP": "0.5",
+        "SD_ACCEL_PROFILE": "lightning",
+        "SD_DEFAULT_LORA": "/vfast/data/models/qwen-image-2.1-lightning/pytorch_lora_weights.safetensors"
+      },
+      "startup_s": 0.5050580888055265,
+      "case_median_s": {
+        "portrait": 12.406026055570692,
+        "edit": 19.5388669539243
+      },
+      "runs": [
+        {
+          "case": "portrait",
+          "repeat": 0,
+          "wall_s": 18.142256440594792,
+          "sha256": "6d1861ee63086214e6e8cbc768fd724555254c84edf82e2929bea2b011fcd5ef",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 18033,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "portrait",
+          "repeat": 1,
+          "wall_s": 12.406026055570692,
+          "sha256": "6d1861ee63086214e6e8cbc768fd724555254c84edf82e2929bea2b011fcd5ef",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 12297,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "edit",
+          "repeat": 0,
+          "wall_s": 21.20533616375178,
+          "sha256": "cc22651fce319b2b9f953b84f7ff1e9ab8633d0f826cea6d8fbd4e10af20caa1",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 21088,
+            "format": "webp"
+          }
+        },
+        {
+          "case": "edit",
+          "repeat": 1,
+          "wall_s": 19.5388669539243,
+          "sha256": "cc22651fce319b2b9f953b84f7ff1e9ab8633d0f826cea6d8fbd4e10af20caa1",
+          "metadata": {
+            "seed": 42,
+            "inference_time_ms": 19426,
+            "format": "webp"
+          }
+        }
+      ],
+      "stage_medians": {
+        "portrait": {
+          "condition_s": 0.58,
+          "sampling_s": 5.42,
+          "decode_s": 6.26,
+          "deterministic_encoded_response": true
+        },
+        "edit": {
+          "condition_s": 1.36,
+          "sampling_s": 11.13,
+          "decode_s": 6.34,
+          "deterministic_encoded_response": true
+        }
+      }
+    }
+  },
+  "gallery": "artifacts/qwen-lightning/comparison.webp"
+}

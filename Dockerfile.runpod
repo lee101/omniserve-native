@@ -20,6 +20,9 @@ RUN /usr/bin/ffmpeg -hide_banner -encoders 2>&1 | grep -q 'libvpx-vp9' \
 # The video person-routing workload imports both packages at runtime.
 RUN python -m pip install --no-cache-dir ultralytics opencv-python-headless
 
+# The anime-pose-control workload detects the reference pose on CPU with rtmlib.
+RUN python -m pip install --no-cache-dir rtmlib onnxruntime
+
 # Wan-Animate-2 landed after the latest stable Diffusers release. Pin the
 # reviewed integration commit so an image rebuild cannot silently change its
 # pipeline contract. NF4 is used only by the 20/28 GiB execution profiles.

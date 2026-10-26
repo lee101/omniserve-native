@@ -5,9 +5,6 @@ Loads the pinned reference weights the same way the Cog worker does — meta-dev
 instantiation, `assign=True` checkpoint adoption, and no base-transformer read —
 then denoises with one batched classifier-free-guidance forward per step and
 replays a prebuilt inductor cache so the first request never compiles.
-
-The weights are non-commercial: the handler fails closed until the operator sets
-`APPNZ_ANIMA_COMMERCIAL_LICENSE_ACCEPTED=1` after obtaining a CircleStone license.
 """
 
 from __future__ import annotations
@@ -44,7 +41,7 @@ COMPILE_MODE = os.getenv("ANIMA_COMPILE_MODE", "default")
 MAX_SEED = 2**31 - 1
 FORMATS = {"webp": ("WEBP", "image/webp"), "png": ("PNG", "image/png"), "jpeg": ("JPEG", "image/jpeg")}
 ALLOWED_INPUTS = {
-    "workload", "kind", "profile", "prompt", "negative_prompt", "width", "height",
+    "workload", "kind", "profile", "execution_profile", "_omniserve_profile", "_omniserve_retry", "prompt", "negative_prompt", "width", "height",
     "num_inference_steps", "guidance_scale", "seed", "output_format",
     "accel", "fused", "teleport", "teleport_fraction",
 }
@@ -93,10 +90,6 @@ def _anima_cog():
         return anima_cog
     except ModuleNotFoundError:
         return None
-
-
-def commercial_license_accepted() -> bool:
-    return os.getenv("APPNZ_ANIMA_COMMERCIAL_LICENSE_ACCEPTED", "").strip() == "1"
 
 
 def _inputs(job: dict) -> dict:
@@ -354,8 +347,6 @@ def generate(pipe, values: dict):
     return image, seed, meta
 
 def handler(job, pipe=None):
-    if not commercial_license_accepted():
-        raise RuntimeError("Anima hosting requires APPNZ_ANIMA_COMMERCIAL_LICENSE_ACCEPTED=1")
     values = _inputs(job)
     unknown = sorted(set(values) - ALLOWED_INPUTS)
     if unknown:

@@ -819,6 +819,25 @@ materially faster and more stable than Xet.
 
 Configure the animation adapter with `OMNISERVE_NATIVE_ANIMATION_UPSTREAM`, optionally rewrite its worker path with `OMNISERVE_NATIVE_ANIMATION_PATH`, and label it with `OMNISERVE_NATIVE_ANIMATION_MODEL`. The request carries the target rig family and bones plus `publish.r2`, `publish.searchable`, and `publish.collection`; the gateway also forces `X-Animation-Publish: r2-searchable`. The worker owns ACE command/animation-data conversion, BVH/GLB output, R2 upload, and atomic searchable-manifest updates. NVIDIA ACE currently provides Animation Graph, animation-data, gesture-command, and Audio2Face components rather than a general public text-to-full-body-motion model, so text planning belongs in that adapter instead of being represented as a native ACE model.
 
+## Video-to-motion worker
+
+`POST /v1/motion/video` relays to `workers/motion_worker.py`, a resident FastAPI worker (GEM-X, NVIDIA Open Model License weights, Apache-2.0 code) that turns a video of one person into a 27-joint skeleton clip in the `ardy-skeleton-motion-1` library format, optionally with native SOMA axis-angle rotations (`include_soma`). Set `OMNISERVE_NATIVE_MOTION_UPSTREAM` (path rewrite `OMNISERVE_NATIVE_MOTION_PATH`, label `OMNISERVE_NATIVE_MOTION_MODEL`, concurrency `OMNISERVE_NATIVE_MOTION_PERMITS`, default 1). The route is admitted like any paid request (not background tier); per-modality `/health` counters for motion are not exposed yet.
+
+```bash
+# worker (GPU, keeps YOLOX + ViTPose + SAM 3D Body + GEM resident)
+cd workers && MOTION_GEMX_ROOT=/path/to/GEM-X python motion_worker.py --port 8793
+OMNISERVE_NATIVE_MOTION_UPSTREAM=http://127.0.0.1:8793 ./build/omniserve-native --port 8791
+curl localhost:8791/v1/motion/video -d '{"video_url":"https://example.com/backflip.mp4","max_seconds":10}'
+```
+
+Request: `video_url` (public http/https; resolved addresses must be global, redirects are re-checked, at most 3) or `video_base64`; `backend` (`gem-x`), `static_cam` (default true; camera motion is not compensated, it falls back to a static camera), `fps_out` (5-60, default 20), `max_seconds` (rejected with 413 before any GPU work when the video is longer), `include_soma`, `name`, `prompt`. Response: `motion`, optional `soma`, `frames_in`, `fps_in`, per-stage `timings`, and `gpu_seconds` for cost accounting. Errors: 413/422 are input errors, 502 is a failed download, 503 while the models load (`GET /health` reports `loading`).
+
+Ground handling: GEM's world translation drifts vertically after flips, so heights are re-anchored using GEM's own foot-contact probabilities (heel/toe, threshold 0.5) and the offset is interpolated through flight; frame 0 faces +z with the hips at the xz origin. Horizontal drift is not corrected.
+
+Environment (pinned because the GEM-X GitHub tree and its Hugging Face weights were restructured on 2026-10-20 and no longer match): torch 2.10 + torchvision 0.25, `onnxruntime-gpu==1.22.0`, `warp-lang==1.10.1`, only `nvidia-cudnn-cu12` 9.10 (a second cuDNN build in the same directory breaks `cudnn`), `nvidia/GEM-X` revision `5b9a69d5ed4713ac4ba2a63b335e66db87279a3e`, `nvidia/SOMA-X` revision `6db1b4e8d737db240e680ca5358ae2897f2d9427` in `inputs/soma_assets`. `MOTION_ALLOW_PRIVATE_URLS=1` disables the address check for local testing only.
+
+Measured on a shared RTX 3090 Ti, 124 frames at 1344x768 (5.2 s). Best of three warm runs: 23.3 s GPU (SAM 3D Body features 13.9 s, ViTPose 5.0 s, YOLOX 3.7 s, GEM motion 0.38 s, SOMA FK 0.03 s), about $0.002 of GPU at $0.35/h. On the same machine while other jobs held the GPU and CPU (load average ~12) the identical request took 250-360 s, mostly YOLOX and SAM 3D Body, so absolute timings on shared hardware are not trustworthy: compare changes with interleaved A/B runs and take the minimum. Cold model load was 519 s the first time and 142-207 s with warm caches, plus 123 s of startup warm-up before `/health` reports `ok`. Tests: `pytest tests/test_motion_format.py tests/test_motion_worker.py` (no GPU).
+
 The public text-generator.io OpenAPI surface—feature extraction, summarization, speech generation, file/URL transcription, text generation, large generation, image captioning, and legacy engine completion—is explicitly routed. Native worker endpoints for image creation, inpainting, style transfer, captioning, TTS, and STT are also admitted through the same scheduler.
 
 ### Exact Music3 repeats
@@ -1257,3 +1276,28 @@ OMNISERVE_PROXY_PROXY_IMAGE=http://127.0.0.1:8791
 Authenticated `POST /v1/music/generations` relays lyrics and musical direction
 to the local YuE2 worker with memory-aware RunPod overflow. See
 [quality, pricing, configuration and validation](performance/yue2-music.md).
+
+## Anime control workloads
+
+Four registry workloads share `workloads/anime_control_core.py` (the 28-block Anima v1.0 DiT and LLM adapter, one sampler with per-step hooks, compile cache, warmup). Each loads its own pipeline, so serve them from separate endpoints or let the registry swap them by VRAM.
+
+| workload | aliases | conditioning | extra cost per step | inputs besides prompt/size/steps/seed |
+| --- | --- | --- | --- | --- |
+| `anime-pose-control` | `pose-control`, `anime-pose` | rtmlib skeleton (CPU), VAE latent added at patch-embed, adapter LoRA merged at load | none | `reference_image`, `control_strength`, `skeleton_style`, `hands`, `face`, `feet` |
+| `anime-regional-control` | `regional-control` | ControlNet-LLLite v2 on every self-attention q/k/v input | about 1% | `region_mask` or `regions` (rectangles), `control_strength`, `control_start`, `control_end` |
+| `anime-depth-control` | `depth-control` | VACE: four extra blocks, hints added after base blocks 0/7/14/21 | about 15% | `depth_image` or `reference_image` (estimated), `control_strength`, `control_start`, `control_end`, `invert_depth` |
+| `anime-sketch-control` | `sketch-control`, `canny-control` | Canny/scribble LoRA merged at load, control latent as a second frame | about 80% (double tokens) | `reference_image` (canny) or `edge_image`, `canny_low`, `canny_high` |
+
+Common inputs: `prompt`, `negative_prompt`, `width`/`height` (multiples of 16, 512-1024, at most 1 MP), `num_inference_steps` (24), `guidance_scale` (4), `cfg_cutoff` (0.6), `seed`, `output_format`. Each returns the image plus the control map it used, and a `timings` object. Regional colours do not bind to prompt words: use spatial words ("girl on the left") for that. The sketch LoRA was trained on Anima preview 3 and works on v1.0 with strong edge adherence (a heavy edge map can override the prompt); depth and regional adapters were trained on v1.0.
+
+Speed (shared RTX 3090 Ti, denoise only, 768 px): 28 steps 8.1 s; 24 steps with `cfg_cutoff` 0.6 (guidance dropped for the last 40% of steps, batch 2 to 1) 5.7 s, same pose and composition. 1024 px runs with automatic VAE tiling on cards under 30 GB (6 GB peak). Other levers: LoRA merged once at load, batched CFG with cached prompt embeddings, fused adaLN kernels (`anima_cog`), `torch.compile`. `max-autotune` compile did not finish in 6 minutes on this card and was dropped.
+
+Start-up: set `OMNISERVE_PRELOAD=anime-pose-control` (comma separated) and `runtime/handler.py` and `runtime/cog_pod.py` load those workloads and run their `warmup()` before accepting jobs, so no request pays for compilation. `warmup()` runs one request per size in `ANIME_CONTROL_WARMUP_SIZES` (default `1024x1024,768x768`) and writes the inductor cache to `ANIMA_COMPILE_ARTIFACT_DIR` (default `/runpod-volume/anima-compile-cache`), which later processes replay. To build it ahead of time on the target GPU:
+
+```bash
+python -m workloads.anime_pose_control --precompile 1024x1024 768x768
+```
+
+A fresh process replaying the artifact serves its first request in about 25 s instead of 85-107 s. Any package that installs an inductor post-grad pass at import (torchao does) disables the FX graph cache, so the core clears those passes before compiling.
+
+Pinned sources: `circlestone-labs/Anima` anime-base-v1.0, `Claquasse/Anima-Control-Pose` preview-2 and its detector ONNX files, `Sen-sou/Anima-LLLite-Regional-Controlnet`, `TaihoC/Anima-ControlNet-VACE-Depth`, `CabalResearch/Anima-Canny-Scribble-Adjustable-Control-LoRA`, `depth-anything/Depth-Anything-V2-Small-hf`.

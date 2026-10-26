@@ -59,6 +59,7 @@ typedef struct {
     oproxy_target *multimodal_upstream;
     oproxy_target *animation_upstream;
     oproxy_target *liveportrait_upstream;
+    oproxy_target *motion_upstream;
     oproxy_target *threed_upstream;
     oproxy_target *aux_upstream;
     int upstream_timeout_ms;
@@ -79,6 +80,7 @@ typedef struct {
     int multimodal_permits;
     int animation_permits;
     int liveportrait_permits;
+    int motion_permits;
     int threed_permits;
     int aux_permits;
     bool prefer_embedded_image;
@@ -1125,6 +1127,8 @@ static void handle_models(ohttp_request *req, const app_state *app) {
                                           "animation", "proxy-background");
     if (app->liveportrait_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_LIVEPORTRAIT_MODEL", "KwaiVGI/LivePortrait"),
                                              "portrait-animation", "proxy-background");
+    if (app->motion_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_MOTION_MODEL", "gem-x-soma-motion"),
+                                       "video-to-motion", "proxy");
     if (app->threed_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_3D_MODEL", "microsoft/TRELLIS.2-4B"),
                                        "image-to-3d", "proxy-background");
 #undef ADD_MODEL
@@ -4140,6 +4144,14 @@ static void route(ohttp_request *req, void *user) {
             TIER_BACKGROUND);
         return;
     }
+    if (ohttp_path_is(req, "/v1/motion/video")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_proxy_as(req, app, app->motion_upstream, app->motion_permits,
+                        "application/json",
+                        configured_path("OMNISERVE_NATIVE_MOTION_PATH", "/v1/motion/video"));
+        return;
+    }
     if (ohttp_path_is(req, "/v1/3d/generations")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
@@ -4350,6 +4362,7 @@ int main(int argc, char **argv) {
     app.multimodal_permits = configured_permits("OMNISERVE_NATIVE_MULTIMODAL_PERMITS", 1, slots);
     app.animation_permits = configured_permits("OMNISERVE_NATIVE_ANIMATION_PERMITS", slots, slots);
     app.liveportrait_permits = configured_permits("OMNISERVE_NATIVE_LIVEPORTRAIT_PERMITS", 1, slots);
+    app.motion_permits = configured_permits("OMNISERVE_NATIVE_MOTION_PERMITS", 1, slots);
     app.threed_permits = configured_permits("OMNISERVE_NATIVE_3D_PERMITS", slots, slots);
     app.aux_permits = configured_permits("OMNISERVE_NATIVE_AUX_PERMITS", 1, slots);
     const char *admission_env = getenv("OMNISERVE_NATIVE_ADMISSION_TIMEOUT_S");
@@ -4481,6 +4494,7 @@ int main(int argc, char **argv) {
     const char *multimodal_upstream = getenv("OMNISERVE_NATIVE_MULTIMODAL_UPSTREAM");
     const char *animation_upstream = getenv("OMNISERVE_NATIVE_ANIMATION_UPSTREAM");
     const char *liveportrait_upstream = getenv("OMNISERVE_NATIVE_LIVEPORTRAIT_UPSTREAM");
+    const char *motion_upstream = getenv("OMNISERVE_NATIVE_MOTION_UPSTREAM");
     const char *threed_upstream = getenv("OMNISERVE_NATIVE_3D_UPSTREAM");
     const char *aux_upstream = getenv("OMNISERVE_NATIVE_AUX_UPSTREAM");
     if (!llm_upstream) llm_upstream = unified_upstream;
@@ -4520,6 +4534,7 @@ int main(int argc, char **argv) {
     CREATE_UPSTREAM(multimodal_upstream, multimodal_upstream, "multimodal");
     CREATE_UPSTREAM(animation_upstream, animation_upstream, "animation");
     CREATE_UPSTREAM(liveportrait_upstream, liveportrait_upstream, "LivePortrait");
+    CREATE_UPSTREAM(motion_upstream, motion_upstream, "motion");
     CREATE_UPSTREAM(threed_upstream, threed_upstream, "3D");
     CREATE_UPSTREAM(aux_upstream, aux_upstream, "auxiliary");
     /* Read once into a local like every other upstream above: the macro
@@ -4808,6 +4823,7 @@ int main(int argc, char **argv) {
     oproxy_target_destroy(app.multimodal_upstream);
     oproxy_target_destroy(app.animation_upstream);
     oproxy_target_destroy(app.liveportrait_upstream);
+    oproxy_target_destroy(app.motion_upstream);
     oproxy_target_destroy(app.threed_upstream);
     oproxy_target_destroy(app.aux_upstream);
     for (int i = 0; i < app.image_model_upstream_count; i++)

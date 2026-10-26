@@ -1,4 +1,5 @@
 #include "obackend.h"
+#include <unistd.h>
 
 #ifdef USE_SD
 
@@ -506,6 +507,7 @@ static struct {
     size_t cache_bytes_max;
     int turbo_n; /* >0: distilled few-step schedule, nodes in turbo_nodes */
     float turbo_nodes[16];
+    bool lightning;
     char default_lora[1024]; /* applied to requests that carry no LoRA of their own */
     float default_lora_scale;
     bool notch;
@@ -513,7 +515,7 @@ static struct {
     float hq_threshold; /* EasyCache threshold for non-turbo text-to-image; 0 = use the global one */
 } g_cfg;
 
-/* Distilled few-step Qwen-Image (Viggle turbo) schedule: raw nodes pushed through the
+/* Distilled few-step Qwen-Image schedule: raw nodes pushed through the
  * pipeline's resolution-dependent exponential time shift, then a terminal 0. */
 static void turbo_sigmas(int width, int height, float *out) {
     double seq = (double)(width / 16) * (double)(height / 16);
@@ -527,6 +529,8 @@ static void turbo_sigmas(int width, int height, float *out) {
 }
 
 static void turbo_cfg_load(void) {
+    const char *profile = getenv("OMNISERVE_NATIVE_SD_ACCEL_PROFILE");
+    g_cfg.lightning = profile && strcmp(profile, "lightning") == 0;
     const char *lora = getenv("OMNISERVE_NATIVE_SD_DEFAULT_LORA");
     g_cfg.default_lora[0] = 0;
     g_cfg.default_lora_scale = sd_env_float("OMNISERVE_NATIVE_SD_DEFAULT_LORA_SCALE", 1.0f, -4.0f, 4.0f);
@@ -535,6 +539,7 @@ static void turbo_cfg_load(void) {
         fprintf(stderr, "sd: default LoRA %s scale=%.2f\n", lora, (double)g_cfg.default_lora_scale);
     }
     const char *spec = getenv("OMNISERVE_NATIVE_SD_TURBO_NODES");
+    if (g_cfg.lightning) spec = "1,0.75,0.5,0.25";
     g_cfg.turbo_n = 0;
     if (!spec || !spec[0]) return;
     float nodes[16];
@@ -969,10 +974,19 @@ bool osd_init(const char *model_path) {
     if (!sd_lib_load()) return false;
     sd_cfg_load();
     snprintf(g_model_path, sizeof g_model_path, "%s", model_path ? model_path : "");
+    const char *profile = getenv("OMNISERVE_NATIVE_SD_ACCEL_PROFILE");
+    if (profile && profile[0] && strcmp(profile, "lightning") && strcmp(profile, "viggle")) {
+        fprintf(stderr, "sd: unknown acceleration profile: %s\n", profile);
+        return false;
+    }
+    if (g_cfg.lightning && (!g_cfg.default_lora[0] || access(g_cfg.default_lora, R_OK))) {
+        fprintf(stderr, "sd: lightning requires a readable absolute OMNISERVE_NATIVE_SD_DEFAULT_LORA\n");
+        return false;
+    }
     const char *diffusion = getenv("OMNISERVE_NATIVE_SD_DIFFUSION_MODEL");
     g_sd = sd_ctx_build(model_path, false);
     if (!g_sd) return false;
-    g_reference_edit = sd_env_flag("OMNISERVE_NATIVE_SD_REFERENCE_EDIT", false);
+    g_reference_edit = g_cfg.lightning || sd_env_flag("OMNISERVE_NATIVE_SD_REFERENCE_EDIT", false);
     const char *named_path = diffusion && diffusion[0] ? diffusion : model_path;
     if (!named_path) named_path = "";
     const char *slash = strrchr(named_path, '/');
@@ -1056,9 +1070,9 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         params.vae_tiling_params.tile_size_y = g_cfg.tile_y;
         params.vae_tiling_params.target_overlap = g_cfg.tile_overlap;
     }
-    /* Turbo only for plain text-to-image: reference edits and requests that bring their
-     * own LoRA keep the base schedule, so edit quality is untouched. */
-    bool turbo = g_cfg.turbo_n > 0 && !req->image_pixels && !req->lora_count && req->turbo != 2;
+    /* Only Lightning is trained for distilled reference edits. */
+    bool turbo = g_cfg.turbo_n > 0 && (!req->image_pixels || g_cfg.lightning) &&
+                 !req->lora_count && req->turbo != 2;
     float turbo_sig[17];
     if (turbo) {
         turbo_sigmas(params.width, params.height, turbo_sig);
@@ -1077,6 +1091,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     }
     if (req->flow_shift > 0.0f) params.sample_params.flow_shift = req->flow_shift;
     if (req->extra_args[0]) params.sample_params.extra_sample_args = req->extra_args;
+    if (turbo && g_cfg.lightning) params.sample_params.sample_method = EULER_SAMPLE_METHOD;
     params.seed = req->seed;
     sd_image_t source_image = {0};
     if (req->image_pixels) {
@@ -1088,7 +1103,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         if (g_reference_edit) {
             params.ref_images = &source_image;
             params.ref_images_count = 1;
-            params.sample_params.flow_shift = g_cfg.flow_shift;
+            params.sample_params.flow_shift = req->flow_shift > 0.0f ? req->flow_shift : g_cfg.flow_shift;
         } else {
             params.init_image = source_image;
             params.strength = req->strength;

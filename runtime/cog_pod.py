@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from runtime.handler import dispatch  # noqa: E402  (needs the path above)
+from runtime.handler import dispatch, preload  # noqa: E402  (needs the path above)
 
 PORT = int(os.getenv("COG_PORT", "5000"))
 MAX_BODY = int(os.getenv("COG_MAX_BODY_BYTES", str(8 << 20)))
@@ -125,6 +125,7 @@ def _workloads() -> list[str]:
 
 def main() -> int:
     host = os.getenv("COG_HOST", "0.0.0.0")
+    print(f"[cog-pod] preloaded={preload()}", flush=True)
     server = ThreadingHTTPServer((host, PORT), Handler)
     server.daemon_threads = True
     print(f"[cog-pod] listening on {host}:{PORT}; workloads={_workloads()}", flush=True)
