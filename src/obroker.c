@@ -135,7 +135,7 @@ int obroker_lease(const char *base_url, const char *owner, int pid, int mb, int 
 
 bool obroker_release(const char *base_url, const char *lease_id) {
     if (!lease_id || !lease_id[0]) return false;
-    char body[128];
+    char body[192];
     snprintf(body, sizeof body, "{\"lease_id\":\"%s\"}", lease_id);
     return post_json(base_url, "/v1/gpu/release", body, 3000, NULL, 0) == 200;
 }

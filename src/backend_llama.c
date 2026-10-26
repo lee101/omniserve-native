@@ -2371,9 +2371,15 @@ static struct llama_sampler *dry_sampler(float mult, float base, int allowed) {
         }
         if (slot < 0 && !g_dry_cache[i].s) slot = i;
     }
+#ifdef LLAMA_DRY_MAX_SEQ_BREAKERS
+    struct llama_sampler *t = llama_sampler_init_dry(g_vocab, mult, base, allowed,
+                                                     llama_model_n_ctx_train(g_model), breakers,
+                                                     sizeof breakers / sizeof *breakers);
+#else
     struct llama_sampler *t = llama_sampler_init_dry(g_vocab, llama_model_n_ctx_train(g_model),
                                                      mult, base, allowed, -1, breakers,
                                                      sizeof breakers / sizeof *breakers);
+#endif
     if (slot < 0) {
         pthread_mutex_unlock(&g_dry_lock);
         return t;
@@ -3510,8 +3516,13 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
          * sampler, so "whole context" has to be spelled out as n_ctx. */
         last_n = req->repetition_last_n ? req->repetition_last_n : penalty_last_n_default();
         if (last_n < 0) last_n = g_ctx_len;
+#ifdef LLAMA_DRY_MAX_SEQ_BREAKERS
+        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(llama_vocab_n_tokens(g_vocab),
+            last_n, repetition, req->frequency_penalty, req->presence_penalty));
+#else
         llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
             last_n, repetition, req->frequency_penalty, req->presence_penalty));
+#endif
     }
     if (dry) {
         llama_sampler_chain_add(smpl, dry_sampler(req->dry_multiplier,
