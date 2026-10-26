@@ -1,0 +1,15 @@
+diffusers==0.38.0
+transformers==5.12.1
+accelerate==1.14.0
+safetensors==0.8.0
+huggingface-hub==1.28.0
+tokenizers==0.22.2
+sentencepiece==0.2.2
+opencv-python-headless==5.0.0.93
+onnxruntime==1.31.0
+rtmlib==0.0.16
+requests==2.34.2
+pyyaml
+regex
+tqdm
+runpod

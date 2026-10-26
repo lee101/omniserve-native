@@ -96,7 +96,28 @@ static void test_image_contract(void) {
     CHECK(oimage_request_parse(edit, strlen(edit), &request, error, sizeof error));
     CHECK(request.generation.image_base64 && strcmp(request.generation.image_base64, "YWJj") == 0);
     CHECK(fabsf(request.generation.strength - 0.4f) < 0.0001f);
+    CHECK(request.generation.steps == 9 && request.generation.guidance_scale == 0.0f && !request.generation.extra_args[0]);
     oimage_request_free(&request);
+    setenv("OMNISERVE_NATIVE_SD_EDIT_STEPS", "16", 1);
+    setenv("OMNISERVE_NATIVE_SD_EDIT_MIN_GUIDANCE", "4", 1);
+    setenv("OMNISERVE_NATIVE_SD_EDIT_EXTRA_ARGS", "cfg_end=0.5", 1);
+    CHECK(oimage_request_parse(edit, strlen(edit), &request, error, sizeof error));
+    CHECK(request.generation.steps == 16 && request.generation.guidance_scale == 4.0f);
+    CHECK(strcmp(request.generation.extra_args, "cfg_end=0.5") == 0);
+    oimage_request_free(&request);
+    const char *explicit_edit = "{\"prompt\":\"p\",\"image_base64\":\"YWJj\",\"steps\":20,\"guidance_scale\":1.0,"
+                                "\"extra_sample_args\":\"cfg_end=1\"}";
+    CHECK(oimage_request_parse(explicit_edit, strlen(explicit_edit), &request, error, sizeof error));
+    CHECK(request.generation.steps == 20 && request.generation.guidance_scale == 4.0f);
+    CHECK(strcmp(request.generation.extra_args, "cfg_end=1") == 0);
+    oimage_request_free(&request);
+    const char *plain = "{\"prompt\":\"p\"}";
+    CHECK(oimage_request_parse(plain, strlen(plain), &request, error, sizeof error));
+    CHECK(request.generation.steps == 9 && request.generation.guidance_scale == 0.0f && !request.generation.extra_args[0]);
+    oimage_request_free(&request);
+    unsetenv("OMNISERVE_NATIVE_SD_EDIT_STEPS");
+    unsetenv("OMNISERVE_NATIVE_SD_EDIT_MIN_GUIDANCE");
+    unsetenv("OMNISERVE_NATIVE_SD_EDIT_EXTRA_ARGS");
     const char *bad_edits[] = {
         "{\"prompt\":\"p\",\"image_base64\":\"\"}",
         "{\"prompt\":\"p\",\"image_base64\":true}",

@@ -504,6 +504,7 @@ bool oimage_request_parse(const char *json, size_t json_len, oimage_request *req
     int steps = request->generation.steps;
     token = oj_obj_get(json, tokens, token_count, 0, "steps");
     if (token < 0) token = oj_obj_get(json, tokens, token_count, 0, "num_inference_steps");
+    bool steps_given = token >= 0;
     if (token >= 0 && !token_int(json, &tokens[token], &steps)) {
         set_error(error, error_cap, "steps must be an integer");
         oimage_request_free(request);
@@ -809,6 +810,22 @@ bool oimage_request_parse(const char *json, size_t json_len, oimage_request *req
     if (min_steps < 0) min_steps = image_env_int("OMNISERVE_NATIVE_SD_MIN_STEPS", 0, 0, 100);
     if (!request->generation.image_base64 && request->generation.steps < min_steps)
         request->generation.steps = min_steps;
+    /* Reference edits follow the instruction weakly without CFG (qualitybench/edit): the lane can set a step count
+     * for requests that omit one, a guidance floor that also lifts clients hardcoding the text-to-image CFG 1, and
+     * default sd.cpp sample args (cfg_end) for requests that send none. */
+    if (request->generation.image_base64) {
+        int edit_steps = image_env_int("OMNISERVE_NATIVE_SD_EDIT_STEPS", 0, 0, 100);
+        const char *g = getenv("OMNISERVE_NATIVE_SD_EDIT_MIN_GUIDANCE");
+        float edit_min_guidance = g && g[0] ? strtof(g, NULL) : 0.0f;
+        if (!(edit_min_guidance >= 0.0f && edit_min_guidance <= 30.0f)) edit_min_guidance = 0.0f;
+        const char *edit_args = getenv("OMNISERVE_NATIVE_SD_EDIT_EXTRA_ARGS");
+        if (edit_args && (strlen(edit_args) >= sizeof request->generation.extra_args || !extra_args_bounded(edit_args)))
+            edit_args = NULL;
+        if (edit_steps && !steps_given) request->generation.steps = edit_steps;
+        if (request->generation.guidance_scale < edit_min_guidance) request->generation.guidance_scale = edit_min_guidance;
+        if (edit_args && edit_args[0] && !request->generation.extra_args[0])
+            memcpy(request->generation.extra_args, edit_args, strlen(edit_args) + 1);
+    }
     return true;
 }
 

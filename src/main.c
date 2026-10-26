@@ -56,6 +56,7 @@ typedef struct {
     oproxy_target *embedding_upstream;
     oproxy_target *multimodal_upstream;
     oproxy_target *animation_upstream;
+    oproxy_target *motion_upstream;
     oproxy_target *threed_upstream;
     oproxy_target *aux_upstream;
     int upstream_timeout_ms;
@@ -73,6 +74,7 @@ typedef struct {
     int embedding_permits;
     int multimodal_permits;
     int animation_permits;
+    int motion_permits;
     int threed_permits;
     int aux_permits;
     bool prefer_embedded_image;
@@ -1085,6 +1087,8 @@ static void handle_models(ohttp_request *req, const app_state *app) {
                                            "multimodal", "proxy");
     if (app->animation_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_ANIMATION_MODEL", "nvidia-ace-animation"),
                                           "animation", "proxy-background");
+    if (app->motion_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_MOTION_MODEL", "gem-x-soma-motion"),
+                                       "video-to-motion", "proxy");
     if (app->threed_upstream) ADD_MODEL(env_or("OMNISERVE_NATIVE_3D_MODEL", "microsoft/TRELLIS.2-4B"),
                                        "image-to-3d", "proxy-background");
 #undef ADD_MODEL
@@ -1911,6 +1915,41 @@ static void guard_refuse_completion(ohttp_request *req, bool legacy, oguard_cate
     ohttp_respond_h(req, 200, "application/json", body, n > 0 ? (size_t)n : 0, hdr);
 }
 
+static void parse_sampling(const char *js, const oj_tok *toks, int n, int root,
+                           ochat_req *out, bool legacy) {
+    const char *dry_env = getenv("OMNISERVE_NATIVE_DRY_MULTIPLIER");
+    if (dry_env && dry_env[0]) out->dry_multiplier = (float)atof(dry_env);
+    int t = oj_obj_get(js, toks, n, root, legacy ? "max_length" : "max_tokens");
+    if (t >= 0) out->max_tokens = (int)oj_number(js, &toks[t], out->max_tokens);
+    t = oj_obj_get(js, toks, n, root, "temperature");
+    if (t >= 0) out->temperature = (float)oj_number(js, &toks[t], out->temperature);
+    t = oj_obj_get(js, toks, n, root, "top_p");
+    if (t >= 0) out->top_p = (float)oj_number(js, &toks[t], out->top_p);
+    t = oj_obj_get(js, toks, n, root, "min_p");
+    if (t >= 0) out->min_p = (float)oj_number(js, &toks[t], out->min_p);
+    t = oj_obj_get(js, toks, n, root, "min_probability");
+    if (t >= 0) out->min_probability = (float)oj_number(js, &toks[t], out->min_probability);
+    t = oj_obj_get(js, toks, n, root, "top_k");
+    if (t >= 0) out->top_k = (int)oj_number(js, &toks[t], out->top_k);
+    t = oj_obj_get(js, toks, n, root, "repetition_penalty");
+    if (t >= 0) out->repetition_penalty = (float)oj_number(js, &toks[t], out->repetition_penalty);
+    t = oj_obj_get(js, toks, n, root, "repetition_last_n");
+    if (t < 0) t = oj_obj_get(js, toks, n, root, "repeat_last_n");
+    if (t >= 0) out->repetition_last_n = (int)oj_number(js, &toks[t], out->repetition_last_n);
+    t = oj_obj_get(js, toks, n, root, "frequency_penalty");
+    if (t >= 0) out->frequency_penalty = (float)oj_number(js, &toks[t], out->frequency_penalty);
+    t = oj_obj_get(js, toks, n, root, "presence_penalty");
+    if (t >= 0) out->presence_penalty = (float)oj_number(js, &toks[t], out->presence_penalty);
+    t = oj_obj_get(js, toks, n, root, "dry_multiplier");
+    if (t >= 0) out->dry_multiplier = (float)oj_number(js, &toks[t], out->dry_multiplier);
+    t = oj_obj_get(js, toks, n, root, "dry_base");
+    if (t >= 0) out->dry_base = (float)oj_number(js, &toks[t], out->dry_base);
+    t = oj_obj_get(js, toks, n, root, "dry_allowed_length");
+    if (t >= 0) out->dry_allowed_length = (int)oj_number(js, &toks[t], out->dry_allowed_length);
+    t = oj_obj_get(js, toks, n, root, "seed");
+    if (t >= 0) out->seed = (int64_t)oj_number(js, &toks[t], out->seed);
+}
+
 static void handle_chat(ohttp_request *req, app_state *app) {
     if (!llm_ensure_loaded(app, request_tier(req))) {
         respond_error(req, 503, "no LLM model loaded; start with OMNISERVE_NATIVE_LLM_GGUF");
@@ -1992,23 +2031,8 @@ static void handle_chat(ohttp_request *req, app_state *app) {
                        .temperature = 0.8f, .top_p = 0.92f, .top_k = 40,
                        .repetition_penalty = 1.0f, .seed = -1,
                        .enable_thinking = thinking_default };
-    int t = oj_obj_get(req->body, toks, n, 0, "max_tokens");
-    if (t >= 0) creq.max_tokens = (int)oj_number(req->body, &toks[t], 512);
-    t = oj_obj_get(req->body, toks, n, 0, "temperature");
-    if (t >= 0) creq.temperature = (float)oj_number(req->body, &toks[t], 0.8);
-    t = oj_obj_get(req->body, toks, n, 0, "top_p");
-    if (t >= 0) creq.top_p = (float)oj_number(req->body, &toks[t], 0.92);
-    t = oj_obj_get(req->body, toks, n, 0, "min_p");
-    if (t >= 0) creq.min_p = (float)oj_number(req->body, &toks[t], 0.0);
-    t = oj_obj_get(req->body, toks, n, 0, "min_probability");
-    if (t >= 0) creq.min_probability = (float)oj_number(req->body, &toks[t], 0.0);
-    t = oj_obj_get(req->body, toks, n, 0, "top_k");
-    if (t >= 0) creq.top_k = (int)oj_number(req->body, &toks[t], 40);
-    t = oj_obj_get(req->body, toks, n, 0, "repetition_penalty");
-    if (t >= 0) creq.repetition_penalty = (float)oj_number(req->body, &toks[t], 1.0);
-    t = oj_obj_get(req->body, toks, n, 0, "seed");
-    if (t >= 0) creq.seed = (int64_t)oj_number(req->body, &toks[t], -1);
-    t = oj_obj_get(req->body, toks, n, 0, "enable_thinking");
+    parse_sampling(req->body, toks, n, 0, &creq, false);
+    int t = oj_obj_get(req->body, toks, n, 0, "enable_thinking");
     if (t >= 0) creq.enable_thinking = oj_bool(req->body, &toks[t], thinking_default);
     const char *stop_values[16];
     creq.stop_count = parse_stop_values(req->body, toks, n, 0, "stop", stop_values,
@@ -2118,26 +2142,6 @@ static bool append_literal(char **buf, size_t *len, size_t *cap, const char *tex
     *len += n;
     (*buf)[*len] = 0;
     return true;
-}
-
-static void parse_sampling(const char *js, const oj_tok *toks, int n, int root,
-                           ochat_req *out, bool legacy) {
-    int t = oj_obj_get(js, toks, n, root, legacy ? "max_length" : "max_tokens");
-    if (t >= 0) out->max_tokens = (int)oj_number(js, &toks[t], out->max_tokens);
-    t = oj_obj_get(js, toks, n, root, "temperature");
-    if (t >= 0) out->temperature = (float)oj_number(js, &toks[t], out->temperature);
-    t = oj_obj_get(js, toks, n, root, "top_p");
-    if (t >= 0) out->top_p = (float)oj_number(js, &toks[t], out->top_p);
-    t = oj_obj_get(js, toks, n, root, "min_p");
-    if (t >= 0) out->min_p = (float)oj_number(js, &toks[t], out->min_p);
-    t = oj_obj_get(js, toks, n, root, "min_probability");
-    if (t >= 0) out->min_probability = (float)oj_number(js, &toks[t], out->min_probability);
-    t = oj_obj_get(js, toks, n, root, "top_k");
-    if (t >= 0) out->top_k = (int)oj_number(js, &toks[t], out->top_k);
-    t = oj_obj_get(js, toks, n, root, "repetition_penalty");
-    if (t >= 0) out->repetition_penalty = (float)oj_number(js, &toks[t], out->repetition_penalty);
-    t = oj_obj_get(js, toks, n, root, "seed");
-    if (t >= 0) out->seed = (int64_t)oj_number(js, &toks[t], out->seed);
 }
 
 static void handle_completion(ohttp_request *req, app_state *app, bool legacy, bool autocomplete) {
@@ -3785,6 +3789,14 @@ static void route(ohttp_request *req, void *user) {
             TIER_BACKGROUND);
         return;
     }
+    if (ohttp_path_is(req, "/v1/motion/video")) {
+        if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_proxy_as(req, app, app->motion_upstream, app->motion_permits,
+                        "application/json",
+                        configured_path("OMNISERVE_NATIVE_MOTION_PATH", "/v1/motion/video"));
+        return;
+    }
     if (ohttp_path_is(req, "/v1/3d/generations")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
         if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
@@ -3989,6 +4001,7 @@ int main(int argc, char **argv) {
     app.embedding_permits = configured_permits("OMNISERVE_NATIVE_EMBEDDING_PERMITS", 1, slots);
     app.multimodal_permits = configured_permits("OMNISERVE_NATIVE_MULTIMODAL_PERMITS", 1, slots);
     app.animation_permits = configured_permits("OMNISERVE_NATIVE_ANIMATION_PERMITS", slots, slots);
+    app.motion_permits = configured_permits("OMNISERVE_NATIVE_MOTION_PERMITS", 1, slots);
     app.threed_permits = configured_permits("OMNISERVE_NATIVE_3D_PERMITS", slots, slots);
     app.aux_permits = configured_permits("OMNISERVE_NATIVE_AUX_PERMITS", 1, slots);
     const char *admission_env = getenv("OMNISERVE_NATIVE_ADMISSION_TIMEOUT_S");
@@ -4105,6 +4118,7 @@ int main(int argc, char **argv) {
     const char *embedding_upstream = getenv("OMNISERVE_NATIVE_EMBEDDING_UPSTREAM");
     const char *multimodal_upstream = getenv("OMNISERVE_NATIVE_MULTIMODAL_UPSTREAM");
     const char *animation_upstream = getenv("OMNISERVE_NATIVE_ANIMATION_UPSTREAM");
+    const char *motion_upstream = getenv("OMNISERVE_NATIVE_MOTION_UPSTREAM");
     const char *threed_upstream = getenv("OMNISERVE_NATIVE_3D_UPSTREAM");
     const char *aux_upstream = getenv("OMNISERVE_NATIVE_AUX_UPSTREAM");
     if (!llm_upstream) llm_upstream = unified_upstream;
@@ -4142,6 +4156,7 @@ int main(int argc, char **argv) {
     CREATE_UPSTREAM(embedding_upstream, embedding_upstream, "embedding");
     CREATE_UPSTREAM(multimodal_upstream, multimodal_upstream, "multimodal");
     CREATE_UPSTREAM(animation_upstream, animation_upstream, "animation");
+    CREATE_UPSTREAM(motion_upstream, motion_upstream, "motion");
     CREATE_UPSTREAM(threed_upstream, threed_upstream, "3D");
     CREATE_UPSTREAM(aux_upstream, aux_upstream, "auxiliary");
     /* Read once into a local like every other upstream above: the macro
@@ -4392,6 +4407,7 @@ int main(int argc, char **argv) {
     oproxy_target_destroy(app.embedding_upstream);
     oproxy_target_destroy(app.multimodal_upstream);
     oproxy_target_destroy(app.animation_upstream);
+    oproxy_target_destroy(app.motion_upstream);
     oproxy_target_destroy(app.threed_upstream);
     oproxy_target_destroy(app.aux_upstream);
     for (int i = 0; i < app.image_model_upstream_count; i++)

@@ -348,7 +348,47 @@ def dispatch(job: dict) -> dict:
             return result
 
 
+def preload(names=None) -> list[str]:
+    """Load workloads and run their optional `warmup()` before serving traffic."""
+    if names is None:
+        names = os.getenv("OMNISERVE_PRELOAD", "").split(",")
+    warmed = []
+    for raw in names:
+        requested = raw.strip().lower()
+        if not requested:
+            continue
+        base_definition = _load_registry().get(requested)
+        if base_definition is None:
+            raise ValueError(f"cannot preload unknown workload {requested!r}")
+        with _dispatch_lock:
+            definition = _profile_for(base_definition, "auto")
+            name = definition["name"]
+            if name in _loaded_modules:
+                continue
+            if ENFORCE_VRAM:
+                _make_room(definition["required_mib"])
+            lease = _acquire_vram_lease(definition["required_mib"], name)
+            if not lease.get("granted"):
+                raise RuntimeError(f"global GPU admission denied: {lease.get('reason', 'no_headroom')}")
+            try:
+                module = importlib.import_module(definition["module"])
+                _loaded_modules[name] = {
+                    "module": module,
+                    "required_mib": definition["required_mib"],
+                    "profile": definition["profile"],
+                    "last_used": time.monotonic(),
+                }
+                warm = getattr(module, "warmup", None)
+                if callable(warm):
+                    warm()
+            finally:
+                _release_vram_lease(lease)
+        warmed.append(name)
+    return warmed
+
+
 if __name__ == "__main__":
     if runpod is None:
         raise RuntimeError("the RunPod SDK is required for the serverless entry point")
+    preload()
     runpod.serverless.start({"handler": dispatch})
