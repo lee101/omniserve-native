@@ -119,6 +119,9 @@ Constrained GPU VAE decode can use `OMNISERVE_NATIVE_SD_VAE_TILING=1` without
 moving the VAE to CPU. Latent tile width and height default to 32 and are controlled by
 `OMNISERVE_NATIVE_SD_VAE_TILE_X`, `_Y`, and `_OVERLAP` (default 0.5). Keep this
 behind the image parity gate because tiling changes the decode graph.
+`OMNISERVE_NATIVE_SD_VAE_CONV_DIRECT=1` runs VAE convolutions as implicit GEMM
+(no im2col buffer); pixels are not bit-identical to the default path (F32 vs F16
+accumulation), so it is also parity-gated (PSNR, not md5).
 
 Other tuning: `OMNISERVE_NATIVE_PORT`, `BIND`, `SLOTS`, `SECRET`, `LLM_GGUF`, `LLM_SWAP_DIR`, `LLM_CONTEXTS`, `NGL`, `NGL_AUTO_KEEP_FREE_MB`, `CTX`, `BATCH`, `UBATCH` (both accept `auto`), `KV_TYPE` (`f16` default, `q8_0` halves the KV cache at no measured quality cost — see `performance/quality.md`), `FLASH_ATTN` (auto; forced on for a quantized cache because llama.cpp requires it for a quantized V), `EMBEDDING_GGUF`, `EMBEDDING_NGL` (defaults to CPU), `EMBEDDING_CTX`, `EMBEDDING_POOLING` (`mean` default, `cls` for retrieval finetunes like gte-modernbert), `EMBEDDING_THREADS`, `SD_MODEL`, `ADMISSION_TIMEOUT_S`, `UPSTREAM_TIMEOUT_MS`, `REACTORS`, `WORKERS`, and per-modality `LLM_PERMITS`, `IMAGE_PERMITS`, `TTS_PERMITS`, `STT_PERMITS`, `EMBEDDING_PERMITS`, `MULTIMODAL_PERMITS`, `ANIMATION_PERMITS`, `3D_PERMITS`, and `AUX_PERMITS`.
 
