@@ -1,0 +1,72 @@
+[
+ {
+  "id": "bg_beach",
+  "key": "57288ae252f43831390e2121a84b1780",
+  "category": "background_change",
+  "instruction": "Adjust the background to a beach.",
+  "file": "bg_beach.jpg"
+ },
+ {
+  "id": "hair_short_black",
+  "key": "bc659e44391c92449841e3cd72dcd17b",
+  "category": "color_alter",
+  "instruction": "Make her hair shorter and darker, black.",
+  "file": "hair_short_black.jpg"
+ },
+ {
+  "id": "woman_laughing",
+  "key": "72fc47119a7cd90ecdcbf073c3fb74be",
+  "category": "motion_change",
+  "instruction": "make the action of the woman to laughing",
+  "file": "woman_laughing.jpg"
+ },
+ {
+  "id": "look_younger",
+  "key": "58d48d76e4705b16a6f03337fc6397e8",
+  "category": "ps_human",
+  "instruction": "Make her look younger",
+  "file": "look_younger.jpg"
+ },
+ {
+  "id": "miyazaki",
+  "key": "4c14aafd852de6b46042af27c98c6a27",
+  "category": "style_change",
+  "instruction": "Apply the art style of Hayao Miyazaki's animated films.",
+  "file": "miyazaki.jpg"
+ },
+ {
+  "id": "add_book",
+  "key": "462493728c812ed7b9a46d35bd923d34",
+  "category": "subject-add",
+  "instruction": "add a book in her hand",
+  "file": "add_book.jpg"
+ },
+ {
+  "id": "remove_person",
+  "key": "2ebb31e51f0de8bba7005352df7150b8",
+  "category": "subject-remove",
+  "instruction": "Remove the person in the distance wearing red clothes and a green backpack.",
+  "file": "remove_person.jpg"
+ },
+ {
+  "id": "id_shirt",
+  "key": "e5c8aea1b4db7ee5e173bcc122a4ba8f",
+  "category": "subject-replace",
+  "instruction": "This is an ID photo—please replace the clothing with a white dress shirt.",
+  "file": "id_shirt.jpg"
+ },
+ {
+  "id": "text_england",
+  "key": "680553ae15691f30c9f717b5eac38ee9",
+  "category": "text_change",
+  "instruction": "Replace the text 'LONDON' with 'ENGLAND'",
+  "file": "text_england.jpg"
+ },
+ {
+  "id": "snowstorm",
+  "key": "3549b73c635e7f5d67d728bd582daffd",
+  "category": "tone_transfer",
+  "instruction": "change the weather to snowstorm",
+  "file": "snowstorm.jpg"
+ }
+]

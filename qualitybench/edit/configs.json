@@ -1,0 +1,88 @@
+{
+ "mg_square_s9_c1": {
+  "steps": 9,
+  "size_policy": "square"
+ },
+ "s9_c1": {
+  "steps": 9
+ },
+ "s20_c1": {
+  "steps": 20,
+  "guidance_scale": 1.0
+ },
+ "s30_c1": {
+  "steps": 30,
+  "guidance_scale": 1.0
+ },
+ "s20_c2.5": {
+  "steps": 20,
+  "guidance_scale": 2.5
+ },
+ "s20_c4": {
+  "steps": 20,
+  "guidance_scale": 4.0
+ },
+ "s20_c6": {
+  "steps": 20,
+  "guidance_scale": 6.0
+ },
+ "s12_c4": {
+  "steps": 12,
+  "guidance_scale": 4.0
+ },
+ "s16_c4": {
+  "steps": 16,
+  "guidance_scale": 4.0
+ },
+ "s20_c3": {
+  "steps": 20,
+  "guidance_scale": 3.0
+ },
+ "s20_c4_ec15": {
+  "steps": 20,
+  "guidance_scale": 4.0,
+  "cache_threshold": 0.15
+ },
+ "s20_c4_fs2": {
+  "steps": 20,
+  "guidance_scale": 4.0,
+  "flow_shift": 2.0
+ },
+ "s20_c4_neg": {
+  "steps": 20,
+  "guidance_scale": 4.0,
+  "negative_prompt": "blurry, low quality, distorted, deformed, artifacts, oversaturated, watermark"
+ },
+ "s8_c4": {
+  "steps": 8,
+  "guidance_scale": 4.0
+ },
+ "s10_c4": {
+  "steps": 10,
+  "guidance_scale": 4.0
+ },
+ "s16_c4_ec15": {
+  "steps": 16,
+  "guidance_scale": 4.0,
+  "cache_threshold": 0.15
+ },
+ "s14_c4": {
+  "steps": 14,
+  "guidance_scale": 4.0
+ },
+ "s16_c4_ce50": {
+  "steps": 16,
+  "guidance_scale": 4.0,
+  "extra_sample_args": "cfg_end=0.5"
+ },
+ "s16_c4_ce35": {
+  "steps": 16,
+  "guidance_scale": 4.0,
+  "extra_sample_args": "cfg_end=0.35"
+ },
+ "s20_c4_ce40": {
+  "steps": 20,
+  "guidance_scale": 4.0,
+  "extra_sample_args": "cfg_end=0.4"
+ }
+}
