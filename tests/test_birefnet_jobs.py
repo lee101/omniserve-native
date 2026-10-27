@@ -339,6 +339,8 @@ class AdaptiveCudaGuardTest(unittest.TestCase):
 
 @unittest.skipIf(worker.video_matting is None, "video matting dependencies unavailable")
 class VideoBackgroundRemovalTest(unittest.TestCase):
+    needs_pydantic_v2 = unittest.skipUnless(hasattr(worker.VideoBackgroundRequest, "model_dump"), "pydantic v2 required")
+
     def test_video_encoder_blacks_transparent_rgb(self):
         import numpy as np
 
@@ -358,6 +360,7 @@ class VideoBackgroundRemovalTest(unittest.TestCase):
             output_public_url="https://cdn.example.test/result.webm",
         )
 
+    @needs_pydantic_v2
     def test_person_route_completes_with_private_video(self):
         result = {"fallback_required": False, "route": "local-rvm-person",
                   "video_url": "https://cdn.example.test/result.webm",
@@ -369,6 +372,7 @@ class VideoBackgroundRemovalTest(unittest.TestCase):
         self.assertFalse(job["fallback_required"])
         self.assertEqual(job["route"], "local-rvm-person")
 
+    @needs_pydantic_v2
     def test_non_person_route_requests_standby_without_error(self):
         result = {"fallback_required": True, "fallback_reason": "no person detected",
                   "route": "standby-general-matting", "duration_seconds": 2.0,

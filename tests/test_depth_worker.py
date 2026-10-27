@@ -47,6 +47,7 @@ class DepthWorkerTest(unittest.TestCase):
         expected = np.rint(values * 65535).astype(np.uint16)
         np.testing.assert_array_equal(decoded, expected)
 
+    @unittest.skipUnless(hasattr(worker.DepthRequest, "model_dump"), "pydantic v2 required")
     def test_busy_worker_spills_to_runpod(self):
         request = worker.DepthRequest(image_url="https://cdn.test/image.webp")
         with mock.patch.object(worker, "OVERFLOW_URL", "https://api.runpod.test/v1/depth-estimations"), mock.patch.object(worker.session, "post", return_value=Response()) as post:

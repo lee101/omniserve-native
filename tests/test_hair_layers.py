@@ -38,7 +38,7 @@ class EnsureCutoutTest(unittest.TestCase):
         opaque = Image.new("RGBA", (32, 32), (10, 20, 30, 255))
         seen = {}
 
-        def fake_segment(image, threshold):
+        def fake_segment(image, threshold, size=None):
             seen["threshold"] = threshold
             return None, np.full((32, 32), 255, dtype=np.uint8)
 
@@ -57,7 +57,7 @@ class EnsureCutoutTest(unittest.TestCase):
 
     def test_signature_is_image_and_request(self):
         self.assertEqual(list(inspect.signature(worker.remove_background).parameters),
-                         ["image", "request"])
+                         ["image", "request", "segmented"])
 
 
 class ProduceHairLayersTest(unittest.TestCase):

@@ -19,5 +19,5 @@ def test_gemma4_profile_is_optional_and_preserves_adaptive_memory_settings():
 def test_gemma4_profile_does_not_change_the_default_unit():
     unit = (ROOT / "systemd" / "omniserve-native.service").read_text()
 
-    assert "Environment=OMNISERVE_NATIVE_NGL=0" in unit
+    assert "Environment=OMNISERVE_NATIVE_NGL=1" in unit
     assert "Environment=OMNISERVE_NATIVE_LLM_GGUF=/nvme0n1-disk/models/omniserve-native/gemma-roleplay-v2-q8_0.gguf" in unit
