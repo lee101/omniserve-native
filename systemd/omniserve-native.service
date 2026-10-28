@@ -19,11 +19,11 @@ Environment=OMNISERVE_NATIVE_BIND=127.0.0.1
 Environment=OMNISERVE_NATIVE_PORT=8791
 Environment=OMNISERVE_NATIVE_LLM_GGUF=/nvme0n1-disk/models/omniserve-native/gemma-roleplay-v2-q8_0.gguf
 Environment=OMNISERVE_NATIVE_LLM_SWAP_DIR=/nvme0n1-disk/models/omniserve-native
-# Keep Gemma on CPU in the shared image profile. Full GPU offload leaves less
-# than the VAE decoder's scratch requirement once Z-Image and the search
-# tenants are resident, causing generation to finish denoising and then return
-# HTTP 500 during decode. Hybrid splits exceed this GGUF's split-input limit.
-Environment=OMNISERVE_NATIVE_NGL=1
+# Gemma fully on GPU: NGL=99 measured 82-85 tok/s single-stream against ~4 at
+# NGL=1 (CPU). Hybrid values abort at startup on GGML_SCHED_MAX_SPLIT_INPUTS for
+# this GGUF, so use only 1 or 99. Image VRAM headroom comes from the broker
+# leases and the SD_* profile below, not from keeping the LLM off the card.
+Environment=OMNISERVE_NATIVE_NGL=99
 Environment=OMNISERVE_NATIVE_CTX=4096
 # One context per admitted request. LLM_PERMITS below is 1, so a second
 # context could never be scheduled while it cost a full KV + compute buffer

@@ -15,8 +15,8 @@ def test_shared_gpu_profile_tiles_vae_decode_for_1024_images():
     assert "Environment=OMNISERVE_NATIVE_SD_VAE_TILE_Y=64" in unit
 
 
-def test_shared_gpu_profile_keeps_llm_off_the_image_gpu():
-    """Z-Image VAE decode needs scratch beyond its resident model allocation."""
+def test_shared_gpu_profile_runs_llm_fully_on_gpu():
+    """NGL=1 serves Gemma on CPU at ~4 tok/s; 99 is the measured GPU path."""
     unit = (ROOT / "systemd" / "omniserve-native.service").read_text()
 
-    assert "Environment=OMNISERVE_NATIVE_NGL=1" in unit
+    assert "Environment=OMNISERVE_NATIVE_NGL=99" in unit
