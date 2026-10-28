@@ -210,7 +210,14 @@ sampling it; rejected rows are removed from the KV. Exact output distribution;
 character persona) from another sequence's cache, `LLM_SWA_FULL=0` shrinks the
 sliding-window cache at the cost of prefix reuse and forks, `LLM_PREFILTER=0`
 samples over the full vocabulary instead of the exact top-(k + distinct
-history + max_new) cut (exact under penalties and DRY), `LLM_SAMPLE_THREADS`
+history) cut (exact under penalties and DRY; the window follows the history as
+it grows, and a row whose post-penalty top k has a tied logit is redone on the
+request-wide cut, so tokens match it bit for bit; `LLM_STEP_CUT=0` keeps only
+the request-wide top-(k + distinct prompt history + max_new) cut),
+`LLM_GPU_CUT=K` (current llama.cpp API only) takes the top K logits of each
+vocabulary half in the graph so the host reads 2K pairs per row instead of
+scanning the 1 MB row (same tokens; 1024 covers top_k + history up to ~1000),
+`LLM_SAMPLE_THREADS`
 sizes the sampling pool, and `LLM_ENGINE_TRACE=1` logs decode time by step kind
 and sampling time every 512 steps. `/status` reports `batching` counters
 (steps, rows, tokens, shared_prefix_tokens, kv_evictions, kv_requeues,

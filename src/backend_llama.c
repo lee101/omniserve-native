@@ -465,6 +465,17 @@ typedef struct ollm_slot_s {
     int produced;
     int max_new;
     int prefilter_k;
+    /* Per-step exact cut (cut_on): the post-penalty top_k lies in the
+     * pre-penalty top (top_k + distinct history tokens), and the history only
+     * grows by accepted tokens, so the window tracks it instead of the
+     * request-wide bound. seen marks the history, n_pre is the number of
+     * chain samplers ahead of top_k. */
+    bool cut_on;
+    bool cut_track;
+    int top_k;
+    int n_pre;
+    int n_seen;
+    uint8_t *seen;
     unsigned long long order;
     /* Prefix fork: the engine copies [0, cp_len) of cp_src's cache into this
      * sequence instead of prefilling it. cp_src is pinned (not acquirable)
@@ -506,6 +517,10 @@ typedef struct ollm_slot_s {
     const float *vrows[OLLM_MTP_BATCH_DRAFT_MAX + 1];
     llama_token_data *vcand[OLLM_MTP_BATCH_DRAFT_MAX];
     long gn[OLLM_MTP_BATCH_DRAFT_MAX + 1]; /* pre-gathered count per verify row, -1 none */
+    /* Device top-k per verify row (LLM_GPU_CUT): local ids and logits, g_gcut_k
+     * per vocabulary half; NULL when the row has none. */
+    const llama_token *gids[OLLM_MTP_BATCH_DRAFT_MAX + 1];
+    const float *gvals[OLLM_MTP_BATCH_DRAFT_MAX + 1];
 } ollm_slot;
 static ollm_slot *g_slots;
 static int g_slot_count;
@@ -1589,32 +1604,169 @@ static size_t gather_top(const float *logits, int32_t n_vocab, size_t k,
     }
 }
 
-/* llama_sampler_sample over a raw row, with the exact top-(k+window) cut when
- * prefilter_k is set. cand holds n_vocab entries. */
+/* Original candidate set: the request-wide exact cut when prefilter_k is set,
+ * else the whole vocabulary. cand holds n_vocab entries. */
+static size_t cand_base(const float *logits, int prefilter_k, llama_token_data *cand) {
+    if (prefilter_k > 0 && prefilter_k < g_n_vocab)
+        return gather_top(logits, g_n_vocab, (size_t)prefilter_k, cand, (size_t)g_n_vocab);
+    for (int32_t i = 0; i < g_n_vocab; i++) {
+        cand[i].id = i;
+        cand[i].logit = logits[i];
+        cand[i].p = 0.0f;
+    }
+    return (size_t)g_n_vocab;
+}
+
+/* Window of the per-step cut: top_k plus every distinct token the penalty and
+ * DRY samplers can lower, plus `ahead` tokens a verify run may accept before
+ * this row. 0 when the cut does not pay. */
+enum { OLLM_CUT_MAX = 16384, OLLM_TIE_MAX = 4097 };
+static int cut_k(const ollm_slot *s, int ahead) {
+    if (!s->cut_on) return 0;
+    long k = (long)s->top_k + s->n_seen + ahead;
+    return k <= OLLM_CUT_MAX && k < g_n_vocab ? (int)k : 0;
+}
+
+static void cut_seen(ollm_slot *s, llama_token t) {
+    if (!s->cut_track || t < 0 || t >= g_n_vocab || (s->seen[t >> 3] & (1u << (t & 7)))) return;
+    s->seen[t >> 3] |= (uint8_t)(1u << (t & 7));
+    s->n_seen++;
+}
+
+/* True when the (k+1) largest logits are not all distinct. Without a tie the
+ * top_k sampler's output (set and order) is the same for every candidate set
+ * holding the post-penalty top k; with one, partial_sort's order of equal
+ * logits depends on the rest of the array, so the caller redoes the row on
+ * the original set. */
+static bool topk_tie(const llama_token_data *d, size_t n, int k) {
+    size_t m = (size_t)k + 1 < n ? (size_t)k + 1 : n;
+    if (m > OLLM_TIE_MAX) return true;
+    if (m < 2) return false;
+    float h[OLLM_TIE_MAX];
+    size_t hn = 0;
+    for (size_t i = 0; i < n; i++) {
+        float v = d[i].logit;
+        if (hn < m) {
+            size_t c = hn++;
+            while (c > 0) {
+                size_t p = (c - 1) / 2;
+                if (h[p] <= v) break;
+                h[c] = h[p];
+                c = p;
+            }
+            h[c] = v;
+        } else if (v > h[0]) {
+            size_t c = 0;
+            for (;;) {
+                size_t l = 2 * c + 1, r = l + 1, b = c;
+                float bv = v;
+                if (l < m && h[l] < bv) { b = l; bv = h[l]; }
+                if (r < m && h[r] < bv) { b = r; bv = h[r]; }
+                if (b == c) break;
+                h[c] = h[b];
+                c = b;
+            }
+            h[c] = v;
+        }
+    }
+    for (size_t i = 1; i < m; i++) {
+        float v = h[i];
+        size_t j = i;
+        while (j > 0 && h[j - 1] > v) { h[j] = h[j - 1]; j--; }
+        h[j] = v;
+    }
+    for (size_t i = 1; i < m; i++)
+        if (h[i] == h[i - 1]) return true;
+    return false;
+}
+
+/* llama_sampler_sample over a raw row. The chain is applied sampler by sampler
+ * (what llama_sampler_chain_apply does), so a per-step cut whose top k has a
+ * tie can be redone on the original set before top_k runs. pre_n >= 0: buf
+ * already holds the row's per-step cut. */
 static double g_trace_gather_us, g_trace_chain_us;
-static llama_token sample_row_pre(struct llama_sampler *smpl, const float *logits, int prefilter_k,
-                                  llama_token_data *cand, long pre_n) {
+static unsigned long long g_trace_cut_rows, g_trace_cut_ties, g_trace_cut_n, g_trace_gcut_rows;
+
+/* Device cut (LLM_GPU_CUT=K): the graph takes the top K logits of each half of
+ * the vocabulary, so only 2K (id, logit) pairs per row are read instead of
+ * scanning the 1 MB row. Every token outside lies at or below M, the larger of
+ * the two halves' K-th logits, so the pairs above M are an exact top set; it
+ * is used when it holds at least k of them, else the row is cut on the host. */
+static int g_gcut_k;
+static int g_gcut_h;
+static size_t gcut_collect(const llama_token *ids, const float *vals, size_t k, llama_token_data *out) {
+    const int32_t half = g_n_vocab / g_gcut_h;
+    float m = -INFINITY;
+    for (int h = 0; h < g_gcut_h; h++) {
+        float mh = INFINITY;
+        for (int j = 0; j < g_gcut_k; j++) {
+            float v = vals[h * g_gcut_k + j];
+            mh = v < mh ? v : mh;
+        }
+        m = mh > m ? mh : m;
+    }
+    size_t n = 0;
+    for (int h = 0; h < g_gcut_h; h++) {
+        for (int j = 0; j < g_gcut_k; j++) {
+            float v = vals[h * g_gcut_k + j];
+            llama_token id = ids[h * g_gcut_k + j];
+            if (!(v > m) || id < 0 || id >= half) continue;
+            out[n].id = h * half + id;
+            out[n].logit = v;
+            out[n].p = 0.0f;
+            n++;
+        }
+    }
+    return n >= k ? n : 0;
+}
+static llama_token sample_row_pre(ollm_slot *s, const float *logits, llama_token_data *buf, long pre_n,
+                                  int ahead, int row) {
     struct timespec ta, tb, tc;
     if (g_engine_trace_flag) clock_gettime(CLOCK_MONOTONIC, &ta);
-    size_t n = 0;
+    struct llama_sampler *smpl = s->smpl;
+    llama_token_data *cand = buf;
+    size_t n;
+    bool cut = false;
+    int k = cut_k(s, ahead);
     if (pre_n >= 0) {
         n = (size_t)pre_n;
-    } else if (prefilter_k > 0 && prefilter_k < g_n_vocab) {
-        n = gather_top(logits, g_n_vocab, (size_t)prefilter_k, cand, (size_t)g_n_vocab);
+        cut = k > 0;
+    } else if (k > 0 && s->gids[row] &&
+               (n = gcut_collect(s->gids[row], s->gvals[row], (size_t)k, s->cand)) > 0) {
+        cand = s->cand;
+        cut = true;
+        if (g_engine_trace_flag) __atomic_fetch_add(&g_trace_gcut_rows, 1, __ATOMIC_RELAXED);
+    } else if (k > 0) {
+        cand = s->cand;
+        n = gather_top(logits, g_n_vocab, (size_t)k, cand, (size_t)g_n_vocab);
+        cut = true;
     } else {
-        for (int32_t i = 0; i < g_n_vocab; i++) {
-            cand[i].id = i;
-            cand[i].logit = logits[i];
-            cand[i].p = 0.0f;
-        }
-        n = (size_t)g_n_vocab;
+        cand = s->cand;
+        n = cand_base(logits, s->prefilter_k, cand);
     }
     if (g_engine_trace_flag) clock_gettime(CLOCK_MONOTONIC, &tb);
     llama_token_data_array cur = { cand, n, -1, false };
-    llama_sampler_apply(smpl, &cur);
+    int nc = llama_sampler_chain_n(smpl);
+    int i0 = 0;
+    if (cut) {
+        for (; i0 < s->n_pre; i0++) llama_sampler_apply(llama_sampler_chain_get(smpl, i0), &cur);
+        bool tie = topk_tie(cur.data, cur.size, s->top_k);
+        if (g_engine_trace_flag) {
+            __atomic_fetch_add(&g_trace_cut_rows, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_trace_cut_n, (unsigned long long)n, __ATOMIC_RELAXED);
+            if (tie) __atomic_fetch_add(&g_trace_cut_ties, 1, __ATOMIC_RELAXED);
+        }
+        if (tie) {
+            cand = s->cand;
+            cur = (llama_token_data_array){ cand, cand_base(logits, s->prefilter_k, cand), -1, false };
+            i0 = 0;
+        }
+    }
+    for (int i = i0; i < nc; i++) llama_sampler_apply(llama_sampler_chain_get(smpl, i), &cur);
     llama_token tok = cur.selected >= 0 && cur.selected < (int64_t)cur.size
         ? cur.data[cur.selected].id : cand[0].id;
     llama_sampler_accept(smpl, tok);
+    cut_seen(s, tok);
     if (g_engine_trace_flag) {
         clock_gettime(CLOCK_MONOTONIC, &tc);
         double g = (tb.tv_sec - ta.tv_sec) * 1e6 + (tb.tv_nsec - ta.tv_nsec) / 1e3;
@@ -1628,9 +1780,16 @@ static llama_token sample_row_pre(struct llama_sampler *smpl, const float *logit
     return tok;
 }
 
+/* The per-slot path: the request-wide cut only. */
 static llama_token sample_row(struct llama_sampler *smpl, const float *logits, int prefilter_k,
                               llama_token_data *cand) {
-    return sample_row_pre(smpl, logits, prefilter_k, cand, -1);
+    size_t n = cand_base(logits, prefilter_k, cand);
+    llama_token_data_array cur = { cand, n, -1, false };
+    llama_sampler_apply(smpl, &cur);
+    llama_token tok = cur.selected >= 0 && cur.selected < (int64_t)cur.size
+        ? cur.data[cur.selected].id : cand[0].id;
+    llama_sampler_accept(smpl, tok);
+    return tok;
 }
 
 /* Verify rows' candidate cuts do not depend on the sampler state, so the
@@ -1646,14 +1805,14 @@ static gather_item *g_gather_items;
  * logits stand because the sampler chose the drafted token itself. */
 static void engine_sample_one(ollm_slot *s) {
     if (s->n_draft <= 0) {
-        s->next = sample_row(s->smpl, s->logits_row, s->prefilter_k, s->cand);
+        s->next = sample_row_pre(s, s->logits_row, s->cand, -1, 0, 0);
         return;
     }
     int n = 0, m = 0;
     for (int i = 0; i <= s->n_draft; i++) {
         llama_token_data *buf = i == 0 ? s->cand : s->vcand[i - 1];
-        llama_token tok = sample_row_pre(s->smpl, s->vrows[i], s->prefilter_k,
-                                         buf ? buf : s->cand, buf ? s->gn[i] : -1);
+        long pre = buf ? s->gn[i] : -1;
+        llama_token tok = sample_row_pre(s, s->vrows[i], pre >= 0 ? buf : s->cand, pre, 0, i);
         s->out_tok[n] = tok;
         s->out_p[n++] = s->capture ? s->capture->probability : 1.0f;
         if (i == s->n_draft || tok != s->draft[i] || llama_vocab_is_eog(g_vocab, tok)) break;
@@ -1675,11 +1834,18 @@ static llama_token slot_sample(ollm_slot *slot, struct llama_sampler *smpl,
 }
 
 static int g_samp_phase; /* 0: gather items, 1: sample jobs */
+/* Pre-gathered verify rows use the per-step cut widened by the drafts that
+ * may be accepted ahead of them (sample_row_pre checks pre_n against cut_k
+ * with ahead 0, which only narrows), else the request-wide cut. */
+static int gather_k(const ollm_slot *s) {
+    int k = cut_k(s, s->n_draft);
+    return k > 0 ? k : s->prefilter_k > 0 && s->prefilter_k < g_n_vocab ? s->prefilter_k : 0;
+}
 static void gather_one(const gather_item *it) {
     ollm_slot *s = it->s;
     llama_token_data *buf = it->k == 0 ? s->cand : s->vcand[it->k - 1];
     size_t cap = it->k == 0 ? (size_t)g_n_vocab : OLLM_VCAND_CAP;
-    size_t n = gather_top(s->vrows[it->k], g_n_vocab, (size_t)s->prefilter_k, buf, cap);
+    size_t n = gather_top(s->vrows[it->k], g_n_vocab, (size_t)gather_k(s), buf, cap);
     s->gn[it->k] = n < cap ? (long)n : -1;
 }
 
@@ -1733,8 +1899,7 @@ static void engine_sample_all(int jobs) {
     for (int i = 0; i < jobs; i++) {
         ollm_slot *s = g_sample_jobs[i];
         for (int k = 0; k <= OLLM_MTP_BATCH_DRAFT_MAX; k++) s->gn[k] = -1;
-        if (!g_gather_items || s->n_draft <= 0 || s->prefilter_k <= 0 || s->prefilter_k >= g_n_vocab ||
-            !s->vcand[0])
+        if (!g_gather_items || s->n_draft <= 0 || gather_k(s) <= 0 || !s->vcand[0] || s->gids[0])
             continue;
         for (int k = 0; k <= s->n_draft; k++) g_gather_items[items++] = (gather_item){ s, k };
     }
@@ -1930,6 +2095,106 @@ static struct llama_sampler_i g_confg_iface = {
     .backend_apply = confg_backend_apply,
 };
 
+/* LLM_GPU_CUT: per sequence, the graph keeps the full logits row (copied as
+ * the sampled logits, for rows the host still cuts) and adds the top g_gcut_k
+ * of each vocabulary half: local ids as the candidates, their logits as the
+ * probs. Needs per-sequence multi-row backend sampling (n_outputs_max_per_seq,
+ * the current llama.cpp API). */
+static struct llama_sampler **g_gcut_smpl;
+#ifdef LLAMA_DRY_MAX_SEQ_BREAKERS
+static const char *gcut_name(const struct llama_sampler *smpl) {
+    (void)smpl;
+    return "omni-gpu-cut";
+}
+static void gcut_apply(struct llama_sampler *smpl, llama_token_data_array *cur) {
+    (void)smpl;
+    (void)cur;
+}
+static bool gcut_backend_init(struct llama_sampler *smpl, ggml_backend_buffer_type_t buft, uint32_t n) {
+    (void)smpl;
+    (void)buft;
+    (void)n;
+    return true;
+}
+static void gcut_backend_apply(struct llama_sampler *smpl, struct ggml_context *ctx,
+                               struct ggml_cgraph *gf, struct llama_sampler_data *data) {
+    (void)smpl;
+    (void)gf;
+    const int64_t half = data->logits->ne[0] / g_gcut_h;
+    struct ggml_tensor *x = ggml_reshape_2d(ctx, data->logits, half, g_gcut_h);
+    struct ggml_tensor *top = ggml_top_k(ctx, x, g_gcut_k);
+    struct ggml_tensor *v = ggml_get_rows(ctx, ggml_reshape_3d(ctx, x, 1, half, g_gcut_h), top);
+    data->candidates = ggml_reshape_1d(ctx, top, (int64_t)g_gcut_k * g_gcut_h);
+    data->probs = ggml_reshape_1d(ctx, v, (int64_t)g_gcut_k * g_gcut_h);
+}
+static struct llama_sampler_i g_gcut_iface = {
+    .name = gcut_name,
+    .apply = gcut_apply,
+    .backend_init = gcut_backend_init,
+    .backend_apply = gcut_backend_apply,
+};
+
+/* The row's full logits plus its device top lists (NULL when absent). */
+static const float *gcut_row(int32_t idx, const llama_token **ids, const float **vals) {
+    const float *row = llama_get_sampled_logits_ith(g_bctx, idx);
+    if (!row || llama_get_sampled_logits_count_ith(g_bctx, idx) != (uint32_t)g_n_vocab) return NULL;
+    uint32_t want = (uint32_t)(g_gcut_k * g_gcut_h);
+    if (llama_get_sampled_candidates_count_ith(g_bctx, idx) == want &&
+        llama_get_sampled_probs_count_ith(g_bctx, idx) == want) {
+        *ids = llama_get_sampled_candidates_ith(g_bctx, idx);
+        *vals = llama_get_sampled_probs_ith(g_bctx, idx);
+    }
+    return row;
+}
+
+/* Arms the device cut on the batched context's params; 0 leaves it off. */
+static int gcut_setup(struct llama_context_params *cp, int draft) {
+    const char *e = getenv("OMNISERVE_NATIVE_LLM_GPU_CUT");
+    int k = e && e[0] ? atoi(e) : 0;
+    if (k <= 0) return 0;
+    g_gcut_h = g_n_vocab % 2 == 0 ? 2 : 1;
+    if (k > g_n_vocab / g_gcut_h / 2) return 0;
+    g_gcut_k = k;
+    g_gcut_smpl = calloc((size_t)g_slot_count, sizeof *g_gcut_smpl);
+    struct llama_sampler_seq_config *sc = calloc((size_t)g_slot_count, sizeof *sc);
+    if (!g_gcut_smpl || !sc) {
+        free(sc);
+        g_gcut_k = 0;
+        return 0;
+    }
+    for (int i = 0; i < g_slot_count; i++) {
+        g_gcut_smpl[i] = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(g_gcut_smpl[i], llama_sampler_init(&g_gcut_iface, NULL));
+        sc[i].seq_id = i;
+        sc[i].sampler = g_gcut_smpl[i];
+    }
+    cp->samplers = sc;
+    cp->n_samplers = (size_t)g_slot_count;
+    cp->n_outputs_max_per_seq = (uint32_t)(1 + draft);
+    /* decode rows (with verify rows) plus one finishing prefill row each */
+    cp->n_outputs_max = (uint32_t)(g_slot_count * (2 + draft));
+    return k;
+}
+#else
+static const float *gcut_row(int32_t idx, const llama_token **ids, const float **vals) {
+    (void)ids;
+    (void)vals;
+    return llama_get_logits_ith(g_bctx, idx);
+}
+static int gcut_setup(struct llama_context_params *cp, int draft) {
+    (void)cp;
+    (void)draft;
+    return 0;
+}
+#endif
+
+static void gcut_free(void) {
+    for (int i = 0; g_gcut_smpl && i < g_slot_count; i++) llama_sampler_free(g_gcut_smpl[i]);
+    free(g_gcut_smpl);
+    g_gcut_smpl = NULL;
+    g_gcut_k = 0;
+}
+
 /* Drafts greedily for every eligible decode row of the step just built, one
  * MTP decode per draft position across all of them (Gemma-4's head reads the
  * target KV and keeps every draft at the position of `next`), then splices the
@@ -2089,11 +2354,15 @@ static void *engine_main(void *arg) {
             for (int r = 0; r < rows; r++) {
                 ollm_slot *s = g_step_slots[r];
                 if (s->row < 0) continue;
-                s->logits_row = llama_get_logits_ith(g_bctx, s->row);
-                for (int k = 0; k <= s->n_draft && s->n_draft > 0; k++) {
-                    s->vrows[k] = llama_get_logits_ith(g_bctx, s->row + k);
-                    if (!s->vrows[k]) s->logits_row = NULL;
+                for (int k = 0; k <= s->n_draft; k++) {
+                    s->gids[k] = NULL;
+                    s->gvals[k] = NULL;
+                    s->vrows[k] = g_gcut_k ? gcut_row(s->row + k, &s->gids[k], &s->gvals[k])
+                                           : llama_get_logits_ith(g_bctx, s->row + k);
                 }
+                s->logits_row = s->vrows[0];
+                for (int k = 1; k <= s->n_draft; k++)
+                    if (!s->vrows[k]) s->logits_row = NULL;
                 if (s->logits_row) g_sample_jobs[jobs++] = s;
                 else rc = -1;
             }
@@ -2124,10 +2393,14 @@ static void *engine_main(void *arg) {
                         g_trace_samp / 512, g_trace_gap / 512, g_trace_draft / 512,
                         g_trace_extra / 512.0, g_trace_draft_steps / 512.0, g_trace_draft_call / 512);
                 if (g_trace_rows_sampled) {
-                    fprintf(stderr, "engine: sample rows=%llu gather=%.1fus chain=%.1fus per row\n",
+                    fprintf(stderr, "engine: sample rows=%llu gather=%.1fus chain=%.1fus per row "
+                            "cut_rows=%llu gpu_cut_rows=%llu cand=%.0f ties=%llu\n",
                             g_trace_rows_sampled, g_trace_gather_us / g_trace_rows_sampled,
-                            g_trace_chain_us / g_trace_rows_sampled);
+                            g_trace_chain_us / g_trace_rows_sampled, g_trace_cut_rows, g_trace_gcut_rows,
+                            g_trace_cut_rows ? (double)g_trace_cut_n / g_trace_cut_rows : 0.0,
+                            g_trace_cut_ties);
                     g_trace_rows_sampled = 0;
+                    g_trace_cut_rows = g_trace_cut_n = g_trace_cut_ties = g_trace_gcut_rows = 0;
                     g_trace_gather_us = g_trace_chain_us = 0;
                 }
                 if (g_mtp_ctx && g_mtp_has_conf) {
@@ -2422,6 +2695,37 @@ static int engine_prefilter_k(const ochat_req *req, bool penalized, bool dry, in
     return (int)k;
 }
 
+/* Arms the per-step cut on a batched slot: same conditions as the
+ * request-wide cut minus its size bound, with seen holding the history the
+ * chain was primed with. Off for LLM_PREFILTER=0 or LLM_STEP_CUT=0. */
+static void engine_cut_init(ollm_slot *s, const ochat_req *req, bool penalized, bool dry, int last_n,
+                            int top_k, const llama_token *tokens, int n_tokens) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *a = getenv("OMNISERVE_NATIVE_LLM_PREFILTER");
+        const char *b = getenv("OMNISERVE_NATIVE_LLM_STEP_CUT");
+        enabled = !(a && strcmp(a, "0") == 0) && !(b && strcmp(b, "0") == 0);
+    }
+    s->cut_on = false;
+    s->cut_track = false;
+    s->n_seen = 0;
+    s->top_k = top_k;
+    s->n_pre = (penalized ? 1 : 0) + (dry ? 1 : 0);
+    if (!enabled || !s->seen || req->min_probability > 0.0f || top_k <= 0) return;
+    if (penalized) {
+        if (req->repetition_penalty > 0.0f && req->repetition_penalty < 1.0f) return;
+        if (req->frequency_penalty < 0.0f || req->presence_penalty < 0.0f) return;
+    }
+    memset(s->seen, 0, (size_t)g_n_vocab / 8 + 1);
+    s->cut_on = true;
+    /* Without DRY or a penalty window nothing lowers a logit: no history. */
+    s->cut_track = penalized && (dry || last_n > 0);
+    if (s->cut_track) {
+        int hist = dry || last_n > n_tokens ? n_tokens : last_n;
+        for (int i = n_tokens - hist; i < n_tokens; i++) cut_seen(s, tokens[i]);
+    }
+}
+
 static void engine_stop_locked(void) {
     if (g_engine_started) {
         pthread_mutex_lock(&g_engine_lock);
@@ -2553,6 +2857,8 @@ static void engine_mtp_init(int n_gpu_layers, struct llama_context_params cp) {
     const char *pd = getenv("OMNISERVE_NATIVE_LLM_MTP_PAD");
     g_mtp_pad = g_mtp_conf > 0.0f && !(pd && strcmp(pd, "0") == 0);
     struct llama_sampler_seq_config *sc = NULL;
+    dcp.samplers = NULL;
+    dcp.n_samplers = 0;
     if (!(bs && strcmp(bs, "0") == 0)) {
         g_mtp_greedy = calloc((size_t)g_slot_count, sizeof *g_mtp_greedy);
         sc = calloc((size_t)g_slot_count, sizeof *sc);
@@ -2603,6 +2909,9 @@ static bool engine_start_locked(void) {
         s->row = -1;
         s->cand = malloc((size_t)g_n_vocab * sizeof *s->cand);
         if (!s->cand) return false;
+        free(s->seen);
+        s->seen = calloc((size_t)g_n_vocab / 8 + 1, 1);
+        if (!s->seen) return false;
         for (int k = 0; par_gather && k < g_mtp_draft && k < OLLM_MTP_BATCH_DRAFT_MAX; k++) {
             free(s->vcand[k]);
             s->vcand[k] = malloc((size_t)OLLM_VCAND_CAP * sizeof *s->vcand[k]);
@@ -2787,7 +3096,11 @@ static bool ollm_init_locked(const char *model_path, int n_gpu_layers, int ctx_l
         g_share_prefix = cp.swa_full && !(share_env && strcmp(share_env, "0") == 0);
         if (kv_auto) g_kv_seqs = engine_auto_kv_seqs(cp);
         cp.n_ctx = (unsigned)g_ctx_len * (unsigned)g_kv_seqs;
-        g_bctx = llama_init_from_model(g_model, cp);
+        struct llama_context_params bcp = cp;
+        if (gcut_setup(&bcp, g_mtp_draft) > 0)
+            fprintf(stderr, "llm GPU cut: top %d per half (%d halves)\n", g_gcut_k, g_gcut_h);
+        g_bctx = llama_init_from_model(g_model, bcp);
+        free((void *)bcp.samplers);
         bool started = g_bctx != NULL;
         for (int i = 0; started && i < g_slot_count; i++) g_slots[i].ctx = g_bctx;
         if (started) engine_mtp_init(n_gpu_layers, cp);
@@ -2796,9 +3109,13 @@ static bool ollm_init_locked(const char *model_path, int n_gpu_layers, int ctx_l
         if (!started) {
             engine_stop_locked();
             engine_mtp_free();
-            for (int i = 0; i < g_slot_count; i++) free(g_slots[i].cand);
+            for (int i = 0; i < g_slot_count; i++) {
+                free(g_slots[i].cand);
+                free(g_slots[i].seen);
+            }
             if (g_bctx) llama_free(g_bctx);
             g_bctx = NULL;
+            gcut_free();
             free(g_slots);
             g_slots = NULL;
             g_slot_count = 0;
@@ -3612,6 +3929,7 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
     int prefilter_k = engine_prefilter_k(req, penalized, dry, last_n, top_k, tokens, n_tokens,
                                          max_new);
     if (!g_batched) slot->prefilter_k = prefilter_k;
+    if (g_batched) engine_cut_init(slot, req, penalized, dry, last_n, top_k, tokens, n_tokens);
     if (g_batched) {
         /* Publish the prompt now; the engine advances cached_count as prefill
          * lands, so concurrent requests can fork the part already computed. */
@@ -3863,6 +4181,7 @@ static void ollm_shutdown_locked(void) {
         }
         if (g_bctx) llama_free(g_bctx);
         g_bctx = NULL;
+        gcut_free();
         g_batched = false;
         g_share_prefix = false;
     }
@@ -3870,6 +4189,7 @@ static void ollm_shutdown_locked(void) {
         if (g_slots[i].ctx) llama_free(g_slots[i].ctx);
         free(g_slots[i].cached_tokens);
         free(g_slots[i].cand);
+        free(g_slots[i].seen);
         for (int k = 0; k < OLLM_MTP_BATCH_DRAFT_MAX; k++) free(g_slots[i].vcand[k]);
     }
     free(g_slots);
