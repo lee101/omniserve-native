@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # MOSS-Image lane server for qualitybench (MOSS needs the MOSS-capable upstream sd.cpp build).
+# LANE=sfw (default): 4-step merged, ~3.4 s/1024px. LANE=nsfw: same + NSFW LoRA @1.0 on every request, ~4.4 s.
 # Env: MODEL=<dit gguf> (default 4-step merged), SDENV="K=V ..." adds OMNISERVE_NATIVE_SD_K=V, PORT.
 cd "$(dirname "$0")/.."
 M=${MOSS_DIR:-/vfast/data/models/moss}
@@ -15,5 +16,9 @@ export OMNISERVE_NATIVE_SD_TOKENIZER=$M/tok/tokenizer.json
 export OMNISERVE_NATIVE_SD_ZERO_GUIDANCE=1.0 OMNISERVE_NATIVE_SD_MIN_STEPS=0
 export OMNISERVE_NATIVE_SD_EAGER_LOAD=1 OMNISERVE_NATIVE_SD_MIN_FREE_MB=256
 export OMNISERVE_NATIVE_SD_WARMUP=${WARMUP:-0}
+if [ "${LANE:-sfw}" = nsfw ]; then
+  export OMNISERVE_NATIVE_SD_DEFAULT_LORA=$M/lora/MOSS-Image-NSFW-Uncensored-LoRA-F16.gguf
+  export OMNISERVE_NATIVE_SD_DEFAULT_LORA_SCALE=${LORA_SCALE:-1.0} OMNISERVE_NATIVE_SD_DEFAULT_LORA_ALWAYS=1
+fi
 [ -n "$SDENV" ] && for kv in $SDENV; do export "OMNISERVE_NATIVE_SD_$kv"; done
 exec "$BUILD/omniserve-native" --port "${PORT:-8794}"
