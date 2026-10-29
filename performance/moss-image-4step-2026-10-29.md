@@ -80,3 +80,22 @@ Model SHA-256 (4-step Q4_0): `f23faecd6fe0ddb3e6fedb7dd31f760c5c67f917b5078e8fee
 - NSFW LoRA (`axiomofmind/Moss-image-nsfw-uncensored-lora-GGUF`) on top of the
   4-step model, and the lodestones 8-step DMD LoRA (needs a custom sampler).
 - Smaller text-encoder quant, VAE/DiT kernel tuning, 5090 numbers.
+
+## Style LoRAs and prompt presets (2026-10-30, `qualitybench/moss_style_sweep.py`)
+
+One resident 4-step server, per-request loopback `loras`; beauty, anime, gouache and psychedelic GGUF LoRAs
+(`axiomofmind/Moss-image-*-lora-GGUF`, F16, ~55-74 MB). Variants per prompt/seed: plain, + positive suffix,
++ negative at CFG 1.5, LoRA, LoRA + suffix, LoRA + suffix + negative (CFG 1.5), LoRA 0.7, alternate checkpoint.
+Sheets: `results/moss-style-20261030/sheets/`. Presets: `qualitybench/moss_style_presets.json`.
+
+- **Anatomy (anime "three legs" prompt, seeds 0-3):** the plain 4-step render often crouches with ambiguous
+  legs (same failure at dense 20/30 steps and CFG 1.5). Adding the positive suffix
+  (`anime character, dynamic composition, clean anatomy`) gave clean two-leg renders on 4/4 seeds at no extra
+  cost (3.4 s). The anime LoRA is more dynamic but keeps some leg ambiguity in crouched poses.
+- **Negative prompt at CFG 1.5** (6.5 s) looked no better than the suffix alone: not worth 2x. Negatives are
+  ignored at CFG 1, so presets default to positive suffix only.
+- **LoRAs transfer to the distilled model** at scale 1.0 (~4.4 s): beauty (richer skin/freckles; alt 1750 more
+  contrasty), gouache (flat painterly style, lettering correct), psychedelic (denser, cleaner detail).
+- The suffix alone also fixed garbled lettering on the gouache cafe prompt ("DISTOUR CAFE").
+- Not run: MOSS I2I LoRAs (`sorryhyun/MOSS-I2I-LORAs`) need the reference-latent path (`ref_isolate`,
+  `ref_timestep`) that sd.cpp's MOSS support lacks. The decensor LoRA is deliberately not integrated.

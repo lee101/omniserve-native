@@ -1,0 +1,24 @@
+{
+ "beauty": {
+  "p1": "a close portrait of a young woman with dark brown skin and freckles, her dark hair framing her face as she gazes forward with light brown eyes and neutral expression, wearing a black garment with soft directional light highlighting her skin and lips.",
+  "p2": "a young woman with fair skin and freckles wears a black turtleneck, her dark hair pulled back with loose strands framing her face, as she gazes directly at the camera with a neutral expression under soft, even studio lighting against a plain gray background.",
+  "p3": "a young woman with fair skin and dark brown hair parted in the middle, her bangs framing a direct gaze with light blue eyes and subtle freckles, wears a black velvet coat with a high collar, her lips neutral and skin softly lit against a blurred neutral background."
+ },
+ "anime": {
+  "legs": "anime key frame, a girl with a long dark ponytail in a navy school uniform pointing angrily at a crumpled paper bag on the pavement, cel shading, vivid sunset sky, clean lineart, a swirling cyan and magenta portal above the bag",
+  "p1": "an adult woman anime character in a charcoal flight suit sliding beneath a closing blast door as blue warning lights streak across a damaged orbital hangar",
+  "p2": "an adult man anime character with copper hair and a weathered green coat standing knee-deep in a river while holding a cracked ceremonial mask beneath cold morning fog",
+  "p3": "two adult anime characters riding the same motorcycle through a narrow tunnel, the driver leaning into a turn while the passenger fires a flare toward pursuing drones",
+  "p4": "an adult woman anime character with braided white hair repairing a mechanical arm at a cluttered night workshop lit by welding sparks and hanging red lamps"
+ },
+ "gouache": {
+  "cafe": "two women sit at a pink table under a green-and-white striped awning reading DISTOUR CAFE, one eating a hot dog in a striped shirt and pink sunglasses, the other in a pink top and black sunglasses, surrounded by cocktails, fries, salad, and pastries.",
+  "canyon": "a river winds through a canyon with orange and pink cliffs under a blue sky, flanked by green reeds and sandy banks with tufts of grass.",
+  "fox": "a pink fox with green eyes and a red tongue sits beside a table laden with broccoli, artichokes, olives, cheese, and pizza, flanked by candles and strawberries against a dark green background."
+ },
+ "psychedelic": {
+  "ram": "a neon purple and pink ram with a green eye stands atop a glowing mountain, its body forming a spiral galaxy with a domed temple, a waving flag, and a tower, surrounded by floating rings, stars, and swirling clouds.",
+  "mushroom": "a glowing mushroom with wavy blue and pink caps rises from a starry field, its stem radiating pink light against a black background.",
+  "astronaut": "an astronaut walks along a rainbow-striped path through a surreal alien landscape of colorful mushrooms and cacti, beneath a large orange cratered moon and swirling neon ribbons in a starry sky."
+ }
+}

@@ -1,0 +1,33 @@
+{
+ "_global_negative": "extra limbs, extra legs, three legs, fused limbs, deformed hands, bad anatomy, blurry, low quality, watermark",
+ "beauty": {
+  "lora": "/vfast/data/models/moss/lora/MOSS-Image-Beauty-LoRA-F16.gguf",
+  "alt_lora": "/vfast/data/models/moss/lora/MOSS-Image-Beauty-LoRA-Alternative-1750-F16.gguf",
+  "scale": 1.0,
+  "trigger": "moss_beauty_style",
+  "positive_suffix": "soft directional light, natural skin texture, sharp eyes",
+  "negative": "plastic skin, oversaturated, harsh shadows, distorted face, asymmetrical eyes"
+ },
+ "anime": {
+  "lora": "/vfast/data/models/moss/lora/MOSS-Image-Anime-LoRA-F16.gguf",
+  "alt_lora": "/vfast/data/models/moss/lora/MOSS-Image-Anime-LoRA-Step1500-F16.gguf",
+  "scale": 1.0,
+  "trigger": "",
+  "positive_suffix": "anime character, dynamic composition, clean anatomy",
+  "negative": "western cartoon, 3d render, photorealistic, extra legs, extra arms, bad hands"
+ },
+ "gouache": {
+  "lora": "/vfast/data/models/moss/lora/MOSS-Image-Gouache-LoRA-F16.gguf",
+  "scale": 1.0,
+  "trigger": "moss_vgouache_style",
+  "positive_suffix": "flat painterly shapes, warm editorial colour",
+  "negative": "photo, photorealistic, 3d render, glossy, gradient shading"
+ },
+ "psychedelic": {
+  "lora": "/vfast/data/models/moss/lora/MOSS-Image-Psychedelic-LoRA-F16.gguf",
+  "scale": 1.0,
+  "trigger": "moss_psychpop_style",
+  "positive_suffix": "saturated neon colour, bold graphic linework",
+  "negative": "muted colors, photorealistic, plain background, washed out"
+ }
+}
