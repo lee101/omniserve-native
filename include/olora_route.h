@@ -9,8 +9,10 @@
 typedef struct {
     char name[64];
     char prefix[128];
+    char suffix[256];   /* appended to the prompt (e.g. anatomy hints) */
+    char negative[512]; /* used only when the request has none; ignored at CFG 1 */
     size_t lora_count;
-    char ids[OLORA_ROUTE_MAX_LORAS][129];
+    char ids[OLORA_ROUTE_MAX_LORAS][257]; /* cache id, or an absolute path from operator config */
     float scales[OLORA_ROUTE_MAX_LORAS];
 } olora_route_pick;
 

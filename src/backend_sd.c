@@ -1079,7 +1079,12 @@ bool osd_init(const char *model_path) {
 }
 
 bool osd_ready(void) { return g_sd != NULL; }
-const char *osd_model_name(void) { return g_sd_name[0] ? g_sd_name : "none"; }
+/* OMNISERVE_NATIVE_SD_PUBLIC_NAME hides the checkpoint filename from responses, /health and /v1/models. */
+const char *osd_model_name(void) {
+    const char *pub = getenv("OMNISERVE_NATIVE_SD_PUBLIC_NAME");
+    if (g_sd_name[0] && pub && pub[0]) return pub;
+    return g_sd_name[0] ? g_sd_name : "none";
+}
 
 typedef struct {
     unsigned char *data;

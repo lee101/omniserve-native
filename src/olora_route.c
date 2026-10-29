@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 bool olora_route_enabled(void) {
     const char *value = getenv("OMNISERVE_NATIVE_LORA_AUTO_ROUTE");
@@ -43,6 +44,12 @@ static bool phrase_match(const char *haystack, const char *phrase) {
     return false;
 }
 
+/* Operator-config LoRA files only: absolute, no traversal, readable. */
+static bool safe_path(const char *value) {
+    if (value[0] != '/' || strlen(value) > 256 || strstr(value, "..")) return false;
+    return access(value, R_OK) == 0;
+}
+
 static bool safe_id(const char *value) {
     if (!value[0] || strlen(value) > 128) return false;
     for (const unsigned char *p = (const unsigned char *)value; *p; ++p) {
@@ -77,22 +84,36 @@ static bool fill_pick(const char *js, const oj_tok *toks, int ntoks, int route,
     if (prefix >= 0 && toks[prefix].type == OJ_STRING) {
         oj_unescape(js, &toks[prefix], pick->prefix, sizeof pick->prefix);
     }
+    int suffix = oj_obj_get(js, toks, ntoks, route, "suffix");
+    if (suffix >= 0 && toks[suffix].type == OJ_STRING) {
+        oj_unescape(js, &toks[suffix], pick->suffix, sizeof pick->suffix);
+    }
+    int negative = oj_obj_get(js, toks, ntoks, route, "negative");
+    if (negative >= 0 && toks[negative].type == OJ_STRING) {
+        oj_unescape(js, &toks[negative], pick->negative, sizeof pick->negative);
+    }
     int loras = oj_obj_get(js, toks, ntoks, route, "loras");
-    if (loras < 0 || toks[loras].type != OJ_ARRAY) return false;
+    if (loras < 0 || toks[loras].type != OJ_ARRAY) return pick->suffix[0] || pick->prefix[0];
     for (int i = 0; i < toks[loras].size && pick->lora_count < OLORA_ROUTE_MAX_LORAS; ++i) {
         int item = oj_arr_at(toks, ntoks, loras, i);
         if (item < 0 || toks[item].type != OJ_OBJECT) return false;
         int id = oj_obj_get(js, toks, ntoks, item, "id");
+        bool is_path = false;
+        if (id < 0) {
+            id = oj_obj_get(js, toks, ntoks, item, "path");
+            is_path = true;
+        }
         if (id < 0 || toks[id].type != OJ_STRING) return false;
         char *slot = pick->ids[pick->lora_count];
-        if (!oj_unescape(js, &toks[id], slot, sizeof pick->ids[0]) || !safe_id(slot)) return false;
+        if (!oj_unescape(js, &toks[id], slot, sizeof pick->ids[0]) ||
+            !(is_path ? safe_path(slot) : safe_id(slot))) return false;
         double scale = 1.0;
         int scale_token = oj_obj_get(js, toks, ntoks, item, "scale");
         if (scale_token >= 0) scale = oj_number(js, &toks[scale_token], NAN);
         if (!isfinite(scale) || scale < -4.0 || scale > 4.0) return false;
         pick->scales[pick->lora_count++] = (float)scale;
     }
-    return pick->lora_count > 0;
+    return pick->lora_count > 0 || pick->suffix[0] || pick->prefix[0];
 }
 
 bool olora_route_select_json(const char *json, size_t json_len, const char *prompt,

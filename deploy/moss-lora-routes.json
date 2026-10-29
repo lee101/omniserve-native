@@ -1,0 +1,165 @@
+{
+ "routes": [
+  {
+   "name": "psychedelic",
+   "keywords": [
+    "psychedelic",
+    "trippy",
+    "psychpop",
+    "acid trip",
+    "blacklight"
+   ],
+   "prefix": "moss_psychpop_style, ",
+   "suffix": ", saturated neon colour, bold graphic linework",
+   "negative": "muted colors, photorealistic, plain background, washed out",
+   "loras": [
+    {
+     "path": "/vfast/data/models/moss/lora/MOSS-Image-Psychedelic-LoRA-F16.gguf",
+     "scale": 1.0
+    }
+   ]
+  },
+  {
+   "name": "gouache",
+   "keywords": [
+    "gouache",
+    "vintage illustration",
+    "editorial illustration",
+    "storybook illustration",
+    "mid-century illustration"
+   ],
+   "prefix": "moss_vgouache_style, ",
+   "suffix": ", flat painterly shapes, warm editorial colour",
+   "negative": "photo, photorealistic, 3d render, glossy, gradient shading",
+   "loras": [
+    {
+     "path": "/vfast/data/models/moss/lora/MOSS-Image-Gouache-LoRA-F16.gguf",
+     "scale": 1.0
+    }
+   ]
+  },
+  {
+   "name": "impressionist",
+   "keywords": [
+    "impressionis*",
+    "monet",
+    "renoir",
+    "plein air"
+   ],
+   "negative": "photo, photorealistic, sharp digital, 3d render",
+   "loras": [
+    {
+     "path": "/vfast/data/models/moss/lora/moss-image-impressionism-lora.safetensors",
+     "scale": 1.2
+    }
+   ]
+  },
+  {
+   "name": "animated3d",
+   "keywords": [
+    "3d animated",
+    "3d cartoon",
+    "pixar style",
+    "animated movie",
+    "claymation"
+   ],
+   "prefix": "moss_ac_style, ",
+   "negative": "photorealistic, flat 2d, extra limbs, bad hands",
+   "loras": [
+    {
+     "path": "/vfast/data/models/moss/lora/MOSS-Image-Animated-LoRA-ComfyUI.safetensors",
+     "scale": 0.7
+    }
+   ]
+  },
+  {
+   "name": "anime",
+   "keywords": [
+    "anime",
+    "manga",
+    "cel shading",
+    "cel shaded",
+    "chibi",
+    "key frame",
+    "visual novel",
+    "waifu"
+   ],
+   "suffix": ", anime character, dynamic composition, clean anatomy",
+   "negative": "western cartoon, 3d render, photorealistic, extra legs, extra arms, bad hands"
+  },
+  {
+   "name": "beauty",
+   "keywords": [
+    "portrait*",
+    "headshot",
+    "close-up of a woman",
+    "close up of a woman",
+    "beauty shot",
+    "fashion photo*",
+    "selfie"
+   ],
+   "exclude": [
+    "anime",
+    "manga",
+    "illustration",
+    "painting",
+    "cartoon",
+    "drawing",
+    "sketch",
+    "3d",
+    "pixel",
+    "logo*",
+    "poster*",
+    "text",
+    "sign",
+    "lettering",
+    "nsfw",
+    "nude",
+    "naked"
+   ],
+   "prefix": "moss_beauty_style, ",
+   "suffix": ", soft directional light, natural skin texture, sharp eyes",
+   "negative": "plastic skin, oversaturated, harsh shadows, distorted face, asymmetrical eyes",
+   "loras": [
+    {
+     "path": "/vfast/data/models/moss/lora/MOSS-Image-Beauty-LoRA-F16.gguf",
+     "scale": 0.7
+    }
+   ]
+  },
+  {
+   "name": "people",
+   "keywords": [
+    "woman",
+    "women",
+    "man",
+    "men",
+    "girl",
+    "girls",
+    "boy",
+    "boys",
+    "lady",
+    "person",
+    "people",
+    "couple",
+    "character*",
+    "portrait*",
+    "headshot",
+    "selfie"
+   ],
+   "exclude": [
+    "logo*",
+    "poster*",
+    "icon*",
+    "infographic",
+    "diagram",
+    "screenshot",
+    "nsfw",
+    "nude",
+    "naked"
+   ],
+   "suffix": ", natural proportions, clean anatomy",
+   "negative": "extra limbs, extra legs, fused limbs, deformed hands, bad anatomy, blurry, low quality"
+  }
+ ]
+}

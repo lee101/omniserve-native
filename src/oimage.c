@@ -436,42 +436,50 @@ static bool add_routed_loras(oimage_request *request, const char *json,
     if (token >= 0 && token_bool(json, &tokens[token], &wanted) && !wanted) return true;
     olora_route_pick pick;
     if (!olora_route_select(request->prompt, &pick)) return true;
-    oimg_lora *loras = calloc(pick.lora_count, sizeof *loras);
-    if (!loras) return false;
+    oimg_lora *loras = pick.lora_count ? calloc(pick.lora_count, sizeof *loras) : NULL;
+    if (pick.lora_count && !loras) return false;
     char error[160];
     for (size_t i = 0; i < pick.lora_count; ++i) {
-        loras[i].path = cached_lora_path(pick.ids[i], NULL, error, sizeof error);
+        loras[i].path = pick.ids[i][0] == '/' ? strdup(pick.ids[i])
+                                              : cached_lora_path(pick.ids[i], NULL, error, sizeof error);
         loras[i].scale = pick.scales[i];
         if (!loras[i].path) {
             fprintf(stderr, "[lora-route] %s: %s: %s; generating without route\n",
-                    pick.name, pick.ids[i], error);
+                    pick.name, pick.ids[i], pick.ids[i][0] == '/' ? "out of memory" : error);
             for (size_t j = 0; j < i; ++j) free((char *)loras[j].path);
             free(loras);
             return true;
         }
     }
-    if (pick.prefix[0]) {
+    if (pick.prefix[0] || pick.suffix[0]) {
         size_t prefix_len = strlen(pick.prefix);
+        size_t suffix_len = strlen(pick.suffix);
         size_t prompt_len = strlen(request->prompt);
-        char *prompt = malloc(prefix_len + prompt_len + 1);
+        char *prompt = malloc(prefix_len + prompt_len + suffix_len + 1);
         if (!prompt) {
             for (size_t i = 0; i < pick.lora_count; ++i) free((char *)loras[i].path);
             free(loras);
             return false;
         }
         memcpy(prompt, pick.prefix, prefix_len);
-        memcpy(prompt + prefix_len, request->prompt, prompt_len + 1);
+        memcpy(prompt + prefix_len, request->prompt, prompt_len);
+        memcpy(prompt + prefix_len + prompt_len, pick.suffix, suffix_len + 1);
         free(request->prompt);
         request->prompt = prompt;
         request->generation.prompt = prompt;
     }
-    free(request->loras);
-    request->loras = loras;
-    request->generation.loras = loras;
-    request->generation.lora_count = pick.lora_count;
+    if (pick.negative[0] && !request->negative_prompt) {
+        request->negative_prompt = strdup(pick.negative);
+        request->generation.negative_prompt = request->negative_prompt;
+    }
+    if (pick.lora_count) {
+        free(request->loras);
+        request->loras = loras;
+        request->generation.loras = loras;
+        request->generation.lora_count = pick.lora_count;
+    }
     snprintf(request->lora_route, sizeof request->lora_route, "%s", pick.name);
-    fprintf(stderr, "[lora-route] %s: %zu lora(s), first %s@%.2f\n", pick.name,
-            pick.lora_count, pick.ids[0], (double)pick.scales[0]);
+    fprintf(stderr, "[lora-route] %s: %zu lora(s)\n", pick.name, pick.lora_count);
     return true;
 }
 
@@ -883,6 +891,17 @@ bool oimage_request_parse(const char *json, size_t json_len, oimage_request *req
     if (min_steps < 0) min_steps = image_env_int("OMNISERVE_NATIVE_SD_MIN_STEPS", 0, 0, 100);
     if (!request->generation.image_base64 && request->generation.steps < min_steps)
         request->generation.steps = min_steps;
+    /* A lane pinned to one recipe (distilled 4-step, or the dense quality tier) ignores client step/CFG hints:
+     * ra2-style callers send their own defaults, which would over-sample a distilled model. */
+    if (!request->generation.image_base64) {
+        int lane_steps = image_env_int("OMNISERVE_NATIVE_SD_LANE_STEPS", 0, 0, 100);
+        const char *lg = getenv("OMNISERVE_NATIVE_SD_LANE_GUIDANCE");
+        if (lane_steps) request->generation.steps = lane_steps;
+        if (lg && lg[0]) {
+            float lane_guidance = strtof(lg, NULL);
+            if (lane_guidance >= 0.0f && lane_guidance <= 30.0f) request->generation.guidance_scale = lane_guidance;
+        }
+    }
     /* Reference edits follow the instruction weakly without CFG (qualitybench/edit): the lane can set a step count
      * for requests that omit one, a guidance floor that also lifts clients hardcoding the text-to-image CFG 1, and
      * default sd.cpp sample args (cfg_end) for requests that send none. */

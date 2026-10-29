@@ -438,6 +438,28 @@ static void test_lora_route_match(void) {
     CHECK(!olora_route_select_json(bad_scale, strlen(bad_scale), "x", &pick));
 }
 
+static void test_lora_route_style_fields(void) {
+    const char *routes = "{\"routes\":["
+        "{\"name\":\"anime\",\"keywords\":[\"anime\"],\"suffix\":\", clean anatomy\",\"negative\":\"extra legs\"},"
+        "{\"name\":\"style\",\"keywords\":[\"gouache\"],\"prefix\":\"trig, \",\"suffix\":\", flat\","
+        "\"loras\":[{\"path\":\"/etc/hostname\",\"scale\":0.7}]},"
+        "{\"name\":\"badpath\",\"keywords\":[\"evil\"],\"loras\":[{\"path\":\"/etc/../etc/passwd\"}]},"
+        "{\"name\":\"relpath\",\"keywords\":[\"rel\"],\"loras\":[{\"path\":\"x.gguf\"}]}]}";
+    size_t len = strlen(routes);
+    olora_route_pick pick;
+    CHECK(olora_route_select_json(routes, len, "an anime girl", &pick));
+    CHECK(strcmp(pick.name, "anime") == 0);
+    CHECK(pick.lora_count == 0);
+    CHECK(strcmp(pick.suffix, ", clean anatomy") == 0);
+    CHECK(strcmp(pick.negative, "extra legs") == 0);
+    CHECK(olora_route_select_json(routes, len, "a gouache cafe", &pick));
+    CHECK(pick.lora_count == 1);
+    CHECK(strcmp(pick.ids[0], "/etc/hostname") == 0);
+    CHECK(strcmp(pick.prefix, "trig, ") == 0);
+    CHECK(!olora_route_select_json(routes, len, "evil", &pick));
+    CHECK(!olora_route_select_json(routes, len, "rel", &pick));
+}
+
 static void test_tier_parse(void) {
     CHECK(otier_parse("paid", 4) == TIER_PAID);
     CHECK(otier_parse("SUB", 3) == TIER_SUB);
@@ -2404,6 +2426,7 @@ int main(void) {
     test_json();
     test_image_contract();
     test_lora_route_match();
+    test_lora_route_style_fields();
     test_matte();
     test_tier_parse();
     test_completion_spacing();
