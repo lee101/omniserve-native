@@ -1,0 +1,12 @@
+{
+ "sign": "a lovely cat holding a sign that says 'moss-image.cpp', studio photo",
+ "note": "A wide view of a refrigerator beside a kitchen counter with a fruit bowl. A small sticky note on the refrigerator door is handwritten: \"Buy milk and eggs! Two cartons of milk, one dozen eggs, and a loaf of bread.\"",
+ "poster": "a minimalist travel poster with a cream background, a blue mountain illustration, and the large dark-blue title EXPLORE at the top, small subtitle 'Alpine Edition 2026' at the bottom",
+ "portrait": "close-up portrait of an elderly fisherman with a weathered face and a knitted wool cap, soft light from a window, deep wrinkles, grey stubble, kind pale blue eyes, a harbour softly blurred behind him, photorealistic, fine detail",
+ "landscape": "a cozy alpine village at dusk in early winter, warm lantern light glowing from the windows of timber houses, fresh snow on the rooftops, a stone bridge over a half-frozen river, pine forest and towering snowy peaks under a deep violet sky with the first stars, highly detailed, cinematic lighting",
+ "anime": "anime key frame, a girl with a long dark ponytail in a navy school uniform pointing angrily at a crumpled paper bag on the pavement, cel shading, vivid sunset sky, clean lineart, a swirling cyan and magenta portal above the bag",
+ "trio": "three full body women standing side by side in different poses, one waving, one hands on hips, one sitting cross-legged, summer dresses, beach at golden hour, full body visible head to toe, photorealistic, detailed hands and faces",
+ "hands": "a close-up photograph of a pianist's hands on piano keys, every finger clearly visible, warm stage light, shallow depth of field, detailed skin",
+ "product": "a studio product photograph of a glass perfume bottle with a gold cap and a label reading 'AURORA No. 5', on a marble surface with soft window light and water droplets",
+ "layout": "{\"summary\": {\"meta\": [\"poster\"], \"canvas\": \"single\", \"caption\": \"A minimalist travel poster with a cream background, a blue mountain illustration, and the title EXPLORE at the top.\"}, \"items\": [{\"label\": \"text\", \"caption\": \"Large dark-blue uppercase title centered at the top.\", \"text\": \"EXPLORE\", \"bbox\": [-416, -384, -288, 384]}, {\"label\": \"object\", \"caption\": \"A flat blue mountain illustration in the lower center.\", \"bbox\": [-192, -288, 384, 288]}], \"bbox_coord_space\": \"abs_centralized\", \"bbox_format\": \"yxyx\"}"
+}

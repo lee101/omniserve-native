@@ -193,7 +193,26 @@ bool osd_prepare_image(oimg_req *req) {
 typedef void (*fn_ctx_params_init)(sd_ctx_params_t *);
 typedef sd_ctx_t *(*fn_new_sd_ctx)(const sd_ctx_params_t *);
 typedef void (*fn_img_params_init)(sd_img_gen_params_t *);
+#ifndef OMNISERVE_SD_RESULT_API
+#define OMNISERVE_SD_RESULT_API 0
+#endif
+#ifndef OMNISERVE_SD_TILE_PX
+#define OMNISERVE_SD_TILE_PX 0
+#endif
+#if OMNISERVE_SD_RESULT_API
+/* Upstream returns an owning sd_image_generation_result_t whose items embed the
+ * images. Present them as the contiguous sd_image_t array the rest of this file
+ * uses; a hidden header keeps the result so the free path can release it. */
+typedef bool (*fn_generate_image)(sd_ctx_t *, const sd_img_gen_params_t *, sd_image_generation_result_t **);
+typedef void (*fn_free_result)(sd_image_generation_result_t *);
+static fn_free_result p_free_result;
+typedef struct {
+    sd_image_generation_result_t *result;
+    sd_image_t images[];
+} sd_image_block;
+#else
 typedef bool (*fn_generate_image)(sd_ctx_t *, const sd_img_gen_params_t *, sd_image_t **, int *);
+#endif
 typedef void (*fn_free_images)(sd_image_t *, int);
 typedef void (*fn_free_sd_ctx)(sd_ctx_t *);
 #if !OMNISERVE_SD_LATENT_API
@@ -225,6 +244,45 @@ static fn_free_sd_ctx p_free_sd_ctx;
 static fn_latent_params_init p_latent_params_init;
 static fn_generate_image_with_latent p_generate_image_with_latent;
 static fn_free_latent p_free_latent;
+static bool sd_generate_compat(sd_ctx_t *ctx, const sd_img_gen_params_t *params,
+                               sd_image_t **images, int *count) {
+#if OMNISERVE_SD_RESULT_API
+    sd_image_generation_result_t *result = NULL;
+    *images = NULL;
+    *count = 0;
+    bool ok = p_generate_image(ctx, params, &result);
+    if (!result) return false;
+    if (!ok || result->count <= 0 || !result->items) {
+        p_free_result(result);
+        return false;
+    }
+    sd_image_block *block = malloc(sizeof *block + (size_t)result->count * sizeof(sd_image_t));
+    if (!block) {
+        p_free_result(result);
+        return false;
+    }
+    block->result = result;
+    for (int i = 0; i < result->count; ++i) block->images[i] = result->items[i].image;
+    *images = block->images;
+    *count = result->count;
+    return true;
+#else
+    return p_generate_image(ctx, params, images, count);
+#endif
+}
+
+static void sd_free_images_compat(sd_image_t *images, int count) {
+#if OMNISERVE_SD_RESULT_API
+    (void)count;
+    if (!images) return;
+    sd_image_block *block = (sd_image_block *)((char *)images - offsetof(sd_image_block, images));
+    p_free_result(block->result);
+    free(block);
+#else
+    p_free_images(images, count);
+#endif
+}
+
 static bool g_webp_enabled = true;
 static float g_webp_quality = 85.0f;
 
@@ -316,6 +374,9 @@ static bool sd_lib_load(void) {
     *(void **)&p_str_to_sample_method = dlsym(lib, "str_to_sample_method");
     *(void **)&p_str_to_scheduler = dlsym(lib, "str_to_scheduler");
     p_free_images = (fn_free_images)dlsym(lib, "free_sd_images");
+#if OMNISERVE_SD_RESULT_API
+    p_free_result = (fn_free_result)dlsym(lib, "free_sd_image_generation_result");
+#endif
     p_free_sd_ctx = (fn_free_sd_ctx)dlsym(lib, "free_sd_ctx");
     p_latent_params_init = (fn_latent_params_init)dlsym(lib, "sd_latent_replay_params_init");
     p_generate_image_with_latent = (fn_generate_image_with_latent)dlsym(lib, "generate_image_with_latent");
@@ -337,7 +398,11 @@ static bool sd_lib_load(void) {
         g_sd_log_min = sd_env_int("OMNISERVE_NATIVE_SD_LOG_LEVEL", SD_LOG_WARN, SD_LOG_DEBUG, SD_LOG_ERROR);
         set_log(sd_log_to_stderr, NULL);
     }
+#if OMNISERVE_SD_RESULT_API
+    return p_ctx_params_init && p_new_sd_ctx && p_img_params_init && p_generate_image && p_free_result;
+#else
     return p_ctx_params_init && p_new_sd_ctx && p_img_params_init && p_generate_image && p_free_images;
+#endif
 }
 
 static sd_ctx_t *g_sd;
@@ -510,6 +575,7 @@ static struct {
     bool lightning;
     char default_lora[1024]; /* applied to requests that carry no LoRA of their own */
     float default_lora_scale;
+    bool default_lora_always; /* OMNISERVE_NATIVE_SD_DEFAULT_LORA_ALWAYS=1: apply it to every request without its own LoRA, not only turbo ones (MOSS NSFW lane) */
     bool notch;
     bool teleport; /* OMNISERVE_NATIVE_SD_TELEPORT=0 ignores request teleport flags (Qwen lanes: latent capture makes a first render ~2x slower and only an exact repeat benefits) */
     float hq_threshold; /* EasyCache threshold for non-turbo text-to-image; 0 = use the global one */
@@ -534,6 +600,7 @@ static void turbo_cfg_load(void) {
     const char *lora = getenv("OMNISERVE_NATIVE_SD_DEFAULT_LORA");
     g_cfg.default_lora[0] = 0;
     g_cfg.default_lora_scale = sd_env_float("OMNISERVE_NATIVE_SD_DEFAULT_LORA_SCALE", 1.0f, -4.0f, 4.0f);
+    g_cfg.default_lora_always = sd_env_flag("OMNISERVE_NATIVE_SD_DEFAULT_LORA_ALWAYS", false);
     if (lora && lora[0] == '/' && strlen(lora) < sizeof g_cfg.default_lora) {
         strcpy(g_cfg.default_lora, lora);
         fprintf(stderr, "sd: default LoRA %s scale=%.2f\n", lora, (double)g_cfg.default_lora_scale);
@@ -850,6 +917,7 @@ static sd_ctx_t *sd_ctx_build(const char *model_path, bool resident) {
     const char *vae = getenv("OMNISERVE_NATIVE_SD_VAE");
     const char *llm = getenv("OMNISERVE_NATIVE_SD_LLM");
     const char *llm_vision = getenv("OMNISERVE_NATIVE_SD_LLM_VISION");
+    const char *tokenizer = getenv("OMNISERVE_NATIVE_SD_TOKENIZER");
     const char *taesd = getenv("OMNISERVE_NATIVE_SD_TAESD");
     const char *max_vram = sd_profile_env("MAX_VRAM", resident, "");
     const char *backend = sd_profile_env("BACKEND", resident, getenv("OMNISERVE_NATIVE_SD_BACKEND"));
@@ -862,6 +930,8 @@ static sd_ctx_t *sd_ctx_build(const char *model_path, bool resident) {
     if (vae && vae[0]) params.vae_path = vae;
     if (llm && llm[0]) params.llm_path = llm;
     if (llm_vision && llm_vision[0]) params.llm_vision_path = llm_vision;
+    /* MOSS-Image's Qwen3.5 text encoder needs the external tokenizer.json. */
+    if (tokenizer && tokenizer[0]) params.tokenizer = tokenizer;
     if (taesd && taesd[0]) params.taesd_path = taesd;
     if (max_vram && max_vram[0]) params.max_vram = max_vram;
     if (backend && backend[0]) params.backend = backend;
@@ -1068,8 +1138,14 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         : req->guidance_scale;
     if (g_cfg.vae_tiling >= 0) params.vae_tiling_params.enabled = g_cfg.vae_tiling;
     if (params.vae_tiling_params.enabled) {
+#if OMNISERVE_SD_TILE_PX
+        /* Env tile sizes are latent units of the 8x VAE; upstream now takes pixels. */
+        params.vae_tiling_params.tile_size_w = g_cfg.tile_x * 8;
+        params.vae_tiling_params.tile_size_h = g_cfg.tile_y * 8;
+#else
         params.vae_tiling_params.tile_size_x = g_cfg.tile_x;
         params.vae_tiling_params.tile_size_y = g_cfg.tile_y;
+#endif
         params.vae_tiling_params.target_overlap = g_cfg.tile_overlap;
     }
     /* Only Lightning is trained for distilled reference edits. */
@@ -1124,7 +1200,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         params.lora_count = (uint32_t)req->lora_count;
     }
     sd_lora_t default_lora = {0};
-    if (turbo && g_cfg.default_lora[0]) {
+    if ((turbo || (g_cfg.default_lora_always && !req->lora_count)) && g_cfg.default_lora[0]) {
         default_lora.path = g_cfg.default_lora;
         default_lora.multiplier = g_cfg.default_lora_scale;
         params.loras = &default_lora;
@@ -1262,10 +1338,10 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         }
     }
     if (!ok) {
-        if (images) p_free_images(images, image_count);
+        if (images) sd_free_images_compat(images, image_count);
         images = NULL;
         image_count = 0;
-        ok = p_generate_image(g_sd, &params, &images, &image_count);
+        ok = sd_generate_compat(g_sd, &params, &images, &image_count);
     }
     out->elapsed_ms = now_ms() - started;
     out->yield_ms = g_yield_used_ms;
@@ -1274,14 +1350,14 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     free(loras);
 
     if (!ok || image_count <= 0 || !images) {
-        if (images) p_free_images(images, image_count);
+        if (images) sd_free_images_compat(images, image_count);
         cache_key_free(&key);
         return false;
     }
     out->images = calloc((size_t)image_count, sizeof *out->images);
     out->image_lens = calloc((size_t)image_count, sizeof *out->image_lens);
     if (!out->images || !out->image_lens) {
-        p_free_images(images, image_count);
+        sd_free_images_compat(images, image_count);
         free(out->images);
         free(out->image_lens);
         out->images = NULL;
@@ -1322,7 +1398,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
                 (int)(images[i].width * images[i].channel));
             if (!encoded || sink.failed || !sink.data) {
                 free(sink.data);
-                p_free_images(images, image_count);
+                sd_free_images_compat(images, image_count);
                 out->image_count = (size_t)i;
                 osd_result_free(out);
                 cache_key_free(&key);
@@ -1332,7 +1408,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
             out->image_lens[i] = sink.len;
         }
     }
-    p_free_images(images, image_count);
+    sd_free_images_compat(images, image_count);
     out->encode_ms = now_ms() - encode_started;
     out->image_count = (size_t)image_count;
     out->png = out->images[0];

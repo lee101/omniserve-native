@@ -9,8 +9,35 @@ void sd_ctx_params_init(sd_ctx_params_t *params) { memset(params, 0, sizeof *par
 sd_ctx_t *new_sd_ctx(const sd_ctx_params_t *params) { (void)params; return (sd_ctx_t *)1; }
 void sd_img_gen_params_init(sd_img_gen_params_t *params) { memset(params, 0, sizeof *params); }
 
+#ifdef OMNISERVE_SD_RESULT_API_STUB
+static bool stub_generate(sd_ctx_t *ctx, const sd_img_gen_params_t *params,
+                          sd_image_t **images, int *count);
+bool generate_image(sd_ctx_t *ctx, const sd_img_gen_params_t *params,
+                    sd_image_generation_result_t **result_out) {
+    sd_image_t *images = NULL;
+    int count = 0;
+    *result_out = NULL;
+    if (!stub_generate(ctx, params, &images, &count)) return false;
+    sd_image_generation_result_t *result = calloc(1, sizeof *result);
+    result->items = calloc((size_t)count, sizeof *result->items);
+    result->count = count;
+    for (int i = 0; i < count; ++i) result->items[i].image = images[i];
+    free(images);
+    *result_out = result;
+    return true;
+}
+void free_sd_image_generation_result(sd_image_generation_result_t *result) {
+    if (!result) return;
+    for (int i = 0; i < result->count; ++i) free(result->items[i].image.data);
+    free(result->items);
+    free(result);
+}
+static bool stub_generate(sd_ctx_t *ctx, const sd_img_gen_params_t *params,
+                          sd_image_t **images, int *count) {
+#else
 bool generate_image(sd_ctx_t *ctx, const sd_img_gen_params_t *params,
                     sd_image_t **images, int *count) {
+#endif
     (void)ctx;
     const char *capture = getenv("OMNISERVE_STUB_PARAMS");
     if (capture) {

@@ -121,29 +121,44 @@ if(WITH_SD AND EXISTS "${SD_DIR}/build/bin/libstable-diffusion.so")
     else()
         set(_sd_latent_api 0)
     endif()
-    target_compile_definitions(omniserve-native PRIVATE
+    # Newer upstream renamed the tiling fields tile_size_x/y (latent units) to
+    # tile_size_w/h (image pixels).
+    if(_sd_header MATCHES "tile_size_w")
+        set(_sd_tile_px 1)
+    else()
+        set(_sd_tile_px 0)
+    endif()
+    # Newer upstream's generate_image returns an owning sd_image_generation_result_t.
+    if(_sd_header MATCHES "sd_image_generation_result_t")
+        set(_sd_result_api 1)
+    else()
+        set(_sd_result_api 0)
+    endif()
+    set(_sd_api_defs
         OMNISERVE_SD_STREAM_LAYERS=${_sd_stream_layers}
-        OMNISERVE_SD_LATENT_API=${_sd_latent_api})
+        OMNISERVE_SD_LATENT_API=${_sd_latent_api}
+        OMNISERVE_SD_TILE_PX=${_sd_tile_px}
+        OMNISERVE_SD_RESULT_API=${_sd_result_api})
+    target_compile_definitions(omniserve-native PRIVATE ${_sd_api_defs})
     # SYSTEM so the vendored stb/sd headers do not trip our own strict warning
     # set; they are third-party code and are not ours to fix.
     target_include_directories(omniserve-native SYSTEM BEFORE PRIVATE "${SD_DIR}/ggml/examples")
     target_include_directories(omniserve-native SYSTEM PRIVATE "${SD_DIR}/include")
     target_include_directories(omniserve-native SYSTEM PRIVATE "${SD_DIR}/thirdparty")
     add_executable(onative_image_decode_tests tests/test_image_decode.c src/backend_sd.c)
-    target_compile_definitions(onative_image_decode_tests PRIVATE USE_SD
-        OMNISERVE_SD_STREAM_LAYERS=${_sd_stream_layers}
-        OMNISERVE_SD_LATENT_API=${_sd_latent_api})
+    target_compile_definitions(onative_image_decode_tests PRIVATE USE_SD ${_sd_api_defs})
     target_include_directories(onative_image_decode_tests SYSTEM PRIVATE
         "${SD_DIR}/ggml/examples" "${SD_DIR}/include" "${SD_DIR}/thirdparty")
     target_link_libraries(onative_image_decode_tests PRIVATE onative_core)
     add_executable(onative_image_bench tests/bench_image.c src/backend_sd.c)
-    target_compile_definitions(onative_image_bench PRIVATE USE_SD
-        OMNISERVE_SD_STREAM_LAYERS=${_sd_stream_layers}
-        OMNISERVE_SD_LATENT_API=${_sd_latent_api})
+    target_compile_definitions(onative_image_bench PRIVATE USE_SD ${_sd_api_defs})
     target_include_directories(onative_image_bench SYSTEM PRIVATE
         "${SD_DIR}/ggml/examples" "${SD_DIR}/include" "${SD_DIR}/thirdparty")
     target_link_libraries(onative_image_bench PRIVATE onative_core)
     add_library(onative_sd_cache_stub SHARED tests/sd_cache_stub.c)
+    if(_sd_result_api)
+        target_compile_definitions(onative_sd_cache_stub PRIVATE OMNISERVE_SD_RESULT_API_STUB)
+    endif()
     target_include_directories(onative_sd_cache_stub SYSTEM PRIVATE "${SD_DIR}/include")
 endif()
 
