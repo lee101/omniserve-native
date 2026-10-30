@@ -14,3 +14,7 @@ description = "HuggingFace access token"
 regex = '''hf_[A-Za-z0-9]{30,}'''
 secretGroup = 0
 entropy = 3.0
+
+[allowlist]
+description = "benchmark case ids (md5 of the case name), not credentials"
+paths = ['''qualitybench/edit/cases\.json''']
