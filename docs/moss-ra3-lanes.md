@@ -52,3 +52,7 @@ layout JSON and is not offered.
 - Fizgig look LoRA (Base only), `darask0` 4-step adapter (custom sampler), lodestones DMD (custom sampler).
 - Celebrity likeness LoRAs and copyrighted-character LoRAs: not used.
 - `deadman44/MOSS_Image_LoRA` (school-age subject matter), `pmczip/MOSS_Image_LoRAs` (celebrity likenesses), alpha/manga-alpha (RGBA VAE), hires LoHa (4 MP+ only, not a style).
+
+## Deploying the lanes
+
+`deploy/moss-ra3-prod.sh [check|build|install|start|smoke|all]` (run on the GPU host as the service user) verifies the model files, builds the sd.cpp `moss-i2i-reference` branch (github.com/lee101/stable-diffusion.cpp-opt) and omniserve, installs `omniserve-native-ra3-fast` (:8793) and `omniserve-native-ra3-hq` (:8794, also serves `/v1/images/edits`), and smoke-tests both. The units call `qualitybench/serve_moss.sh`, so recipe changes need no unit edits. `LANES=fast` installs only the fast lane. On a 24 GB card the lanes cannot be resident together; use one lane per card or let the hq lane be started on demand. Netwrck needs `RA3_LOCAL_IMAGE_URL`, `RA3_LOCAL_HQ_IMAGE_URL` and `RA3_LOCAL_IMAGE_SECRET`; without them the ra3 endpoints answer with a generic failure and charge nothing.
