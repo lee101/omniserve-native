@@ -427,15 +427,23 @@ static bool token_bool(const char *json, const oj_tok *token, bool *value) {
 
 static bool add_routed_loras(oimage_request *request, const char *json,
                              const oj_tok *tokens, int token_count) {
-    if (!olora_route_enabled() || request->generation.lora_count ||
-        request->generation.image_base64 || !request->prompt) {
+    if (!olora_route_enabled() || request->generation.lora_count || !request->prompt) {
         return true;
     }
-    int token = oj_obj_get(json, tokens, token_count, 0, "auto_lora");
-    bool wanted = true;
-    if (token >= 0 && token_bool(json, &tokens[token], &wanted) && !wanted) return true;
     olora_route_pick pick;
-    if (!olora_route_select(request->prompt, &pick)) return true;
+    if (request->generation.image_base64) { /* reference edit: only an explicit task picks a route */
+        char task[64];
+        int task_token = oj_obj_get(json, tokens, token_count, 0, "task");
+        if (task_token < 0 || tokens[task_token].type != OJ_STRING ||
+            !oj_unescape(json, &tokens[task_token], task, sizeof task) || !olora_route_select_task(task, &pick)) {
+            return true;
+        }
+    } else {
+        int token = oj_obj_get(json, tokens, token_count, 0, "auto_lora");
+        bool wanted = true;
+        if (token >= 0 && token_bool(json, &tokens[token], &wanted) && !wanted) return true;
+        if (!olora_route_select(request->prompt, &pick)) return true;
+    }
     oimg_lora *loras = pick.lora_count ? calloc(pick.lora_count, sizeof *loras) : NULL;
     if (pick.lora_count && !loras) return false;
     char error[160];
@@ -451,6 +459,19 @@ static bool add_routed_loras(oimage_request *request, const char *json,
             return true;
         }
     }
+    if (pick.prompt[0]) {
+        char *prompt = strdup(pick.prompt);
+        if (!prompt) {
+            for (size_t i = 0; i < pick.lora_count; ++i) free((char *)loras[i].path);
+            free(loras);
+            return false;
+        }
+        free(request->prompt);
+        request->prompt = prompt;
+        request->generation.prompt = prompt;
+    }
+    if (pick.steps) request->generation.steps = pick.steps;
+    if (pick.guidance > 0.0f) request->generation.guidance_scale = pick.guidance;
     if (pick.prefix[0] || pick.suffix[0]) {
         size_t prefix_len = strlen(pick.prefix);
         size_t suffix_len = strlen(pick.suffix);

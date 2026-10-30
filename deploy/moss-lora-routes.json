@@ -1,4 +1,5 @@
 {
+ "avoid_weight": 0.5,
  "routes": [
   {
    "name": "psychedelic",
@@ -17,7 +18,17 @@
      "path": "/vfast/data/models/moss/lora/MOSS-Image-Psychedelic-LoRA-F16.gguf",
      "scale": 1.0
     }
-   ]
+   ],
+   "positive": [
+    "psychedelic trippy swirling fractal colours",
+    "acid trip blacklight poster art",
+    "dreamlike kaleidoscopic neon pattern, warped vivid colours"
+   ],
+   "avoid": [
+    "realistic photograph",
+    "plain minimal"
+   ],
+   "min_score": 0.4
   },
   {
    "name": "gouache",
@@ -36,7 +47,17 @@
      "path": "/vfast/data/models/moss/lora/MOSS-Image-Gouache-LoRA-F16.gguf",
      "scale": 1.0
     }
-   ]
+   ],
+   "positive": [
+    "gouache painting with flat painterly shapes",
+    "vintage mid-century storybook illustration",
+    "retro children's book picture, flat shapes, warm limited palette"
+   ],
+   "avoid": [
+    "photograph",
+    "3d render"
+   ],
+   "min_score": 0.4
   },
   {
    "name": "impressionist",
@@ -52,7 +73,17 @@
      "path": "/vfast/data/models/moss/lora/moss-image-impressionism-lora.safetensors",
      "scale": 1.2
     }
-   ]
+   ],
+   "positive": [
+    "impressionist oil painting with soft brushstrokes",
+    "monet style garden in dappled light",
+    "hazy plein air landscape painting, dabs of colour"
+   ],
+   "avoid": [
+    "photograph",
+    "sharp digital render"
+   ],
+   "min_score": 0.4
   },
   {
    "name": "animated3d",
@@ -70,6 +101,45 @@
      "path": "/vfast/data/models/moss/lora/MOSS-Image-Animated-LoRA-ComfyUI.safetensors",
      "scale": 0.7
     }
+   ],
+   "positive": [
+    "3d animated movie character, pixar style",
+    "cute 3d cartoon character from a computer animated kids film",
+    "claymation stop motion figure"
+   ],
+   "avoid": [
+    "photograph of a real person",
+    "flat 2d drawing"
+   ],
+   "min_score": 0.42
+  },
+  {
+   "name": "pixelart",
+   "keywords": [
+    "pixel art",
+    "pixelart",
+    "8-bit",
+    "16-bit",
+    "sprite*",
+    "game icon*"
+   ],
+   "positive": [
+    "pixel art game sprite icon",
+    "retro 8-bit pixel art with a dark outline",
+    "16x16 pixel art item for a video game"
+   ],
+   "avoid": [
+    "photograph",
+    "realistic painting"
+   ],
+   "min_score": 0.45,
+   "prefix": "pixel art 16x16 game icon, ",
+   "negative": "blurry, photo, gradient, antialiased",
+   "loras": [
+    {
+     "path": "/vfast/data/models/moss/lora/moss-image-pixelart-16x16.safetensors",
+     "scale": 0.6
+    }
    ]
   },
   {
@@ -82,10 +152,24 @@
     "chibi",
     "key frame",
     "visual novel",
-    "waifu"
+    "waifu",
+    "mecha",
+    "magical girl"
    ],
    "suffix": ", anime character, dynamic composition, clean anatomy",
-   "negative": "western cartoon, 3d render, photorealistic, extra legs, extra arms, bad hands"
+   "negative": "western cartoon, 3d render, photorealistic, extra legs, extra arms, bad hands",
+   "positive": [
+    "anime girl illustration",
+    "manga character, cel shaded japanese cartoon",
+    "anime key visual with big sparkling eyes",
+    "manga style warrior with a sword, dynamic pose",
+    "anime scene, detailed background, cel shading"
+   ],
+   "avoid": [
+    "photograph",
+    "3d render"
+   ],
+   "min_score": 0.42
   },
   {
    "name": "beauty",
@@ -125,7 +209,18 @@
      "path": "/vfast/data/models/moss/lora/MOSS-Image-Beauty-LoRA-F16.gguf",
      "scale": 0.7
     }
-   ]
+   ],
+   "positive": [
+    "close-up portrait photo of a woman, studio lighting",
+    "fashion photography headshot of a model, flawless skin",
+    "beauty shot of a young woman, natural skin texture"
+   ],
+   "avoid": [
+    "illustration or painting",
+    "cartoon character",
+    "logo poster or text"
+   ],
+   "min_score": 0.5
   },
   {
    "name": "people",
@@ -156,10 +251,65 @@
     "screenshot",
     "nsfw",
     "nude",
-    "naked"
+    "naked",
+    "illustration",
+    "painting",
+    "anime",
+    "manga",
+    "cartoon",
+    "drawing",
+    "sketch"
    ],
    "suffix": ", natural proportions, clean anatomy",
-   "negative": "extra limbs, extra legs, fused limbs, deformed hands, bad anatomy, blurry, low quality"
+   "negative": "extra limbs, extra legs, fused limbs, deformed hands, bad anatomy, blurry, low quality",
+   "positive": [
+    "a photo of a person or people doing something",
+    "man and woman, candid photograph",
+    "friends together outdoors, candid photo",
+    "an elderly man working, documentary photograph",
+    "a girl or boy playing, everyday life photo",
+    "a man",
+    "a woman",
+    "a girl",
+    "a boy",
+    "an old man",
+    "a child walking",
+    "a person working at a job, documentary photo"
+   ],
+   "avoid": [
+    "animal",
+    "landscape",
+    "object only",
+    "logo or diagram"
+   ],
+   "min_score": 0.38
+  }
+ ],
+ "edit_routes": [
+  {
+   "task": "clean",
+   "prompt": "no sfx, no dialogue, no watermark",
+   "steps": 30,
+   "guidance": 4.0,
+   "loras": [
+    {
+     "path": "/vfast/data/models/moss/lora/moss_i2i_sanitize_v3.safetensors",
+     "scale": 1.0
+    }
+   ]
+  },
+  {
+   "task": "colorize",
+   "prefix": "comic, ",
+   "steps": 30,
+   "guidance": 3.0,
+   "negative": "worst quality, greyscale, blurry, jpeg artifact",
+   "loras": [
+    {
+     "path": "/vfast/data/models/moss/lora/moss_colorize_3k_v4.safetensors",
+     "scale": 1.0
+    }
+   ]
   }
  ]
 }

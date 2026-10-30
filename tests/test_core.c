@@ -460,6 +460,24 @@ static void test_lora_route_style_fields(void) {
     CHECK(!olora_route_select_json(routes, len, "rel", &pick));
 }
 
+static void test_lora_route_edit_tasks_and_embed(void) {
+    const char *routes = "{\"routes\":[{\"name\":\"p\",\"keywords\":[\"zzz\"],\"min_score\":0.4,"
+        "\"positive\":[\"anime girl illustration\"],\"avoid\":[\"photograph\"],\"suffix\":\", s\"}],"
+        "\"edit_routes\":[{\"task\":\"clean\",\"prompt\":\"no text\",\"steps\":30,\"guidance\":4,"
+        "\"loras\":[{\"path\":\"/etc/hostname\",\"scale\":1.0}]},{\"task\":\"bad\",\"loras\":[{\"path\":\"/nope\"}]}]}";
+    size_t len = strlen(routes);
+    olora_route_pick pick;
+    CHECK(olora_route_select_task_json(routes, len, "clean", &pick));
+    CHECK(strcmp(pick.prompt, "no text") == 0 && pick.steps == 30 && pick.guidance == 4.0f && pick.lora_count == 1);
+    CHECK(!olora_route_select_task_json(routes, len, "bad", &pick));      /* unreadable LoRA path */
+    CHECK(!olora_route_select_task_json(routes, len, "missing", &pick));
+    CHECK(!olora_route_select_task_json(routes, len, "", &pick));
+    /* text routes never match an edit task name and vice versa */
+    CHECK(!olora_route_select_json(routes, len, "clean", &pick));
+    /* no embed model configured: a route with positives still works through its keywords */
+    CHECK(olora_route_select_json(routes, len, "zzz", &pick) && strcmp(pick.name, "p") == 0);
+}
+
 static void test_tier_parse(void) {
     CHECK(otier_parse("paid", 4) == TIER_PAID);
     CHECK(otier_parse("SUB", 3) == TIER_SUB);
@@ -2427,6 +2445,7 @@ int main(void) {
     test_image_contract();
     test_lora_route_match();
     test_lora_route_style_fields();
+    test_lora_route_edit_tasks_and_embed();
     test_matte();
     test_tier_parse();
     test_completion_spacing();
