@@ -345,4 +345,9 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
 if __name__ == "__main__":
     if runpod is None:
         raise RuntimeError("runpod is required for the serverless worker")
+    try:  # ship per-job logs to the shared private R2 bucket (needs LOG_R2_* env); no-op if the module is absent
+        import runpod_joblog
+        handler = runpod_joblog.wrap(handler, "omniserve-native/music3")
+    except ImportError:
+        pass
     runpod.serverless.start({"handler": handler})
