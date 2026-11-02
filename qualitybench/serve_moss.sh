@@ -18,10 +18,10 @@ export OMNISERVE_NATIVE_SD_TOKENIZER=$M/tok/tokenizer.json
 export OMNISERVE_NATIVE_SD_ZERO_GUIDANCE=1.0 OMNISERVE_NATIVE_SD_MIN_STEPS=0
 export OMNISERVE_NATIVE_SD_EAGER_LOAD=1 OMNISERVE_NATIVE_SD_MIN_FREE_MB=256
 export OMNISERVE_NATIVE_SD_WARMUP=${WARMUP:-0}
-if [ "${LANE:-sfw}" = fast ] || [ "$LANE" = hq ]; then
+if [ "${LANE:-sfw}" = fast ] || [ "$LANE" = hq ] || [ "$LANE" = idm ]; then
   export OMNISERVE_NATIVE_LORA_AUTO_ROUTE=1 OMNISERVE_NATIVE_LORA_ROUTES=$PWD/deploy/moss-lora-routes.json OMNISERVE_NATIVE_LORA_EMBED_DIR=${MOSS_EMBED_DIR:-/vfast/data/models/moss/embed}
 fi
-if [ "${LANE:-sfw}" = fast ] || [ "$LANE" = hq ]; then export OMNISERVE_NATIVE_SD_PUBLIC_NAME=${PUBLIC_NAME:-ra3}; fi
+if [ "${LANE:-sfw}" = fast ] || [ "$LANE" = hq ] || [ "$LANE" = idm ]; then export OMNISERVE_NATIVE_SD_PUBLIC_NAME=${PUBLIC_NAME:-ra3}; fi
 if [ "$LANE" = fast ]; then
   export OMNISERVE_NATIVE_SD_LANE_STEPS=4 OMNISERVE_NATIVE_SD_LANE_GUIDANCE=1.0
 elif [ "$LANE" = hq ]; then
@@ -29,6 +29,14 @@ elif [ "$LANE" = hq ]; then
   export OMNISERVE_NATIVE_SD_LANE_STEPS=30 OMNISERVE_NATIVE_SD_LANE_GUIDANCE=3.0
   export OMNISERVE_NATIVE_SD_CACHE_MODE=easycache OMNISERVE_NATIVE_SD_EASYCACHE_THRESHOLD=0.15
   export OMNISERVE_NATIVE_SD_REFERENCE_EDIT=1  # image requests carry a reference latent (task routes: clean, colorize)
+fi
+if [ "$LANE" = idm ]; then
+  # IDM 2-step (akhaliq/MOSS-Image-IDM-2-Steps v1 export 750): dense SFT base + fp32 LoRA, 2 network evaluations, no CFG.
+  I=${IDM_DIR:-$M/idm/v1_750}
+  export SD_IDM_DATASPACE=$I/dataspace.bin SD_IDM_TIME_EMBEDDING=$I/time_embedding.safetensors
+  export OMNISERVE_NATIVE_SD_DIFFUSION_MODEL=${MODEL:-$M/sft/MOSS-Image-SFT-Q4_K.gguf}
+  export OMNISERVE_NATIVE_SD_DEFAULT_LORA=$I/lora.safetensors OMNISERVE_NATIVE_SD_DEFAULT_LORA_SCALE=1.0 OMNISERVE_NATIVE_SD_DEFAULT_LORA_ALWAYS=1
+  export OMNISERVE_NATIVE_SD_LANE_STEPS=2 OMNISERVE_NATIVE_SD_LANE_GUIDANCE=1.0 OMNISERVE_NATIVE_SD_PUBLIC_NAME=${PUBLIC_NAME:-ra3}
 fi
 if [ "${LANE:-sfw}" = nsfw ]; then
   export OMNISERVE_NATIVE_SD_DEFAULT_LORA=$M/lora/MOSS-Image-NSFW-Uncensored-LoRA-F16.gguf
