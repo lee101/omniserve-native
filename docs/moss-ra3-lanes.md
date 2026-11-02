@@ -15,6 +15,9 @@ tool pages or marketing. Public name is "ra3"; callers see one art generator wit
 4-step lane is more saturated and spelled lettering better in our sheets (`results/moss-routes/fast_vs_hq.jpg`).
 Sell it as "natural look", priced 3x in netwrck (`ra3HQPriceFactor`).
 
+One-image smoke test (builds if needed, starts the lane, writes `moss-out/00.webp`, stops it):
+`scripts/test-moss.sh "a red fox sitting in snow, photograph"` (`LANE=`, `PORT=`, `KEEP=1`).
+
 ## Routing (`deploy/moss-lora-routes.json`, `OMNISERVE_NATIVE_LORA_AUTO_ROUTE=1`)
 
 First matching route wins; each can add a trigger prefix, a prompt suffix, a negative (only effective at

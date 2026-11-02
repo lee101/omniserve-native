@@ -188,6 +188,15 @@ one retry is enough before rendering locally. The lane warms itself with one
 start script does with `RA2_TURBO=1`) makes the 6-step tier the default for
 text-to-image, `{"turbo":false}` selects the base path; off by default here.
 
+### MOSS-Image one-image test
+
+`scripts/test-moss.sh "a red fox sitting in snow, photograph"` builds the
+gateway against `MOSS_SD_LIB`, starts `qualitybench/serve_moss.sh`, renders one
+1024² WebP into `moss-out/`, prints path, wall time and `inference_time_ms`, and
+stops the lane. A lane already answering on `PORT` (default 8794) is reused;
+`LANE=fast|hq|nsfw`, `W`, `H`, `STEPS`, `SEED`, `KEEP=1` override.
+`docs/moss-ra3-lanes.md` has the recipes; the public name is ra3.
+
 ### LLM continuous batching
 
 The embedded LLM runs every request as a sequence in one shared context.
