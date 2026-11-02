@@ -188,6 +188,15 @@ one retry is enough before rendering locally. The lane warms itself with one
 start script does with `RA2_TURBO=1`) makes the 6-step tier the default for
 text-to-image, `{"turbo":false}` selects the base path; off by default here.
 
+### MOSS-Image one-image test
+
+`scripts/test-moss.sh "a red fox sitting in snow, photograph"` builds the
+gateway against `MOSS_SD_LIB`, starts `qualitybench/serve_moss.sh`, renders one
+1024² WebP into `moss-out/`, prints path, wall time and `inference_time_ms`, and
+stops the lane. A lane already answering on `PORT` (default 8794) is reused;
+`LANE=fast|hq|nsfw`, `W`, `H`, `STEPS`, `SEED`, `KEEP=1` override.
+`docs/moss-ra3-lanes.md` has the recipes; the public name is ra3.
+
 ### LLM continuous batching
 
 The embedded LLM runs every request as a sequence in one shared context.
@@ -1304,3 +1313,10 @@ python -m workloads.anime_pose_control --precompile 1024x1024 768x768
 A fresh process replaying the artifact serves its first request in about 25 s instead of 85-107 s. Any package that installs an inductor post-grad pass at import (torchao does) disables the FX graph cache, so the core clears those passes before compiling.
 
 Pinned sources: `circlestone-labs/Anima` anime-base-v1.0, `Claquasse/Anima-Control-Pose` preview-2 and its detector ONNX files, `Sen-sou/Anima-LLLite-Regional-Controlnet`, `TaihoC/Anima-ControlNet-VACE-Depth`, `CabalResearch/Anima-Canny-Scribble-Adjustable-Control-LoRA`, `depth-anything/Depth-Anything-V2-Small-hf`.
+
+## Worker job logs (private bucket)
+
+`runtime/handler.py` and `music3/handler.py` wrap their handler with `runpod_joblog.wrap(handler, "omniserve-native/<service>")` and upload the
+job log (also on failure) to the shared private R2 bucket `private` at `omniserve-native/<service>/worker-logs/YYYY/MM/DD/<job>.log.gz`.
+The C gateway does not presign yet, so set `LOG_R2_ACCOUNT_ID`, `LOG_R2_ACCESS_KEY_ID`, `LOG_R2_SECRET_ACCESS_KEY` on the endpoint
+(or pass `input._log_upload_url`). Rollup: manifoldgen-site `scripts/h3_log_rollup.py --prefix omniserve-native/`. Logs contain job inputs.

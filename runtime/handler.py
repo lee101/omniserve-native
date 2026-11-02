@@ -391,4 +391,9 @@ if __name__ == "__main__":
     if runpod is None:
         raise RuntimeError("the RunPod SDK is required for the serverless entry point")
     preload()
+    try:  # ship per-job logs to the shared private R2 bucket (needs LOG_R2_* env); no-op if the module is absent
+        import runpod_joblog
+        dispatch = runpod_joblog.wrap(dispatch, "omniserve-native/runtime")
+    except ImportError:
+        pass
     runpod.serverless.start({"handler": dispatch})

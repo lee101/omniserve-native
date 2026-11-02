@@ -14,6 +14,7 @@ RUN git clone --filter=blob:none https://github.com/sgl-project/sglang-omni.git 
     && python3 -m pip install --no-cache-dir 'runpod==1.8.1'
 
 COPY music3/handler.py /opt/omniserve-music3/handler.py
+COPY music3/runpod_joblog.py /opt/omniserve-music3/runpod_joblog.py
 
 ENV PYTHONPATH=/opt/sglang-omni \
     SGLANG_OMNI_AUTO_CLONE=0 \
