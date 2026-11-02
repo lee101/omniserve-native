@@ -21,12 +21,17 @@ SQLITE_LIB := $(CONDA_PREFIX)/lib/libsqlite3.so
 override LDFLAGS += -Wl,-rpath,$(CONDA_PREFIX)/lib
 endif
 
-.PHONY: all run test clean
+.PHONY: all run test clean oencode
 
 all: $(BIN) $(JOBCTL) $(MUSIC3C) $(WAVWRAP)
 
 build:
 	mkdir -p $@
+
+oencode: build/liboencode.so
+
+build/liboencode.so: build src/oencode.c include/oencode.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -O3 -fPIC -shared src/oencode.c -ldeflate -lwebp -pthread -o $@
 
 $(BIN): build $(BIN_SRC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Wno-overlength-strings $(BIN_SRC) -pthread -ldl -lm -o $@
