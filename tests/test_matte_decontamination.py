@@ -21,7 +21,7 @@ try:
     import numpy as np
 except ImportError:  # pragma: no cover
     print("skipping: numpy is not installed")
-    raise SystemExit(0)
+    raise SystemExit(0) if __name__ == "__main__" else unittest.SkipTest("dependencies unavailable")
 
 try:
     import omatte
@@ -30,7 +30,7 @@ try:
         raise omatte.MatteUnavailable("library not loaded")
 except Exception as error:  # pragma: no cover - library not built
     print(f"skipping: {error}")
-    raise SystemExit(0)
+    raise SystemExit(0) if __name__ == "__main__" else unittest.SkipTest("dependencies unavailable")
 
 
 FOREGROUND = np.array([0.85, 0.35, 0.25], dtype=np.float32)

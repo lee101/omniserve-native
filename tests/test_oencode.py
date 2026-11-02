@@ -12,13 +12,11 @@ try:
     from PIL import Image
 except ImportError:
     print("skipping: numpy or Pillow is not installed")
-    raise SystemExit(0)
+    raise SystemExit(0) if __name__ == "__main__" else unittest.SkipTest("dependencies unavailable")
 
 import oencode
 
-if not oencode.available():
-    print("skipping: liboencode.so is not built")
-    raise SystemExit(0)
+needs_lib = unittest.skipUnless(oencode.available(), "liboencode.so is not built")
 
 
 def decode(data):
@@ -38,6 +36,7 @@ def scene(h, w, seed=0):
     return np.dstack([rgb, alpha])
 
 
+@needs_lib
 class PngTest(unittest.TestCase):
     def test_rgba_lossless_at_every_level(self):
         arr = scene(61, 97)
@@ -76,6 +75,7 @@ class PngTest(unittest.TestCase):
         self.assertLessEqual(len(oencode.png(arr, 2)), len(buf.getvalue()))
 
 
+@needs_lib
 class WebpTest(unittest.TestCase):
     def reference(self, arr, method):
         blank = arr.copy()
