@@ -49,6 +49,18 @@ sequence, ref at timestep 0 with its own modulation, ref queries attend only to 
 a skipped uncond layer still runs the ref rows. The decensor LoRA has no route on purpose; `swap_text` needs
 layout JSON and is not offered.
 
+## IDM 2-step lane (`LANE=idm`, experimental, not the default)
+
+`akhaliq/MOSS-Image-IDM-2-Steps` v1 export 750 (`/vfast/data/models/moss/idm/v1_750/`): dense SFT Q4_K + fp32 LoRA at runtime, 2 network
+evaluations, no CFG. Needs the sd.cpp patch: `src/runtime/idm.hpp` (data-space sampler `x = z + Q x0; x0 = z - v(x, code[r])`,
+codes 1000/968 replace the timestep), `SD_IDM_TIME_EMBEDDING` (tensor override of the time MLP + modulation biases),
+`SD_IDM_DATASPACE` (`dataspace.bin` = Q f32[128x128] + codes; convert from the adapter's `dataspace.safetensors`).
+Result (17 prompts, same seeds, `qualitybench/idm_ab.py`): 2.65 s vs 3.43 s for the 4-step lane (-22%), text rendering as good or better,
+anatomy fine; but 2/17 composition misses (extra face, stray fist), and the beauty/gouache/psychedelic LoRA routes do not take effect on top of
+the IDM LoRA (only suffix-only routes do), so it is not a drop-in for `fast`. Cold start ~9 min from a cold disk cache.
+v2 edit adapter not wired: it needs image-conditioned prompt embeds (VLM sees the input), which our text-only encoder path lacks, and the
+adapter card reports structural edits (colorize) fail at 2 steps.
+
 ## Evaluated, not adopted
 
 - Banding-fix LoRA (`MATLOWAI/MOSS-Image-SFT-DeBand`, 1.1 GB): no stripes seen in our sheets.
