@@ -3842,12 +3842,38 @@ static bool ops_authorized(const app_state *app, const ohttp_request *req) {
     return g_allow_open;
 }
 
+/* Several routes forward the caller's path (job polls, 3D assets) to a
+ * worker. A dot segment or an encoded slash/dot there would let a caller
+ * address a different worker route than the one this gateway authorized, so
+ * such paths are refused before routing. */
+static bool path_is_clean(const ohttp_request *req) {
+    const char *p = req->path;
+    size_t n = req->path_len;
+    if (!n || p[0] != '/') return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = p[i];
+        if (c == '\\' || c == '\0') return false;
+        if (c == '%' && i + 2 < n) {
+            char a = p[i + 1], b = (char)(p[i + 2] | 0x20);
+            if ((a == '2' && (b == 'e' || b == 'f')) || (a == '5' && b == 'c') ||
+                (a == '0' && b == '0')) return false;
+        }
+        if (c == '/' && i + 1 < n && p[i + 1] == '.') {
+            size_t j = i + 2;
+            if (j < n && p[j] == '.') j++;
+            if (j == n || p[j] == '/') return false;
+        }
+    }
+    return true;
+}
+
 static void route(ohttp_request *req, void *user) {
     app_state *app = user;
     if (ohttp_method_is(req, "OPTIONS")) {
         ohttp_respond_str(req, 204, "text/plain", "");
         return;
     }
+    if (!path_is_clean(req)) { respond_error(req, 400, "invalid path"); return; }
     if (!auth_gate(req, app)) return;
     if (ohttp_path_is(req, "/health") || ohttp_path_is(req, "/healthz") ||
         ohttp_path_is(req, "/liveness_check")) { handle_health(req); return; }

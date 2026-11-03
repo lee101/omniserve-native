@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -45,6 +46,23 @@ PUBLIC_BASE = os.getenv("OMNISERVE_OBJECT_PUBLIC_BASE") or (
 CACHE_DIR = Path(os.getenv("OMNISERVE_OBJECT_CACHE_DIR", "/tmp/omniserve-objects"))
 
 _client = None
+# Keys are built from fixed prefixes, a hex digest and a format suffix; anything
+# else (a "../" smuggled in through a request's output_format) is refused.
+_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*(?:/[A-Za-z0-9][A-Za-z0-9_-]*)*(?:\.[A-Za-z0-9]{1,16})?")
+
+
+def _valid_key(key: str) -> bool:
+    return isinstance(key, str) and len(key) <= 512 and _KEY_RE.fullmatch(key) is not None
+
+
+def _local_path(key: str) -> Path:
+    if not _valid_key(key):
+        raise ValueError("invalid object key")
+    root = CACHE_DIR.resolve()
+    path = (root / key).resolve()
+    if root not in path.parents:
+        raise ValueError("invalid object key")
+    return path
 
 
 def remote_configured() -> bool:
@@ -67,6 +85,8 @@ def _get_client():
 def cache_key(source: str, params: dict[str, Any], *, prefix: str = "cutouts", suffix: str = "webp") -> str:
     """Content key derived from the input URL plus the parameters that change
     the output. Two identical requests therefore collide on purpose."""
+    if not re.fullmatch(r"[A-Za-z0-9]{1,16}", suffix) or not _valid_key(prefix):
+        raise ValueError("invalid object key prefix or suffix")
     normalised = _normalise_url(source)
     payload = normalised + "|" + "&".join(f"{k}={params[k]}" for k in sorted(params))
     digest = hashlib.sha256(payload.encode()).hexdigest()
@@ -115,6 +135,8 @@ def public_url(key: str) -> str | None:
 
 def exists(key: str) -> bool:
     """True when the object is already stored - checked before doing any work."""
+    if not _valid_key(key):
+        return False
     if remote_configured():
         try:
             _get_client().head_object(Bucket=BUCKET, Key=key)
@@ -123,22 +145,26 @@ def exists(key: str) -> bool:
             return False
         except Exception:
             return False
-    return (CACHE_DIR / key).exists()
+    return _local_path(key).exists()
 
 
 def get(key: str) -> bytes | None:
+    if not _valid_key(key):
+        return None
     if remote_configured():
         try:
             response = _get_client().get_object(Bucket=BUCKET, Key=key)
             return response["Body"].read()
         except Exception:
             return None
-    path = CACHE_DIR / key
+    path = _local_path(key)
     return path.read_bytes() if path.exists() else None
 
 
 def put(key: str, data: bytes, content_type: str = "image/webp") -> str | None:
     """Stores the object and returns its public URL (None when only local)."""
+    if not _valid_key(key):
+        raise ValueError("invalid object key")
     if remote_configured():
         _get_client().put_object(
             Bucket=BUCKET,
@@ -149,7 +175,7 @@ def put(key: str, data: bytes, content_type: str = "image/webp") -> str | None:
         )
         return public_url(key)
 
-    path = CACHE_DIR / key
+    path = _local_path(key)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     return None
