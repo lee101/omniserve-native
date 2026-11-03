@@ -139,7 +139,14 @@ if(WITH_SD AND EXISTS "${SD_DIR}/build/bin/libstable-diffusion.so")
     else()
         set(_sd_result_api 0)
     endif()
+    # MOSS-Image builds take an external tokenizer.json path.
+    if(_sd_header MATCHES "[ \t*]tokenizer;")
+        set(_sd_tokenizer 1)
+    else()
+        set(_sd_tokenizer 0)
+    endif()
     set(_sd_api_defs
+        OMNISERVE_SD_TOKENIZER=${_sd_tokenizer}
         OMNISERVE_SD_STREAM_LAYERS=${_sd_stream_layers}
         OMNISERVE_SD_LATENT_API=${_sd_latent_api}
         OMNISERVE_SD_TILE_PX=${_sd_tile_px}

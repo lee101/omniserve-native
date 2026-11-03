@@ -933,7 +933,11 @@ static sd_ctx_t *sd_ctx_build(const char *model_path, bool resident) {
     if (llm && llm[0]) params.llm_path = llm;
     if (llm_vision && llm_vision[0]) params.llm_vision_path = llm_vision;
     /* MOSS-Image's Qwen3.5 text encoder needs the external tokenizer.json. */
+#if OMNISERVE_SD_TOKENIZER
     if (tokenizer && tokenizer[0]) params.tokenizer = tokenizer;
+#else
+    if (tokenizer && tokenizer[0]) fprintf(stderr, "sd: OMNISERVE_NATIVE_SD_TOKENIZER ignored: this sd.cpp build has no tokenizer param\n");
+#endif
     if (taesd && taesd[0]) params.taesd_path = taesd;
     if (max_vram && max_vram[0]) params.max_vram = max_vram;
     if (backend && backend[0]) params.backend = backend;
