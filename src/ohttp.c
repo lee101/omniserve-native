@@ -49,6 +49,7 @@ struct ohttp_conn {
     bool chunked_out;
     bool status_recorded; /* one status per request, even across many raw writes */
     int last_status;      /* what that status was, for the access log */
+    uint64_t last_active_ns; /* last read or hand-back, for the stall/idle sweep */
     pthread_mutex_t ownership_lock;
     struct ohttp_server *srv;
     struct ohttp_conn *next_job;
@@ -161,7 +162,15 @@ struct ohttp_server {
     struct ohttp_conn *q_head, *q_tail;
     pthread_mutex_t all_lock;
     struct ohttp_conn *all_head;
+    uint64_t stall_ns; /* partial request with no progress: close (0 = off) */
+    uint64_t idle_ns;  /* idle keep-alive from a non-loopback peer: close (0 = off) */
 };
+
+/* Heap bytes held by request buffers across all connections. Each request
+ * may buffer up to OHTTP_MAX_BODY, so without a global ceiling a few hundred
+ * concurrent large uploads exhaust host RAM shared with the model workers. */
+static atomic_size_t heap_buffered;
+static size_t heap_buffered_cap = (size_t)4096 << 20;
 
 static void server_free_empty(struct ohttp_server *srv) {
     if (srv->listen_fd >= 0) close(srv->listen_fd);
@@ -194,7 +203,10 @@ static void conn_free(struct ohttp_conn *c) {
         pthread_mutex_unlock(&srv->all_lock);
     }
     if (c->fd >= 0) close(c->fd);
-    if (c->buf != c->inline_buf) free(c->buf);
+    if (c->buf != c->inline_buf) {
+        atomic_fetch_sub(&heap_buffered, c->buf_cap);
+        free(c->buf);
+    }
     pthread_mutex_destroy(&c->ownership_lock);
     free(c);
 }
@@ -662,6 +674,7 @@ static void *worker_main(void *arg) {
             c->streaming = false;
             c->chunked_out = false;
             c->state = CONN_READING;
+            c->last_active_ns = monotonic_ns();
             if (!remaining) break;
             ohttp_request probe;
             if (!parse_request(c, &probe)) {
@@ -686,6 +699,11 @@ static bool handle_readable(struct ohttp_server *srv, struct ohttp_conn *c) {
             if (c->buf_cap >= OHTTP_MAX_BUFFER) return false;
             size_t ncap = c->buf_cap ? c->buf_cap * 2 : 16384;
             if (ncap > OHTTP_MAX_BUFFER) ncap = OHTTP_MAX_BUFFER;
+            size_t grow = ncap - (c->buf == c->inline_buf ? 0 : c->buf_cap);
+            if (atomic_fetch_add(&heap_buffered, grow) + grow > heap_buffered_cap) {
+                atomic_fetch_sub(&heap_buffered, grow);
+                return false;
+            }
             char *nb;
             if (c->buf == c->inline_buf) {
                 nb = malloc(ncap);
@@ -693,13 +711,17 @@ static bool handle_readable(struct ohttp_server *srv, struct ohttp_conn *c) {
             } else {
                 nb = realloc(c->buf, ncap);
             }
-            if (!nb) return false;
+            if (!nb) {
+                atomic_fetch_sub(&heap_buffered, grow);
+                return false;
+            }
             c->buf = nb;
             c->buf_cap = ncap;
         }
         ssize_t n = read(c->fd, c->buf + c->buf_len, c->buf_cap - c->buf_len);
         if (n > 0) {
             c->buf_len += (size_t)n;
+            c->last_active_ns = monotonic_ns();
             continue;
         }
         if (n == 0) return false;
@@ -720,11 +742,39 @@ static bool handle_readable(struct ohttp_server *srv, struct ohttp_conn *c) {
     }
 }
 
+/* Closes connections stalled mid-request (slowloris) and, for non-loopback
+ * peers, idle keep-alives. Only connections waiting in the reactor are
+ * touched: shutdown() wakes the armed one-shot event and the normal read
+ * path frees the connection, so nothing is freed here. Holding all_lock keeps
+ * every listed connection alive; trylock never waits on a busy one. */
+static void sweep_stalled(struct ohttp_server *srv) {
+    if (!srv->stall_ns && !srv->idle_ns) return;
+    uint64_t now = monotonic_ns();
+    pthread_mutex_lock(&srv->all_lock);
+    for (struct ohttp_conn *c = srv->all_head; c; c = c->next_all) {
+        if (pthread_mutex_trylock(&c->ownership_lock) != 0) continue;
+        if (c->state == CONN_READING && c->fd >= 0) {
+            uint64_t age = now - c->last_active_ns;
+            bool stalled = c->buf_len > 0 && srv->stall_ns && age > srv->stall_ns;
+            bool idle = c->buf_len == 0 && !c->peer_loopback && srv->idle_ns && age > srv->idle_ns;
+            if (stalled || idle) shutdown(c->fd, SHUT_RDWR);
+        }
+        pthread_mutex_unlock(&c->ownership_lock);
+    }
+    pthread_mutex_unlock(&srv->all_lock);
+}
+
 static void *reactor_main(void *arg) {
     struct ohttp_server *srv = arg;
     struct epoll_event events[128];
+    uint64_t last_sweep = monotonic_ns();
     while (atomic_load(&srv->running)) {
         int n = epoll_wait(srv->epoll_fd, events, 128, 500);
+        uint64_t now = monotonic_ns();
+        if (now - last_sweep > 1000000000ull) {
+            last_sweep = now;
+            sweep_stalled(srv);
+        }
         for (int i = 0; i < n; i++) {
             if (events[i].data.ptr == NULL) {
                 for (;;) {
@@ -747,6 +797,7 @@ static void *reactor_main(void *arg) {
                     c->buf_cap = sizeof c->inline_buf;
                     c->srv = srv;
                     c->state = CONN_READING;
+                    c->last_active_ns = monotonic_ns();
                     pthread_mutex_lock(&srv->all_lock);
                     c->next_all = srv->all_head;
                     srv->all_head = c;
@@ -781,6 +832,14 @@ ohttp_server *ohttp_start(const ohttp_config *cfg) {
     srv->cfg = *cfg;
     if (srv->cfg.reactor_threads <= 0) srv->cfg.reactor_threads = 1;
     if (srv->cfg.worker_threads <= 0) srv->cfg.worker_threads = 8;
+    const char *v = getenv("OMNISERVE_NATIVE_MAX_BUFFERED_MB");
+    if (v && atoll(v) > 0) heap_buffered_cap = (size_t)atoll(v) << 20;
+    v = getenv("OMNISERVE_NATIVE_REQUEST_STALL_S");
+    long long stall_s = v && v[0] ? atoll(v) : 120;
+    v = getenv("OMNISERVE_NATIVE_IDLE_TIMEOUT_S");
+    long long idle_s = v && v[0] ? atoll(v) : 300;
+    srv->stall_ns = stall_s > 0 ? (uint64_t)stall_s * 1000000000ull : 0;
+    srv->idle_ns = idle_s > 0 ? (uint64_t)idle_s * 1000000000ull : 0;
     atomic_store(&srv->running, true);
     pthread_mutex_init(&srv->q_lock, NULL);
     pthread_cond_init(&srv->q_cond, NULL);
