@@ -320,8 +320,36 @@ static int request_key_tier(const ohttp_request *req) {
     return -1;
 }
 
+/* Public placeholders shipped in deploy scripts and examples. A gateway whose
+ * secret is one of these is as open as one with none, so it is treated as
+ * unconfigured: relayed callers fail closed, loopback callers keep working. */
+static bool secret_is_placeholder(const char *s) {
+    static const char *const weak[] = { "change-me", "changeme", "replace-me", "secret", "...",
+                                        "replace-with-a-long-random-secret" };
+    for (size_t i = 0; i < sizeof weak / sizeof weak[0]; i++)
+        if (strcmp(s, weak[i]) == 0) return true;
+    return false;
+}
+
+/* OMNISERVE_NATIVE_ALLOW_OPEN=1 restores the old "no secret means open to
+ * everyone" behaviour for relayed callers. Off by default. */
+static bool g_allow_open;
+static bool request_is_internal(const ohttp_request *req);
+typedef enum { AUTH_OFF, AUTH_SHADOW, AUTH_ENFORCE } auth_mode;
+static auth_mode g_auth_mode;
+
+/* True when some credential decision exists for relayed callers: a shared
+ * secret, caller keys (an intentional open free tier plus keyed tiers), or
+ * the public auth gate. With none of these the gateway fails closed for
+ * relayed callers instead of serving anyone who can reach the tunnel. */
+static bool relayed_open_allowed(const ohttp_request *req) {
+    if (g_allow_open || request_is_internal(req)) return true;
+    pthread_once(&g_key_tiers_once, key_tiers_load);
+    return g_key_tier_n > 0 || __atomic_load_n(&g_auth_mode, __ATOMIC_RELAXED) != AUTH_OFF;
+}
+
 static bool authorized(const app_state *app, const ohttp_request *req) {
-    if (!app->secret || !app->secret[0]) return true;
+    if (!app->secret || !app->secret[0]) return relayed_open_allowed(req);
     if (request_key_tier(req) >= 0) return true;
     size_t len = 0;
     const char *v = ohttp_req_header(req, "secret", &len);
@@ -370,7 +398,6 @@ static bool request_is_internal(const ohttp_request *req) {
  * vouches for. Verdicts are cached per credential so the verifier sees at
  * most one call per credential per TTL; a verifier outage keeps a recently
  * verified subscriber serving from the stale entry. */
-typedef enum { AUTH_OFF, AUTH_SHADOW, AUTH_ENFORCE } auth_mode;
 #define SUBCACHE_N 4096
 #define SUBCRED_MAX 256
 typedef struct {
@@ -381,7 +408,6 @@ typedef struct {
 } subcache_ent;
 static subcache_ent g_subcache[SUBCACHE_N];
 static pthread_mutex_t g_subcache_lock = PTHREAD_MUTEX_INITIALIZER;
-static auth_mode g_auth_mode;
 static bool g_auth_scope_all;
 static oproxy_target *g_auth_verify;
 static char g_auth_verify_path[256];
@@ -4464,7 +4490,18 @@ int main(int argc, char **argv) {
         if (paths[0]) ohost_prefetch_start(paths, keep_pct);
     }
     app.secret = getenv("OMNISERVE_NATIVE_SECRET");
+    if (app.secret && app.secret[0] && secret_is_placeholder(app.secret)) {
+        fprintf(stderr, "OMNISERVE_NATIVE_SECRET is a published placeholder; ignoring it "
+                        "(relayed callers are refused until a real secret is set)\n");
+        app.secret = NULL;
+    }
+    g_allow_open = env_flag("OMNISERVE_NATIVE_ALLOW_OPEN", 0);
     auth_gate_init();
+    if (!(app.secret && app.secret[0]) && !g_key_tier_n && g_auth_mode == AUTH_OFF &&
+        !g_auth_mode_file)
+        fprintf(stderr, "auth: no secret, caller keys or auth gate configured: %s\n",
+                g_allow_open ? "OPEN to relayed callers (OMNISERVE_NATIVE_ALLOW_OPEN=1)"
+                             : "relayed callers refused, loopback callers allowed");
     app.h3_api_key = getenv("OMNISERVE_NATIVE_H3_API_KEY");
     app.h3_tier_mask = parse_tier_mask(getenv("OMNISERVE_NATIVE_H3_TIERS"));
     app.prefer_embedded_image = env_flag("OMNISERVE_NATIVE_IMAGE_PREFER_EMBEDDED", 0);
