@@ -92,7 +92,7 @@ EOF
   # secret shared with the zimage instance so netwrck/cutedsl can reuse their config
   if [ ! -f /etc/omniserve-qwen.env ]; then
     SECRET=$(sudo grep -h OMNISERVE_NATIVE_SECRET /etc/omniserve-h3.env /etc/systemd/system/omniserve-native.service /etc/systemd/system/omniserve-native.service.d/*.conf 2>/dev/null | head -1 | sed 's/^Environment=//' || true)
-    echo "${SECRET:-OMNISERVE_NATIVE_SECRET=change-me}" | sudo tee /etc/omniserve-qwen.env > /dev/null
+    echo "${SECRET:-OMNISERVE_NATIVE_SECRET=$(openssl rand -hex 32)}" | sudo tee /etc/omniserve-qwen.env > /dev/null
     sudo chmod 600 /etc/omniserve-qwen.env
   fi
   sudo systemctl daemon-reload

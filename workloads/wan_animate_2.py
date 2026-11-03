@@ -203,12 +203,14 @@ def _upload(path: Path, upload_url: str) -> None:
     parsed = urlparse(upload_url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("output_upload_url must be an HTTPS presigned URL")
+    _public_url(upload_url, "output_upload_url")
     with path.open("rb") as source:
         response = requests.put(
             upload_url,
             data=source,
             headers={"Content-Type": "video/mp4", "Content-Length": str(path.stat().st_size)},
             timeout=REQUEST_TIMEOUT,
+            allow_redirects=False,
         )
     if response.status_code >= 300:
         raise RuntimeError(f"output upload returned {response.status_code}")

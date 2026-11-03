@@ -233,11 +233,18 @@ static int resolve_llm_ngl(const char *model_path, const char *value, int fallba
     return fits ? 999 : 0;
 }
 
-static bool ct_eq(const void *a, const void *b, size_t n) {
+/* Compares a caller-supplied credential (a, alen) with a configured one
+ * (k, klen). The work is a function of klen only: a wrong length is folded
+ * into the result instead of returning early, so neither the bytes nor the
+ * length of the configured key leak through timing. */
+static bool ct_eq_len(const void *a, size_t alen, const void *k, size_t klen) {
     const volatile unsigned char *x = a;
-    const volatile unsigned char *y = b;
-    unsigned char d = 0;
-    for (size_t i = 0; i < n; i++) d |= (unsigned char)(x[i] ^ y[i]);
+    const volatile unsigned char *y = k;
+    unsigned char d = (unsigned char)(alen != klen) | (unsigned char)(klen == 0);
+    for (size_t i = 0; i < klen; i++) {
+        unsigned char xi = i < alen ? x[i] : 0;
+        d |= (unsigned char)(xi ^ y[i]);
+    }
     return d == 0;
 }
 
@@ -249,8 +256,7 @@ static bool query_secret_matches(const ohttp_request *req, const char *secret, s
         const char *field_end = amp ? amp : end;
         const char *eq = memchr(p, '=', (size_t)(field_end - p));
         if (eq && (size_t)(eq - p) == 6 && memcmp(p, "secret", 6) == 0 &&
-            (size_t)(field_end - eq - 1) == secret_len &&
-            ct_eq(eq + 1, secret, secret_len)) {
+            ct_eq_len(eq + 1, (size_t)(field_end - eq - 1), secret, secret_len)) {
             return true;
         }
         p = amp ? amp + 1 : end;
@@ -300,14 +306,14 @@ static void key_tiers_load(void) {
 static bool credential_matches(const ohttp_request *req, const char *key, size_t klen) {
     size_t len = 0;
     const char *v = ohttp_req_header(req, "secret", &len);
-    if (v && len == klen && ct_eq(v, key, klen)) return true;
+    if (v && ct_eq_len(v, len, key, klen)) return true;
     v = ohttp_req_header(req, "Authorization", &len);
     if (v && len > 7 && strncasecmp(v, "Bearer ", 7) == 0 &&
-        len - 7 == klen && ct_eq(v + 7, key, klen)) return true;
+        ct_eq_len(v + 7, len - 7, key, klen)) return true;
     v = ohttp_req_header(req, "X-API-Key", &len);
-    if (v && len == klen && ct_eq(v, key, klen)) return true;
+    if (v && ct_eq_len(v, len, key, klen)) return true;
     v = ohttp_req_header(req, "X-Rapid-API-Key", &len);
-    if (v && len == klen && ct_eq(v, key, klen)) return true;
+    if (v && ct_eq_len(v, len, key, klen)) return true;
     return query_secret_matches(req, key, klen);
 }
 
@@ -320,22 +326,38 @@ static int request_key_tier(const ohttp_request *req) {
     return -1;
 }
 
-static bool authorized(const app_state *app, const ohttp_request *req) {
-    if (!app->secret || !app->secret[0]) return true;
-    if (request_key_tier(req) >= 0) return true;
-    size_t len = 0;
-    const char *v = ohttp_req_header(req, "secret", &len);
-    size_t slen = strlen(app->secret);
-    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
-    v = ohttp_req_header(req, "Authorization", &len);
-    if (v && len > 7 && strncasecmp(v, "Bearer ", 7) == 0 &&
-        len - 7 == slen && ct_eq(v + 7, app->secret, slen)) return true;
-    v = ohttp_req_header(req, "X-API-Key", &len);
-    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
-    v = ohttp_req_header(req, "X-Rapid-API-Key", &len);
-    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
-    if (query_secret_matches(req, app->secret, slen)) return true;
+/* Public placeholders shipped in deploy scripts and examples. A gateway whose
+ * secret is one of these is as open as one with none, so it is treated as
+ * unconfigured: relayed callers fail closed, loopback callers keep working. */
+static bool secret_is_placeholder(const char *s) {
+    static const char *const weak[] = { "change-me", "changeme", "replace-me", "secret", "...",
+                                        "replace-with-a-long-random-secret" };
+    for (size_t i = 0; i < sizeof weak / sizeof weak[0]; i++)
+        if (strcmp(s, weak[i]) == 0) return true;
     return false;
+}
+
+/* OMNISERVE_NATIVE_ALLOW_OPEN=1 restores the old "no secret means open to
+ * everyone" behaviour for relayed callers. Off by default. */
+static bool g_allow_open;
+static bool request_is_internal(const ohttp_request *req);
+typedef enum { AUTH_OFF, AUTH_SHADOW, AUTH_ENFORCE } auth_mode;
+static auth_mode g_auth_mode;
+
+/* True when some credential decision exists for relayed callers: a shared
+ * secret, caller keys (an intentional open free tier plus keyed tiers), or
+ * the public auth gate. With none of these the gateway fails closed for
+ * relayed callers instead of serving anyone who can reach the tunnel. */
+static bool relayed_open_allowed(const ohttp_request *req) {
+    if (g_allow_open || request_is_internal(req)) return true;
+    pthread_once(&g_key_tiers_once, key_tiers_load);
+    return g_key_tier_n > 0 || __atomic_load_n(&g_auth_mode, __ATOMIC_RELAXED) != AUTH_OFF;
+}
+
+static bool authorized(const app_state *app, const ohttp_request *req) {
+    if (!app->secret || !app->secret[0]) return relayed_open_allowed(req);
+    if (request_key_tier(req) >= 0) return true;
+    return credential_matches(req, app->secret, strlen(app->secret));
 }
 
 /* Headers a reverse proxy, tunnel or load balancer adds on the way in. Their
@@ -370,7 +392,6 @@ static bool request_is_internal(const ohttp_request *req) {
  * vouches for. Verdicts are cached per credential so the verifier sees at
  * most one call per credential per TTL; a verifier outage keeps a recently
  * verified subscriber serving from the stale entry. */
-typedef enum { AUTH_OFF, AUTH_SHADOW, AUTH_ENFORCE } auth_mode;
 #define SUBCACHE_N 4096
 #define SUBCRED_MAX 256
 typedef struct {
@@ -381,7 +402,6 @@ typedef struct {
 } subcache_ent;
 static subcache_ent g_subcache[SUBCACHE_N];
 static pthread_mutex_t g_subcache_lock = PTHREAD_MUTEX_INITIALIZER;
-static auth_mode g_auth_mode;
 static bool g_auth_scope_all;
 static oproxy_target *g_auth_verify;
 static char g_auth_verify_path[256];
@@ -423,7 +443,7 @@ static int subcache_get(const char *cred, size_t len, int *verdict, bool allow_s
     subcache_ent *e = &g_subcache[cred_hash(cred, len) % SUBCACHE_N];
     int rc = 0;
     pthread_mutex_lock(&g_subcache_lock);
-    if (e->len == len && memcmp(e->cred, cred, len) == 0) {
+    if (ct_eq_len(cred, len, e->cred, e->len)) {
         if (now < e->fresh_until) { *verdict = e->verdict; rc = 1; }
         else if (allow_stale && e->verdict >= 0 && now < e->stale_until) { *verdict = e->verdict; rc = 2; }
     }
@@ -602,8 +622,8 @@ static bool auth_gate(ohttp_request *req, const app_state *app) {
     size_t len = 0;
     const char *cred = request_credential(req, &len);
     if (request_key_tier(req) >= 0 ||
-        (app->secret && app->secret[0] && cred && len == strlen(app->secret) &&
-         ct_eq(cred, app->secret, len))) {
+        (app->secret && app->secret[0] && cred &&
+         ct_eq_len(cred, len, app->secret, strlen(app->secret)))) {
         __atomic_add_fetch(&g_auth_counts[0], 1, __ATOMIC_RELAXED);
         return true;
     }
@@ -3803,12 +3823,57 @@ static void handle_guard_classify(ohttp_request *req, app_state *app) {
     ohttp_respond_str(req, 200, "application/json", body);
 }
 
+/* Telemetry and capacity endpoints: host memory, VRAM, upstream health,
+ * recent errors. Loopback callers keep reading them freely; anyone else needs
+ * a service credential (shared secret or a caller key), never just a
+ * subscriber login, and never nothing. */
+static bool ops_path(const ohttp_request *req) {
+    return ohttp_path_is(req, "/metrics") || ohttp_path_is(req, "/errors") ||
+           ohttp_path_is(req, "/status") || ohttp_path_is(req, "/backend_status") ||
+           ohttp_path_is(req, "/v1/gpu/vram") || ohttp_path_is(req, "/v1/gpu/status") ||
+           ohttp_path_is(req, "/v1/host/memory");
+}
+
+static bool ops_authorized(const app_state *app, const ohttp_request *req) {
+    if (request_is_internal(req)) return true;
+    if (request_key_tier(req) >= 0) return true;
+    if (app->secret && app->secret[0])
+        return credential_matches(req, app->secret, strlen(app->secret));
+    return g_allow_open;
+}
+
+/* Several routes forward the caller's path (job polls, 3D assets) to a
+ * worker. A dot segment or an encoded slash/dot there would let a caller
+ * address a different worker route than the one this gateway authorized, so
+ * such paths are refused before routing. */
+static bool path_is_clean(const ohttp_request *req) {
+    const char *p = req->path;
+    size_t n = req->path_len;
+    if (!n || p[0] != '/') return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = p[i];
+        if (c == '\\' || c == '\0') return false;
+        if (c == '%' && i + 2 < n) {
+            char a = p[i + 1], b = (char)(p[i + 2] | 0x20);
+            if ((a == '2' && (b == 'e' || b == 'f')) || (a == '5' && b == 'c') ||
+                (a == '0' && b == '0')) return false;
+        }
+        if (c == '/' && i + 1 < n && p[i + 1] == '.') {
+            size_t j = i + 2;
+            if (j < n && p[j] == '.') j++;
+            if (j == n || p[j] == '/') return false;
+        }
+    }
+    return true;
+}
+
 static void route(ohttp_request *req, void *user) {
     app_state *app = user;
     if (ohttp_method_is(req, "OPTIONS")) {
         ohttp_respond_str(req, 204, "text/plain", "");
         return;
     }
+    if (!path_is_clean(req)) { respond_error(req, 400, "invalid path"); return; }
     if (!auth_gate(req, app)) return;
     if (ohttp_path_is(req, "/health") || ohttp_path_is(req, "/healthz") ||
         ohttp_path_is(req, "/liveness_check")) { handle_health(req); return; }
@@ -3820,6 +3885,10 @@ static void route(ohttp_request *req, void *user) {
     }
     if (ohttp_path_is(req, "/readyz") || ohttp_path_is(req, "/readiness_check")) {
         handle_readyz(req); return;
+    }
+    if (ops_path(req) && !ops_authorized(app, req)) {
+        respond_error(req, 401, "invalid secret");
+        return;
     }
     if (ohttp_path_is(req, "/metrics")) { handle_metrics(req, app); return; }
     if (ohttp_path_is(req, "/errors")) { handle_errors(req); return; }
@@ -4008,6 +4077,7 @@ static void route(ohttp_request *req, void *user) {
     }
     if (ohttp_path_is(req, "/loras")) {
         if (!ohttp_method_is(req, "GET")) { respond_error(req, 405, "GET required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
         handle_proxy_as(req, app, app->image_upstream, 0, NULL, NULL);
         return;
     }
@@ -4218,13 +4288,13 @@ static void route(ohttp_request *req, void *user) {
     }
     if (ohttp_path_is(req, "/v1/training/status") ||
         ohttp_path_is(req, "/v1/training/jobs")) {
-        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        if (!ops_authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
         handle_proxy(req, app, app->training_upstream, 0, "application/json");
         return;
     }
     if (ohttp_path_is(req, "/v1/training/jobs/run")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
-        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        if (!ops_authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
         handle_proxy_as_tier(
             req, app, app->training_upstream, app->training_permits,
             "application/json", NULL, TIER_BACKGROUND);
@@ -4464,7 +4534,18 @@ int main(int argc, char **argv) {
         if (paths[0]) ohost_prefetch_start(paths, keep_pct);
     }
     app.secret = getenv("OMNISERVE_NATIVE_SECRET");
+    if (app.secret && app.secret[0] && secret_is_placeholder(app.secret)) {
+        fprintf(stderr, "OMNISERVE_NATIVE_SECRET is a published placeholder; ignoring it "
+                        "(relayed callers are refused until a real secret is set)\n");
+        app.secret = NULL;
+    }
+    g_allow_open = env_flag("OMNISERVE_NATIVE_ALLOW_OPEN", 0);
     auth_gate_init();
+    if (!(app.secret && app.secret[0]) && !g_key_tier_n && g_auth_mode == AUTH_OFF &&
+        !g_auth_mode_file)
+        fprintf(stderr, "auth: no secret, caller keys or auth gate configured: %s\n",
+                g_allow_open ? "OPEN to relayed callers (OMNISERVE_NATIVE_ALLOW_OPEN=1)"
+                             : "relayed callers refused, loopback callers allowed");
     app.h3_api_key = getenv("OMNISERVE_NATIVE_H3_API_KEY");
     app.h3_tier_mask = parse_tier_mask(getenv("OMNISERVE_NATIVE_H3_TIERS"));
     app.prefer_embedded_image = env_flag("OMNISERVE_NATIVE_IMAGE_PREFER_EMBEDDED", 0);

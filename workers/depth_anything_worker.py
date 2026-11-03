@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import gc
+import http.client
 import io
 import logging
 import os
@@ -20,6 +21,11 @@ import torch.nn.functional as functional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from PIL import Image, ImageOps
+
+try:
+    import url_guard
+except ImportError:  # e.g. a Space image that did not ship url_guard.py: fail closed on URL fetches
+    url_guard = None
 
 
 MODEL_ID = os.getenv("DEPTH_MODEL", "depth-anything/Depth-Anything-V2-Small-hf")
@@ -141,28 +147,28 @@ def read_image(value: str) -> Image.Image:
         parsed = urlparse(value)
         if parsed.scheme not in {"http", "https"}:
             raise HTTPException(400, "image_url must use http, https, or data")
+        if url_guard is None:
+            raise HTTPException(400, "image_url fetching is unavailable; send a data URL")
         try:
-            with session.get(value, timeout=(10, 60), stream=True) as response:
-                response.raise_for_status()
-                chunks = []
-                total = 0
-                for chunk in response.iter_content(1 << 20):
-                    total += len(chunk)
-                    if total > MAX_DOWNLOAD_BYTES:
-                        raise HTTPException(413, "source image is too large")
-                    chunks.append(chunk)
-                data = b"".join(chunks)
-        except requests.RequestException as error:
-            raise HTTPException(502, f"source image download failed: {error}") from error
+            data = url_guard.fetch_bytes(value, MAX_DOWNLOAD_BYTES, timeout=60)[0]
+        except url_guard.TooLarge as error:
+            raise HTTPException(413, "source image is too large") from error
+        except url_guard.BlockedURL as error:
+            raise HTTPException(400, f"image_url rejected: {error}") from error
+        except (url_guard.FetchError, OSError, http.client.HTTPException) as error:
+            raise HTTPException(502, f"source image download failed: {type(error).__name__}") from error
     if len(data) > MAX_DOWNLOAD_BYTES:
         raise HTTPException(413, "source image is too large")
     try:
-        image = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+        image = Image.open(io.BytesIO(data))
     except Exception as error:
         raise HTTPException(400, "source is not a supported image") from error
     if image.width * image.height > MAX_PIXELS:
         raise HTTPException(413, "source image has too many pixels")
-    return image
+    try:
+        return ImageOps.exif_transpose(image).convert("RGB")
+    except Exception as error:
+        raise HTTPException(400, "source is not a supported image") from error
 
 
 def normalize_depth(depth: np.ndarray, invert: bool) -> np.ndarray:

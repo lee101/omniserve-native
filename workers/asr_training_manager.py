@@ -27,6 +27,10 @@ MIN_FREE_VRAM_GIB = float(os.getenv("OMNISERVE_TRAINING_MIN_FREE_VRAM_GIB", "18"
 CHECK_INTERVAL_S = float(os.getenv("OMNISERVE_TRAINING_CHECK_INTERVAL_S", "1"))
 PREEMPT_GRACE_S = float(os.getenv("OMNISERVE_TRAINING_PREEMPT_GRACE_S", "90"))
 SCRIPT = Path(__file__).with_name("train_asr.py")
+# Jobs arrive through the gateway from any authorised key, so where a trainer may write is
+# fixed by the operator: output_dir must live under this root.
+OUTPUT_ROOT = Path(os.getenv("OMNISERVE_TRAINING_OUTPUT_ROOT", str(STATE_DIR.parent))).resolve()
+MAX_BODY = 1 << 20
 LOCK = threading.RLock()
 RUNNING = False
 
@@ -202,10 +206,21 @@ def validate_job_config(config: dict[str, Any]) -> None:
         raise ValueError("manifest does not exist")
     if not audio_root.is_dir():
         raise ValueError("audio_root does not exist")
-    # Output can be new, but must not be the source tree or root.
+    # Output can be new, but must sit under OUTPUT_ROOT (and never be the state dir itself).
     output = Path(config["output_dir"]).resolve()
-    if output in {Path("/"), SCRIPT.parent.parent.resolve()}:
-        raise ValueError("unsafe output_dir")
+    if OUTPUT_ROOT not in output.parents or output == STATE_DIR or STATE_DIR in output.parents:
+        raise ValueError(f"output_dir must be inside {OUTPUT_ROOT}")
+    for field in ("manifest", "audio_root", "output_dir", "base_model"):
+        if str(config.get(field, "")).startswith("-"):
+            raise ValueError(f"{field} must not start with '-'")
+    for field in ("max_steps", "save_steps", "eval_steps", "gradient_accumulation_steps"):
+        if field in config:
+            try:
+                value = int(config[field])
+            except (TypeError, ValueError):
+                value = 0
+            if not 1 <= value <= 1_000_000:
+                raise ValueError(f"{field} must be between 1 and 1000000")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -222,7 +237,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def body_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
-        return json.loads(self.rfile.read(length) or b"{}")
+        if not 0 <= length <= MAX_BODY:
+            raise ValueError("request body too large")
+        value = json.loads(self.rfile.read(length) or b"{}")
+        if not isinstance(value, dict):
+            raise ValueError("request body must be a JSON object")
+        return value
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":

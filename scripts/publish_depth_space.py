@@ -19,7 +19,8 @@ def main() -> None:
         for source in SPACE.iterdir():
             if source.is_file():
                 (target / source.name).write_bytes(source.read_bytes())
-        (target / "depth_anything_worker.py").write_bytes((ROOT / "workers" / "depth_anything_worker.py").read_bytes())
+        for name in ("depth_anything_worker.py", "url_guard.py"):
+            (target / name).write_bytes((ROOT / "workers" / name).read_bytes())
         api = HfApi()
         api.create_repo(args.repo_id, repo_type="space", space_sdk="docker", exist_ok=True)
         api.upload_folder(repo_id=args.repo_id, repo_type="space", folder_path=target)

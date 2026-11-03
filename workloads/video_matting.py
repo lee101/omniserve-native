@@ -452,6 +452,10 @@ def _validate_vp9_alpha(path: Path) -> dict[str, object]:
 
 
 def _upload(path: Path, upload_url: str) -> None:
+    try:
+        _validate_public_url(upload_url)
+    except ValueError as error:
+        raise ValueError("output_upload_url must be a public HTTP(S) URL") from error
     size = path.stat().st_size
     with path.open("rb") as payload:
         response = requests.put(
@@ -459,8 +463,11 @@ def _upload(path: Path, upload_url: str) -> None:
             data=payload,
             headers={"Content-Type": "video/webm", "Content-Length": str(size)},
             timeout=(15, 900),
+            allow_redirects=False,
         )
     response.raise_for_status()
+    if response.is_redirect:
+        raise ValueError("output_upload_url redirected; presigned upload URLs must not redirect")
 
 
 def handler(job: dict) -> dict:

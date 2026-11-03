@@ -12,6 +12,7 @@ import argparse
 import base64
 import fcntl
 import hashlib
+import http.client
 import io
 import ipaddress
 import json
@@ -33,6 +34,7 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pixal_local  # noqa: E402
 import remote_3d  # noqa: E402
+import url_guard  # noqa: E402
 
 
 MODEL_TRELLIS = "microsoft/TRELLIS.2-4B"
@@ -99,22 +101,20 @@ def validate_public_url(raw: str) -> str:
 
 
 def download_image(url: str, destination: Path) -> None:
-    request = Request(url, headers={"User-Agent": "OmniServe3D/1.0", "Accept": "image/*"})
-    with urlopen(request, timeout=30) as response:
-        content_type = response.headers.get_content_type()
-        if not content_type.startswith("image/"):
-            raise ValueError("image_url did not return an image")
-        with destination.open("wb") as output:
-            remaining = MAX_IMAGE + 1
-            while remaining > 0:
-                chunk = response.read(min(1 << 20, remaining))
-                if not chunk:
-                    break
-                output.write(chunk)
-                remaining -= len(chunk)
-        if destination.stat().st_size > MAX_IMAGE:
-            destination.unlink(missing_ok=True)
-            raise ValueError("source image exceeds 24 MiB")
+    # Pinned to the checked address and every redirect hop re-checked: validate_public_url
+    # alone left urlopen free to follow a redirect to 169.254.169.254 or 127.0.0.1.
+    try:
+        content_type = url_guard.fetch_to_file(
+            url, destination, MAX_IMAGE, timeout=30,
+            headers={"User-Agent": "OmniServe3D/1.0", "Accept": "image/*"},
+            allow_loopback=os.getenv("OMNISERVE_3D_ALLOW_LOOPBACK_URLS") == "1")
+    except url_guard.TooLarge as exc:
+        raise ValueError("source image exceeds 24 MiB") from exc
+    except (OSError, http.client.HTTPException) as exc:
+        raise ValueError(f"image_url download failed: {type(exc).__name__}") from exc
+    if not content_type.split(";")[0].strip().lower().startswith("image/"):
+        destination.unlink(missing_ok=True)
+        raise ValueError("image_url did not return an image")
 
 
 def append_manifest(path: Path, entry: dict) -> None:

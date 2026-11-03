@@ -155,6 +155,7 @@ def main():
         "OMNISERVE_NATIVE_BIND": "127.0.0.1",
         "OMNISERVE_NATIVE_AUX_UPSTREAM": f"http://127.0.0.1:{stub_port}",
         "OMNISERVE_NATIVE_CHAT_COMPAT_PROXY": "1",
+        "OMNISERVE_NATIVE_ALLOW_OPEN": "1",
         "OMNISERVE_ACCESS_LOG": "1",
         "OMNISERVE_ACCESS_LOG_DIR": log_dir,
     }

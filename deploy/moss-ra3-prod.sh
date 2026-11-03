@@ -60,7 +60,7 @@ EOF
   if [ ! -f "$ENVFILE" ]; then
     # shared secret: reuse the existing omniserve one so netwrck keeps a single value
     S=$(sudo grep -h OMNISERVE_NATIVE_SECRET /etc/omniserve-qwen.env /etc/omniserve-h3.env 2>/dev/null | head -1 || true)
-    echo "${S:-OMNISERVE_NATIVE_SECRET=change-me}" | sudo tee "$ENVFILE" > /dev/null
+    echo "${S:-OMNISERVE_NATIVE_SECRET=$(openssl rand -hex 32)}" | sudo tee "$ENVFILE" > /dev/null
     sudo chmod 600 "$ENVFILE"
   fi
   sudo systemctl daemon-reload

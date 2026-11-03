@@ -125,6 +125,16 @@ class LocalStoreTest(unittest.TestCase):
         self.assertTrue(object_store.exists(key))
         self.assertEqual(object_store.get(key), b"webp-bytes")
 
+    def test_traversal_keys_are_refused(self):
+        with self.assertRaises(ValueError):
+            object_store.cache_key("https://x.test/i.jpg", PARAMS, suffix="webp/../../../../tmp/x")
+        for key in ("../escape", "cutouts/../../escape.webp", "/etc/passwd", "a//b", "cutouts/ab/.hidden"):
+            self.assertFalse(object_store.exists(key), key)
+            self.assertIsNone(object_store.get(key), key)
+            with self.assertRaises(ValueError, msg=key):
+                object_store.put(key, b"x")
+        self.assertEqual(list(self.tmp.parent.glob("escape*")), [])
+
     def test_describe_reports_local_backend(self):
         described = object_store.describe()
         self.assertEqual(described["backend"], "local")

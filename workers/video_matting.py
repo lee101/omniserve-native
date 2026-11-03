@@ -564,11 +564,18 @@ def _validate_vp9_alpha(path: Path) -> dict[str, object]:
 
 
 def _upload(path: Path, upload_url: str) -> None:
+    # Caller-supplied: a PUT to an internal address is a write-capable SSRF.
+    try:
+        _validate_public_url(upload_url)
+    except ValueError as error:
+        raise ValueError("output_upload_url must be a public HTTP(S) URL") from error
     with path.open("rb") as payload:
         response = requests.put(upload_url, data=payload,
                                 headers={"Content-Type": "video/webm", "Content-Length": str(path.stat().st_size)},
-                                timeout=(15, 900))
+                                timeout=(15, 900), allow_redirects=False)
     response.raise_for_status()
+    if response.is_redirect:
+        raise ValueError("output_upload_url redirected; presigned upload URLs must not redirect")
 
 
 def process(request: dict, progress=lambda _frames: None) -> dict:

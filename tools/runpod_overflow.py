@@ -4,7 +4,7 @@ here (plain http, localhost). If PRIMARY_UPSTREAM is set (another gateway, e.g.
 a LAN GPU box) it is tried first; anything it cannot serve (connection error,
 5xx, timeout) runs as a RunPod serverless job on the omniserve-ra2-overflow
 endpoint and the worker's OpenAI-shaped output is returned unchanged. Stdlib only."""
-import http.client, http.server, json, os, sys, threading, time, urllib.parse, urllib.request, urllib.error
+import hmac, http.client, http.server, json, os, sys, threading, time, urllib.parse, urllib.request, urllib.error
 
 sys.path.insert(0, os.environ.get("FRONTIER_LIB", "/nvme0n1-disk/code/omniserve-native"))
 try:
@@ -31,6 +31,7 @@ INPUT_KEYS = set(filter(None, os.environ.get(
     "guidance_scale,seed,output_format,image_base64,strength,n").split(",")))
 INPUT_KEYS.add("task")
 DEADLINE_S = float(os.environ.get("OVERFLOW_DEADLINE_S", "580"))
+MAX_BODY = int(os.environ.get("OVERFLOW_MAX_BODY_BYTES", str(96 << 20)))
 PRIMARY = os.environ.get("PRIMARY_UPSTREAM", "").rstrip("/")
 # Cloudflare's bot rules reject Python-urllib's default user agent (error 1010).
 UA = "omniserve-overflow/1.0"
@@ -329,12 +330,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     False, not budget_exhausted, count=not budget_exhausted)
 
     def do_POST(self):
-        if TOKEN and self.headers.get("Authorization", "") != "Bearer " + TOKEN:
+        if TOKEN and not hmac.compare_digest(self.headers.get("Authorization", "").encode(),
+                                             ("Bearer " + TOKEN).encode()):
             return self.reply(401, {"error": {"message": "invalid token"}})
         if self.path not in ("/v1/images/generations", "/v1/images/edits", "/v1/images/img2img"):
             return self.reply(404, {"error": {"message": "unsupported path"}})
         try:
-            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if not 0 <= length <= MAX_BODY:
+            self.close_connection = True
+            return self.reply(413, {"error": {"message": "request body too large or invalid"}})
+        try:
+            raw = self.rfile.read(length)
             tier = self.headers.get("X-Omniserve-Tier", "")
             started = time.monotonic()
             body = json.loads(raw or b"{}")
