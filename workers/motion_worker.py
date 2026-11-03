@@ -220,6 +220,8 @@ def assert_public_url(url: str) -> None:
 
 def fetch_video(url: str | None, b64: str | None, dest: Path) -> None:
     if b64:
+        if len(b64) > (MAX_DOWNLOAD_BYTES + 2) // 3 * 4 + 4:
+            raise MotionError(413, "video is too large")
         try:
             dest.write_bytes(base64.b64decode(b64, validate=True))
         except Exception as exc:
