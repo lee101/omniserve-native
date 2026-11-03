@@ -349,6 +349,12 @@ unsigned long long ollm_moe_last_est_bytes(void) {
 
 #ifdef USE_LLAMA
 #include "llama.h"
+/* llama.cpp moved n_ctx_train out of llama_sampler_init_dry and added n_vocab
+ * to llama_sampler_init_penalties before it defined LLAMA_DRY_MAX_SEQ_BREAKERS;
+ * CMake detects the header for checkouts in between. */
+#if defined(LLAMA_DRY_MAX_SEQ_BREAKERS) && !defined(OMNI_LLAMA_SAMPLER_VOCAB)
+#define OMNI_LLAMA_SAMPLER_VOCAB 1
+#endif
 
 #include <dlfcn.h>
 
@@ -2644,7 +2650,7 @@ static struct llama_sampler *dry_sampler(float mult, float base, int allowed) {
         }
         if (slot < 0 && !g_dry_cache[i].s) slot = i;
     }
-#ifdef LLAMA_DRY_MAX_SEQ_BREAKERS
+#ifdef OMNI_LLAMA_SAMPLER_VOCAB
     struct llama_sampler *t = llama_sampler_init_dry(g_vocab, mult, base, allowed,
                                                      llama_model_n_ctx_train(g_model), breakers,
                                                      sizeof breakers / sizeof *breakers);
@@ -3833,7 +3839,7 @@ static bool ollm_chat_locked(const ochat_req *req, otoken_cb on_token, void *use
          * sampler, so "whole context" has to be spelled out as n_ctx. */
         last_n = req->repetition_last_n ? req->repetition_last_n : penalty_last_n_default();
         if (last_n < 0) last_n = g_ctx_len;
-#ifdef LLAMA_DRY_MAX_SEQ_BREAKERS
+#ifdef OMNI_LLAMA_SAMPLER_VOCAB
         llama_sampler_chain_add(smpl, llama_sampler_init_penalties(llama_vocab_n_tokens(g_vocab),
             last_n, repetition, req->frequency_penalty, req->presence_penalty));
 #else
