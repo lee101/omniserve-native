@@ -299,6 +299,12 @@ if(Python3_Interpreter_FOUND)
     )
     set_tests_properties(image_worker_routing PROPERTIES
         ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    add_test(
+        NAME proxy_overflow_permits
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_proxy_overflow_permits.py"
+    )
+    set_tests_properties(proxy_overflow_permits PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
     # Drives the real gateway with the stub diffusion backend: a saturated
     # embedded image lane must relay to its standing remote instead of queueing.
     if(TARGET onative_sd_cache_stub)
