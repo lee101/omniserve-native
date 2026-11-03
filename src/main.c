@@ -3829,6 +3829,25 @@ static void handle_guard_classify(ohttp_request *req, app_state *app) {
     ohttp_respond_str(req, 200, "application/json", body);
 }
 
+/* Telemetry and capacity endpoints: host memory, VRAM, upstream health,
+ * recent errors. Loopback callers keep reading them freely; anyone else needs
+ * a service credential (shared secret or a caller key), never just a
+ * subscriber login, and never nothing. */
+static bool ops_path(const ohttp_request *req) {
+    return ohttp_path_is(req, "/metrics") || ohttp_path_is(req, "/errors") ||
+           ohttp_path_is(req, "/status") || ohttp_path_is(req, "/backend_status") ||
+           ohttp_path_is(req, "/v1/gpu/vram") || ohttp_path_is(req, "/v1/gpu/status") ||
+           ohttp_path_is(req, "/v1/host/memory");
+}
+
+static bool ops_authorized(const app_state *app, const ohttp_request *req) {
+    if (request_is_internal(req)) return true;
+    if (request_key_tier(req) >= 0) return true;
+    if (app->secret && app->secret[0])
+        return credential_matches(req, app->secret, strlen(app->secret));
+    return g_allow_open;
+}
+
 static void route(ohttp_request *req, void *user) {
     app_state *app = user;
     if (ohttp_method_is(req, "OPTIONS")) {
@@ -3846,6 +3865,10 @@ static void route(ohttp_request *req, void *user) {
     }
     if (ohttp_path_is(req, "/readyz") || ohttp_path_is(req, "/readiness_check")) {
         handle_readyz(req); return;
+    }
+    if (ops_path(req) && !ops_authorized(app, req)) {
+        respond_error(req, 401, "invalid secret");
+        return;
     }
     if (ohttp_path_is(req, "/metrics")) { handle_metrics(req, app); return; }
     if (ohttp_path_is(req, "/errors")) { handle_errors(req); return; }
@@ -4034,6 +4057,7 @@ static void route(ohttp_request *req, void *user) {
     }
     if (ohttp_path_is(req, "/loras")) {
         if (!ohttp_method_is(req, "GET")) { respond_error(req, 405, "GET required"); return; }
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
         handle_proxy_as(req, app, app->image_upstream, 0, NULL, NULL);
         return;
     }
