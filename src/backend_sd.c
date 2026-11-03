@@ -577,6 +577,7 @@ static struct {
     float default_lora_scale;
     bool default_lora_always; /* OMNISERVE_NATIVE_SD_DEFAULT_LORA_ALWAYS=1: apply it to every request without its own LoRA, not only turbo ones (MOSS NSFW lane) */
     bool notch;
+    bool turbo_stack; /* request LoRAs stack on the default turbo LoRA instead of disabling turbo */
     bool teleport; /* OMNISERVE_NATIVE_SD_TELEPORT=0 ignores request teleport flags (Qwen lanes: latent capture makes a first render ~2x slower and only an exact repeat benefits) */
     float hq_threshold; /* EasyCache threshold for non-turbo text-to-image; 0 = use the global one */
 } g_cfg;
@@ -605,6 +606,7 @@ static void turbo_cfg_load(void) {
         strcpy(g_cfg.default_lora, lora);
         fprintf(stderr, "sd: default LoRA %s scale=%.2f\n", lora, (double)g_cfg.default_lora_scale);
     }
+    g_cfg.turbo_stack = getenv("OMNISERVE_NATIVE_SD_TURBO_STACK") && atoi(getenv("OMNISERVE_NATIVE_SD_TURBO_STACK")) > 0;
     const char *spec = getenv("OMNISERVE_NATIVE_SD_TURBO_NODES");
     if (g_cfg.lightning) spec = "1,0.75,0.5,0.25";
     g_cfg.turbo_n = 0;
@@ -1153,9 +1155,10 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
 #endif
         params.vae_tiling_params.target_overlap = g_cfg.tile_overlap;
     }
-    /* Only Lightning is trained for distilled reference edits. */
+    /* Only Lightning is trained for distilled reference edits; request LoRAs keep the
+     * base schedule unless OMNISERVE_NATIVE_SD_TURBO_STACK stacks them on the turbo LoRA. */
     bool turbo = g_cfg.turbo_n > 0 && (!req->image_pixels || g_cfg.lightning) &&
-                 !req->lora_count && req->turbo != 2;
+                 (!req->lora_count || g_cfg.turbo_stack) && req->turbo != 2;
     float turbo_sig[17];
     if (turbo) {
         turbo_sigmas(params.width, params.height, turbo_sig);
@@ -1204,12 +1207,18 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
         params.loras = loras;
         params.lora_count = (uint32_t)req->lora_count;
     }
-    sd_lora_t default_lora = {0};
+    sd_lora_t *stacked = NULL;
     if ((turbo || (g_cfg.default_lora_always && !req->lora_count)) && g_cfg.default_lora[0]) {
-        default_lora.path = g_cfg.default_lora;
-        default_lora.multiplier = g_cfg.default_lora_scale;
-        params.loras = &default_lora;
-        params.lora_count = 1;
+        stacked = calloc(req->lora_count + 1, sizeof *stacked);
+        if (!stacked) {
+            free(loras);
+            return false;
+        }
+        stacked[0].path = g_cfg.default_lora;
+        stacked[0].multiplier = g_cfg.default_lora_scale;
+        for (size_t i = 0; i < req->lora_count; ++i) stacked[i + 1] = loras[i];
+        params.loras = stacked;
+        params.lora_count = (uint32_t)(req->lora_count + 1);
     }
 
     out->teleport_requested = req->teleport;
@@ -1281,6 +1290,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
             pthread_mutex_unlock(&g_sd_lock);
             cache_key_free(&key);
             free(loras);
+            free(stacked);
             return true;
         }
     }
@@ -1305,6 +1315,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
             pthread_mutex_unlock(&g_sd_lock);
             cache_key_free(&key);
             free(loras);
+            free(stacked);
             return true;
         }
         sd_latent_replay_params_t replay;
@@ -1353,6 +1364,7 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     g_yield_left_ms = 0.0;
     pthread_mutex_unlock(&g_sd_lock);
     free(loras);
+    free(stacked);
 
     if (!ok || image_count <= 0 || !images) {
         if (images) sd_free_images_compat(images, image_count);
