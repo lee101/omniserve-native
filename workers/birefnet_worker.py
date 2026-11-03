@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -54,6 +55,8 @@ try:
     import video_matting
 except ImportError:  # pragma: no cover - image cutouts remain available
     video_matting = None
+
+import url_guard
 
 
 MODEL_ID = os.getenv("BIREFNET_MODEL", "ZhengPeng7/BiRefNet")
@@ -568,7 +571,7 @@ def load_model() -> None:
         raise
 
 
-def _download_image_bytes(value: str) -> bytes:
+def _download_image_bytes(value: str, *, trusted: bool = False) -> bytes:
     if value.startswith("data:"):
         try:
             payload = value.split(",", 1)[1]
@@ -582,23 +585,19 @@ def _download_image_bytes(value: str) -> bytes:
     if parsed.scheme not in {"http", "https"}:
         raise HTTPException(400, "image_url must use http, https, or data")
     try:
-        with requests.get(value, timeout=(10, 60), stream=True) as response:
-            response.raise_for_status()
-            chunks: list[bytes] = []
-            total = 0
-            for chunk in response.iter_content(1 << 20):
-                total += len(chunk)
-                if total > MAX_DOWNLOAD_BYTES:
-                    raise HTTPException(413, "source image is too large")
-                chunks.append(chunk)
-            return b"".join(chunks)
-    except requests.RequestException as error:
-        raise HTTPException(502, f"source image download failed: {error}") from error
+        # Gateway-returned backdrop URLs are ours; everything else is caller input.
+        return url_guard.fetch_bytes(value, MAX_DOWNLOAD_BYTES, timeout=60, allow_loopback=trusted)[0]
+    except url_guard.TooLarge as error:
+        raise HTTPException(413, "source image is too large") from error
+    except url_guard.BlockedURL as error:
+        raise HTTPException(400, f"image_url rejected: {error}") from error
+    except (url_guard.FetchError, OSError, http.client.HTTPException) as error:
+        raise HTTPException(502, f"source image download failed: {type(error).__name__}") from error
 
 
-def read_image(value: str) -> Image.Image:
+def read_image(value: str, *, trusted: bool = False) -> Image.Image:
     try:
-        return ImageOps.exif_transpose(Image.open(io.BytesIO(_download_image_bytes(value)))).convert("RGB")
+        return ImageOps.exif_transpose(Image.open(io.BytesIO(_download_image_bytes(value, trusted=trusted)))).convert("RGB")
     except HTTPException:
         raise
     except Exception as error:
@@ -903,7 +902,7 @@ def generate_backdrop(prompt: str, width: int, height: int, init_url: str | None
                 data = base64.b64decode(first["b64_json"])
                 url = None
         if url:
-            return read_image(url)
+            return read_image(url, trusted=True)
     return ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
 
 

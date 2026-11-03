@@ -233,11 +233,18 @@ static int resolve_llm_ngl(const char *model_path, const char *value, int fallba
     return fits ? 999 : 0;
 }
 
-static bool ct_eq(const void *a, const void *b, size_t n) {
+/* Compares a caller-supplied credential (a, alen) with a configured one
+ * (k, klen). The work is a function of klen only: a wrong length is folded
+ * into the result instead of returning early, so neither the bytes nor the
+ * length of the configured key leak through timing. */
+static bool ct_eq_len(const void *a, size_t alen, const void *k, size_t klen) {
     const volatile unsigned char *x = a;
-    const volatile unsigned char *y = b;
-    unsigned char d = 0;
-    for (size_t i = 0; i < n; i++) d |= (unsigned char)(x[i] ^ y[i]);
+    const volatile unsigned char *y = k;
+    unsigned char d = (unsigned char)(alen != klen) | (unsigned char)(klen == 0);
+    for (size_t i = 0; i < klen; i++) {
+        unsigned char xi = i < alen ? x[i] : 0;
+        d |= (unsigned char)(xi ^ y[i]);
+    }
     return d == 0;
 }
 
@@ -249,8 +256,7 @@ static bool query_secret_matches(const ohttp_request *req, const char *secret, s
         const char *field_end = amp ? amp : end;
         const char *eq = memchr(p, '=', (size_t)(field_end - p));
         if (eq && (size_t)(eq - p) == 6 && memcmp(p, "secret", 6) == 0 &&
-            (size_t)(field_end - eq - 1) == secret_len &&
-            ct_eq(eq + 1, secret, secret_len)) {
+            ct_eq_len(eq + 1, (size_t)(field_end - eq - 1), secret, secret_len)) {
             return true;
         }
         p = amp ? amp + 1 : end;
@@ -300,14 +306,14 @@ static void key_tiers_load(void) {
 static bool credential_matches(const ohttp_request *req, const char *key, size_t klen) {
     size_t len = 0;
     const char *v = ohttp_req_header(req, "secret", &len);
-    if (v && len == klen && ct_eq(v, key, klen)) return true;
+    if (v && ct_eq_len(v, len, key, klen)) return true;
     v = ohttp_req_header(req, "Authorization", &len);
     if (v && len > 7 && strncasecmp(v, "Bearer ", 7) == 0 &&
-        len - 7 == klen && ct_eq(v + 7, key, klen)) return true;
+        ct_eq_len(v + 7, len - 7, key, klen)) return true;
     v = ohttp_req_header(req, "X-API-Key", &len);
-    if (v && len == klen && ct_eq(v, key, klen)) return true;
+    if (v && ct_eq_len(v, len, key, klen)) return true;
     v = ohttp_req_header(req, "X-Rapid-API-Key", &len);
-    if (v && len == klen && ct_eq(v, key, klen)) return true;
+    if (v && ct_eq_len(v, len, key, klen)) return true;
     return query_secret_matches(req, key, klen);
 }
 
@@ -351,19 +357,7 @@ static bool relayed_open_allowed(const ohttp_request *req) {
 static bool authorized(const app_state *app, const ohttp_request *req) {
     if (!app->secret || !app->secret[0]) return relayed_open_allowed(req);
     if (request_key_tier(req) >= 0) return true;
-    size_t len = 0;
-    const char *v = ohttp_req_header(req, "secret", &len);
-    size_t slen = strlen(app->secret);
-    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
-    v = ohttp_req_header(req, "Authorization", &len);
-    if (v && len > 7 && strncasecmp(v, "Bearer ", 7) == 0 &&
-        len - 7 == slen && ct_eq(v + 7, app->secret, slen)) return true;
-    v = ohttp_req_header(req, "X-API-Key", &len);
-    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
-    v = ohttp_req_header(req, "X-Rapid-API-Key", &len);
-    if (v && len == slen && ct_eq(v, app->secret, slen)) return true;
-    if (query_secret_matches(req, app->secret, slen)) return true;
-    return false;
+    return credential_matches(req, app->secret, strlen(app->secret));
 }
 
 /* Headers a reverse proxy, tunnel or load balancer adds on the way in. Their
@@ -449,7 +443,7 @@ static int subcache_get(const char *cred, size_t len, int *verdict, bool allow_s
     subcache_ent *e = &g_subcache[cred_hash(cred, len) % SUBCACHE_N];
     int rc = 0;
     pthread_mutex_lock(&g_subcache_lock);
-    if (e->len == len && memcmp(e->cred, cred, len) == 0) {
+    if (ct_eq_len(cred, len, e->cred, e->len)) {
         if (now < e->fresh_until) { *verdict = e->verdict; rc = 1; }
         else if (allow_stale && e->verdict >= 0 && now < e->stale_until) { *verdict = e->verdict; rc = 2; }
     }
@@ -628,8 +622,8 @@ static bool auth_gate(ohttp_request *req, const app_state *app) {
     size_t len = 0;
     const char *cred = request_credential(req, &len);
     if (request_key_tier(req) >= 0 ||
-        (app->secret && app->secret[0] && cred && len == strlen(app->secret) &&
-         ct_eq(cred, app->secret, len))) {
+        (app->secret && app->secret[0] && cred &&
+         ct_eq_len(cred, len, app->secret, strlen(app->secret)))) {
         __atomic_add_fetch(&g_auth_counts[0], 1, __ATOMIC_RELAXED);
         return true;
     }
