@@ -26,6 +26,7 @@ GATEWAY_STATUS = os.getenv("OMNISERVE_ASR_GATEWAY_STATUS", "http://127.0.0.1:879
 MIN_FREE_VRAM_GIB = float(os.getenv("OMNISERVE_ASR_MIN_FREE_VRAM_GIB", "3"))
 TIMEOUT_S = float(os.getenv("OMNISERVE_ASR_TIMEOUT_S", "600"))
 HEALTH_TIMEOUT_S = float(os.getenv("OMNISERVE_ASR_HEALTH_TIMEOUT_S", "1.5"))
+MAX_BODY_BYTES = int(os.getenv("OMNISERVE_ASR_MAX_BODY_BYTES", str(96 << 20)))
 TRANSIENT_STATUSES = {
     HTTPStatus.TOO_MANY_REQUESTS,
     HTTPStatus.BAD_GATEWAY,
@@ -120,9 +121,23 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self) -> None:  # noqa: N802
-        length = int(self.headers.get("Content-Length", "0"))
+        # The path is spliced onto the upstream base: "@evil/x" would become userinfo@host,
+        # and /admin/* would reach the worker's unauthenticated hold/release.
+        path = urllib.parse.urlsplit(self.path).path
+        if not self.path.startswith("/") or self.path.startswith("//") or path.startswith("/admin"):
+            self.close_connection = True  # body left unread
+            self.json_response(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
         if length <= 0:
             self.json_response(HTTPStatus.BAD_REQUEST, {"error": "empty request"})
+            return
+        if length > MAX_BODY_BYTES:
+            self.close_connection = True
+            self.json_response(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request too large"})
             return
         body = self.rfile.read(length)
         headers = {name: value for name, value in self.headers.items()}
