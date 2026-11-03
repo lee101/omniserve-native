@@ -106,6 +106,14 @@ def main():
     finally:
         proc.terminate(); proc.wait(timeout=10)
 
+    proc, port = start(binary, {"OMNISERVE_NATIVE_KEY_TIERS": "", "OMNISERVE_NATIVE_AUTH_MODE": "shadow"})
+    try:
+        check("shadow gate: relayed training refused without service key",
+              call(port, "/v1/training/jobs", RELAYED), 401)
+        check("shadow gate: loopback training not refused", call(port, "/v1/training/jobs") != 401, True)
+    finally:
+        proc.terminate(); proc.wait(timeout=10)
+
     proc, port = start(binary, {"OMNISERVE_NATIVE_SECRET": "change-me"})
     try:
         check("placeholder secret: relayed refused even with it",

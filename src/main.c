@@ -4288,13 +4288,13 @@ static void route(ohttp_request *req, void *user) {
     }
     if (ohttp_path_is(req, "/v1/training/status") ||
         ohttp_path_is(req, "/v1/training/jobs")) {
-        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        if (!ops_authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
         handle_proxy(req, app, app->training_upstream, 0, "application/json");
         return;
     }
     if (ohttp_path_is(req, "/v1/training/jobs/run")) {
         if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
-        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        if (!ops_authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
         handle_proxy_as_tier(
             req, app, app->training_upstream, app->training_permits,
             "application/json", NULL, TIER_BACKGROUND);
