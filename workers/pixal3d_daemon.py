@@ -26,6 +26,8 @@ os.environ.setdefault("PIXAL3D_HF_HOME", "/nvme0n1-disk/models/huggingface")
 os.environ.setdefault("PIXAL3D_LOW_VRAM", "1")
 os.environ.setdefault("ATTN_BACKEND", "xformers")
 sys.path.insert(0, COG_DIR)
+sys.path.insert(1, str(Path(__file__).resolve().parent))
+import url_guard  # noqa: E402
 
 BROKER = os.getenv("PIXAL3D_BROKER_URL", "http://127.0.0.1:8791").rstrip("/")
 LEASE_MB = int(os.getenv("PIXAL3D_LEASE_MB", "16500"))
@@ -34,6 +36,8 @@ LEASE_TIER = os.getenv("PIXAL3D_LEASE_TIER", "sub")
 LEASE_WAIT_MS = int(os.getenv("PIXAL3D_LEASE_WAIT_MS", "45000"))
 MAX_RESOLUTION = 1024
 MAX_IMAGE_BYTES = 25 << 20
+MAX_BODY = 1 << 20
+OUTPUT_ROOT = Path(os.getenv("OMNISERVE_3D_OUTPUT_DIR", "/nvme0n1-disk/models/omniserve-3d/outputs"))
 
 state = {"predictor": None, "error": None, "loading": False}
 JOB_LOCK = threading.Lock()
@@ -85,14 +89,17 @@ def load_predictor() -> None:
 
 
 def download(url: str, target: Path) -> None:
-    request = urllib.request.Request(url, headers={"User-Agent": "pixal3d-daemon/1"})
-    with urllib.request.urlopen(request, timeout=60) as response, target.open("wb") as out:
-        size = 0
-        while chunk := response.read(1 << 20):
-            size += len(chunk)
-            if size > MAX_IMAGE_BYTES:
-                raise ValueError("image too large")
-            out.write(chunk)
+    url_guard.fetch_to_file(url, target, MAX_IMAGE_BYTES, timeout=60, headers={"User-Agent": "pixal3d-daemon/1"},
+                            allow_loopback=os.getenv("OMNISERVE_3D_ALLOW_LOOPBACK_URLS") == "1")
+
+
+def confined_out_path(raw: str) -> Path:
+    """out_path must be <OUTPUT_ROOT>/<job>/model.glb: the daemon mkdirs and moves files there."""
+    root = OUTPUT_ROOT.resolve()
+    path = Path(raw).resolve()
+    if path.name != "model.glb" or path.parent.parent != root:
+        raise ValueError("out_path must be <output root>/<job>/model.glb")
+    return path
 
 
 def generate(payload: dict) -> tuple[int, dict]:
@@ -113,7 +120,7 @@ def generate(payload: dict) -> tuple[int, dict]:
         total = torch.cuda.get_device_properties(0).total_memory
         torch.cuda.set_per_process_memory_fraction(min(1.0, grant["mb"] * (1 << 20) / total))
         torch.cuda.reset_peak_memory_stats()
-        out_path = Path(payload["out_path"])
+        out_path = confined_out_path(str(payload["out_path"]))
         out_path.parent.mkdir(parents=True, exist_ok=True)
         source = out_path.parent / "source"
         download(payload["image_url"], source)
@@ -165,7 +172,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         try:
-            payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= MAX_BODY:
+                raise ValueError("bad length")
+            payload = json.loads(self.rfile.read(length))
             payload["image_url"], payload["out_path"]
         except (ValueError, KeyError, TypeError):
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "image_url and out_path are required"})
