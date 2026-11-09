@@ -45,6 +45,15 @@ prompt, while :8100 runs its own `quality_retry`; 16k prompts were rejected afte
 
 Backup of the previous command: `/nvme0n1-disk/tmp/cutedsl-gallery-generator-supervisor.conf.bak-20261110`.
 
+Route switches are free on this lane: gen p50 is 3665 ms whether the previous request used the same route
+(n=3148) or a different one (n=585), so the MOSS `SD_LORA_KEEP` work has nothing to add here.
+
+## MOSS fast lane (local 3090 Ti)
+
+`performance/moss-fast-lane-fusion-2026-11-10.md`: paired, bit-identical, plain x0.845, LoRA-routed x0.80-0.82,
+lane start ~9 min -> 12-15 s from `~/models-fast/moss`. sd.cpp `moss-i2i-reference` 61b59f6, ggml
+`moss-dit-fusion` 7c2f2a11.
+
 ## BiRefNet worker (prod, live 2026-11-10, branch `perf/birefnet-20261110`)
 
 Drop-in `zzzz-perf-20261110.conf` (worktree snapshot `omniserve-native-deploy/birefnet-perf-20261110`): strip-parallel
