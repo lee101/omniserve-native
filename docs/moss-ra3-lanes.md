@@ -7,13 +7,16 @@ tool pages or marketing. Public name is "ra3"; callers see one art generator wit
 
 | Lane | Model / recipe | Time @1024 | Port (netwrck default) |
 | --- | --- | ---: | --- |
-| `LANE=fast` | 4-step merged Q4_0, CFG 1, keyword style routing | 3.4-6 s | 8793 (`RA3_LOCAL_IMAGE_URL`) |
+| `LANE=fast` | 4-step merged Q4_0, CFG 1, keyword style routing | ~2.9 s plain, ~3.5 s LoRA route (idle 3090 Ti) | 8793 (`RA3_LOCAL_IMAGE_URL`) |
 | `LANE=hq` | dense SFT Q4_K, 30 steps, CFG 3, EasyCache 0.15, routing with negatives | 27-40 s | 8794 (`RA3_LOCAL_HQ_IMAGE_URL`) |
 | `LANE=nsfw` | 4-step + adult LoRA 1.0 on every request (no routing) | ~4.4 s | separate, never shared with public routes |
 
 `hq` is a different look (softer, more natural, more compositional variety), not a strict upgrade: the
 4-step lane is more saturated and spelled lettering better in our sheets (`results/moss-routes/fast_vs_hq.jpg`).
 Sell it as "natural look", priced 3x in netwrck (`ra3HQPriceFactor`).
+
+The fast lane needs sd.cpp `moss-i2i-reference` with ggml `moss-dit-fusion` (bit-identical DiT/LoRA fusions, `SD_LORA_KEEP`);
+numbers and switches in `performance/moss-fast-lane-fusion-2026-11-10.md`. Models load from `~/models-fast/moss` when present.
 
 One-image smoke test (builds if needed, starts the lane, writes `moss-out/00.webp`, stops it):
 `scripts/test-moss.sh "a red fox sitting in snow, photograph"` (`LANE=`, `PORT=`, `KEEP=1`).
