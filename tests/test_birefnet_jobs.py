@@ -154,6 +154,62 @@ class EncodingTest(unittest.TestCase):
         np.testing.assert_array_equal(np.asarray(Image.open(BytesIO(produced["composite"]))), np.asarray(expected))
         self.assertIsNone(worker._source.image)
 
+    def test_read_image_matches_the_plain_pillow_decode(self):
+        import base64
+        import numpy as np
+        from io import BytesIO
+        from PIL import ImageOps
+
+        rgb, alpha = self._scene()
+        exif = Image.Exif()
+        exif[0x0112] = 6
+        cases = {
+            "png-rgb": (Image.fromarray(rgb, "RGB"), "PNG", {}),
+            "png-rgba": (Image.fromarray(np.dstack([rgb, alpha]), "RGBA"), "PNG", {}),
+            "png-palette": (Image.fromarray(rgb, "RGB").quantize(16), "PNG", {}),
+            "jpeg": (Image.fromarray(rgb, "RGB"), "JPEG", {"quality": 90}),
+            "jpeg-rotated": (Image.fromarray(rgb, "RGB"), "JPEG", {"quality": 90, "exif": exif.tobytes()}),
+            "webp": (Image.fromarray(rgb, "RGB"), "WEBP", {"quality": 90}),
+            "webp-alpha": (Image.fromarray(np.dstack([rgb, alpha]), "RGBA"), "WEBP", {"quality": 90}),
+            "webp-lossless": (Image.fromarray(rgb, "RGB"), "WEBP", {"lossless": True}),
+            "webp-rotated": (Image.fromarray(rgb, "RGB"), "WEBP", {"quality": 90, "exif": exif.tobytes()}),
+        }
+        for name, (image, fmt, options) in cases.items():
+            with self.subTest(name=name):
+                buffer = BytesIO()
+                image.save(buffer, format=fmt, **options)
+                url = f"data:image/{fmt.lower()};base64," + base64.b64encode(buffer.getvalue()).decode()
+                expected = ImageOps.exif_transpose(Image.open(BytesIO(buffer.getvalue()))).convert("RGB")
+                for native in (True, False):
+                    with mock.patch.object(worker, "NATIVE_DECODE", native and worker.NATIVE_DECODE):
+                        got = worker.read_image(url)
+                    self.assertEqual(got.mode, "RGB")
+                    self.assertEqual(got.size, expected.size)
+                    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+                    np.testing.assert_array_equal(worker._rgb_array(got), np.asarray(expected))
+                    np.testing.assert_array_equal(np.asarray(got.resize((16, 16))), np.asarray(expected.resize((16, 16))))
+
+    def test_read_image_rejects_garbage_and_oversized_sources(self):
+        import base64
+        from io import BytesIO
+
+        with self.assertRaises(worker.HTTPException) as caught:
+            worker.read_image("data:image/png;base64," + base64.b64encode(b"not an image").decode())
+        self.assertEqual(caught.exception.status_code, 400)
+        for fmt in ("PNG", "WEBP"):
+            buffer = BytesIO()
+            Image.new("RGB", (64, 64), (1, 2, 3)).save(buffer, format=fmt)
+            url = f"data:image/{fmt.lower()};base64," + base64.b64encode(buffer.getvalue()).decode()
+            with mock.patch.object(worker, "MAX_PIXELS", 1000), self.assertRaises(worker.HTTPException) as caught:
+                worker.read_image(url)
+            self.assertEqual(caught.exception.status_code, 413)
+        truncated = BytesIO()
+        Image.new("RGB", (64, 64), (1, 2, 3)).save(truncated, format="PNG")
+        url = "data:image/png;base64," + base64.b64encode(truncated.getvalue()[:60]).decode()
+        with self.assertRaises(worker.HTTPException) as caught:
+            worker.read_image(url)
+        self.assertEqual(caught.exception.status_code, 400)
+
     def test_host_path_packs_float_foreground_with_rounding(self):
         import numpy as np
 

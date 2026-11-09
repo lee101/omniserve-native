@@ -40,6 +40,20 @@ def _load():
         lib.oenc_webp.restype = ctypes.c_int
         lib.oenc_free.argtypes = [ctypes.c_void_p]
         lib.oenc_free.restype = None
+        if hasattr(lib, "oenc_webp_decode"):
+            ip = ctypes.POINTER(ctypes.c_int)
+            lib.oenc_webp_info.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ip, ip, ip]
+            lib.oenc_webp_info.restype = ctypes.c_int
+            lib.oenc_webp_decode.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
+                                             ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            lib.oenc_webp_decode.restype = ctypes.c_int
+        if hasattr(lib, "oenc_png_decode"):
+            ip = ctypes.POINTER(ctypes.c_int)
+            lib.oenc_png_info.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ip, ip, ip]
+            lib.oenc_png_info.restype = ctypes.c_int
+            lib.oenc_png_decode.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
+                                            ctypes.c_int, ctypes.c_int]
+            lib.oenc_png_decode.restype = ctypes.c_int
         if hasattr(lib, "oenc_png_mt"):
             lib.oenc_png_mt.argtypes = lib.oenc_png.argtypes
             lib.oenc_png_mt.restype = ctypes.c_int
@@ -65,6 +79,52 @@ def has_png_mt() -> bool:
 
 def has_webp2() -> bool:
     return _lib is not None and hasattr(_lib, "oenc_webp2")
+
+
+def has_webp_decode() -> bool:
+    return _lib is not None and hasattr(_lib, "oenc_webp_decode")
+
+
+def webp_size(data: bytes) -> tuple[int, int, bool] | None:
+    """(width, height, has_alpha) of a still WebP this module can decode, else None
+    (not WebP, animated, or carrying EXIF that may hold an orientation)."""
+    if len(data) < 30 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None
+    w, h, a = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+    if _lib.oenc_webp_info(data, len(data), ctypes.byref(w), ctypes.byref(h), ctypes.byref(a)):
+        return None
+    return w.value, h.value, bool(a.value)
+
+
+def webp_decode(data: bytes, width: int, height: int, channels: int = 3, threads: int = THREADS) -> np.ndarray:
+    """(height, width, channels) uint8, RGB or RGBA, the pixels Pillow's decoder gives."""
+    out = np.empty((height, width, channels), dtype=np.uint8)
+    if _lib.oenc_webp_decode(data, len(data), out.ctypes.data, out.nbytes, width * channels, channels, threads):
+        raise RuntimeError("native webp decode failed")
+    return out
+
+
+def has_png_decode() -> bool:
+    return _lib is not None and hasattr(_lib, "oenc_png_decode")
+
+
+def png_size(data: bytes) -> tuple[int, int, bool] | None:
+    """(width, height, has_alpha) of a PNG on the fast path (8-bit RGB/RGBA, not interlaced,
+    no tRNS/eXIf/APNG), else None."""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    w, h, c = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+    if _lib.oenc_png_info(data, len(data), ctypes.byref(w), ctypes.byref(h), ctypes.byref(c)):
+        return None
+    return w.value, h.value, c.value == 4
+
+
+def png_decode(data: bytes, width: int, height: int, channels: int = 3) -> np.ndarray:
+    """(height, width, channels) uint8; RGBA sources lose their alpha when channels is 3."""
+    out = np.empty((height, width, channels), dtype=np.uint8)
+    if _lib.oenc_png_decode(data, len(data), out.ctypes.data, out.nbytes, width * channels, channels):
+        raise RuntimeError("native png decode failed")
+    return out
 
 
 def _take(ptr, size: int) -> bytes:

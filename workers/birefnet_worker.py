@@ -116,6 +116,7 @@ NATIVE_PNG_LEVEL = max(1, min(12, int(os.getenv("BIREFNET_NATIVE_PNG_LEVEL", "2"
 WEBP_ALPHA_FILTER = max(0, min(2, int(os.getenv("BIREFNET_WEBP_ALPHA_FILTER", "0"))))
 # Strip-parallel PNG (zlib, one filter+deflate strip per thread): same pixels, 3-4x faster than
 # the single libdeflate stream at 2048^2; zlib level 4 is within 1% of its size.
+NATIVE_DECODE = NATIVE_ENCODE and os.getenv("BIREFNET_NATIVE_DECODE", "1") != "0"
 PNG_PARALLEL = os.getenv("BIREFNET_PNG_PARALLEL", "1") != "0"
 PNG_ZLEVEL = max(1, min(9, int(os.getenv("BIREFNET_PNG_ZLEVEL", "4"))))
 # Effort of the (always lossless) WebP alpha plane, -1 = same as the colour method; the
@@ -128,7 +129,8 @@ WEBP_ALPHA_FILTER_LARGE = max(0, min(2, int(os.getenv("BIREFNET_WEBP_ALPHA_FILTE
 # Resize the network input on the GPU from the one full-resolution upload instead of in
 # Pillow. Not bit-identical to Pillow's bilinear (mask delta in matte/bench/README.md).
 GPU_PREPROCESS = os.getenv("BIREFNET_GPU_PREPROCESS", "0") == "1"
-_encoder = ThreadPoolExecutor(max_workers=3, thread_name_prefix="encode")
+_encoder = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("BIREFNET_ENCODE_WORKERS", "3"))),
+                              thread_name_prefix="encode")
 DEFAULT_FORMAT = os.getenv("BIREFNET_OUTPUT_FORMAT", "webp").lower()
 CACHE_ENABLED = os.getenv("BIREFNET_CACHE", "1") == "1"
 JOB_TTL_SECONDS = int(os.getenv("BIREFNET_JOB_TTL", "3600"))
@@ -637,9 +639,54 @@ def _open_capped(data: bytes) -> Image.Image:
     return ImageOps.exif_transpose(image)
 
 
+def _rgb_array(image: Image.Image) -> np.ndarray:
+    """(h, w, 3) uint8 view of an RGB image's pixels; read-only by contract."""
+    pixels = getattr(image, "_native_pixels", None)
+    if pixels is not None and image.mode == "RGB" and pixels.shape[:2] == (image.height, image.width):
+        return pixels
+    return np.asarray(image if image.mode == "RGB" else image.convert("RGB"))
+
+
+def _decode_native(data: bytes) -> Image.Image | None:
+    """Still WebP (libwebp with threads) and plain 8-bit RGB/RGBA PNG (libdeflate, SIMD Paeth):
+    2048^2 70 -> 25 ms and 85 -> 30 ms, same pixels as Pillow. None leaves the source to Pillow."""
+    if not NATIVE_DECODE:
+        return None
+    decode = None
+    if oencode.has_webp_decode() and (info := oencode.webp_size(data)) is not None:
+        decode = oencode.webp_decode
+    elif oencode.has_png_decode() and (info := oencode.png_size(data)) is not None:
+        decode = oencode.png_decode
+    if decode is None:
+        return None
+    width, height, _ = info
+    if width * height > MAX_PIXELS:
+        raise HTTPException(413, "source image has too many pixels")
+    try:
+        pixels = decode(data, width, height, 3)
+    except RuntimeError:
+        return None
+    image = Image.frombuffer("RGB", (width, height), pixels, "raw", "RGB", 0, 1)
+    image._native_pixels = pixels
+    return image
+
+
 def read_image(value: str, *, trusted: bool = False) -> Image.Image:
     try:
-        return _open_capped(_download_image_bytes(value, trusted=trusted)).convert("RGB")
+        data = _download_image_bytes(value, trusted=trusted)
+        image = _decode_native(data)
+        if image is not None:
+            return image
+        image = Image.open(io.BytesIO(data))
+        if image.width * image.height > MAX_PIXELS:
+            raise HTTPException(413, "source image has too many pixels")
+        # exif_transpose and convert each copy the pixels even when they change nothing.
+        if 2 <= image.getexif().get(0x0112, 1) <= 8:
+            image = ImageOps.exif_transpose(image)
+        if image.mode != "RGB":
+            return image.convert("RGB")
+        image.load()
+        return image
     except HTTPException:
         raise
     except Exception as error:
@@ -700,8 +747,7 @@ def image_to_device(image: Image.Image, device: str):
 def _upload_bytes(image: Image.Image, device: str):
     # np.asarray of a PIL image is a read-only copy of its pixels; nothing writes to it,
     # so the "not writable" warning is filtered at import instead of paying a second copy.
-    array = np.asarray(image if image.mode == "RGB" else image.convert("RGB"))
-    return torch.from_numpy(array).to(device, non_blocking=True)
+    return torch.from_numpy(_rgb_array(image)).to(device, non_blocking=True)
 
 
 class _Source(threading.local):
@@ -813,7 +859,7 @@ def _pack_rgba(image: Image.Image, foreground, on_device, alpha_device, alpha_by
     if foreground is not None:
         rgba[..., :3] = np.clip(foreground * 255.0 + 0.5, 0, 255)
     else:
-        rgba[..., :3] = np.asarray(image if image.mode == "RGB" else image.convert("RGB"))
+        rgba[..., :3] = _rgb_array(image)
     rgba[..., 3] = alpha_bytes
     return rgba
 
@@ -1318,6 +1364,8 @@ def health() -> dict[str, Any]:
                            "method_large": WEBP_ALPHA_METHOD_LARGE, "filter_large": WEBP_ALPHA_FILTER_LARGE},
             "encode_threads": oencode.THREADS if oencode is not None else 0,
             "gpu_preprocess": GPU_PREPROCESS,
+            "webp_decode": bool(NATIVE_DECODE and oencode.has_webp_decode()),
+            "png_decode": bool(NATIVE_DECODE and oencode.has_png_decode()),
         },
         "webp_transparent_rgb": "black",
         "cache": object_store.describe() if (CACHE_ENABLED and object_store) else {"backend": "off"},

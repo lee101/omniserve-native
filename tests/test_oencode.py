@@ -189,5 +189,141 @@ class WebpSplitTest(unittest.TestCase):
         self.assertEqual(oencode.webp2(arr, 85, 2), oencode.webp(arr, 85, 2))
 
 
+@needs_lib
+@unittest.skipUnless(oencode.has_png_decode(), "liboencode.so predates oenc_png_decode")
+class PngDecodeTest(unittest.TestCase):
+    def pillow(self, arr, **options):
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, format="PNG", **options)
+        return buf.getvalue()
+
+    def test_matches_pillow_for_every_filter_and_layout(self):
+        rng = np.random.default_rng(11)
+        images = [scene(61, 97), scene(128, 31, seed=3), rng.integers(0, 256, (40, 53, 4), dtype=np.uint8),
+                  rng.integers(0, 256, (1, 1, 4), dtype=np.uint8), rng.integers(0, 256, (5, 1, 4), dtype=np.uint8),
+                  rng.integers(0, 256, (1, 7, 4), dtype=np.uint8), rng.integers(0, 256, (9, 2, 4), dtype=np.uint8)]
+        for index, rgba in enumerate(images):
+            for pixels in (rgba, np.ascontiguousarray(rgba[:, :, :3])):
+                encodings = [oencode.png(pixels, 1), self.pillow(pixels), self.pillow(pixels, compress_level=0)]
+                if oencode.has_png_mt():
+                    encodings.append(oencode.png_mt(pixels, 4, 8))
+                for which, data in enumerate(encodings):
+                    with self.subTest(image=index, channels=pixels.shape[2], encoding=which):
+                        w, h, has_alpha = oencode.png_size(data)
+                        self.assertEqual((h, w, has_alpha), (*pixels.shape[:2], pixels.shape[2] == 4))
+                        reference = Image.open(io.BytesIO(data))
+                        np.testing.assert_array_equal(oencode.png_decode(data, w, h, 3), np.asarray(reference.convert("RGB")))
+                        np.testing.assert_array_equal(oencode.png_decode(data, w, h, 4), np.asarray(reference.convert("RGBA")))
+
+    def test_each_filter_type_alone(self):
+        import struct
+        import zlib
+
+        rng = np.random.default_rng(2)
+        for channels in (3, 4):
+            arr = rng.integers(0, 256, (12, 19, channels), dtype=np.uint8)
+            h, w = arr.shape[:2]
+            for kind in range(5):
+                rows = []
+                prev = np.zeros(w * channels, np.int32)
+                for y in range(h):
+                    cur = arr[y].reshape(-1).astype(np.int32)
+                    left = np.concatenate([np.zeros(channels, np.int32), cur[:-channels]])
+                    upleft = np.concatenate([np.zeros(channels, np.int32), prev[:-channels]])
+                    p = left + prev - upleft
+                    pa, pb, pc = abs(p - left), abs(p - prev), abs(p - upleft)
+                    paeth = np.where((pa <= pb) & (pa <= pc), left, np.where(pb <= pc, prev, upleft))
+                    predictor = [0, left, prev, (left + prev) // 2, paeth][kind]
+                    rows.append(bytes([kind]) + ((cur - predictor) & 0xff).astype(np.uint8).tobytes())
+                    prev = cur
+
+                def chunk(tag, body):
+                    return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body))
+
+                packed = zlib.compress(b"".join(rows))
+                data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2 if channels == 3 else 6, 0, 0, 0))
+                        + chunk(b"IDAT", packed[:40]) + chunk(b"IDAT", packed[40:]) + chunk(b"IEND", b""))
+                with self.subTest(channels=channels, filter=kind):
+                    np.testing.assert_array_equal(np.asarray(Image.open(io.BytesIO(data))), arr)
+                    np.testing.assert_array_equal(oencode.png_decode(data, w, h, channels), arr)
+
+    def test_leaves_other_pngs_to_the_caller(self):
+        arr = scene(40, 40)
+        rgb = Image.fromarray(arr[:, :, :3])
+        exif = Image.Exif()
+        exif[0x0112] = 6
+        others = {
+            "palette": (rgb.quantize(16), {}),
+            "gray": (Image.fromarray(arr[:, :, 0]), {}),
+            "gray-alpha": (Image.fromarray(arr[:, :, [0, 3]], "LA"), {}),
+            "16-bit": (Image.fromarray(arr[:, :, 0].astype(np.uint16) * 257), {}),
+            "transparency": (rgb, {"transparency": (1, 2, 3)}),
+            "exif": (rgb, {"exif": exif.tobytes()}),
+            "animated": (rgb, {"save_all": True, "append_images": [rgb.rotate(90)]}),
+        }
+        for name, (image, options) in others.items():
+            with self.subTest(name=name):
+                buf = io.BytesIO()
+                image.save(buf, format="PNG", **options)
+                self.assertIsNone(oencode.png_size(buf.getvalue()))
+        self.assertIsNone(oencode.png_size(b"RIFF" + bytes(60)))
+        self.assertIsNotNone(oencode.png_size(self.pillow(arr, dpi=(72, 72), icc_profile=b"x" * 32)))
+
+    def test_corrupt_data_fails(self):
+        data = bytearray(self.pillow(scene(64, 64)))
+        w, h, _ = oencode.png_size(bytes(data))
+        with self.assertRaises(RuntimeError):
+            oencode.png_decode(bytes(data[:len(data) // 2]), w, h)
+        data[len(data) // 2] ^= 0x55
+        with self.assertRaises(RuntimeError):
+            oencode.png_decode(bytes(data), w, h)
+
+
+@needs_lib
+@unittest.skipUnless(oencode.has_webp_decode(), "liboencode.so predates oenc_webp_decode")
+class WebpDecodeTest(unittest.TestCase):
+    def encoded(self, arr, **options):
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, format="WEBP", **options)
+        return buf.getvalue()
+
+    def test_matches_pillow_pixels(self):
+        arr = scene(131, 149)
+        cases = [self.encoded(arr, quality=85), self.encoded(arr[:, :, :3], quality=90),
+                 self.encoded(arr, lossless=True), self.encoded(arr[:, :, :3], lossless=True),
+                 self.encoded(scene(1, 1)[:, :, :3], quality=80)]
+        for i, data in enumerate(cases):
+            for threads in (1, 8):
+                with self.subTest(case=i, threads=threads):
+                    w, h, has_alpha = oencode.webp_size(data)
+                    reference = Image.open(io.BytesIO(data))
+                    self.assertEqual((w, h), reference.size)
+                    self.assertEqual(has_alpha, reference.mode == "RGBA")
+                    np.testing.assert_array_equal(oencode.webp_decode(data, w, h, 3, threads),
+                                                  np.asarray(reference.convert("RGB")))
+                    np.testing.assert_array_equal(oencode.webp_decode(data, w, h, 4, threads),
+                                                  np.asarray(reference.convert("RGBA")))
+
+    def test_leaves_other_inputs_to_the_caller(self):
+        arr = scene(40, 40)
+        png = io.BytesIO()
+        Image.fromarray(arr).save(png, format="PNG")
+        self.assertIsNone(oencode.webp_size(png.getvalue()))
+        self.assertIsNone(oencode.webp_size(b"RIFF" + bytes(4) + b"WEBP" + bytes(40)))
+        animated = io.BytesIO()
+        frames = [Image.fromarray(arr), Image.fromarray(arr[::-1].copy())]
+        frames[0].save(animated, format="WEBP", save_all=True, append_images=frames[1:], duration=50)
+        self.assertIsNone(oencode.webp_size(animated.getvalue()))
+        exif = Image.Exif()
+        exif[0x0112] = 6
+        self.assertIsNone(oencode.webp_size(self.encoded(arr[:, :, :3], quality=80, exif=exif.tobytes())))
+
+    def test_truncated_data_fails(self):
+        data = self.encoded(scene(64, 64), quality=80)
+        w, h, _ = oencode.webp_size(data)
+        with self.assertRaises(RuntimeError):
+            oencode.webp_decode(data[:len(data) // 2], w, h)
+
+
 if __name__ == "__main__":
     unittest.main()

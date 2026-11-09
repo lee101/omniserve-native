@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <webp/decode.h>
 #include <webp/encode.h>
 #ifndef OENC_NO_ZLIB
 #include <zlib.h>
@@ -578,6 +579,188 @@ int oenc_webp2(const uint8_t *rgba, int w, int h, int stride, float quality, int
     *out = buf;
     *n = total;
     return 0;
+}
+
+static uint32_t get_be32(const uint8_t *p)
+{
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+/* 8-bit truecolour, non-interlaced, nothing that changes interpretation (tRNS, eXIf, APNG,
+   unknown critical chunks): everything else returns -2 and is left to the caller's decoder. */
+int oenc_png_info(const uint8_t *data, size_t n, int *w, int *h, int *channels)
+{
+    static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
+    if (!data || n < 8 + 25 + 12 || memcmp(data, sig, 8) || get_be32(data + 8) != 13 || memcmp(data + 12, "IHDR", 4))
+        return -1;
+    const uint8_t *ihdr = data + 16;
+    uint32_t pw = get_be32(ihdr), ph = get_be32(ihdr + 4);
+    if (!pw || !ph || pw > 0x7fffffffu || ph > 0x7fffffffu) return -1;
+    if (ihdr[8] != 8 || (ihdr[9] != 2 && ihdr[9] != 6) || ihdr[10] || ihdr[11] || ihdr[12]) return -2;
+    size_t p = 8 + 25;
+    int idat = 0;
+    while (p + 12 <= n) {
+        size_t len = get_be32(data + p);
+        const uint8_t *type = data + p + 4;
+        if (len > n - p - 12) return -1;
+        if (!memcmp(type, "IEND", 4)) break;
+        if (!memcmp(type, "IDAT", 4)) idat = 1;
+        else if (!memcmp(type, "tRNS", 4) || !memcmp(type, "eXIf", 4) || !memcmp(type, "acTL", 4)) return -2;
+        else if (!(type[0] & 0x20) && memcmp(type, "PLTE", 4)) return -2;
+        p += 12 + len;
+    }
+    if (!idat) return -1;
+    if (w) *w = (int)pw;
+    if (h) *h = (int)ph;
+    if (channels) *channels = ihdr[9] == 6 ? 4 : 3;
+    return 0;
+}
+
+#ifdef __SSE2__
+#include <emmintrin.h>
+
+static inline __m128i abs16(__m128i x)
+{
+    return _mm_max_epi16(x, _mm_sub_epi16(_mm_setzero_si128(), x));
+}
+
+static inline __m128i pick(__m128i mask, __m128i yes, __m128i no)
+{
+    return _mm_or_si128(_mm_and_si128(mask, yes), _mm_andnot_si128(mask, no));
+}
+
+/* One pixel per step, its channels in parallel. Each step loads 4 bytes, so a 3-byte row
+   leaves its last pixel to the scalar loop. Returns the number of bytes done. */
+static size_t unfilter_paeth_simd(uint8_t *row, const uint8_t *prev, size_t n, int bpp)
+{
+    const __m128i zero = _mm_setzero_si128();
+    __m128i a = zero, c = zero;
+    size_t i = 0;
+    for (; i + 4 <= n; i += bpp) {
+        int32_t pv, xv;
+        memcpy(&pv, prev + i, 4);
+        memcpy(&xv, row + i, 4);
+        __m128i b = _mm_unpacklo_epi8(_mm_cvtsi32_si128(pv), zero);
+        __m128i x = _mm_unpacklo_epi8(_mm_cvtsi32_si128(xv), zero);
+        __m128i pa = _mm_sub_epi16(b, c), pb = _mm_sub_epi16(a, c);
+        __m128i pc = abs16(_mm_add_epi16(pa, pb));
+        pa = abs16(pa);
+        pb = abs16(pb);
+        __m128i smallest = _mm_min_epi16(pc, _mm_min_epi16(pa, pb));
+        __m128i nearest = pick(_mm_cmpeq_epi16(smallest, pa), a, pick(_mm_cmpeq_epi16(smallest, pb), b, c));
+        a = _mm_and_si128(_mm_add_epi16(x, nearest), _mm_set1_epi16(0xff));
+        c = b;
+        int32_t out = _mm_cvtsi128_si32(_mm_packus_epi16(a, a));
+        memcpy(row + i, &out, bpp);
+    }
+    return i;
+}
+#endif
+
+static void unfilter_row(int type, uint8_t *row, const uint8_t *prev, size_t n, int bpp)
+{
+    size_t i = 0;
+    switch (type) {
+    case 1:
+        for (i = bpp; i < n; i++) row[i] = (uint8_t)(row[i] + row[i - bpp]);
+        break;
+    case 2:
+        for (; i < n; i++) row[i] = (uint8_t)(row[i] + prev[i]);
+        break;
+    case 3:
+        for (; i < (size_t)bpp && i < n; i++) row[i] = (uint8_t)(row[i] + (prev[i] >> 1));
+        for (; i < n; i++) row[i] = (uint8_t)(row[i] + ((row[i - bpp] + prev[i]) >> 1));
+        break;
+    case 4:
+#ifdef __SSE2__
+        i = unfilter_paeth_simd(row, prev, n, bpp);
+#endif
+        for (; i < (size_t)bpp && i < n; i++) row[i] = (uint8_t)(row[i] + prev[i]);
+        for (; i < n; i++) row[i] = (uint8_t)(row[i] + paeth(row[i - bpp], prev[i], prev[i - bpp]));
+        break;
+    }
+}
+
+int oenc_png_decode(const uint8_t *data, size_t n, uint8_t *out, size_t out_size, int stride, int channels)
+{
+    int w, h, src;
+    if (!out || (channels != 3 && channels != 4) || oenc_png_info(data, n, &w, &h, &src)) return -1;
+    if (w > (1 << 24) || h > (1 << 24)) return -1;
+    if (stride < w * channels || out_size < (size_t)stride * (h - 1) + (size_t)w * channels) return -1;
+    size_t row = (size_t)w * src, raw = (row + 1) * (size_t)h, zlen = 0, p = 8 + 25;
+    uint8_t *z = malloc(n), *buf = malloc(raw + row);
+    struct libdeflate_decompressor *d = NULL;
+    int rc = -1;
+    if (!z || !buf) goto done;
+    while (p + 12 <= n) {
+        size_t len = get_be32(data + p);
+        if (len > n - p - 12) goto done;
+        if (!memcmp(data + p + 4, "IEND", 4)) break;
+        if (!memcmp(data + p + 4, "IDAT", 4)) {
+            if (libdeflate_crc32(0, data + p + 4, len + 4) != get_be32(data + p + 8 + len)) goto done;
+            memcpy(z + zlen, data + p + 8, len);
+            zlen += len;
+        }
+        p += 12 + len;
+    }
+    d = libdeflate_alloc_decompressor();
+    if (!d) goto done;
+    size_t got = 0;
+    if (libdeflate_zlib_decompress(d, z, zlen, buf + row, raw, &got) != LIBDEFLATE_SUCCESS || got != raw) goto done;
+    /* Rows are unfiltered in place behind their filter byte; a zero row in front serves the first. */
+    memset(buf, 0, row);
+    const uint8_t *prev = buf;
+    for (int y = 0; y < h; y++) {
+        uint8_t *cur = buf + row + (size_t)y * (row + 1);
+        int type = *cur++;
+        if (type > 4) goto done;
+        unfilter_row(type, cur, prev, row, src);
+        prev = cur;
+        uint8_t *dst = out + (size_t)y * stride;
+        if (src == channels) {
+            memcpy(dst, cur, row);
+        } else if (src == 4) {
+            for (int x = 0; x < w; x++) memcpy(dst + 3 * x, cur + 4 * x, 3);
+        } else {
+            for (int x = 0; x < w; x++) {
+                memcpy(dst + 4 * x, cur + 3 * x, 3);
+                dst[4 * x + 3] = 0xff;
+            }
+        }
+    }
+    rc = 0;
+done:
+    if (d) libdeflate_free_decompressor(d);
+    free(z);
+    free(buf);
+    return rc;
+}
+
+/* Still images only: an animation, or EXIF that may carry an orientation, is left to the caller. */
+int oenc_webp_info(const uint8_t *data, size_t n, int *w, int *h, int *has_alpha)
+{
+    WebPBitstreamFeatures f;
+    if (!data || n < 30 || WebPGetFeatures(data, n, &f) != VP8_STATUS_OK) return -1;
+    if (f.has_animation) return -2;
+    if (!memcmp(data + 12, "VP8X", 4) && (data[20] & 0x08)) return -2;
+    if (w) *w = f.width;
+    if (h) *h = f.height;
+    if (has_alpha) *has_alpha = f.has_alpha;
+    return 0;
+}
+
+int oenc_webp_decode(const uint8_t *data, size_t n, uint8_t *out, size_t out_size, int stride,
+                     int channels, int threads)
+{
+    WebPDecoderConfig cfg;
+    if (!data || !out || (channels != 3 && channels != 4) || !WebPInitDecoderConfig(&cfg)) return -1;
+    cfg.options.use_threads = threads > 1;
+    cfg.output.colorspace = channels == 4 ? MODE_RGBA : MODE_RGB;
+    cfg.output.is_external_memory = 1;
+    cfg.output.u.RGBA.rgba = out;
+    cfg.output.u.RGBA.stride = stride;
+    cfg.output.u.RGBA.size = out_size;
+    return WebPDecode(data, n, &cfg) == VP8_STATUS_OK ? 0 : -1;
 }
 
 void oenc_free(void *p)

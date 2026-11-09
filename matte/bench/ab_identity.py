@@ -1,10 +1,10 @@
 """Output identity and interleaved timing of two revisions of the worker in one process.
 
     BIREFNET_VRAM_BROKER_URL= OMATTE_LIB=... OENCODE_LIB=... [BIREFNET_REFINER=...] \
-        python3 matte/bench/ab_identity.py BASE_WORKER.py [image ...] [--n 7] [--sizes 1024,2048]
+        python3 matte/bench/ab_identity.py BASE_WORKERS_DIR [image ...] [--n 7] [--sizes 1024,2048]
 
-BASE_WORKER.py is another revision's birefnet_worker.py (e.g. `git show REV:workers/birefnet_worker.py`);
-both use this checkout's helper modules. PNG outputs must decode to identical pixels; WebP
+BASE_WORKERS_DIR is another revision's workers/ (e.g. from `git archive REV workers | tar -x -C DIR`);
+each revision imports its own helper modules. PNG outputs must decode to identical pixels; WebP
 outputs must be byte-identical unless BIREFNET_WEBP_ALPHA_METHOD is set, then pixel-identical.
 Exit status 1 on any difference.
 """
@@ -28,13 +28,20 @@ parser.add_argument("--n", type=int, default=7)
 parser.add_argument("--sizes", default="1024,2048")
 args = parser.parse_args()
 sys.argv = sys.argv[:1]
-sys.path.insert(0, str(ROOT.parents[1] / "workers"))
 
 
-def load(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+def load(name, directory):
+    directory = str(Path(directory).resolve())
+    sys.path.insert(0, directory)
+    try:
+        spec = importlib.util.spec_from_file_location(name, Path(directory) / "birefnet_worker.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(directory)
+        for key, helper in list(sys.modules.items()):
+            if str(getattr(helper, "__file__", "") or "").startswith(directory + "/"):
+                del sys.modules[key]
     module.load_model()
     return module
 
@@ -53,7 +60,7 @@ def timed(module, image, request):
 
 def main():
     base = load("birefnet_worker_base", args.base)
-    new = load("birefnet_worker_new", ROOT.parents[1] / "workers" / "birefnet_worker.py")
+    new = load("birefnet_worker_new", ROOT.parents[1] / "workers")
     print(f"engine={new.runtime.engine} refiner={bool(new.matte_refine and new.matte_refine.refiner_loaded())} perf={new.health()['perf']}")
     failures = 0
     variants = {"cutout": {}, "nodecon": {"decontaminate": False}, "composite": {"background": "#141a38"},
