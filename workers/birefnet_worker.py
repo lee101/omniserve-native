@@ -14,9 +14,9 @@ import re
 import threading
 import time
 import uuid
+import warnings
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -63,6 +63,7 @@ except ImportError:  # pragma: no cover - image cutouts remain available
 
 import url_guard
 
+warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
 
 MODEL_ID = os.getenv("BIREFNET_MODEL", "ZhengPeng7/BiRefNet")
 DEVICE = os.getenv("BIREFNET_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
@@ -113,7 +114,23 @@ PNG_LEVEL = max(0, min(9, int(os.getenv("BIREFNET_PNG_LEVEL", "3"))))
 NATIVE_ENCODE = oencode is not None and oencode.available() and os.getenv("BIREFNET_NATIVE_ENCODE", "1") != "0"
 NATIVE_PNG_LEVEL = max(1, min(12, int(os.getenv("BIREFNET_NATIVE_PNG_LEVEL", "2"))))
 WEBP_ALPHA_FILTER = max(0, min(2, int(os.getenv("BIREFNET_WEBP_ALPHA_FILTER", "0"))))
-_encoder = ThreadPoolExecutor(max_workers=3, thread_name_prefix="encode")
+# Strip-parallel PNG (zlib, one filter+deflate strip per thread): same pixels, 3-4x faster than
+# the single libdeflate stream at 2048^2; zlib level 4 is within 1% of its size.
+NATIVE_DECODE = NATIVE_ENCODE and os.getenv("BIREFNET_NATIVE_DECODE", "1") != "0"
+PNG_PARALLEL = os.getenv("BIREFNET_PNG_PARALLEL", "1") != "0"
+PNG_ZLEVEL = max(1, min(9, int(os.getenv("BIREFNET_PNG_ZLEVEL", "4"))))
+# Effort of the (always lossless) WebP alpha plane, -1 = same as the colour method; the
+# _LARGE pair applies above LARGE_PIXELS. The alpha plane is what bounds a method <= 2
+# encode: alpha method 0 with alpha filter 1 cuts a 2048^2 encode by 40-45% for ~11% more
+# bytes, decoded pixels unchanged (matte/bench/README.md).
+WEBP_ALPHA_METHOD = max(-1, min(6, int(os.getenv("BIREFNET_WEBP_ALPHA_METHOD", "-1"))))
+WEBP_ALPHA_METHOD_LARGE = max(-1, min(6, int(os.getenv("BIREFNET_WEBP_ALPHA_METHOD_LARGE", str(WEBP_ALPHA_METHOD)))))
+WEBP_ALPHA_FILTER_LARGE = max(0, min(2, int(os.getenv("BIREFNET_WEBP_ALPHA_FILTER_LARGE", str(WEBP_ALPHA_FILTER)))))
+# Resize the network input on the GPU from the one full-resolution upload instead of in
+# Pillow. Not bit-identical to Pillow's bilinear (mask delta in matte/bench/README.md).
+GPU_PREPROCESS = os.getenv("BIREFNET_GPU_PREPROCESS", "0") == "1"
+_encoder = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("BIREFNET_ENCODE_WORKERS", "3"))),
+                              thread_name_prefix="encode")
 DEFAULT_FORMAT = os.getenv("BIREFNET_OUTPUT_FORMAT", "webp").lower()
 CACHE_ENABLED = os.getenv("BIREFNET_CACHE", "1") == "1"
 JOB_TTL_SECONDS = int(os.getenv("BIREFNET_JOB_TTL", "3600"))
@@ -459,11 +476,18 @@ def _prepare_input(image: Image.Image, size: int | None = None):
     if not DEVICE.startswith("cuda"):
         resized = image.convert("RGB").resize((size, size), Image.Resampling.BILINEAR)
         return runtime.transform(resized).unsqueeze(0).to(DEVICE, dtype=runtime.dtype)
-    resized = image.convert("RGB").resize((size, size), Image.Resampling.BILINEAR)
-    # Upload three uint8 bytes per pixel, then cast/normalize on the device;
-    # torchvision's ToTensor would send four float32 bytes per channel.
-    array = np.array(resized, dtype=np.uint8, order="C", copy=True)
-    tensor = torch.from_numpy(array).to(DEVICE, non_blocking=True)
+    if image.size == (size, size) and _in_source_scope(image):
+        tensor = _source_bytes(image, DEVICE)
+    elif GPU_PREPROCESS and _in_source_scope(image):
+        full = _source_bytes(image, DEVICE).permute(2, 0, 1)[None].float()
+        tensor = functional.interpolate(full, size=(size, size), mode="bilinear", antialias=True,
+                                        align_corners=False)
+        tensor = tensor.round_().clamp_(0, 255)[0].permute(1, 2, 0)
+    else:
+        resized = image.convert("RGB").resize((size, size), Image.Resampling.BILINEAR)
+        # Upload three uint8 bytes per pixel, then cast/normalize on the device;
+        # torchvision's ToTensor would send four float32 bytes per channel.
+        tensor = torch.from_numpy(np.asarray(resized)).to(DEVICE, non_blocking=True)
     tensor = tensor.permute(2, 0, 1)[None].to(dtype=runtime.dtype)
     tensor.div_(255.0).sub_(runtime.normalize_mean).div_(runtime.normalize_std)
     return tensor.contiguous(memory_format=torch.channels_last)
@@ -615,9 +639,54 @@ def _open_capped(data: bytes) -> Image.Image:
     return ImageOps.exif_transpose(image)
 
 
+def _rgb_array(image: Image.Image) -> np.ndarray:
+    """(h, w, 3) uint8 view of an RGB image's pixels; read-only by contract."""
+    pixels = getattr(image, "_native_pixels", None)
+    if pixels is not None and image.mode == "RGB" and pixels.shape[:2] == (image.height, image.width):
+        return pixels
+    return np.asarray(image if image.mode == "RGB" else image.convert("RGB"))
+
+
+def _decode_native(data: bytes) -> Image.Image | None:
+    """Still WebP (libwebp with threads) and plain 8-bit RGB/RGBA PNG (libdeflate, SIMD Paeth):
+    2048^2 70 -> 25 ms and 85 -> 30 ms, same pixels as Pillow. None leaves the source to Pillow."""
+    if not NATIVE_DECODE:
+        return None
+    decode = None
+    if oencode.has_webp_decode() and (info := oencode.webp_size(data)) is not None:
+        decode = oencode.webp_decode
+    elif oencode.has_png_decode() and (info := oencode.png_size(data)) is not None:
+        decode = oencode.png_decode
+    if decode is None:
+        return None
+    width, height, _ = info
+    if width * height > MAX_PIXELS:
+        raise HTTPException(413, "source image has too many pixels")
+    try:
+        pixels = decode(data, width, height, 3)
+    except RuntimeError:
+        return None
+    image = Image.frombuffer("RGB", (width, height), pixels, "raw", "RGB", 0, 1)
+    image._native_pixels = pixels
+    return image
+
+
 def read_image(value: str, *, trusted: bool = False) -> Image.Image:
     try:
-        return _open_capped(_download_image_bytes(value, trusted=trusted)).convert("RGB")
+        data = _download_image_bytes(value, trusted=trusted)
+        image = _decode_native(data)
+        if image is not None:
+            return image
+        image = Image.open(io.BytesIO(data))
+        if image.width * image.height > MAX_PIXELS:
+            raise HTTPException(413, "source image has too many pixels")
+        # exif_transpose and convert each copy the pixels even when they change nothing.
+        if 2 <= image.getexif().get(0x0112, 1) <= 8:
+            image = ImageOps.exif_transpose(image)
+        if image.mode != "RGB":
+            return image.convert("RGB")
+        image.load()
+        return image
     except HTTPException:
         raise
     except Exception as error:
@@ -668,17 +737,68 @@ def image_to_device(image: Image.Image, device: str):
     Converting on the device means 3 bytes per pixel cross the bus instead of
     12, which on a 1024x1024 cutout is 3 MB rather than 12 MB.
     """
-    # PIL may expose a read-only buffer.  ascontiguousarray can return that same
-    # buffer, which makes torch warn that later writes would be undefined.  The
-    # explicit copy is the staging buffer we want for an asynchronous upload.
-    array = np.array(image.convert("RGB"), dtype=np.uint8, order="C", copy=True)
-    tensor = torch.from_numpy(array).to(device, non_blocking=True)
-    return tensor.float().div_(255.0)
+    if _in_source_scope(image):
+        if _source.floats is None or _source.floats.device.type != torch.device(device).type:
+            _source.floats = _source_bytes(image, device).float().div_(255.0)
+        return _source.floats
+    return _upload_bytes(image, device).float().div_(255.0)
+
+
+def _upload_bytes(image: Image.Image, device: str):
+    # np.asarray of a PIL image is a read-only copy of its pixels; nothing writes to it,
+    # so the "not writable" warning is filtered at import instead of paying a second copy.
+    return torch.from_numpy(_rgb_array(image)).to(device, non_blocking=True)
+
+
+class _Source(threading.local):
+    image = None
+    bytes = None
+    floats = None
+
+
+_source = _Source()
+
+
+@contextmanager
+def _source_scope(image: Image.Image):
+    """Within one request the source goes to the device once; the network input, the
+    refiner, the alpha upsample and the colour solve all read that upload. Consumers
+    must not write to the shared tensors."""
+    previous = (_source.image, _source.bytes, _source.floats)
+    _source.image, _source.bytes, _source.floats = image, None, None
+    try:
+        yield
+    finally:
+        _source.image, _source.bytes, _source.floats = previous
+
+
+def _in_source_scope(image: Image.Image) -> bool:
+    return _source.image is image
+
+
+def _source_bytes(image: Image.Image, device: str):
+    """(h, w, 3) uint8 on the device, uploaded once per source scope."""
+    if _source.bytes is None or _source.bytes.device.type != torch.device(device).type:
+        _source.bytes = _upload_bytes(image, device)
+    return _source.bytes
+
+
+def device_to_array(tensor, alpha=None, opaque: bool = False) -> np.ndarray:
+    """(h, w, 3) float colours in [0, 1] -> uint8 host array, in one download.
+
+    alpha (float (h, w) in [0, 1]) or opaque=True appends a fourth channel on the
+    device, so an RGBA encode needs no host-side channel packing.
+    """
+    pixels = tensor.clamp(0.0, 1.0).mul_(255.0).add_(0.5).to(torch.uint8)
+    if alpha is not None:
+        pixels = torch.cat((pixels, alpha.mul(255.0).round().to(torch.uint8)[..., None]), dim=-1)
+    elif opaque:
+        pixels = functional.pad(pixels, (0, 1), value=255)
+    return pixels.cpu().numpy()
 
 
 def device_to_image(tensor) -> Image.Image:
-    array = tensor.clamp(0.0, 1.0).mul_(255.0).add_(0.5).to(torch.uint8).cpu().numpy()
-    return Image.fromarray(array, mode="RGB")
+    return Image.fromarray(device_to_array(tensor), mode="RGB")
 
 
 def estimate_foreground_background(image: Image.Image, alpha_device, alpha_array: np.ndarray,
@@ -731,16 +851,32 @@ def to_pil_rgb(colours, on_device) -> Image.Image:
     return Image.fromarray(np.clip(colours * 255.0 + 0.5, 0, 255).astype("uint8"), mode="RGB")
 
 
+def _pack_rgba(image: Image.Image, foreground, on_device, alpha_device, alpha_bytes: np.ndarray) -> np.ndarray:
+    """The cutout as one (h, w, 4) uint8 array, ready for the encoder."""
+    if foreground is not None and on_device and alpha_device is not None:
+        return device_to_array(foreground, alpha=alpha_device)
+    rgba = np.empty((*alpha_bytes.shape, 4), dtype=np.uint8)
+    if foreground is not None:
+        rgba[..., :3] = np.clip(foreground * 255.0 + 0.5, 0, 255)
+    else:
+        rgba[..., :3] = _rgb_array(image)
+    rgba[..., 3] = alpha_bytes
+    return rgba
+
+
 def composite_over(foreground, alpha_device, alpha_array, on_device, backdrop=None,
-                   backdrop_rgb=None) -> Image.Image:
-    """alpha * foreground + (1 - alpha) * backdrop, wherever the pixels live."""
+                   backdrop_rgb=None, opaque: bool = False):
+    """alpha * foreground + (1 - alpha) * backdrop, wherever the pixels live.
+
+    A uint8 array from the device (RGBA with opaque=True), a PIL image from the host.
+    """
     if on_device:
         backdrop_device = None
         if backdrop is not None:
             backdrop_device = image_to_device(backdrop, str(alpha_device.device))
         out = omatte.composite_torch(foreground, alpha_device, background=backdrop_device,
                                      background_rgb=backdrop_rgb)
-        return device_to_image(out)
+        return device_to_array(out, opaque=opaque)
 
     alpha = alpha_array.astype(np.float32)[..., None]
     if alpha_array.dtype == np.uint8:
@@ -767,21 +903,38 @@ def _black_fully_transparent(rgba: Image.Image) -> Image.Image:
     return Image.fromarray(pixels, mode="RGBA")
 
 
-def _encode_native(rgba: Image.Image, output_format: str) -> bytes:
+def _encode_native(rgba, output_format: str) -> bytes:
     if output_format == "webp":
-        method = WEBP_METHOD if rgba.width * rgba.height <= LARGE_PIXELS else min(WEBP_METHOD, WEBP_METHOD_LARGE)
-        return oencode.webp(np.asarray(rgba.convert("RGBA")), WEBP_QUALITY, method, WEBP_ALPHA_FILTER)
-    if rgba.mode not in ("L", "LA", "RGB", "RGBA"):
-        rgba = rgba.convert("RGBA")
-    return oencode.png(np.asarray(rgba), NATIVE_PNG_LEVEL)
+        if isinstance(rgba, np.ndarray):
+            pixels = rgba if rgba.ndim == 3 and rgba.shape[2] == 4 else np.asarray(Image.fromarray(rgba).convert("RGBA"))
+        else:
+            pixels = np.asarray(rgba if rgba.mode == "RGBA" else rgba.convert("RGBA"))
+        height, width = pixels.shape[:2]
+        large = width * height > LARGE_PIXELS
+        method = min(WEBP_METHOD, WEBP_METHOD_LARGE) if large else WEBP_METHOD
+        alpha_filter = WEBP_ALPHA_FILTER_LARGE if large else WEBP_ALPHA_FILTER
+        if oencode.has_webp2():
+            return oencode.webp2(pixels, WEBP_QUALITY, method,
+                                 WEBP_ALPHA_METHOD_LARGE if large else WEBP_ALPHA_METHOD, alpha_filter)
+        return oencode.webp(pixels, WEBP_QUALITY, method, alpha_filter)
+    if not isinstance(rgba, np.ndarray):
+        if rgba.mode not in ("L", "LA", "RGB", "RGBA"):
+            rgba = rgba.convert("RGBA")
+        rgba = np.asarray(rgba)
+    if PNG_PARALLEL and oencode.has_png_mt():
+        return oencode.png_mt(rgba, PNG_ZLEVEL)
+    return oencode.png(rgba, NATIVE_PNG_LEVEL)
 
 
-def encode_image(rgba: Image.Image, output_format: str) -> tuple[bytes, str]:
+def encode_image(rgba, output_format: str) -> tuple[bytes, str]:
+    """Encode a PIL image or an (h, w[, c]) uint8 array."""
     if NATIVE_ENCODE:
         try:
             return _encode_native(rgba, output_format), "image/webp" if output_format == "webp" else "image/png"
         except RuntimeError:
             pass
+    if isinstance(rgba, np.ndarray):
+        rgba = Image.fromarray(rgba)
     buffer = io.BytesIO()
     if output_format == "webp":
         # The cutout's alpha is the contract. Invisible RGB is blacked above,
@@ -795,7 +948,7 @@ def encode_image(rgba: Image.Image, output_format: str) -> tuple[bytes, str]:
     return buffer.getvalue(), "image/png"
 
 
-def _encode_later(rgba: Image.Image, output_format: str):
+def _encode_later(rgba, output_format: str):
     return _encoder.submit(lambda: encode_image(rgba, output_format)[0])
 
 
@@ -1089,12 +1242,17 @@ def remove_background(image: Image.Image, request: RemoveBackgroundRequest,
     present; "background" is the estimated backdrop, "composite" is the subject
     over a replacement one.
     """
+    with _source_scope(image):
+        artifacts = _remove_background(image, request, segmented)
+    return {name: future.result() for name, future in artifacts.items()}
+
+
+def _remove_background(image: Image.Image, request: RemoveBackgroundRequest, segmented) -> dict[str, Any]:
     output_format = request.output_format.lower()
     mask_device, mask_array = segmented or segment(image, request.foreground_threshold,
                                                    request.input_size)
     alpha_bytes = (mask_array if mask_array.dtype == np.uint8
                    else (mask_array * 255).round().astype("uint8"))
-    alpha = Image.fromarray(alpha_bytes, mode="L")
 
     want_decontaminate = DECONTAMINATE if request.decontaminate is None else request.decontaminate
     needs_backdrop = bool(request.return_background or
@@ -1118,10 +1276,7 @@ def remove_background(image: Image.Image, request: RemoveBackgroundRequest,
             print(f"colour decontamination skipped: {error}")
             foreground, estimated_backdrop, on_device = None, None, False
 
-    base = to_pil_rgb(foreground, on_device) if foreground is not None else image
-    rgba = base.convert("RGBA")
-    rgba.putalpha(alpha)
-
+    rgba = _pack_rgba(image, foreground, on_device, mask_device, alpha_bytes)
     artifacts = {"cutout": _encode_later(rgba, output_format)}
 
     backdrop_image = None
@@ -1140,13 +1295,14 @@ def remove_background(image: Image.Image, request: RemoveBackgroundRequest,
                 composite = Image.composite(image.convert("RGB"),
                                             backdrop or Image.new("RGB", image.size, tuple(
                                                 int(c * 255 + 0.5) for c in (backdrop_rgb or (0, 0, 0)))),
-                                            alpha)
+                                            Image.fromarray(alpha_bytes, mode="L"))
             else:
                 composite = composite_over(foreground, mask_device, mask_array, on_device,
-                                           backdrop=backdrop, backdrop_rgb=backdrop_rgb)
+                                           backdrop=backdrop, backdrop_rgb=backdrop_rgb,
+                                           opaque=output_format == "webp")
             artifacts["composite"] = _encode_later(composite, output_format)
 
-    return {name: future.result() for name, future in artifacts.items()}
+    return artifacts
 
 
 @asynccontextmanager
@@ -1198,6 +1354,19 @@ def health() -> dict[str, Any]:
         "webp_quality": WEBP_QUALITY,
         "hair_layers": hair_layers is not None,
         "webp_method": WEBP_METHOD,
+        "native_encode": NATIVE_ENCODE,
+        "perf": {
+            "png_parallel": bool(NATIVE_ENCODE and PNG_PARALLEL and oencode.has_png_mt()),
+            "png_zlevel": PNG_ZLEVEL,
+            "webp_split": bool(NATIVE_ENCODE and oencode.has_webp2()),
+            "webp_method_large": WEBP_METHOD_LARGE,
+            "webp_alpha": {"method": WEBP_ALPHA_METHOD, "filter": WEBP_ALPHA_FILTER,
+                           "method_large": WEBP_ALPHA_METHOD_LARGE, "filter_large": WEBP_ALPHA_FILTER_LARGE},
+            "encode_threads": oencode.THREADS if oencode is not None else 0,
+            "gpu_preprocess": GPU_PREPROCESS,
+            "webp_decode": bool(NATIVE_DECODE and oencode.has_webp_decode()),
+            "png_decode": bool(NATIVE_DECODE and oencode.has_png_decode()),
+        },
         "webp_transparent_rgb": "black",
         "cache": object_store.describe() if (CACHE_ENABLED and object_store) else {"backend": "off"},
         "video_matting": video_matting.health() if video_matting is not None else {"status": "unavailable"},

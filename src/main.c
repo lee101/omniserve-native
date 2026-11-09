@@ -1368,8 +1368,10 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
     oproxy_target *local = upstream;
     oproxy_target *overflow = admit ? overflow_for(app, local, tier) : NULL;
     bool on_overflow = false;
+    bool held = false;
     if (overflow) {
-        if (!osched_try_acquire_n(app->sched, tier, permits) && oproxy_target_allow(overflow)) {
+        held = osched_try_acquire_n(app->sched, tier, permits);
+        if (!held && oproxy_target_allow(overflow)) {
             upstream = overflow;
             on_overflow = true;
             app->overflow_saturated++;
@@ -1378,7 +1380,7 @@ static void handle_proxy_as_tier(ohttp_request *req, app_state *app, oproxy_targ
             permits = 0;
         }
     }
-    if (admit && !on_overflow && !osched_acquire_n(app->sched, tier, permits)) {
+    if (admit && !on_overflow && !held && !osched_acquire_n(app->sched, tier, permits)) {
         respond_error(req, 503, "admission timeout; retry");
         return;
     }

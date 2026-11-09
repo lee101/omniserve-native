@@ -112,6 +112,115 @@ class EncodingTest(unittest.TestCase):
         self.assertEqual(normalized.getpixel((1, 0)), (12, 34, 56, 255))
         self.assertEqual(normalized.getpixel((2, 0)), (0, 0, 0, 0))
 
+    def _scene(self):
+        import numpy as np
+
+        rng = np.random.default_rng(7)
+        rgb = rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)
+        alpha = np.zeros((48, 64), np.uint8)
+        alpha[8:40, 8:56] = 255
+        alpha[8:40, 8] = rng.integers(1, 255, 32)
+        return rgb, alpha
+
+    def test_arrays_and_images_encode_to_the_same_bytes(self):
+        import numpy as np
+
+        rgb, alpha = self._scene()
+        rgba = np.dstack([rgb, alpha])
+        for pixels, mode in ((rgba, "RGBA"), (rgb, "RGB")):
+            for output_format in ("png", "webp"):
+                with self.subTest(mode=mode, output_format=output_format):
+                    self.assertEqual(worker.encode_image(pixels, output_format),
+                                     worker.encode_image(Image.fromarray(pixels, mode), output_format))
+                    with mock.patch.object(worker, "NATIVE_ENCODE", False):
+                        self.assertEqual(worker.encode_image(pixels, output_format),
+                                         worker.encode_image(Image.fromarray(pixels, mode), output_format))
+
+    def test_host_path_cutout_is_the_source_under_the_network_alpha(self):
+        import numpy as np
+        from io import BytesIO
+
+        rgb, alpha = self._scene()
+        image = Image.fromarray(rgb, "RGB")
+        request = worker.RemoveBackgroundRequest(image_url="x", output_format="png", decontaminate=False,
+                                                 background="#102030", cache=False)
+        with mock.patch.object(worker, "segment", return_value=(None, alpha)), \
+                mock.patch.object(worker, "omatte", None):
+            produced = worker.remove_background(image, request)
+
+        cutout = np.asarray(Image.open(BytesIO(produced["cutout"])))
+        np.testing.assert_array_equal(cutout, np.dstack([rgb, alpha]))
+        expected = Image.composite(image, Image.new("RGB", image.size, (16, 32, 48)), Image.fromarray(alpha, "L"))
+        np.testing.assert_array_equal(np.asarray(Image.open(BytesIO(produced["composite"]))), np.asarray(expected))
+        self.assertIsNone(worker._source.image)
+
+    def test_read_image_matches_the_plain_pillow_decode(self):
+        import base64
+        import numpy as np
+        from io import BytesIO
+        from PIL import ImageOps
+
+        rgb, alpha = self._scene()
+        exif = Image.Exif()
+        exif[0x0112] = 6
+        cases = {
+            "png-rgb": (Image.fromarray(rgb, "RGB"), "PNG", {}),
+            "png-rgba": (Image.fromarray(np.dstack([rgb, alpha]), "RGBA"), "PNG", {}),
+            "png-palette": (Image.fromarray(rgb, "RGB").quantize(16), "PNG", {}),
+            "jpeg": (Image.fromarray(rgb, "RGB"), "JPEG", {"quality": 90}),
+            "jpeg-rotated": (Image.fromarray(rgb, "RGB"), "JPEG", {"quality": 90, "exif": exif.tobytes()}),
+            "webp": (Image.fromarray(rgb, "RGB"), "WEBP", {"quality": 90}),
+            "webp-alpha": (Image.fromarray(np.dstack([rgb, alpha]), "RGBA"), "WEBP", {"quality": 90}),
+            "webp-lossless": (Image.fromarray(rgb, "RGB"), "WEBP", {"lossless": True}),
+            "webp-rotated": (Image.fromarray(rgb, "RGB"), "WEBP", {"quality": 90, "exif": exif.tobytes()}),
+            "webp-xmp-rotated": (Image.fromarray(rgb, "RGB"), "WEBP", {
+                "quality": 90,
+                "xmp": b'<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:Description tiff:Orientation="6"/></x:xmpmeta>'}),
+        }
+        for name, (image, fmt, options) in cases.items():
+            with self.subTest(name=name):
+                buffer = BytesIO()
+                image.save(buffer, format=fmt, **options)
+                url = f"data:image/{fmt.lower()};base64," + base64.b64encode(buffer.getvalue()).decode()
+                expected = ImageOps.exif_transpose(Image.open(BytesIO(buffer.getvalue()))).convert("RGB")
+                for native in (True, False):
+                    with mock.patch.object(worker, "NATIVE_DECODE", native and worker.NATIVE_DECODE):
+                        got = worker.read_image(url)
+                    self.assertEqual(got.mode, "RGB")
+                    self.assertEqual(got.size, expected.size)
+                    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+                    np.testing.assert_array_equal(worker._rgb_array(got), np.asarray(expected))
+                    np.testing.assert_array_equal(np.asarray(got.resize((16, 16))), np.asarray(expected.resize((16, 16))))
+
+    def test_read_image_rejects_garbage_and_oversized_sources(self):
+        import base64
+        from io import BytesIO
+
+        with self.assertRaises(worker.HTTPException) as caught:
+            worker.read_image("data:image/png;base64," + base64.b64encode(b"not an image").decode())
+        self.assertEqual(caught.exception.status_code, 400)
+        for fmt in ("PNG", "WEBP"):
+            buffer = BytesIO()
+            Image.new("RGB", (64, 64), (1, 2, 3)).save(buffer, format=fmt)
+            url = f"data:image/{fmt.lower()};base64," + base64.b64encode(buffer.getvalue()).decode()
+            with mock.patch.object(worker, "MAX_PIXELS", 1000), self.assertRaises(worker.HTTPException) as caught:
+                worker.read_image(url)
+            self.assertEqual(caught.exception.status_code, 413)
+        truncated = BytesIO()
+        Image.new("RGB", (64, 64), (1, 2, 3)).save(truncated, format="PNG")
+        url = "data:image/png;base64," + base64.b64encode(truncated.getvalue()[:60]).decode()
+        with self.assertRaises(worker.HTTPException) as caught:
+            worker.read_image(url)
+        self.assertEqual(caught.exception.status_code, 400)
+
+    def test_host_path_packs_float_foreground_with_rounding(self):
+        import numpy as np
+
+        rgb, alpha = self._scene()
+        foreground = rgb.astype(np.float32) / 255.0
+        packed = worker._pack_rgba(Image.fromarray(rgb, "RGB"), foreground, False, None, alpha)
+        np.testing.assert_array_equal(packed, np.dstack([rgb, alpha]))
+
 
 class CacheParamsTest(unittest.TestCase):
     def test_params_cover_everything_that_changes_pixels(self):

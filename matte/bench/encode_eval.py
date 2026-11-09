@@ -33,7 +33,7 @@ def run(img, req, native, record=None, n=3):
     real = w.encode_image
     if record is not None:
         def tap(rgba, fmt):
-            record.append((rgba.copy(), fmt))
+            record.append((Image.fromarray(rgba) if isinstance(rgba, np.ndarray) else rgba.copy(), fmt))
             return real(rgba, fmt)
         w.encode_image = tap
     try:

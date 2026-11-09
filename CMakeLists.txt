@@ -305,6 +305,12 @@ if(Python3_Interpreter_FOUND)
     )
     set_tests_properties(image_worker_routing PROPERTIES
         ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    add_test(
+        NAME proxy_overflow_permits
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_proxy_overflow_permits.py"
+    )
+    set_tests_properties(proxy_overflow_permits PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
     # Drives the real gateway with the stub diffusion backend: a saturated
     # embedded image lane must relay to its standing remote instead of queueing.
     if(TARGET onative_sd_cache_stub)
@@ -380,6 +386,12 @@ if(OENCODE_DEFLATE_LIB AND OENCODE_WEBP_LIB AND OENCODE_DEFLATE_INC AND OENCODE_
     add_library(oencode SHARED src/oencode.c)
     target_include_directories(oencode PUBLIC include PRIVATE ${OENCODE_DEFLATE_INC} ${OENCODE_WEBP_INC})
     target_link_libraries(oencode PRIVATE ${OENCODE_DEFLATE_LIB} ${OENCODE_WEBP_LIB} pthread)
+    find_package(ZLIB)
+    if(ZLIB_FOUND)
+        target_link_libraries(oencode PRIVATE ZLIB::ZLIB)
+    else()
+        target_compile_definitions(oencode PRIVATE OENC_NO_ZLIB)
+    endif()
     set_target_properties(oencode PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
