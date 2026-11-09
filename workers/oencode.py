@@ -40,6 +40,14 @@ def _load():
         lib.oenc_webp.restype = ctypes.c_int
         lib.oenc_free.argtypes = [ctypes.c_void_p]
         lib.oenc_free.restype = None
+        if hasattr(lib, "oenc_png_mt"):
+            lib.oenc_png_mt.argtypes = lib.oenc_png.argtypes
+            lib.oenc_png_mt.restype = ctypes.c_int
+        if hasattr(lib, "oenc_webp2"):
+            lib.oenc_webp2.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, out,
+                                       ctypes.POINTER(ctypes.c_size_t)]
+            lib.oenc_webp2.restype = ctypes.c_int
         return lib
     return None
 
@@ -49,6 +57,14 @@ _lib = _load()
 
 def available() -> bool:
     return _lib is not None
+
+
+def has_png_mt() -> bool:
+    return _lib is not None and hasattr(_lib, "oenc_png_mt")
+
+
+def has_webp2() -> bool:
+    return _lib is not None and hasattr(_lib, "oenc_webp2")
 
 
 def _take(ptr, size: int) -> bytes:
@@ -70,6 +86,19 @@ def png(pixels: np.ndarray, level: int = 3, threads: int = THREADS) -> bytes:
     return _take(out, size.value)
 
 
+def png_mt(pixels: np.ndarray, level: int = 1, threads: int = THREADS) -> bytes:
+    """zlib level (1..9), one filter+deflate strip per thread. Same pixels as png(), other bytes."""
+    arr = np.ascontiguousarray(pixels, dtype=np.uint8)
+    if arr.ndim == 2:
+        arr = arr[:, :, None]
+    h, w, c = arr.shape
+    out = ctypes.POINTER(ctypes.c_uint8)()
+    size = ctypes.c_size_t()
+    if _lib.oenc_png_mt(arr.ctypes.data, w, h, c, level, threads, ctypes.byref(out), ctypes.byref(size)):
+        raise RuntimeError("native png encode failed")
+    return _take(out, size.value)
+
+
 def webp(rgba: np.ndarray, quality: float, method: int, alpha_filter: int = 0, blank_transparent: bool = True,
          threads: int = THREADS) -> bytes:
     arr = np.ascontiguousarray(rgba, dtype=np.uint8)
@@ -80,5 +109,24 @@ def webp(rgba: np.ndarray, quality: float, method: int, alpha_filter: int = 0, b
     size = ctypes.c_size_t()
     if _lib.oenc_webp(arr.ctypes.data, w, h, w * 4, quality, method, alpha_filter, int(blank_transparent), threads,
                       ctypes.byref(out), ctypes.byref(size)):
+        raise RuntimeError("native webp encode failed")
+    return _take(out, size.value)
+
+
+def webp2(rgba: np.ndarray, quality: float, method: int, alpha_method: int = -1, alpha_filter: int = 0,
+          blank_transparent: bool = True, threads: int = THREADS) -> bytes:
+    """webp() with a threaded colour conversion and the alpha plane as its own job.
+
+    Same bytes as webp() when alpha_method is -1 or equals method; a lower alpha_method
+    costs alpha bytes only (alpha is lossless at every setting, colour is untouched).
+    """
+    arr = np.ascontiguousarray(rgba, dtype=np.uint8)
+    h, w, c = arr.shape
+    if c != 4:
+        raise ValueError("webp expects RGBA")
+    out = ctypes.POINTER(ctypes.c_uint8)()
+    size = ctypes.c_size_t()
+    if _lib.oenc_webp2(arr.ctypes.data, w, h, w * 4, quality, method, alpha_method, alpha_filter,
+                       int(blank_transparent), threads, ctypes.byref(out), ctypes.byref(size)):
         raise RuntimeError("native webp encode failed")
     return _take(out, size.value)

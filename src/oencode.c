@@ -5,8 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <webp/encode.h>
+#ifndef OENC_NO_ZLIB
+#include <zlib.h>
+#endif
 
 #define NFILTERS 5
+#define PNG_MT_MIN_STRIP (128u << 10)
 
 typedef struct {
     const uint8_t *px;
@@ -177,6 +181,127 @@ int oenc_png(const uint8_t *px, int w, int h, int channels, int level, int threa
     return 0;
 }
 
+#ifndef OENC_NO_ZLIB
+typedef struct {
+    filter_job f;
+    int level, last, failed;
+    uint8_t *out;
+    size_t n;
+    uint32_t adler;
+} strip_job;
+
+static void *strip_worker(void *arg)
+{
+    strip_job *j = arg;
+    j->failed = 1;
+    if (filter_worker(&j->f)) return NULL;
+    const uint8_t *in = j->f.filtered + (size_t)j->f.y0 * (j->f.stride + 1);
+    size_t len = (size_t)(j->f.y1 - j->f.y0) * (j->f.stride + 1);
+    z_stream z = {0};
+    if (deflateInit2(&z, j->level, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK) return NULL;
+    size_t cap = deflateBound(&z, len) + 16;
+    j->out = malloc(cap);
+    if (!j->out) { deflateEnd(&z); return NULL; }
+    z.next_in = (Bytef *)in;
+    z.avail_in = (uInt)len;
+    z.next_out = j->out;
+    z.avail_out = (uInt)cap;
+    int r = deflate(&z, j->last ? Z_FINISH : Z_SYNC_FLUSH);
+    j->n = z.total_out;
+    int done = j->last ? r == Z_STREAM_END : (r == Z_OK && z.avail_in == 0 && z.avail_out > 0);
+    deflateEnd(&z);
+    if (!done) return NULL;
+    j->adler = libdeflate_adler32(1, in, len);
+    j->failed = 0;
+    return NULL;
+}
+#endif
+
+/* Rows are filtered and deflated in independent strips (one per thread) that are joined
+   with sync flushes into a single zlib stream. */
+int oenc_png_mt(const uint8_t *px, int w, int h, int channels, int level, int threads,
+                uint8_t **out, size_t *n)
+{
+#ifdef OENC_NO_ZLIB
+    (void)px; (void)w; (void)h; (void)channels; (void)level; (void)threads; (void)out; (void)n;
+    return -2;
+#else
+    int ctype;
+    switch (channels) {
+    case 1: ctype = 0; break;
+    case 2: ctype = 4; break;
+    case 3: ctype = 2; break;
+    case 4: ctype = 6; break;
+    default: return -1;
+    }
+    if (!px || w <= 0 || h <= 0 || !out || !n) return -1;
+    if (level < 1) level = 1;
+    if (level > 9) level = 9;
+    size_t stride = (size_t)w * channels;
+    size_t raw = (stride + 1) * (size_t)h;
+    if (threads > 64) threads = 64;
+    if ((size_t)threads > raw / PNG_MT_MIN_STRIP) threads = (int)(raw / PNG_MT_MIN_STRIP);
+    if (threads > h) threads = h;
+    if (threads < 1) threads = 1;
+    if (raw / (size_t)threads > 0x3fffffffu) return -1;
+
+    uint8_t *filtered = malloc(raw);
+    if (!filtered) return -1;
+    pthread_t tid[64];
+    strip_job jobs[64];
+    int started[64] = {0};
+    for (int t = 0; t < threads; t++) {
+        int y0 = (int)((long)h * t / threads), y1 = (int)((long)h * (t + 1) / threads);
+        jobs[t] = (strip_job){{px, filtered, h, channels, stride, y0, y1}, level, t == threads - 1, 0, NULL, 0, 1};
+        if (t == 0) continue;
+        if (pthread_create(&tid[t], NULL, strip_worker, &jobs[t]) == 0) started[t] = 1;
+        else strip_worker(&jobs[t]);
+    }
+    strip_worker(&jobs[0]);
+    int failed = 0;
+    size_t z = 2 + 4;
+    for (int t = 0; t < threads; t++) {
+        if (started[t] && pthread_join(tid[t], NULL)) failed = 1;
+        failed |= jobs[t].failed;
+        z += jobs[t].n;
+    }
+    free(filtered);
+    uint8_t *buf = failed || z > 0xffffffffu ? NULL : malloc(8 + 25 + 12 + z + 12);
+    if (!buf) {
+        for (int t = 0; t < threads; t++) free(jobs[t].out);
+        return -1;
+    }
+    static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
+    uint8_t *p = buf;
+    memcpy(p, sig, 8);
+    p += 8;
+    uint8_t ihdr[13];
+    put_be32(ihdr, (uint32_t)w);
+    put_be32(ihdr + 4, (uint32_t)h);
+    ihdr[8] = 8; ihdr[9] = (uint8_t)ctype; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    p = put_chunk(p, "IHDR", ihdr, 13);
+    put_be32(p, (uint32_t)z);
+    memcpy(p + 4, "IDAT", 4);
+    uint8_t *q = p + 8;
+    *q++ = 0x78;
+    *q++ = 0x01;
+    uint32_t adler = 1;
+    for (int t = 0; t < threads; t++) {
+        memcpy(q, jobs[t].out, jobs[t].n);
+        q += jobs[t].n;
+        free(jobs[t].out);
+        size_t len = (size_t)(jobs[t].f.y1 - jobs[t].f.y0) * (stride + 1);
+        adler = (uint32_t)adler32_combine(adler, jobs[t].adler, (z_off_t)len);
+    }
+    put_be32(q, adler);
+    put_be32(q + 4, libdeflate_crc32(0, p + 4, z + 4));
+    p = put_chunk(q + 8, "IEND", NULL, 0);
+    *out = buf;
+    *n = (size_t)(p - buf);
+    return 0;
+#endif
+}
+
 typedef struct {
     uint8_t *buf;
     size_t len, cap;
@@ -232,6 +357,226 @@ int oenc_webp(const uint8_t *rgba, int w, int h, int stride, float quality, int 
     if (!ok) { free(s.buf); return -1; }
     *out = s.buf;
     *n = s.len;
+    return 0;
+}
+
+typedef struct {
+    const uint8_t *rgba;
+    int w, stride, blank, y0, y1, has_alpha, failed;
+    WebPPicture *dst;
+} import_job;
+
+static void *import_worker(void *arg)
+{
+    import_job *j = arg;
+    int rows = j->y1 - j->y0, w = j->w;
+    const uint8_t *src = j->rgba + (size_t)j->y0 * j->stride;
+    int stride = j->stride;
+    uint8_t *tmp = NULL;
+    j->failed = 1;
+    if (j->blank) {
+        tmp = malloc((size_t)rows * w * 4);
+        if (!tmp) return NULL;
+        for (int y = 0; y < rows; y++) {
+            const uint8_t *s = src + (size_t)y * j->stride;
+            uint8_t *d = tmp + (size_t)y * w * 4;
+            memcpy(d, s, (size_t)w * 4);
+            for (int x = 0; x < w; x++)
+                if (!d[4 * x + 3]) memset(d + 4 * x, 0, 4);
+        }
+        src = tmp;
+        stride = w * 4;
+    }
+    WebPPicture sp;
+    if (!WebPPictureInit(&sp)) { free(tmp); return NULL; }
+    sp.use_argb = 0;
+    sp.width = w;
+    sp.height = rows;
+    int ok = WebPPictureImportRGBA(&sp, src, stride);
+    free(tmp);
+    if (!ok) { WebPPictureFree(&sp); return NULL; }
+    WebPPicture *d = j->dst;
+    int cw = (w + 1) / 2, crows = (rows + 1) / 2;
+    j->has_alpha = (sp.colorspace & WEBP_CSP_ALPHA_BIT) && sp.a;
+    for (int y = 0; y < rows; y++) {
+        memcpy(d->y + (size_t)(j->y0 + y) * d->y_stride, sp.y + (size_t)y * sp.y_stride, w);
+        if (j->has_alpha) memcpy(d->a + (size_t)(j->y0 + y) * d->a_stride, sp.a + (size_t)y * sp.a_stride, w);
+        else memset(d->a + (size_t)(j->y0 + y) * d->a_stride, 0xff, w);
+    }
+    for (int y = 0; y < crows; y++) {
+        memcpy(d->u + (size_t)(j->y0 / 2 + y) * d->uv_stride, sp.u + (size_t)y * sp.uv_stride, cw);
+        memcpy(d->v + (size_t)(j->y0 / 2 + y) * d->uv_stride, sp.v + (size_t)y * sp.uv_stride, cw);
+    }
+    WebPPictureFree(&sp);
+    j->failed = 0;
+    return NULL;
+}
+
+typedef struct {
+    const WebPConfig *cfg;
+    WebPPicture *pic;
+    int ok;
+} encode_job;
+
+static void *encode_worker(void *arg)
+{
+    encode_job *j = arg;
+    j->ok = WebPEncode(j->cfg, j->pic);
+    return NULL;
+}
+
+static const uint8_t *find_chunk(const sink *s, const char *tag, size_t *len)
+{
+    size_t p = 12;
+    while (s->buf && p + 8 <= s->len) {
+        size_t size = (size_t)s->buf[p + 4] | (size_t)s->buf[p + 5] << 8 | (size_t)s->buf[p + 6] << 16 | (size_t)s->buf[p + 7] << 24;
+        if (p + 8 + size > s->len) return NULL;
+        if (!memcmp(s->buf + p, tag, 4)) { *len = size; return s->buf + p + 8; }
+        p += 8 + size + (size & 1);
+    }
+    return NULL;
+}
+
+static void put_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
+}
+
+static uint8_t *put_riff_chunk(uint8_t *p, const char *tag, const uint8_t *data, size_t len)
+{
+    memcpy(p, tag, 4);
+    put_le32(p + 4, (uint32_t)len);
+    memcpy(p + 8, data, len);
+    p += 8 + len;
+    if (len & 1) *p++ = 0;
+    return p;
+}
+
+static int finish_single(const WebPConfig *cfg, WebPPicture *view, WebPPicture *owner, sink *s,
+                         uint8_t **out, size_t *n)
+{
+    int ok = WebPEncode(cfg, view);
+    WebPPictureFree(owner);
+    if (!ok) { free(s->buf); return -1; }
+    *out = s->buf;
+    *n = s->len;
+    return 0;
+}
+
+/* Same pixels as oenc_webp (same bytes when alpha_method == method), with the RGBA -> YUVA
+   conversion done in parallel strips and the alpha plane encoded as its own job. The colour
+   and alpha bitstreams are independent: the alpha is encoded beside a flat dummy luma, so
+   only its ALPH chunk is real work, and the two are muxed by hand. alpha_method (0..6, or
+   -1 for `method`) trades alpha bytes for time; alpha stays lossless at every setting. */
+int oenc_webp2(const uint8_t *rgba, int w, int h, int stride, float quality, int method, int alpha_method,
+               int alpha_filter, int blank_transparent, int threads, uint8_t **out, size_t *n)
+{
+    if (!rgba || w <= 0 || h <= 0 || !out || !n) return -1;
+    if (!stride) stride = w * 4;
+    if (alpha_method < 0 || alpha_method > 6) alpha_method = method;
+    WebPConfig cfg, acfg;
+    if (!WebPConfigInit(&cfg)) return -1;
+    cfg.quality = quality;
+    cfg.method = method;
+    cfg.exact = 0;
+    cfg.alpha_filtering = alpha_filter;
+    cfg.thread_level = threads > 1;
+    acfg = cfg;
+    acfg.method = alpha_method;
+    acfg.exact = 1;
+    if (!WebPValidateConfig(&cfg) || !WebPValidateConfig(&acfg)) return -1;
+
+    WebPPicture pic, apic;
+    if (!WebPPictureInit(&pic) || !WebPPictureInit(&apic)) return -1;
+    pic.use_argb = 0;
+    pic.colorspace = WEBP_YUV420A;
+    pic.width = w;
+    pic.height = h;
+    if (!WebPPictureAlloc(&pic)) return -1;
+
+    if (threads < 1) threads = 1;
+    if (threads > 64) threads = 64;
+    int strips = threads;
+    if (strips > h / 64) strips = h / 64;
+    if (strips < 1) strips = 1;
+    pthread_t tid[64];
+    import_job jobs[64];
+    int started[64] = {0};
+    for (int t = 0; t < strips; t++) {
+        int y0 = (int)((long)h * t / strips) & ~1;
+        int y1 = t == strips - 1 ? h : (int)((long)h * (t + 1) / strips) & ~1;
+        jobs[t] = (import_job){rgba, w, stride, blank_transparent, y0, y1, 0, 1, &pic};
+        if (t == 0) continue;
+        if (pthread_create(&tid[t], NULL, import_worker, &jobs[t]) == 0) started[t] = 1;
+        else import_worker(&jobs[t]);
+    }
+    import_worker(&jobs[0]);
+    int failed = 0, has_alpha = 0;
+    for (int t = 0; t < strips; t++) {
+        if (started[t] && pthread_join(tid[t], NULL)) failed = 1;
+        failed |= jobs[t].failed;
+        has_alpha |= jobs[t].has_alpha;
+    }
+    if (failed) { WebPPictureFree(&pic); return -1; }
+
+    sink s = {0}, as = {0};
+    WebPPicture main_pic = pic;
+    main_pic.writer = sink_write;
+    main_pic.custom_ptr = &s;
+    if (!has_alpha) {
+        main_pic.colorspace = WEBP_YUV420;
+        main_pic.a = NULL;
+        return finish_single(&cfg, &main_pic, &pic, &s, out, n);
+    }
+    WebPCleanupTransparentArea(&pic);
+    if (threads < 2) return finish_single(&cfg, &main_pic, &pic, &s, out, n);
+
+    main_pic.colorspace = WEBP_YUV420;
+    main_pic.a = NULL;
+    apic.use_argb = 0;
+    apic.colorspace = WEBP_YUV420A;
+    apic.width = w;
+    apic.height = h;
+    if (!WebPPictureAlloc(&apic)) { WebPPictureFree(&pic); return -1; }
+    for (int y = 0; y < h; y++) {
+        memset(apic.y + (size_t)y * apic.y_stride, 128, w);
+        memcpy(apic.a + (size_t)y * apic.a_stride, pic.a + (size_t)y * pic.a_stride, w);
+    }
+    for (int y = 0; y < (h + 1) / 2; y++) {
+        memset(apic.u + (size_t)y * apic.uv_stride, 128, (w + 1) / 2);
+        memset(apic.v + (size_t)y * apic.uv_stride, 128, (w + 1) / 2);
+    }
+    apic.writer = sink_write;
+    apic.custom_ptr = &as;
+    encode_job aj = {&acfg, &apic, 0};
+    pthread_t at;
+    int threaded = pthread_create(&at, NULL, encode_worker, &aj) == 0;
+    if (!threaded) encode_worker(&aj);
+    int ok = WebPEncode(&cfg, &main_pic);
+    if (threaded && pthread_join(at, NULL)) aj.ok = 0;
+    WebPPictureFree(&pic);
+    WebPPictureFree(&apic);
+
+    size_t alen = 0, vlen = 0;
+    const uint8_t *alph = ok && aj.ok ? find_chunk(&as, "ALPH", &alen) : NULL;
+    const uint8_t *vp8 = alph ? find_chunk(&s, "VP8 ", &vlen) : NULL;
+    size_t total = 12 + 18 + 8 + alen + (alen & 1) + 8 + vlen + (vlen & 1);
+    uint8_t *buf = vp8 && total <= 0xfffffff6u ? malloc(total) : NULL;
+    if (buf) {
+        memcpy(buf, "RIFF", 4);
+        put_le32(buf + 4, (uint32_t)(total - 8));
+        memcpy(buf + 8, "WEBP", 4);
+        uint8_t x[10] = {0x10, 0, 0, 0, (uint8_t)(w - 1), (uint8_t)((w - 1) >> 8), (uint8_t)((w - 1) >> 16),
+                         (uint8_t)(h - 1), (uint8_t)((h - 1) >> 8), (uint8_t)((h - 1) >> 16)};
+        uint8_t *p = put_riff_chunk(buf + 12, "VP8X", x, 10);
+        p = put_riff_chunk(p, "ALPH", alph, alen);
+        put_riff_chunk(p, "VP8 ", vp8, vlen);
+    }
+    free(s.buf);
+    free(as.buf);
+    if (!buf) return -1;
+    *out = buf;
+    *n = total;
     return 0;
 }
 

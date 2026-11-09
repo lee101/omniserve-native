@@ -380,6 +380,12 @@ if(OENCODE_DEFLATE_LIB AND OENCODE_WEBP_LIB AND OENCODE_DEFLATE_INC AND OENCODE_
     add_library(oencode SHARED src/oencode.c)
     target_include_directories(oencode PUBLIC include PRIVATE ${OENCODE_DEFLATE_INC} ${OENCODE_WEBP_INC})
     target_link_libraries(oencode PRIVATE ${OENCODE_DEFLATE_LIB} ${OENCODE_WEBP_LIB} pthread)
+    find_package(ZLIB)
+    if(ZLIB_FOUND)
+        target_link_libraries(oencode PRIVATE ZLIB::ZLIB)
+    else()
+        target_compile_definitions(oencode PRIVATE OENC_NO_ZLIB)
+    endif()
     set_target_properties(oencode PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 

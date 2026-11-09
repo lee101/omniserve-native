@@ -118,5 +118,76 @@ class WebpTest(unittest.TestCase):
             oencode.webp(np.zeros((4, 4, 3), np.uint8), 85, 2)
 
 
+@needs_lib
+@unittest.skipUnless(oencode.has_png_mt(), "liboencode.so predates oenc_png_mt")
+class PngParallelTest(unittest.TestCase):
+    def test_lossless_for_every_level_layout_and_thread_count(self):
+        arr = scene(301, 517)
+        for pixels in (arr, arr[:, :, :3], arr[:, :, 0], arr[:, :, [0, 3]]):
+            for level in (1, 4, 9):
+                for threads in (1, 2, 8, 64):
+                    with self.subTest(shape=pixels.shape, level=level, threads=threads):
+                        np.testing.assert_array_equal(decode(oencode.png_mt(pixels, level, threads)), pixels)
+
+    def test_tiny(self):
+        for h, w in ((1, 1), (1, 9), (7, 1), (3, 5)):
+            arr = np.random.default_rng(h + w).integers(0, 256, (h, w, 4), dtype=np.uint8)
+            for threads in (1, 8):
+                with self.subTest(h=h, w=w, threads=threads):
+                    np.testing.assert_array_equal(decode(oencode.png_mt(arr, 1, threads)), arr)
+
+    def test_incompressible_strips(self):
+        arr = np.random.default_rng(3).integers(0, 256, (700, 900, 4), dtype=np.uint8)
+        np.testing.assert_array_equal(decode(oencode.png_mt(arr, 1, 16)), arr)
+
+    def test_close_to_single_stream_size(self):
+        arr = scene(1024, 1024)
+        self.assertLess(len(oencode.png_mt(arr, 4, 16)), len(oencode.png(arr, 2)) * 1.1)
+
+    def test_bad_channels(self):
+        with self.assertRaises(RuntimeError):
+            oencode.png_mt(np.zeros((4, 4, 5), np.uint8))
+
+
+@needs_lib
+@unittest.skipUnless(oencode.has_webp2(), "liboencode.so predates oenc_webp2")
+class WebpSplitTest(unittest.TestCase):
+    def test_same_bytes_as_single_call(self):
+        for h, w in ((130, 150), (131, 149), (64, 64), (1, 1), (2, 3), (517, 301)):
+            arr = scene(h, w) if h > 3 else np.random.default_rng(h + w).integers(0, 256, (h, w, 4), dtype=np.uint8)
+            for method in (0, 2, 4):
+                for alpha_filter in (0, 1):
+                    for threads in (1, 2, 8, 64):
+                        with self.subTest(h=h, w=w, method=method, alpha_filter=alpha_filter, threads=threads):
+                            self.assertEqual(oencode.webp2(arr, 85, method, -1, alpha_filter, True, threads),
+                                             oencode.webp(arr, 85, method, alpha_filter, True, 8))
+
+    def test_opaque_and_unblanked_match(self):
+        arr = scene(200, 120)
+        self.assertEqual(oencode.webp2(arr, 85, 2, -1, 0, False), oencode.webp(arr, 85, 2, 0, False))
+        arr[:, :, 3] = 255
+        self.assertEqual(oencode.webp2(arr, 85, 4), oencode.webp(arr, 85, 4))
+
+    def test_opaque_strip_beside_transparent_strip(self):
+        arr = scene(512, 96)
+        arr[:256, :, 3] = 255
+        for threads in (2, 8):
+            self.assertEqual(oencode.webp2(arr, 85, 2, -1, 0, True, threads), oencode.webp(arr, 85, 2))
+
+    def test_alpha_method_changes_bytes_not_pixels(self):
+        arr = scene(260, 300)
+        reference = decode(oencode.webp(arr, 85, 4))
+        for alpha_method in (0, 1, 6):
+            for alpha_filter in (0, 1):
+                with self.subTest(alpha_method=alpha_method, alpha_filter=alpha_filter):
+                    out = decode(oencode.webp2(arr, 85, 4, alpha_method, alpha_filter))
+                    np.testing.assert_array_equal(out, reference)
+                    np.testing.assert_array_equal(out[:, :, 3], arr[:, :, 3])
+
+    def test_noncontiguous_input(self):
+        arr = scene(80, 120)[:, ::2]
+        self.assertEqual(oencode.webp2(arr, 85, 2), oencode.webp(arr, 85, 2))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -112,6 +112,56 @@ class EncodingTest(unittest.TestCase):
         self.assertEqual(normalized.getpixel((1, 0)), (12, 34, 56, 255))
         self.assertEqual(normalized.getpixel((2, 0)), (0, 0, 0, 0))
 
+    def _scene(self):
+        import numpy as np
+
+        rng = np.random.default_rng(7)
+        rgb = rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)
+        alpha = np.zeros((48, 64), np.uint8)
+        alpha[8:40, 8:56] = 255
+        alpha[8:40, 8] = rng.integers(1, 255, 32)
+        return rgb, alpha
+
+    def test_arrays_and_images_encode_to_the_same_bytes(self):
+        import numpy as np
+
+        rgb, alpha = self._scene()
+        rgba = np.dstack([rgb, alpha])
+        for pixels, mode in ((rgba, "RGBA"), (rgb, "RGB")):
+            for output_format in ("png", "webp"):
+                with self.subTest(mode=mode, output_format=output_format):
+                    self.assertEqual(worker.encode_image(pixels, output_format),
+                                     worker.encode_image(Image.fromarray(pixels, mode), output_format))
+                    with mock.patch.object(worker, "NATIVE_ENCODE", False):
+                        self.assertEqual(worker.encode_image(pixels, output_format),
+                                         worker.encode_image(Image.fromarray(pixels, mode), output_format))
+
+    def test_host_path_cutout_is_the_source_under_the_network_alpha(self):
+        import numpy as np
+        from io import BytesIO
+
+        rgb, alpha = self._scene()
+        image = Image.fromarray(rgb, "RGB")
+        request = worker.RemoveBackgroundRequest(image_url="x", output_format="png", decontaminate=False,
+                                                 background="#102030", cache=False)
+        with mock.patch.object(worker, "segment", return_value=(None, alpha)), \
+                mock.patch.object(worker, "omatte", None):
+            produced = worker.remove_background(image, request)
+
+        cutout = np.asarray(Image.open(BytesIO(produced["cutout"])))
+        np.testing.assert_array_equal(cutout, np.dstack([rgb, alpha]))
+        expected = Image.composite(image, Image.new("RGB", image.size, (16, 32, 48)), Image.fromarray(alpha, "L"))
+        np.testing.assert_array_equal(np.asarray(Image.open(BytesIO(produced["composite"]))), np.asarray(expected))
+        self.assertIsNone(worker._source.image)
+
+    def test_host_path_packs_float_foreground_with_rounding(self):
+        import numpy as np
+
+        rgb, alpha = self._scene()
+        foreground = rgb.astype(np.float32) / 255.0
+        packed = worker._pack_rgba(Image.fromarray(rgb, "RGB"), foreground, False, None, alpha)
+        np.testing.assert_array_equal(packed, np.dstack([rgb, alpha]))
+
 
 class CacheParamsTest(unittest.TestCase):
     def test_params_cover_everything_that_changes_pixels(self):
