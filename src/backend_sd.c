@@ -49,6 +49,48 @@ static fn_webp_encode_rgba p_webp_encode_rgba; /* Qwen Image 2.1 decodes RGBA (l
 static fn_webp_get_info p_webp_get_info;
 static fn_webp_decode_rgb_into p_webp_decode_rgb_into; /* reference/init images may arrive as WebP; stb_image cannot decode it */
 static pthread_once_t webp_once = PTHREAD_ONCE_INIT;
+static int (*p_oenc_webp)(const unsigned char *, int, int, int, float, int, int, int, int, unsigned char **, size_t *);
+static int g_webp_method = -1;
+static float g_webp_quality;
+
+static void oenc_lib_load(void) {
+    const char *name = getenv("OMNISERVE_NATIVE_OENCODE_LIB");
+    if (!name || !name[0]) name = "liboencode.so";
+    void *h = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+    if (!h && !strchr(name, '/')) {
+        char exe[4096];
+        ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+        char *slash = n > 0 ? (exe[n] = 0, strrchr(exe, '/')) : NULL;
+        if (slash) {
+            snprintf(slash + 1, sizeof exe - (size_t)(slash + 1 - exe), "%s", name);
+            h = dlopen(exe, RTLD_NOW | RTLD_LOCAL);
+        }
+    }
+    if (h) *(void **)&p_oenc_webp = dlsym(h, "oenc_webp");
+    fprintf(stderr, "[sd] webp method=%d encoder=%s\n", g_webp_method, p_oenc_webp ? "oencode" : "libwebp-simple");
+}
+
+static size_t oenc_webp_any(const unsigned char *px, int w, int h, int ch, unsigned char **out) {
+    const unsigned char *rgba = px;
+    unsigned char *tmp = NULL;
+    if (ch == 3) {
+        size_t n = (size_t)w * (size_t)h;
+        tmp = malloc(n * 4);
+        if (!tmp) return 0;
+        for (size_t i = 0; i < n; ++i) {
+            tmp[i * 4] = px[i * 3];
+            tmp[i * 4 + 1] = px[i * 3 + 1];
+            tmp[i * 4 + 2] = px[i * 3 + 2];
+            tmp[i * 4 + 3] = 255;
+        }
+        rgba = tmp;
+    }
+    size_t len = 0;
+    *out = NULL;
+    int r = p_oenc_webp(rgba, w, h, w * 4, g_webp_quality, g_webp_method, 1, 0, 4, out, &len);
+    free(tmp);
+    return r == 0 ? len : 0;
+}
 
 static void webp_lib_load_once(void) {
     static const char *const candidates[] = {
@@ -1080,6 +1122,8 @@ bool osd_init(const char *model_path) {
     g_webp_enabled = !format || !format[0] || strcasecmp(format, "png") != 0;
     g_webp_quality = sd_env_float("OMNISERVE_NATIVE_SD_WEBP_QUALITY", 85.0f, 1.0f, 100.0f);
     if (g_webp_enabled) webp_lib_load();
+    g_webp_method = sd_env_int("OMNISERVE_NATIVE_SD_WEBP_METHOD", -1, -1, 6);
+    if (g_webp_enabled && g_webp_method >= 0) oenc_lib_load();
     if (sd_env_flag("OMNISERVE_NATIVE_SD_WARMUP", false)) osd_warmup();
     return true;
 }
@@ -1395,6 +1439,10 @@ bool osd_generate(const oimg_req *req, oimg_result *out) {
     for (int i = 0; i < image_count; ++i) {
         if (use_webp && (images[i].channel == 3 || (images[i].channel == 4 && p_webp_encode_rgba))) {
             fn_webp_encode_rgb encode = images[i].channel == 4 ? (fn_webp_encode_rgb)p_webp_encode_rgba : p_webp_encode_rgb;
+            if (p_oenc_webp)
+                out->image_lens[i] = oenc_webp_any(images[i].data, (int)images[i].width, (int)images[i].height,
+                                                   (int)images[i].channel, &out->images[i]);
+            if (p_oenc_webp && out->image_lens[i] && out->images[i]) continue;
             out->image_lens[i] = encode(
                 images[i].data, (int)images[i].width, (int)images[i].height,
                 (int)(images[i].width * images[i].channel), g_webp_quality,
