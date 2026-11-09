@@ -76,8 +76,27 @@ What changed (decoded pixels identical on every row unless stated; `ab_identity.
   Mask mean |delta| 1.1e-4..4.0e-4, binary agreement >= 0.99966 on 7 images (the compiled-model gate is 5e-3 / 0.99);
   final alpha differs by more than 8/255 on 0..0.1% of pixels.
 
-Not taken: pinned staging buffers (the 12 MB upload is 0.65 ms pageable, 0.49 ms pinned; the RGBA download 3 ms); torch.compile `max-autotune` (no result after 25 min of autotuning on the shared card); batching concurrent
-jobs through one forward (see `forward_bench.py`; a new batch size makes a compiled model recompile under the model lock).
+HTTP end to end with the forward stubbed out (the card was shared and the forward swung 130..430 ms, identically for
+both revisions), PNG data-URL source, sync endpoint, wall ms min/median and req/s (best round of 2, interleaved):
+
+| | before | after | after + alpha settings, 16 encode threads |
+|---|---:|---:|---:|
+| 1024² webp cutout | 148 / 152 | 129 / 131 | 129 / 130 |
+| 1024² png cutout | 118 / 124 | 86 / 87 | 81 / 82 |
+| 2048² webp cutout | 581 / 630 | 402 / 405 | 348 / 359 |
+| 2048² png cutout | 491 / 542 | 252 / 276 | 268 / 270 |
+| 2048² png cutout + composite | 552 / 650 | 306 / 380 | 295 / 308 |
+| 2048² webp req/s at 1 / 2 / 4 | 1.60 / 3.03 / 4.21 | 2.57 / 3.89 / 5.20 | 2.99 / 4.66 / 6.25 |
+| 1024² webp req/s at 1 / 2 / 4 | 6.2 / 9.7 / 14.7 | 5.9 / 8.3 / 14.5 | 7.4 / 10.9 / 13.5 |
+
+(1024² WebP is bound by the single-threaded method-4 colour encode; its req/s rows are within run-to-run noise.)
+The glibc malloc env (MMAP_THRESHOLD 1G, TRIM 2G, TOP_PAD 256M, ARENA_MAX 4) on top of "after": 2048² webp 402 -> 361,
+png 252 -> 246, 1024² unchanged; still opt-in.
+
+Not taken: pinned staging buffers (the 12 MB upload is 0.65 ms pageable, 0.49 ms pinned; the RGBA download 3 ms);
+torch.compile `max-autotune` (no result after 25 min of autotuning on the shared card); batching concurrent jobs through
+one forward (`forward_bench.py`: batch 2 is 270 vs 285 ms per image on the contended card, the mask moves by up to 1.5e-3,
+batch 4 wants another 3.75 GiB, and a new batch size makes a compiled model recompile under the model lock).
 
 ## Learned refiner (matte/train, 2026-10-06)
 
