@@ -12,6 +12,7 @@
 #include "osched.h"
 #include "ohost.h"
 #include "otext.h"
+#include "oupscale.h"
 #include <unistd.h>
 
 #include "ovram.h"
@@ -83,6 +84,7 @@ typedef struct {
     int motion_permits;
     int threed_permits;
     int aux_permits;
+    int upscale_permits;
     bool prefer_embedded_image;
     const char *h3_api_key;
     unsigned h3_tier_mask;
@@ -2947,6 +2949,108 @@ encode_image:;
     free(json);
 }
 
+/* POST /v1/images/upscales: in-process Real-ESRGAN through stable-diffusion.cpp.
+ * Raw image bytes out. Admission is the tier scheduler (upscale permits) plus a
+ * VRAM lease sized from the tile plan; OMNISERVE_NATIVE_UPSCALE_QUEUE bounds
+ * requests in flight (fetching, queued or running) before answering 503. */
+static int g_up_inflight;
+
+static void handle_upscale(ohttp_request *req, app_state *app) {
+    if (ohttp_method_is(req, "GET")) {
+        char status[1024];
+        size_t n = oup_backend_status_json(status, sizeof status);
+        ohttp_respond(req, 200, "application/json", status, n);
+        return;
+    }
+    if (!ohttp_method_is(req, "POST")) { respond_error(req, 405, "POST required"); return; }
+    oup_req ur;
+    char err[256];
+    if (!oup_parse(req->body, req->body_len, &ur, err, sizeof err)) {
+        respond_error(req, 400, err);
+        return;
+    }
+    if (!oup_backend_available(ur.model, ur.scale)) {
+        oup_req_free(&ur);
+        respond_error(req, 503, "upscale model weights are not configured on this server");
+        return;
+    }
+    int queue_cap = env_int("OMNISERVE_NATIVE_UPSCALE_QUEUE", 4);
+    if (__atomic_add_fetch(&g_up_inflight, 1, __ATOMIC_RELAXED) > (queue_cap > 0 ? queue_cap : 1)) {
+        __atomic_sub_fetch(&g_up_inflight, 1, __ATOMIC_RELAXED);
+        oup_req_free(&ur);
+        respond_error(req, 503, "upscale lane saturated; retry");
+        return;
+    }
+    unsigned char *bytes = NULL;
+    size_t nbytes = 0;
+    int status = oup_fetch(ur.image_url, &bytes, &nbytes, err, sizeof err);
+    int w = 0, h = 0;
+    if (!status && !oup_probe_dims(bytes, nbytes, &w, &h)) {
+        status = 400;
+        snprintf(err, sizeof err, "image_url is not a decodable PNG, JPEG or WebP");
+    }
+    if (!status) status = oup_check_limits(w, h, ur.scale, err, sizeof err);
+    if (status) {
+        free(bytes);
+        oup_req_free(&ur);
+        __atomic_sub_fetch(&g_up_inflight, 1, __ATOMIC_RELAXED);
+        respond_error(req, status, err);
+        return;
+    }
+    otier tier = request_tier(req);
+    int permits = app->upscale_permits;
+    double queued = frontier_now_ms();
+    if (!osched_acquire_n(app->sched, tier, permits)) {
+        free(bytes);
+        oup_req_free(&ur);
+        __atomic_sub_fetch(&g_up_inflight, 1, __ATOMIC_RELAXED);
+        respond_error(req, 503, "admission timeout; retry");
+        return;
+    }
+    double queue_ms = frontier_now_ms() - queued;
+    int need_mb = oup_backend_lease_mb(w, h, ur.model, ur.scale);
+    char lease_id[40] = {0};
+    bool lease_remote = false;
+    int lease_waited = 0;
+    bool denied = image_gpu_lease(app, need_mb, tier, lease_id, sizeof lease_id, &lease_remote, &lease_waited) < need_mb;
+    double free_gib = -1.0, total_gib = -1.0;
+    if (!denied && !lease_id[0] && ogpu_memory_gib(&free_gib, &total_gib) && free_gib * 1024.0 < need_mb)
+        denied = true;
+    if (denied) {
+        image_gpu_release(app, lease_id, lease_remote);
+        osched_release_n(app->sched, tier, permits);
+        free(bytes);
+        oup_req_free(&ur);
+        __atomic_sub_fetch(&g_up_inflight, 1, __ATOMIC_RELAXED);
+        snprintf(err, sizeof err, "upscale needs %d MB free GPU memory; GPU capacity is busy (queued %d ms)",
+                 need_mb, lease_waited);
+        respond_error(req, 503, err);
+        return;
+    }
+    oup_result res;
+    oup_status st = oup_backend_run(bytes, nbytes, &ur, &res, err, sizeof err);
+    image_gpu_release(app, lease_id, lease_remote);
+    osched_release_n(app->sched, tier, permits);
+    __atomic_sub_fetch(&g_up_inflight, 1, __ATOMIC_RELAXED);
+    free(bytes);
+    fprintf(stderr, "[upscale] %s q=%.0f lease=%dMB/%dms st=%d\n", otier_name(tier), queue_ms, need_mb,
+            lease_waited, (int)st);
+    oup_format fmt = ur.format;
+    oup_req_free(&ur);
+    if (st != OUP_OK) {
+        int code = st == OUP_ERR_INPUT ? 400 : st == OUP_ERR_TOO_LARGE ? 413 : st == OUP_ERR_UNAVAILABLE ? 503 : 500;
+        respond_error(req, code, err);
+        return;
+    }
+    char hdr[256];
+    snprintf(hdr, sizeof hdr,
+             "X-Upscale-Width: %d\r\nX-Upscale-Height: %d\r\nX-Upscale-Scale: %d\r\n"
+             "X-Upscale-Model: %s\r\nX-Upscale-Ms: %.0f",
+             res.width, res.height, res.scale, res.model, res.ms);
+    ohttp_respond_h(req, 200, oup_format_mime(fmt), (const char *)res.data, res.len, hdr);
+    oup_result_free(&res);
+}
+
 static bool path_starts_with(const ohttp_request *req, const char *prefix) {
     size_t n = strlen(prefix);
     return req->path_len >= n && memcmp(req->path, prefix, n) == 0;
@@ -3995,6 +4099,11 @@ static void route(ohttp_request *req, void *user) {
         }
         return;
     }
+    if (ohttp_path_is(req, "/v1/images/upscales")) {
+        if (!authorized(app, req)) { respond_error(req, 401, "invalid secret"); return; }
+        handle_upscale(req, app);
+        return;
+    }
     if (app->image_model_upstream_count &&
         (ohttp_path_is(req, "/v1/images/generations") ||
          ohttp_path_is(req, "/v1/images/edits") ||
@@ -4435,6 +4544,7 @@ int main(int argc, char **argv) {
     app.motion_permits = configured_permits("OMNISERVE_NATIVE_MOTION_PERMITS", 1, slots);
     app.threed_permits = configured_permits("OMNISERVE_NATIVE_3D_PERMITS", slots, slots);
     app.aux_permits = configured_permits("OMNISERVE_NATIVE_AUX_PERMITS", 1, slots);
+    app.upscale_permits = configured_permits("OMNISERVE_NATIVE_UPSCALE_PERMITS", 1, slots);
     const char *admission_env = getenv("OMNISERVE_NATIVE_ADMISSION_TIMEOUT_S");
     app.sched = osched_create(slots, admission_env ? atof(admission_env) : 30.0);
     {
@@ -4829,6 +4939,8 @@ int main(int argc, char **argv) {
                     g_rs.resident_mb, g_rs.stream_mb, g_rs.saved_ms);
         }
     }
+
+    if (env_flag("OMNISERVE_NATIVE_ESRGAN_PRELOAD", 1)) oup_backend_preload();
 
     app.scale = oscale_create();
     if (app.scale) {

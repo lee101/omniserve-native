@@ -1,0 +1,57 @@
+{
+ "_lora": {
+  "dp": "/vfast/data/models/moss/lora/moss-digital-painting-dora.safetensors",
+  "nai5": "/vfast/data/models/moss/lora/moss-nai5-painterly-cine.safetensors",
+  "r32": "/vfast/data/models/moss/lora/moss-r32-v2-kohaku.safetensors",
+  "beauty": "/vfast/data/models/moss/lora/MOSS-Image-Beauty-LoRA-F16.gguf"
+ },
+ "painting": {
+  "prompts": {
+   "knight": "a detailed digital painting of a weary knight resting against a mossy stone wall at dusk, ornate armor, dramatic rim light",
+   "city": "digital painting of a floating sky city above the clouds at sunrise, airships, intricate architecture, volumetric light",
+   "witch": "concept art portrait of an elderly witch with silver braids in a candlelit library, painterly brushwork, detailed face",
+   "dragon": "a painted illustration of a red dragon coiled on a cliff over a stormy sea, artstation concept art"
+  },
+  "variants": [
+   {"tag": "plain"},
+   {"tag": "dp06", "loras": [["dp", 0.6]]},
+   {"tag": "dp08", "loras": [["dp", 0.8]]},
+   {"tag": "dp10", "loras": [["dp", 1.0]]},
+   {"tag": "nai5_08", "prefix": "@painterly cine, ", "loras": [["nai5", 0.8]]}
+  ]
+ },
+ "anime": {
+  "prompts": {
+   "legs": "anime key frame, a girl with a long dark ponytail in a navy school uniform pointing angrily at a crumpled paper bag on the pavement, cel shading, vivid sunset sky, clean lineart",
+   "hangar": "an adult woman anime character in a charcoal flight suit sliding beneath a closing blast door as blue warning lights streak across a damaged orbital hangar",
+   "river": "an adult man anime character with copper hair and a weathered green coat standing knee-deep in a river while holding a cracked ceremonial mask beneath cold morning fog",
+   "foxgirl": "anime illustration of a cute girl with fennec fox ears and a fluffy tail, long wavy blonde hair, blue eyes, smiling and holding a wooden sign that reads \"MOSS\"",
+   "face": "close-up anime portrait of a young woman with short silver hair and amber eyes, soft window light, detailed eyes"
+  },
+  "variants": [
+   {"tag": "route", "suffix": ", anime character, dynamic composition, clean anatomy"},
+   {"tag": "nai5_06", "prefix": "@painterly cine, ", "suffix": ", anime character, dynamic composition, clean anatomy", "loras": [["nai5", 0.6]]},
+   {"tag": "nai5_08", "prefix": "@painterly cine, ", "suffix": ", anime character, dynamic composition, clean anatomy", "loras": [["nai5", 0.8]]},
+   {"tag": "nai5_10", "prefix": "@painterly cine, ", "suffix": ", anime character, dynamic composition, clean anatomy", "loras": [["nai5", 1.0]]},
+   {"tag": "nai5_08_notrig", "suffix": ", anime character, dynamic composition, clean anatomy", "loras": [["nai5", 0.8]]},
+   {"tag": "r32_08", "suffix": ", anime character, dynamic composition, clean anatomy", "loras": [["r32", 0.8]]}
+  ]
+ },
+ "people": {
+  "prompts": {
+   "portrait": "a close portrait of a young woman with dark brown skin and freckles, gazing forward with light brown eyes, wearing a black garment, soft directional light",
+   "oldman": "photo of an old fisherman with a weathered face and white beard on a wooden dock, overcast light, 85mm",
+   "group": "candid photo of three friends laughing at a cafe table, natural light, sharp faces",
+   "fullbody": "full body photo of a man in a grey suit walking across a city street at golden hour",
+   "chef": "a chef plating food in a busy restaurant kitchen, documentary photo, face in focus"
+  },
+  "variants": [
+   {"tag": "route", "suffix": ", natural skin texture, sharp eyes, correct anatomy"},
+   {"tag": "r32_06", "suffix": ", natural skin texture, sharp eyes, correct anatomy", "loras": [["r32", 0.6]]},
+   {"tag": "r32_08", "suffix": ", natural skin texture, sharp eyes, correct anatomy", "loras": [["r32", 0.8]]},
+   {"tag": "r32_10", "suffix": ", natural skin texture, sharp eyes, correct anatomy", "loras": [["r32", 1.0]]},
+   {"tag": "beauty07", "prefix": "moss_beauty_style, ", "suffix": ", soft directional light, natural skin texture, sharp eyes", "loras": [["beauty", 0.7]]},
+   {"tag": "dp08", "suffix": ", natural skin texture, sharp eyes, correct anatomy", "loras": [["dp", 0.8]]}
+  ]
+ }
+}

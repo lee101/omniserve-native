@@ -1,0 +1,34 @@
+[Unit]
+Description=omniserve-native Real-ESRGAN upscale gateway (port 8795, cuDNN conv)
+After=network.target nvidia-persistenced.service omniserve-native.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/nvme0n1-disk/code/omniserve-native-deploy/deploy-upscale-20261108
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do nvidia-smi -L | grep -q GPU && exit 0; sleep 2; done; exit 1'
+Environment=OMNISERVE_NATIVE_BIND=127.0.0.1
+Environment=OMNISERVE_NATIVE_PORT=8795
+Environment=OMNISERVE_NATIVE_GUARD_JUDGE=0
+Environment=OMNISERVE_NATIVE_SD_LIB=/nvme0n1-disk/code/omniserve-native-deploy/sd-20261108-upscale/libstable-diffusion.so
+Environment=OMNISERVE_NATIVE_ESRGAN_GENERAL=/nvme0n1-disk/models/omniserve-native/esrgan/RealESRGAN_x4plus.pth
+Environment=OMNISERVE_NATIVE_ESRGAN_GENERAL_X2=/nvme0n1-disk/models/omniserve-native/esrgan/RealESRGAN_x2plus.pth
+Environment=OMNISERVE_NATIVE_ESRGAN_ANIME=/nvme0n1-disk/models/omniserve-native/esrgan/RealESRGAN_x4plus_anime_6B.pth
+Environment=OMNISERVE_NATIVE_ESRGAN_VRAM_MB=3500
+Environment=OMNISERVE_NATIVE_ESRGAN_PRELOAD=1
+Environment=OMNISERVE_NATIVE_UPSCALE_QUEUE=6
+Environment=GGML_CUDA_CUDNN_LIB=libcudnn.so.9
+Environment=GGML_CUDA_DISABLE_GRAPHS=1
+Environment=OMNISERVE_NATIVE_VRAM_BROKER_URL=http://127.0.0.1:8791
+Environment=OMNISERVE_NATIVE_VRAM_OWNER=esrgan-upscale
+Environment=OMNISERVE_NATIVE_VRAM_WAIT_MS_PAID=20000
+Environment=OMNISERVE_NATIVE_VRAM_WAIT_MS_SUB=20000
+Environment=OMNISERVE_NATIVE_VRAM_WAIT_MS_FREE=25000
+Environment=OMNISERVE_NATIVE_VRAM_WAIT_MS_BACKGROUND=30000
+ExecStart=/nvme0n1-disk/code/omniserve-native-deploy/deploy-upscale-20261108/omniserve-native --port 8795
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

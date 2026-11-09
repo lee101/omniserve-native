@@ -35,6 +35,7 @@ artifacts/
 *.safetensors
 *.onnx
 *.gguf
+*.pth
 
 # Local credentials and machine-specific configuration.
 .env

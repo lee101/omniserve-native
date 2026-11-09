@@ -141,7 +141,8 @@ static int embed_pick_route(const char *js, const oj_tok *toks, int ntoks, int r
         }
         int keywords = oj_obj_get(js, toks, ntoks, route, "keywords");
         if (keywords >= 0 && toks[keywords].type == OJ_ARRAY && any_keyword(js, toks, ntoks, keywords, lowered)) {
-            score += 0.15f; /* an explicit keyword is evidence, not a verdict */
+            int bonus = oj_obj_get(js, toks, ntoks, route, "keyword_bonus");
+            score += bonus >= 0 ? (float)oj_number(js, &toks[bonus], 0.15) : 0.15f; /* evidence, not a verdict; style phrases ("digital painting") can weigh more */
         }
         int min_token = oj_obj_get(js, toks, ntoks, route, "min_score");
         double min_score = min_token >= 0 ? oj_number(js, &toks[min_token], 0.45) : 0.45;

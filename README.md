@@ -759,6 +759,7 @@ while headroom stays high means leases are being held, not that VRAM ran out.
 - Embeddings: `POST /api/v1/feature-extraction` (legacy flat vector) and `/v1/embeddings` (OpenAI scalar or batched shape)
 - Image: `POST /v1/images/generations`
 - Foreground image generation: `POST /v1/images/foreground-generations/jobs` combines text-to-image and BiRefNet matting in one queued stage
+- Upscale: `POST /v1/images/upscales` in-process Real-ESRGAN 2x/4x (general/anime; png/webp/jpeg raw bytes), see [docs/upscale.md](docs/upscale.md)
 - Background removal: `POST /v1/images/background-removals` or `/api/v1/birefnet`
 - Depth estimation: `POST /v1/depth-estimations` or `/api/v1/depth-anything-v2`
 - TTS: `POST /v1/audio/speech` and `/api/v1/generate_speech`

@@ -70,13 +70,13 @@ set(SD_DIR "${CMAKE_SOURCE_DIR}/../stable-diffusion.cpp" CACHE PATH "stable-diff
 
 set(CORE_SRC src/ocapacity.c src/ohttp.c src/oimage.c src/ojson.c src/olog.c src/olora_route.c src/cbed.c src/omatte.c src/onsfw.c src/oproxy.c src/osched.c src/ofrontier.c
              src/ohost.c src/ovram.c src/obroker.c src/oresidency.c src/ospec.c
-             src/oscale.c src/otext.c src/otune.c src/oguard.c)
+             src/oscale.c src/otext.c src/otune.c src/oguard.c src/oupscale.c)
 
 add_library(onative_core STATIC ${CORE_SRC})
 target_include_directories(onative_core PUBLIC include)
 target_link_libraries(onative_core PUBLIC pthread dl m)
 
-add_executable(omniserve-native src/main.c src/docs.c src/backend_llama.c src/backend_sd.c)
+add_executable(omniserve-native src/main.c src/docs.c src/backend_llama.c src/backend_sd.c src/backend_upscale.c)
 target_include_directories(omniserve-native PRIVATE include)
 target_link_libraries(omniserve-native PRIVATE onative_core)
 
@@ -268,6 +268,12 @@ if(Python3_Interpreter_FOUND)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_key_tiers.py"
     )
     set_tests_properties(key_tiers PROPERTIES
+        ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
+    add_test(
+        NAME upscale_route
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_upscale_route.py"
+    )
+    set_tests_properties(upscale_route PROPERTIES
         ENVIRONMENT "OMNISERVE_NATIVE_BIN=$<TARGET_FILE:omniserve-native>")
     add_test(
         NAME auth_gate

@@ -15,6 +15,7 @@
 #include "ovram.h"
 #include "ohost.h"
 #include "ospec.h"
+#include "oupscale.h"
 
 #include <arpa/inet.h>
 #include <assert.h>
@@ -524,6 +525,100 @@ static void test_utf8_slice(void) {
     CHECK(total == len);
 }
 
+static void test_upscale_contract(void) {
+    char err[256];
+    oup_req r;
+    const char *ok = "{\"image_url\":\"https://example.com/a.png\"}";
+    CHECK(oup_parse(ok, strlen(ok), &r, err, sizeof err));
+    CHECK(r.scale == 2 && r.model == OUP_GENERAL && r.format == OUP_PNG);
+    CHECK(strcmp(r.image_url, "https://example.com/a.png") == 0);
+    oup_req_free(&r);
+    const char *full = "{\"image_url\":\"data:image/png;base64,iVBO\",\"scale\":4,\"model\":\"anime\",\"output_format\":\"webp\"}";
+    CHECK(oup_parse(full, strlen(full), &r, err, sizeof err));
+    CHECK(r.scale == 4 && r.model == OUP_ANIME && r.format == OUP_WEBP);
+    CHECK(strcmp(oup_format_mime(r.format), "image/webp") == 0 && strcmp(oup_model_name(r.model), "anime") == 0);
+    oup_req_free(&r);
+    const char *jpg = "{\"image_url\":\"https:\\/\\/x.io\\/a.jpg\",\"output_format\":\"jpeg\",\"scale\":null}";
+    CHECK(oup_parse(jpg, strlen(jpg), &r, err, sizeof err) && r.format == OUP_JPEG && r.scale == 2);
+    CHECK(r.image_url && strcmp(r.image_url, "https://x.io/a.jpg") == 0);
+    oup_req_free(&r);
+    static const char *const bad[] = {
+        "", "[]", "{}", "{\"image_url\":\"\"}", "{\"image_url\":\"http://x.io/a.png\"}",
+        "{\"image_url\":\"file:///etc/passwd\"}", "{\"image_url\":\"https://user@x.io/a.png\"}",
+        "{\"image_url\":\"https://x.io/a.png\",\"scale\":3}", "{\"image_url\":\"https://x.io/a.png\",\"scale\":\"8\"}",
+        "{\"image_url\":\"https://x.io/a.png\",\"model\":\"photo\"}",
+        "{\"image_url\":\"https://x.io/a.png\",\"output_format\":\"gif\"}",
+        "{\"image_url\":\"https://x.io/a.png\",\"model\":5}",
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i) CHECK(!oup_parse(bad[i], strlen(bad[i]), &r, err, sizeof err));
+
+    CHECK(oup_check_limits(2048, 2048, 2, err, sizeof err) == 0);
+    CHECK(oup_check_limits(2049, 2048, 2, err, sizeof err) == 413);
+    CHECK(oup_check_limits(1448, 1448, 4, err, sizeof err) == 0);
+    CHECK(oup_check_limits(1500, 1500, 4, err, sizeof err) == 413);
+    CHECK(oup_check_limits(4097, 100, 2, err, sizeof err) == 413);
+    CHECK(oup_check_limits(2049, 100, 4, err, sizeof err) == 413);
+    CHECK(oup_check_limits(0, 10, 2, err, sizeof err) == 400);
+
+    static const unsigned char png[24] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 13,
+                                          'I', 'H', 'D', 'R', 0, 0, 0x05, 0x40, 0, 0, 0x03, 0};
+    int w = 0, h = 0;
+    CHECK(oup_probe_dims(png, sizeof png, &w, &h) && w == 1344 && h == 768);
+    static const unsigned char jpeg[] = {0xff, 0xd8, 0xff, 0xe0, 0, 4, 0, 0, 0xff, 0xc0, 0, 17, 8,
+                                         0x02, 0x00, 0x03, 0x00, 3, 0, 0, 0, 0, 0, 0};
+    CHECK(oup_probe_dims(jpeg, sizeof jpeg, &w, &h) && w == 768 && h == 512);
+    unsigned char vp8x[30] = {'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'E', 'B', 'P', 'V', 'P', '8', 'X'};
+    vp8x[24] = 0xff; vp8x[25] = 0x0f; vp8x[27] = 0x63;
+    CHECK(oup_probe_dims(vp8x, sizeof vp8x, &w, &h) && w == 4096 && h == 100);
+    CHECK(!oup_probe_dims((const unsigned char *)"hello world, not an image", 25, &w, &h));
+
+    unsigned char *bytes = NULL;
+    size_t n = 0;
+    CHECK(oup_data_url_decode("data:image/png;base64,aGVsbG8=", &bytes, &n) && n == 5 && memcmp(bytes, "hello", 5) == 0);
+    free(bytes);
+    CHECK(!oup_data_url_decode("data:image/png,aGVsbG8=", &bytes, &n));
+    CHECK(!oup_data_url_decode("data:image/png;base64,@@@@", &bytes, &n));
+    CHECK(!oup_data_url_decode("data:text/plain;base64,aGVsbG8=", &bytes, &n));
+
+    struct sockaddr_in v4 = {.sin_family = AF_INET};
+    struct sockaddr_in6 v6 = {.sin6_family = AF_INET6};
+    static const char *const private4[] = {"127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1",
+                                           "169.254.169.254", "100.64.0.1", "0.0.0.0", "224.0.0.1", "255.255.255.255"};
+    for (size_t i = 0; i < sizeof private4 / sizeof private4[0]; ++i) {
+        inet_pton(AF_INET, private4[i], &v4.sin_addr);
+        CHECK(!oup_ip_public((struct sockaddr *)&v4));
+    }
+    static const char *const public4[] = {"8.8.8.8", "93.127.141.100", "172.32.0.1", "1.1.1.1"};
+    for (size_t i = 0; i < sizeof public4 / sizeof public4[0]; ++i) {
+        inet_pton(AF_INET, public4[i], &v4.sin_addr);
+        CHECK(oup_ip_public((struct sockaddr *)&v4));
+    }
+    static const char *const private6[] = {"::1", "::", "fe80::1", "fc00::1", "fd12::1", "ff02::1",
+                                           "::ffff:127.0.0.1", "::ffff:10.0.0.1", "64:ff9b::a9fe:a9fe", "2002:7f00:1::1"};
+    for (size_t i = 0; i < sizeof private6 / sizeof private6[0]; ++i) {
+        inet_pton(AF_INET6, private6[i], &v6.sin6_addr);
+        CHECK(!oup_ip_public((struct sockaddr *)&v6));
+    }
+    inet_pton(AF_INET6, "2606:4700:4700::1111", &v6.sin6_addr);
+    CHECK(oup_ip_public((struct sockaddr *)&v6));
+    inet_pton(AF_INET6, "::ffff:8.8.8.8", &v6.sin6_addr);
+    CHECK(oup_ip_public((struct sockaddr *)&v6));
+
+    CHECK(oup_fetch("https://127.0.0.1:1/x.png", &bytes, &n, err, sizeof err) != 0 && !bytes);
+
+    unsigned char quad[4 * 2 * 3];
+    for (int i = 0; i < 24; ++i) quad[i] = (unsigned char)(i * 10);
+    unsigned char half[2 * 1 * 3];
+    oup_box_down2(quad, 4, 2, 3, half);
+    CHECK(half[0] == (0 + 30 + 120 + 150 + 2) / 4 && half[5] == (80 + 110 + 200 + 230 + 2) / 4);
+    unsigned char alpha_src[2 * 2 * 4] = {0};
+    alpha_src[3] = 0; alpha_src[7] = 255; alpha_src[11] = 255; alpha_src[15] = 255;
+    unsigned char alpha_dst[4 * 4 * 4] = {0};
+    oup_resize_plane_bilinear(alpha_src + 3, 2, 2, 4, alpha_dst + 3, 4, 4, 4);
+    CHECK(alpha_dst[3] == 0 && alpha_dst[(15) * 4 + 3] == 255);
+    CHECK(alpha_dst[(1 * 4 + 1) * 4 + 3] > 0 && alpha_dst[(1 * 4 + 1) * 4 + 3] < 255);
+}
+
 static void test_openapi(void) {
     const int capacity = 8192;
     oj_tok *toks = malloc((size_t)capacity * sizeof *toks);
@@ -546,6 +641,7 @@ static void test_openapi(void) {
         "/v1/images/foreground-generations/jobs/{job_id}",
         "/v1/images/background-removals/jobs",
         "/v1/images/background-removals",
+        "/v1/images/upscales",
         "/v1/images/captions", "/v1/images/classifications",
         "/v1/classifications", "/v1/video/generations", "/loras",
         "/v1/3d/assets/{job}/{file}",
@@ -2443,6 +2539,7 @@ int main(void) {
     test_vram_priority();
     test_json();
     test_image_contract();
+    test_upscale_contract();
     test_lora_route_match();
     test_lora_route_style_fields();
     test_lora_route_edit_tasks_and_embed();

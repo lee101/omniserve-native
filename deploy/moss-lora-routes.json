@@ -143,6 +143,43 @@
    ]
   },
   {
+   "name": "animepaint",
+   "keywords": [
+    "painterly anime",
+    "cinematic anime",
+    "anime painting",
+    "anime oil painting",
+    "painted anime",
+    "anime concept art",
+    "anime film still",
+    "novelai",
+    "nai style",
+    "@painterly cine"
+   ],
+   "prefix": "@painterly cine, ",
+   "suffix": ", anime character, dynamic composition, clean anatomy",
+   "negative": "western cartoon, 3d render, photorealistic, extra legs, extra arms, bad hands",
+   "loras": [
+    {
+     "path": "/vfast/data/models/moss/lora/moss-nai5-painterly-cine.safetensors",
+     "scale": 0.8
+    }
+   ],
+   "positive": [
+    "painterly anime illustration with cinematic lighting",
+    "anime style digital painting, soft brushwork, film still",
+    "cinematic anime key visual painted with dramatic light and haze"
+   ],
+   "avoid": [
+    "photograph",
+    "3d render",
+    "flat cel shaded cartoon",
+    "chibi"
+   ],
+   "min_score": 0.45,
+   "keyword_bonus": 0.3
+  },
+  {
    "name": "anime",
    "keywords": [
     "anime",
@@ -169,7 +206,62 @@
     "photograph",
     "3d render"
    ],
-   "min_score": 0.42
+   "min_score": 0.42,
+   "loras": [
+    {
+     "path": "/vfast/data/models/moss/lora/moss-r32-v2-kohaku.safetensors",
+     "scale": 0.8
+    }
+   ]
+  },
+  {
+   "name": "digitalpainting",
+   "keywords": [
+    "digital painting",
+    "digital art",
+    "concept art",
+    "artstation",
+    "matte painting",
+    "fantasy art",
+    "fantasy painting",
+    "painted illustration",
+    "speedpaint*",
+    "character art",
+    "fantasy illustration"
+   ],
+   "exclude": [
+    "anime",
+    "manga",
+    "pixel",
+    "photo",
+    "photograph*",
+    "logo*",
+    "nsfw",
+    "nude",
+    "naked"
+   ],
+   "negative": "photo, photorealistic, flat vector, blurry, low detail",
+   "loras": [
+    {
+     "path": "/vfast/data/models/moss/lora/moss-digital-painting-dora.safetensors",
+     "scale": 0.8
+    }
+   ],
+   "positive": [
+    "detailed digital painting, fantasy concept art",
+    "epic matte painting of a fantasy landscape",
+    "painterly character concept art with dramatic lighting",
+    "artstation fantasy illustration of a knight or dragon"
+   ],
+   "avoid": [
+    "photograph",
+    "anime cel shading",
+    "pixel art",
+    "flat vector logo",
+    "vintage storybook gouache"
+   ],
+   "min_score": 0.45,
+   "keyword_bonus": 0.3
   },
   {
    "name": "beauty",
@@ -282,7 +374,13 @@
     "object only",
     "logo or diagram"
    ],
-   "min_score": 0.38
+   "min_score": 0.38,
+   "loras": [
+    {
+     "path": "/vfast/data/models/moss/lora/moss-r32-v2-kohaku.safetensors",
+     "scale": 0.8
+    }
+   ]
   }
  ],
  "edit_routes": [

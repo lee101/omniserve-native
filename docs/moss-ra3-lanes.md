@@ -23,7 +23,9 @@ One-image smoke test (builds if needed, starts the lane, writes `moss-out/00.web
 First matching route wins; each can add a trigger prefix, a prompt suffix, a negative (only effective at
 CFG > 1, i.e. the hq lane) and LoRAs by absolute path. Routes: psychedelic, gouache, impressionist,
 3d animated, anime (suffix only: `anime character, dynamic composition, clean anatomy` fixed the
-three-legs failure on 4/4 seeds without a LoRA), beauty (0.7), people (anatomy suffix). Lane steps/CFG are
+three-legs failure on 4/4 seeds without a LoRA; now + r32 realism/detail LoRA 0.8), animepaint (nai5 painterly-cine 0.8, opt-in phrasing only:
+it drifts to revealing outfits), digitalpainting (DoRA 0.8), beauty (0.7), people (anatomy suffix + r32 0.8). Scores and decisions:
+`performance/moss-style-loras-2026-11-06.md`. A route's `keyword_bonus` (default 0.15) weights an exact keyword hit in the embedding score. Lane steps/CFG are
 pinned server side (`SD_LANE_STEPS`, `SD_LANE_GUIDANCE`) so a client's hardcoded 20 steps cannot over-sample
 the distilled model. `SD_PUBLIC_NAME` (default `ra3` in the script) hides the checkpoint name from
 responses, `/health` and `/v1/models`; the route name only appears in stderr logs.
