@@ -9,6 +9,7 @@ outputs must be byte-identical unless BIREFNET_WEBP_ALPHA_METHOD is set, then pi
 Exit status 1 on any difference.
 """
 import argparse
+import base64
 import importlib.util
 import io
 import statistics
@@ -26,6 +27,7 @@ parser.add_argument("base")
 parser.add_argument("images", nargs="*")
 parser.add_argument("--n", type=int, default=7)
 parser.add_argument("--sizes", default="1024,2048")
+parser.add_argument("--read", default="", help="also time read_image + cutout from data URLs in these formats, e.g. png,webp,jpeg")
 args = parser.parse_args()
 sys.argv = sys.argv[:1]
 
@@ -53,7 +55,7 @@ def decoded(data):
 def timed(module, image, request):
     torch.cuda.synchronize()
     started = time.perf_counter()
-    out = module.remove_background(image, request)
+    out = module.remove_background(module.read_image(image) if isinstance(image, str) else image, request)
     torch.cuda.synchronize()
     return (time.perf_counter() - started) * 1e3, out
 
@@ -71,13 +73,19 @@ def main():
             scale = size / max(source.size)
             image = source if scale == 1 else source.resize(
                 (round(source.width * scale), round(source.height * scale)), Image.Resampling.LANCZOS)
-            for fmt in ("webp", "png"):
-                for name, extra in variants.items():
+            cases = [(fmt, name, extra, image) for fmt in ("webp", "png") for name, extra in variants.items()]
+            for source_format in filter(None, args.read.split(",")):
+                buffer = io.BytesIO()
+                image.save(buffer, format=source_format.upper(), **({"quality": 92} if source_format != "png" else {}))
+                url = f"data:image/{source_format};base64," + base64.b64encode(buffer.getvalue()).decode()
+                cases += [(fmt, f"read-{source_format}", {}, url) for fmt in ("webp", "png")]
+            for fmt, name, extra, image_or_url in cases:
+                if True:
                     request = new.RemoveBackgroundRequest(image_url="x", output_format=fmt, cache=False, **extra)
                     times = {"base": [], "new": []}
                     for i in range(args.n + 1):
                         for tag, module in (("base", base), ("new", new)) if i % 2 else (("new", new), ("base", base)):
-                            ms, out = timed(module, image, request)
+                            ms, out = timed(module, image_or_url, request)
                             if i:
                                 times[tag].append(ms)
                             if tag == "base":

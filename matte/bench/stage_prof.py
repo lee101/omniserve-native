@@ -88,7 +88,9 @@ def main():
                 if i >= 2:
                     totals.append((time.perf_counter() - started) * 1e3)
                     runs.append(dict(times))
-            print(f"== {size} {fmt}{' +composite' if args.composite else ''}: e2e min {min(totals):.0f} med {statistics.median(totals):.0f} ms")
+            rest = [t - r.get("_forward", 0.0) for t, r in zip(totals, runs)]
+            print(f"== {size} {fmt}{' +composite' if args.composite else ''}: e2e min {min(totals):.0f} med {statistics.median(totals):.0f} ms"
+                  f" | without forward min {min(rest):.0f} med {statistics.median(rest):.0f} ms")
             accounted = 0.0
             for name, depth in STAGES:
                 values = [r[name] for r in runs if name in r]

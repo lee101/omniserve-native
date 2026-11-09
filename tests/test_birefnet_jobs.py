@@ -173,6 +173,9 @@ class EncodingTest(unittest.TestCase):
             "webp-alpha": (Image.fromarray(np.dstack([rgb, alpha]), "RGBA"), "WEBP", {"quality": 90}),
             "webp-lossless": (Image.fromarray(rgb, "RGB"), "WEBP", {"lossless": True}),
             "webp-rotated": (Image.fromarray(rgb, "RGB"), "WEBP", {"quality": 90, "exif": exif.tobytes()}),
+            "webp-xmp-rotated": (Image.fromarray(rgb, "RGB"), "WEBP", {
+                "quality": 90,
+                "xmp": b'<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:Description tiff:Orientation="6"/></x:xmpmeta>'}),
         }
         for name, (image, fmt, options) in cases.items():
             with self.subTest(name=name):

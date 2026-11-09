@@ -252,6 +252,10 @@ class PngDecodeTest(unittest.TestCase):
         rgb = Image.fromarray(arr[:, :, :3])
         exif = Image.Exif()
         exif[0x0112] = 6
+        from PIL import PngImagePlugin
+
+        xmp_info = PngImagePlugin.PngInfo()
+        xmp_info.add_itxt("XML:com.adobe.xmp", '<rdf:Description tiff:Orientation="6"/>')
         others = {
             "palette": (rgb.quantize(16), {}),
             "gray": (Image.fromarray(arr[:, :, 0]), {}),
@@ -259,6 +263,7 @@ class PngDecodeTest(unittest.TestCase):
             "16-bit": (Image.fromarray(arr[:, :, 0].astype(np.uint16) * 257), {}),
             "transparency": (rgb, {"transparency": (1, 2, 3)}),
             "exif": (rgb, {"exif": exif.tobytes()}),
+            "xmp": (rgb, {"pnginfo": xmp_info}),
             "animated": (rgb, {"save_all": True, "append_images": [rgb.rotate(90)]}),
         }
         for name, (image, options) in others.items():
@@ -317,6 +322,8 @@ class WebpDecodeTest(unittest.TestCase):
         exif = Image.Exif()
         exif[0x0112] = 6
         self.assertIsNone(oencode.webp_size(self.encoded(arr[:, :, :3], quality=80, exif=exif.tobytes())))
+        xmp = b'<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:Description tiff:Orientation="6"/></x:xmpmeta>'
+        self.assertIsNone(oencode.webp_size(self.encoded(arr[:, :, :3], quality=80, xmp=xmp)))
 
     def test_truncated_data_fails(self):
         data = self.encoded(scene(64, 64), quality=80)

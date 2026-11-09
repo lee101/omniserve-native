@@ -586,8 +586,9 @@ static uint32_t get_be32(const uint8_t *p)
     return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
 
-/* 8-bit truecolour, non-interlaced, nothing that changes interpretation (tRNS, eXIf, APNG,
-   unknown critical chunks): everything else returns -2 and is left to the caller's decoder. */
+/* 8-bit truecolour, non-interlaced, nothing that changes interpretation (tRNS, eXIf, iTXt that
+   may hold XMP, APNG, unknown critical chunks): everything else returns -2 and is left to the
+   caller's decoder. */
 int oenc_png_info(const uint8_t *data, size_t n, int *w, int *h, int *channels)
 {
     static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
@@ -605,7 +606,8 @@ int oenc_png_info(const uint8_t *data, size_t n, int *w, int *h, int *channels)
         if (len > n - p - 12) return -1;
         if (!memcmp(type, "IEND", 4)) break;
         if (!memcmp(type, "IDAT", 4)) idat = 1;
-        else if (!memcmp(type, "tRNS", 4) || !memcmp(type, "eXIf", 4) || !memcmp(type, "acTL", 4)) return -2;
+        else if (!memcmp(type, "tRNS", 4) || !memcmp(type, "eXIf", 4) || !memcmp(type, "acTL", 4) ||
+                 !memcmp(type, "iTXt", 4)) return -2;
         else if (!(type[0] & 0x20) && memcmp(type, "PLTE", 4)) return -2;
         p += 12 + len;
     }
@@ -736,13 +738,13 @@ done:
     return rc;
 }
 
-/* Still images only: an animation, or EXIF that may carry an orientation, is left to the caller. */
+/* Still images only: an animation, or EXIF/XMP that may carry an orientation, is left to the caller. */
 int oenc_webp_info(const uint8_t *data, size_t n, int *w, int *h, int *has_alpha)
 {
     WebPBitstreamFeatures f;
     if (!data || n < 30 || WebPGetFeatures(data, n, &f) != VP8_STATUS_OK) return -1;
     if (f.has_animation) return -2;
-    if (!memcmp(data + 12, "VP8X", 4) && (data[20] & 0x08)) return -2;
+    if (!memcmp(data + 12, "VP8X", 4) && (data[20] & 0x0c)) return -2;
     if (w) *w = f.width;
     if (h) *h = f.height;
     if (has_alpha) *has_alpha = f.has_alpha;

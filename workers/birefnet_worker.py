@@ -738,7 +738,7 @@ def image_to_device(image: Image.Image, device: str):
     12, which on a 1024x1024 cutout is 3 MB rather than 12 MB.
     """
     if _in_source_scope(image):
-        if _source.floats is None or str(_source.floats.device) != device:
+        if _source.floats is None or _source.floats.device.type != torch.device(device).type:
             _source.floats = _source_bytes(image, device).float().div_(255.0)
         return _source.floats
     return _upload_bytes(image, device).float().div_(255.0)
@@ -778,7 +778,7 @@ def _in_source_scope(image: Image.Image) -> bool:
 
 def _source_bytes(image: Image.Image, device: str):
     """(h, w, 3) uint8 on the device, uploaded once per source scope."""
-    if _source.bytes is None or str(_source.bytes.device) != device:
+    if _source.bytes is None or _source.bytes.device.type != torch.device(device).type:
         _source.bytes = _upload_bytes(image, device)
     return _source.bytes
 
