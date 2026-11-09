@@ -45,6 +45,26 @@ prompt, while :8100 runs its own `quality_retry`; 16k prompts were rejected afte
 
 Backup of the previous command: `/nvme0n1-disk/tmp/cutedsl-gallery-generator-supervisor.conf.bak-20261110`.
 
+## BiRefNet worker (prod, live 2026-11-10, branch `perf/birefnet-20261110`)
+
+Drop-in `zzzz-perf-20261110.conf` (worktree snapshot `omniserve-native-deploy/birefnet-perf-20261110`): strip-parallel
+PNG, split-alpha WebP, native PNG/WebP decode, one source upload and one RGBA download per cutout, separable edge
+band. PNG pixels identical, WebP colour bitstream identical (alpha stays lossless at lower effort: +0.4% bytes
+<= 2 MP, +11% above). Rollback: delete the drop-in, daemon-reload, restart. Details: `matte/bench/README.md`.
+
+| live worker, server ms min | before | after |
+| --- | ---: | ---: |
+| 1024 webp cutout | 280 | 188 |
+| 1024 png cutout | 168 | 86 |
+| 2048 webp cutout | 842 | 519 |
+| 2048 png cutout | 663 | 305 |
+| 1024 webp req/s at 1 / 2 / 4 | 3.7 / 5.4 / 8.6 | 4.7 / 7.1 / 11.2 |
+| 2048 webp req/s at 1 / 2 / 4 | 1.04 / 1.74 / 2.53 | 1.74 / 3.23 / 5.40 |
+
+Left off: `BIREFNET_GPU_PREPROCESS=1` (moves 0.1% of alpha pixels by > 8/255 on one upscaled image),
+`BIREFNET_WEBP_METHOD=2`. The unit's WorkingDirectory is now the snapshot, so edits to main's `workers/` do not
+reach this unit until the next snapshot.
+
 ### WebP encode (`OMNISERVE_NATIVE_SD_WEBP_METHOD`, opt-in)
 
 1024^2 q85 on the prod Broadwell, `liboencode`: method 4 133 ms / 86.0 KB, method 2 54 ms / 88.3 KB but 3.3 dB
