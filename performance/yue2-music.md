@@ -72,6 +72,78 @@ correctly marked truncated. Stage timings were 119.45 seconds planning, 84.29
 seconds semantic generation, 577.68 seconds NAR and 8.36 seconds VAE. This is a
 functional check, not a GPU speed or subjective audio-quality result.
 
+## Exact acceleration (2026-11-10)
+
+`../yue-cog` branch `perf/yue-20261110` carries `patches/yue2-accel.patch` for the
+pinned upstream package plus `scripts/apply_yue2_patch.py` (idempotent, refuses
+anything but the pinned pristine files, `--check`, `--revert`). Every default
+produces the same ABC tokens, semantic tokens, latents and FLAC bytes as the
+unpatched package: 40 patched renders on the local RTX 3090 Ti matched the
+upstream FLAC byte for byte, and three further prompts/seeds plus CFG,
+`cot=off` and `cot=melody` matched token for token. The quality preset is
+unchanged (BF16 AR/NAR, FP32 VAE, full planning, 32 steps, no quantization), so
+`RUNTIME_VERSION` and the result caches are not bumped.
+
+| Change (env, default) | What it removes |
+| --- | --- |
+| `YUE_FAST_PLACEMENT=1` | Upstream moved 6.8 GiB of weights four times per request with AR offload (upload, AR down, AR up, everything down for the VAE; 2-3.5 s each). Weights now keep an immutable CPU master, so offload is free and AR is not restored after NAR: one 1.9 s upload per request, same peak VRAM. |
+| `YUE_FUSED_SAMPLING=1` | Logits processing, the multinomial draw and the penalty history ran as about 25 eager ops with several host round-trips per token. They now run inside the decode CUDA graph, with one sync per token. Checked bitwise against the eager sampler once per process; CFG and `cot=off` keep the eager sampler. |
+| `YUE_LEAN_DECODE=1` | Q and K heads share one RMSNorm+RoPE pass per layer, so each token launches fewer tiny kernels. Checked bitwise (logits and KV) once per process. |
+| `YUE_RESIDENT=0` (image: 1) | Opt-in on the shared host: LM and VAE stay on the GPU. Peak allocation 9.6 GiB instead of 7.6 GiB, idle process VRAM 8.4 GiB instead of 1.5 GiB. |
+| `YUE_PIN_WEIGHTS=0` | Opt-in: pinned masters upload in 0.5 s instead of 1.9 s, for 8 s once per process and about 9 GiB locked host RAM. Loses with the 30 s idle exit. |
+
+Local RTX 3090 Ti, Electric Gold request (seed 831002, 3000-token cap, 32
+steps, FLAC), 68.2 s of audio, 723 ABC + 1706 semantic tokens, warm, shared-host
+settings (`YUE_OFFLOAD_AR=1`, 18 GiB budget), same process, min / median of 3,
+no other GPU tenant. "Upstream paths" is the patched package with every switch
+off, which runs the unmodified upstream code:
+
+| Stage | Upstream paths | Defaults | `YUE_RESIDENT=1` |
+| --- | ---: | ---: | ---: |
+| ABC planning | 7.04 / 7.07 s | 5.39 / 5.53 s | 5.49 / 6.22 s |
+| Semantic AR | 16.01 / 16.05 s | 12.80 / 12.85 s | 12.78 / 12.82 s |
+| NAR, 32 steps (incl. AR offload) | 9.95 / 10.32 s | 8.17 / 8.22 s | 8.22 / 8.22 s |
+| VAE (incl. LM offload) | 3.67 / 3.75 s | 1.03 / 1.03 s | 0.87 / 0.92 s |
+| Other (upload, FLAC, base64) | 2.38 / 2.40 s | 1.66 / 1.82 s | 0.29 / 0.33 s |
+| Wall | 39.20 / 39.57 s | 29.26 / 29.38 s | 27.65 / 28.54 s |
+| Semantic tok/s | 106 | 133 | 133 |
+| Peak allocated | 7744 MiB | 7758 MiB | 9831 MiB |
+
+With another process holding the same GPU at 100% utilisation the unpatched
+package took 77.35 / 77.96 s (own process, 3 renders) and the defaults 63.8 s
+(one interleaved render; 63.45 / 63.92 s for two more before the lean decode
+existed). The solver itself (NAR 7.9-8.0 s, VAE tiles 0.75-0.83 s) is untouched;
+the NAR and VAE rows shrink only because weight moves left them.
+Records: `../yue-cog/examples/accel-ab-20261110.json`.
+
+Cold start is the largest remaining local cost. With the page cache hot, a fresh child spent 10.7 and 17.3 s outside the
+model stages on its first request (imports, mmap load, first upload) against
+2.2 s for a warm request, and the 30 s idle exit makes
+most sporadic requests cold. The idle non-resident child holds 1.5 GiB of
+VRAM. This host's HF cache is on the spinning `/vfast` pool: the first read of
+the 7.3 GB checkpoint took 133 s and its first integrity hash 436 s, so local
+serving wants `YUE_HF_HOME` on NVMe. Raising `YUE_IDLE_SECONDS` is a policy
+choice (VRAM and about 7 GiB of page cache held); it is unchanged here.
+
+Measured and rejected: LM-head row slicing to the allowed token range (BF16
+GEMM on the slice is not bitwise equal); cuDNN autotuning for the VAE (1.5 ->
+1.03 s on repeated shapes, 115 dB SNR, not exact, and it retunes for every new
+last-tile length); one 2048-frame VAE tile (112 dB SNR, no gain, +1.4 GiB);
+folding VAE weight norm (exact, no gain); pinning by default (above). The
+per-request CUDA-graph capture costs 0.2-0.4 s and was left alone.
+
+Rollout. Shared-host worker: update `../yue-cog`, run
+`.venv/bin/python scripts/apply_yue2_patch.py` in the worker virtualenv (needs
+`patch`), restart `omniserve-yue-worker`; no env change is required and
+`--revert` restores upstream. RunPod: rebuild and push the image (the
+Dockerfile applies the patch and sets `YUE_RESIDENT=1`; not built or tested
+here), save a new template, then rerun `scripts/benchmark_runpod.py`: the
+4090 render should reproduce FLAC sha256 `509a973d...d83c` from
+`gpu-benchmark-20260920.json`; a different hash on the same GPU type blocks the rollout. `scripts/accel_ab.py` runs the same-process
+legacy/accel comparison on any GPU and fails on any difference. `cog build`
+images stay unpatched and keep the upstream paths. No cache revision bump in
+`yue_runtime.py` or `yue_music.go` is needed while outputs stay identical.
+
 ## Configuration
 
 Install `systemd/omniserve-yue-worker.service`. Put secrets in
