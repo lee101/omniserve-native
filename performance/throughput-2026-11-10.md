@@ -79,3 +79,16 @@ reach this unit until the next snapshot.
 1024^2 q85 on the prod Broadwell, `liboencode`: method 4 133 ms / 86.0 KB, method 2 54 ms / 88.3 KB but 3.3 dB
 lower PSNR against the same source, method 1 40 ms / 97.5 KB. libwebp's lossy threading does nothing for opaque
 images. Default unchanged; with client concurrency 2 the encode no longer holds the GPU idle anyway.
+
+## YuE2 music (local 3090 Ti, not deployed)
+
+`performance/yue2-music.md`, yue-cog `perf/yue-20261110` 71d81ce: 68.2 s clip, warm, 39.6 -> 29.4 s median
+(27.7-28.5 s with `YUE_RESIDENT=1`), FLAC sha256 identical over 40 renders. Free AR offload from a CPU master
+(-5.4 s of weight moves), in-graph sampling + shared Q/K norm (semantic 106 -> 133 tok/s), NAR untouched.
+Prod worker never admits locally right now (8.9 GB free vs `YUE_MIN_FREE_MIB=18432`), so the gain lands on RunPod:
+rebuild the image, new template, `scripts/benchmark_runpod.py`. Shared host: checkout with the `yue_runtime.py`
+change plus `scripts/apply_yue2_patch.py` in the worker venv.
+
+## Not touched
+
+H3 video (RunPod image), Qwen ra2 (:8792, low traffic, tuned 2026-10).
